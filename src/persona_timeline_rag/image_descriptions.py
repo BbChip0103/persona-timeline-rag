@@ -22,8 +22,8 @@ from typing import Any
 MODEL = "gpt-6-luna"
 EFFORT = "medium"
 PROMPT_VERSION = "original-image-ko-v3"
-OUTPUT_DIRECTORY = "data/research/image_descriptions_v4"
-REPORT_DIRECTORY = "reports/image-description-v4"
+OUTPUT_DIRECTORY = "data/research/image_descriptions_v4_1"
+REPORT_DIRECTORY = "reports/image-description-v4_1"
 LANES = 5
 EXECUTION_VARIANT = "v4-luna-medium-five-lanes"
 INTENT_STATUS = "tentative_not_author_fact"
@@ -165,6 +165,160 @@ def source_context(source: dict[str, Any], category: str, context_id: str,
             "caption_sha256": hashlib.sha256(caption.encode()).hexdigest(),
             "caption_chars": len(caption), "hashtag_count": caption.count("#"),
             "unsafe_source": bool(source.get("unsafe"))}
+
+
+WIRE_VERSION = "required-maps-evidence-indices-v1"
+WIRE_ADAPTER = """Structural response adapter only; observation/context meaning remains unchanged.
+Use the required JSON schema's images OBJECT with every required image ID as a key, not an array.
+For every image, use a context_interpretations OBJECT with every supplied context ID as a key.
+Do not repeat imageId/contextId inside values; the required keys carry these identifiers.
+Inside each tentative hypothesis, return visual_basis_indices: one or two zero-based integer indices
+into that image's observed_emphasis.visual_basis, instead of duplicating visual_basis strings.
+An index must reference an existing observed basis string. Do not invent a new evidence string in
+hypotheses; the wrapper copies referenced strings canonically. No hypothesis is needed if unclear.
+Every required image/context key must be present. Missing keys cannot be omitted or summarized away.
+"""
+WIRE_HASH = hashlib.sha256(WIRE_ADAPTER.encode()).hexdigest()
+
+
+def wire_schema(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    properties = {}
+    for image in batch:
+        item = copy.deepcopy(OUTPUT_SCHEMA["properties"]["images"]["items"])
+        item["required"].remove("imageId")
+        del item["properties"]["imageId"]
+        hypothesis = item["properties"]["communicative_intent"]["properties"][
+            "hypotheses"]["items"]
+        hypothesis["required"].remove("visual_basis")
+        del hypothesis["properties"]["visual_basis"]
+        hypothesis["required"].append("visual_basis_indices")
+        hypothesis["properties"]["visual_basis_indices"] = {
+            "type": "array", "minItems": 1, "maxItems": 2,
+            "items": {"type": "integer", "enum": [0, 1, 2]},
+        }
+        context_item = copy.deepcopy(item["properties"]["context_interpretations"]["items"])
+        context_item["required"].remove("contextId")
+        del context_item["properties"]["contextId"]
+        context_ids = [context["contextId"] for context in image["contexts"]]
+        item["properties"]["context_interpretations"] = {
+            "type": "object", "additionalProperties": False, "required": context_ids,
+            "properties": {context_id: copy.deepcopy(context_item) for context_id in context_ids},
+        }
+        properties[image["imageId"]] = item
+    return {"type": "object", "additionalProperties": False, "required": ["images"],
+            "properties": {"images": {"type": "object", "additionalProperties": False,
+                                      "required": list(properties), "properties": properties}}}
+
+
+def normalize_wire(value: Any, batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = [image["imageId"] for image in batch]
+    if (not isinstance(value, dict) or set(value) != {"images"}
+            or not isinstance(value["images"], dict) or set(value["images"]) != set(ids)):
+        raise ValueError("Every required image key must be present, without extras")
+    rows = []
+    for image in batch:
+        row = copy.deepcopy(value["images"][image["imageId"]])
+        if not isinstance(row, dict) or set(row) != (FIELDS - {"imageId"}) | {
+                "context_interpretations"}:
+            raise ValueError("Invalid keyed image fields")
+        basis = row["observed_emphasis"]["visual_basis"]
+        for hypothesis in row["communicative_intent"]["hypotheses"]:
+            if "visual_basis" in hypothesis or "visual_basis_indices" not in hypothesis:
+                raise ValueError("Hypothesis evidence must use canonical indices")
+            indices = hypothesis.pop("visual_basis_indices")
+            if (not isinstance(indices, list) or not 1 <= len(indices) <= 2 or
+                    any(type(index) is not int or not 0 <= index < len(basis)
+                        for index in indices)):
+                raise ValueError("Evidence index does not reference observed basis")
+            hypothesis["visual_basis"] = [basis[index] for index in indices]
+        contexts = row["context_interpretations"]
+        context_ids = [context["contextId"] for context in image["contexts"]]
+        if not isinstance(contexts, dict) or set(contexts) != set(context_ids):
+            raise ValueError("Every required source-context key must be present")
+        row["context_interpretations"] = [
+            {"contextId": context_id, **contexts[context_id]} for context_id in context_ids]
+        row["imageId"] = image["imageId"]
+        rows.append(row)
+    return validate_annotation({"images": rows}, batch)
+
+
+def legacy_contract(inv: dict[str, Any], batch_size: int) -> str:
+    return canonical_hash({"inventory": inv, "batch_size": batch_size,
+                           "model": MODEL, "effort": EFFORT, "lanes": LANES,
+                           "execution_variant": EXECUTION_VARIANT,
+                           "prompt_hash": PROMPT_HASH, "core_schema": SCHEMA,
+                           "context_hash": CONTEXT_HASH, "schema": OUTPUT_SCHEMA})
+
+
+def import_completed_v4(root: Path, output: Path, batches: list[list[dict[str, Any]]],
+                        inv: dict[str, Any], batch_size: int, contract: str) -> None:
+    previous = root / "data/research/image_descriptions_v4"
+    old_manifest = load_json(previous / "manifest.json")
+    old_contract = legacy_contract(inv, batch_size)
+    if old_manifest["contract"] != old_contract or old_manifest["inventory"] != inv:
+        raise ValueError("Recovery input/model/context must exactly match preserved V4")
+    authorization = load_json(root / REPORT_DIRECTORY / "corrective-authorization.json")
+    allowed = set(authorization["batch_indices"])
+    if authorization["source_contract"] != old_contract or authorization["max_attempts"] != 1:
+        raise ValueError("Invalid bounded corrective authorization")
+    with (previous / "runner.lock").open("a") as old_lock:
+        fcntl.flock(old_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for number, batch in enumerate(batches):
+            old_directory = batch_directory(previous, number)
+            old_state_path = old_directory / "state.json"
+            if not old_state_path.exists():
+                continue
+            old_state = load_json(old_state_path)
+            directory = batch_directory(output, number)
+            state_path = directory / "state.json"
+            if state_path.exists():
+                continue  # Never reset used corrective attempts or replace accepted output.
+            lineage = {"source_run": str(previous.relative_to(root)), "source_batch": number,
+                       "source_contract": old_contract,
+                       "source_state_sha256": digest(old_state_path)}
+            if old_state["status"] == "succeeded":
+                result = validate_result(old_directory / "result.json", batch, old_contract,
+                                         legacy=True)
+                if old_state["result_sha256"] != digest(old_directory / "result.json"):
+                    raise ValueError("Preserved successful V4 result hash mismatch")
+                # Preserve original model records/provenance; link rather than relabel.
+                result["contract"] = contract
+                result["adopted_from"] = {**lineage,
+                    "result_sha256": digest(old_directory / "result.json")}
+                atomic_json(directory / "result.json", result)
+                atomic_json(state_path, {"status": "succeeded", "contract": contract,
+                    "adopted_from": result["adopted_from"],
+                    "result_sha256": digest(directory / "result.json"),
+                    "started_at": old_state["started_at"], "ended_at": old_state["ended_at"]})
+            else:
+                if number not in allowed or old_state["status"] != "unknown":
+                    raise RuntimeError("Uncertain/unapproved request cannot be resubmitted")
+                process = load_json(old_directory / "workspace/process.json")
+                try:
+                    os.kill(process["pid"], 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise RuntimeError("Previous request PID is still live")
+                events = [json.loads(line) for line in
+                          (old_directory / "workspace/events.jsonl").open()]
+                completed = [event for event in events if event["type"] == "turn.completed"]
+                if len(completed) != 1 or old_state.get("error_type") != "ValueError":
+                    raise RuntimeError("Only verified terminal validation failures are corrective")
+                if any(event["type"] == "item.completed" and event.get("item", {}).get("type")
+                       not in {"agent_message", "reasoning"} for event in events):
+                    raise RuntimeError("Tool use in old request prevents automatic correction")
+                raw = load_json(old_directory / "workspace/response.json")
+                try:
+                    validate_annotation(raw, batch)
+                except (ValueError, KeyError, TypeError):
+                    pass
+                else:
+                    raise RuntimeError("Valid old result should be reconciled, not resubmitted")
+                atomic_json(state_path, {"status": "pending", "contract": contract,
+                    "corrective_attempt": 1, "corrects_completed_invalid": lineage,
+                    "prior_observed_usage": completed[0]["usage"]})
+
 
 
 def utc_now() -> str:
@@ -357,10 +511,31 @@ def validate_annotation(value: Any, batch: list[dict[str, Any]]) -> list[dict[st
     return value["images"]
 
 
-def validate_result(path: Path, batch: list[dict[str, Any]], contract: str) -> dict[str, Any]:
+def validate_result(path: Path, batch: list[dict[str, Any]], contract: str,
+                    legacy: bool = False) -> dict[str, Any]:
     value = load_json(path)
     if value.get("contract") != contract or value.get("model") != MODEL:
         raise ValueError("Incompatible stored result")
+    if "adopted_from" in value:
+        link = value["adopted_from"]
+        if link["source_run"] != "data/research/image_descriptions_v4":
+            raise ValueError("Unexpected adopted source run")
+        root = path.parents[5]
+        original = batch_directory(root / link["source_run"], link["source_batch"]) / "result.json"
+        if digest(original) != link["result_sha256"]:
+            raise ValueError("Adopted source result checksum mismatch")
+        source_state = original.parent / "state.json"
+        if digest(source_state) != link["source_state_sha256"]:
+            raise ValueError("Adopted source-state checksum mismatch")
+        prior = load_json(original)
+        if prior["contract"] != link["source_contract"] or any(
+            prior[field] != value[field] for field in ("images", "usage", "observed_at", "model")
+        ):
+            raise ValueError("Adopted model records/provenance must remain unchanged")
+    if not legacy and "adopted_from" not in value:
+        if (value.get("response_adapter") != WIRE_VERSION
+                or value.get("response_adapter_hash") != WIRE_HASH):
+            raise ValueError("Response adapter provenance mismatch")
     validate_annotation({"images": [{**row["visual"],
                                      "context_interpretations": row["caption_context"]}
                                     for row in value["images"]]}, batch)
@@ -458,7 +633,7 @@ def build_prompt(batch: list[dict[str, Any]]) -> str:
 def execute_batch(workspace: Path, batch: list[dict[str, Any]], root: Path,
                   timeout: int, on_started: Callable[[], Any] | None = None) -> dict[str, Any]:
     private_dir(workspace)
-    atomic_json(workspace / "schema.json", OUTPUT_SCHEMA)
+    atomic_json(workspace / "schema.json", wire_schema(batch))
     image_paths = []
     for image in batch:
         original = root / "data/subsets/instagram" / image["files"][0]
@@ -469,7 +644,7 @@ def execute_batch(workspace: Path, batch: list[dict[str, Any]], root: Path,
         os.chmod(target, 0o600)
         image_paths.append(target)
     output = workspace / "response.json"
-    prompt = build_prompt(batch)
+    prompt = build_prompt(batch) + "\n" + WIRE_ADAPTER
     events_path, error_path = workspace / "events.jsonl", workspace / "stderr.log"
     with events_path.open("w") as events, error_path.open("w") as errors:
         os.chmod(events_path, 0o600)
@@ -479,7 +654,8 @@ def execute_batch(workspace: Path, batch: list[dict[str, Any]], root: Path,
             "argv": args, "model": MODEL, "effort": EFFORT,
             "runner_source_sha256": digest(Path(__file__)),
             "prompt_hash": PROMPT_HASH, "context_adapter_hash": CONTEXT_HASH,
-            "execution_variant": EXECUTION_VARIANT, "auth": "ChatGPT-only",
+            "execution_variant": EXECUTION_VARIANT, "response_adapter": WIRE_VERSION,
+            "response_adapter_hash": WIRE_HASH, "auth": "ChatGPT-only",
         })
         child = subprocess.Popen(args, stdin=subprocess.PIPE,
                                  stdout=events, stderr=errors, env=child_environment(),
@@ -502,7 +678,7 @@ def execute_batch(workspace: Path, batch: list[dict[str, Any]], root: Path,
     usages = record_usage(workspace)
     if child.returncode != 0 or len(usages) != 1:
         raise RuntimeError("Codex failed/incomplete: inspect private stderr/events; no retry")
-    return {"descriptions": validate_annotation(load_json(output), batch), "usage": usages[0]}
+    return {"descriptions": normalize_wire(load_json(output), batch), "usage": usages[0]}
 
 
 def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
@@ -510,6 +686,8 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
     counts: dict[str, int] = {}
     complete_files = complete_images = 0
     tokens: dict[str, int] = {}
+    adopted_tokens: dict[str, int] = {}
+    prior_invalid_tokens: dict[str, int] = {}
     usage_batches = 0
     missing_usage_batches = 0
     lane_statistics: list[dict[str, Any]] = [
@@ -536,6 +714,9 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
             duration = (dt.datetime.fromisoformat(state["ended_at"]) -
                         dt.datetime.fromisoformat(state["started_at"])).total_seconds()
             lane["durations_seconds"].append(duration)
+        for key, amount in state.get("prior_observed_usage", {}).items():
+            if type(amount) is int and amount >= 0:
+                prior_invalid_tokens[key] = prior_invalid_tokens.get(key, 0) + amount
         observed_usages = []
         if status == "succeeded":
             ensure_resumable(state, contract)
@@ -556,6 +737,8 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
             for key, amount in usage.items():
                 if type(amount) is int and amount >= 0:
                     tokens[key] = tokens.get(key, 0) + amount
+                    if state.get("adopted_from"):
+                        adopted_tokens[key] = adopted_tokens.get(key, 0) + amount
     for lane in lane_statistics:
         durations = lane.pop("durations_seconds")
         lane["mean_batch_seconds"] = sum(durations) / len(durations) if durations else None
@@ -567,6 +750,12 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
         "total_content_images": len(inv["images"]), "validated_files": complete_files,
         "validated_content_images": complete_images, "batch_status": counts,
         "observed_codex_usage": tokens, "cached_input_is_subset": True,
+        "adopted_success_usage": adopted_tokens, "preserved_invalid_usage": prior_invalid_tokens,
+        "observed_new_usage": {key: amount - adopted_tokens.get(key, 0)
+                               for key, amount in tokens.items()},
+        "lineage_codex_usage": {key: tokens.get(key, 0) + prior_invalid_tokens.get(key, 0)
+                                for key in tokens.keys() | prior_invalid_tokens.keys()},
+        "response_adapter": WIRE_VERSION, "response_adapter_hash": WIRE_HASH,
         "reasoning_tokens": tokens.get("reasoning_output_tokens"),
         "reasoning_output_is_subset": True, "observed_usage_batches": usage_batches,
         "missing_usage_batches": missing_usage_batches,
@@ -616,7 +805,7 @@ def prepare_batch(directory: Path, batch: list[dict[str, Any]], contract: str,
         if result_path.exists():
             validate_result(result_path, batch, contract)
         else:
-            rows = validate_annotation(load_json(directory / "workspace/response.json"), batch)
+            rows = normalize_wire(load_json(directory / "workspace/response.json"), batch)
             usages = record_usage(directory / "workspace")
             if len(usages) != 1:
                 raise RuntimeError("Cannot reconcile without exact successful usage event")
@@ -633,7 +822,8 @@ def prepare_batch(directory: Path, batch: list[dict[str, Any]], contract: str,
 
 
 def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
-        status_only: bool = False, reconcile: bool = False) -> dict[str, Any]:
+        status_only: bool = False, reconcile: bool = False,
+        recover_completed_v4: bool = False) -> dict[str, Any]:
     os.umask(0o077)
     output = root / OUTPUT_DIRECTORY
     reports = root / REPORT_DIRECTORY
@@ -650,7 +840,8 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
                                    "model": MODEL, "effort": EFFORT, "lanes": LANES,
                                    "execution_variant": EXECUTION_VARIANT,
                                    "prompt_hash": PROMPT_HASH, "core_schema": SCHEMA,
-                                   "context_hash": CONTEXT_HASH, "schema": OUTPUT_SCHEMA})
+                                   "context_hash": CONTEXT_HASH, "schema": OUTPUT_SCHEMA,
+                                   "response_adapter_hash": WIRE_HASH})
         manifest = output / "manifest.json"
         if manifest.exists() and load_json(manifest)["contract"] != contract:
             raise ValueError("Changed inventory/config: never reuse incompatible run directory")
@@ -659,12 +850,17 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
                                   "batch_size": batch_size, "started_at": utc_now(),
                                   "prompt_version": PROMPT_VERSION, "lanes": LANES,
                                   "execution_variant": EXECUTION_VARIANT,
-                                  "variant_policy": "New model/parallel v4 annotation for every "
-                                  "original image; preserve v1/v2/v3 output and usage separately"})
+                                  "response_adapter": WIRE_VERSION,
+                                  "response_adapter_hash": WIRE_HASH,
+                                  "variant_policy": "V4 repair; adopt successes unchanged; "
+                                  "correct only authorized terminal invalid batches once; "
+                                  "preserve original results and observed usage"})
         images = inv["images"]
         batches = [images[index:index + batch_size] for index in range(0, len(images), batch_size)]
         if status_only:
             return summarize(output, reports, batches, contract, inv)
+        if recover_completed_v4:
+            import_completed_v4(root, output, batches, inv, batch_size, contract)
         auth_preflight()
         # Validate ALL existing state before ANY new request; unresolved work blocks every lane.
         pending = [number for number, batch in enumerate(batches)
@@ -756,6 +952,7 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
 def make_result(batch: list[dict[str, Any]], rows: list[dict[str, Any]],
                 usage: dict[str, Any], contract: str) -> dict[str, Any]:
     return {"contract": contract, "model": MODEL, "observed_at": utc_now(), "usage": usage,
+            "response_adapter": WIRE_VERSION, "response_adapter_hash": WIRE_HASH,
             "images": [{"visual": {key: row[key] for key in FIELDS},
                         "caption_context": row["context_interpretations"],
                         "source": image, "provenance": {
@@ -782,6 +979,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--reconcile", action="store_true")
+    parser.add_argument("--recover-completed-v4", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.batch_size <= 8 or not 30 <= args.timeout <= 1800:
         parser.error("batch-size must be 1..8 and timeout 30..1800 seconds")
@@ -792,7 +990,8 @@ def main() -> None:
         print(json.dumps(load_json(progress)), flush=True)
         return
     print(json.dumps(run(args.root.resolve(), args.batch_size, args.max_batches,
-                         args.timeout, args.status, args.reconcile)), flush=True)
+                         args.timeout, args.status, args.reconcile,
+                         args.recover_completed_v4)), flush=True)
 
 
 if __name__ == "__main__":

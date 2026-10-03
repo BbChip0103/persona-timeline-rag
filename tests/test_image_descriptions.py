@@ -228,8 +228,8 @@ class ImageDescriptionTests(unittest.TestCase):
         for domain_example in ("scenery", "landscape", "makeup", "cream", "product label",
                                "blue shirt", "pink cafe", "passerby"):
             self.assertNotIn(domain_example, prompt)
-        self.assertEqual(mod.OUTPUT_DIRECTORY, "data/research/image_descriptions_v4")
-        self.assertEqual(mod.REPORT_DIRECTORY, "reports/image-description-v4")
+        self.assertEqual(mod.OUTPUT_DIRECTORY, "data/research/image_descriptions_v4_1")
+        self.assertEqual(mod.REPORT_DIRECTORY, "reports/image-description-v4_1")
 
     def test_command_fixed_model_auth_disabled_tools_and_clean_env(self):
         args = mod.command(Path("/private"), [Path("/private/img_a.jpg")], Path("/output"))
@@ -265,7 +265,7 @@ class ImageDescriptionTests(unittest.TestCase):
                 self.assertEqual(execute.call_count, 2)
                 with self.assertRaises(ValueError):
                     mod.run(root, 2, None, 30)
-                result = root / "data/research/image_descriptions_v4/lane-0/batch-0000/result.json"
+                result = root / mod.OUTPUT_DIRECTORY / "lane-0/batch-0000/result.json"
                 value = mod.load_json(result)
                 value["images"][0]["source"]["sha256"] = "tampered"
                 mod.atomic_json(result, value)
@@ -451,12 +451,97 @@ class ImageDescriptionTests(unittest.TestCase):
             self.assertEqual([lane["succeeded"] for lane in summary["lane_statistics"]], [3]*5)
             self.assertTrue(all(value["validated_files"] <= 15 for value in reads))
 
+    def test_required_maps_and_evidence_indices_canonicalize_without_id_repair(self):
+        batch = [{"imageId": "img_000000", "contexts": []},
+                 {"imageId": "img_000001", "contexts": []}]
+        schema = mod.wire_schema(batch)
+        self.assertEqual(schema["properties"]["images"]["required"],
+                         ["img_000000", "img_000001"])
+        keyed = {}
+        for row in rows_for(batch):
+            image_id = row.pop("imageId")
+            row["observed_emphasis"] = {"main_subjects": ["합성 주요 대상"],
+                                        "visual_basis": ["합성 관찰 근거"]}
+            row["communicative_intent"]["hypotheses"] = [{
+                "hypothesis_ko": "주요 내용을 전달하려는 구성일 수 있다.",
+                "visual_basis_indices": [0], "confidence": "low",
+                "uncertainty_ko": "실제 의도는 확인할 수 없다.",
+                "alternatives": ["구성을 기록한 장면일 수도 있다."]}]
+            row["context_interpretations"] = {}
+            keyed[image_id] = row
+        normalized = mod.normalize_wire({"images": keyed}, batch)
+        self.assertEqual(normalized[0]["communicative_intent"]["hypotheses"][0]["visual_basis"],
+                         ["합성 관찰 근거"])
+        for mutation in ("missing_image", "bad_index", "string_evidence", "extra_image"):
+            changed = copy.deepcopy(keyed)
+            if mutation == "missing_image":
+                changed.pop("img_000001")
+            elif mutation == "extra_image":
+                changed["img_wrong"] = changed["img_000001"]
+            elif mutation == "bad_index":
+                changed["img_000000"]["communicative_intent"]["hypotheses"][0][
+                    "visual_basis_indices"] = [2]
+            else:
+                changed["img_000000"]["communicative_intent"]["hypotheses"][0][
+                    "visual_basis"] = ["unlinked fact"]
+            with self.assertRaises(ValueError):
+                mod.normalize_wire({"images": changed}, batch)
+
+    def test_terminal_corrective_once_preserves_success_failures_and_lineage_usage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            synthetic(root)
+            inv = mod.inventory(root)
+            batches = [[image] for image in inv["images"]]
+            old = root / "data/research/image_descriptions_v4"
+            contract = mod.legacy_contract(inv, 1)
+            mod.atomic_json(old / "manifest.json", {"contract": contract, "inventory": inv})
+            good = mod.batch_directory(old, 0)
+            result = mod.make_result(batches[0], annotations_for(batches[0]),
+                                     {"input_tokens": 10}, contract)
+            result.pop("response_adapter")
+            result.pop("response_adapter_hash")
+            mod.atomic_json(good / "result.json", result)
+            mod.atomic_json(good / "state.json", {"status": "succeeded", "contract": contract,
+                "result_sha256": mod.digest(good / "result.json"),
+                "started_at": mod.utc_now(), "ended_at": mod.utc_now()})
+            bad = mod.batch_directory(old, 1)
+            mod.atomic_json(bad / "state.json", {"status": "unknown", "contract": contract,
+                                                 "error_type": "ValueError"})
+            mod.atomic_json(bad / "workspace/process.json", {"pid": 999999999})
+            mod.atomic_json(bad / "workspace/response.json", {"images": []})
+            events = bad / "workspace/events.jsonl"
+            events.write_text(json.dumps({"type": "turn.completed",
+                                         "usage": {"input_tokens": 42}}) + "\n")
+            mod.atomic_json(root / mod.REPORT_DIRECTORY / "corrective-authorization.json",
+                            {"source_contract": contract, "max_attempts": 1, "batch_indices": [1]})
+            originals = {path: path.read_bytes() for path in old.rglob("*") if path.is_file()}
+            def fake_execute(workspace, batch, root, timeout, on_started=None):
+                return {"descriptions": annotations_for(batch), "usage": {"input_tokens": 7}}
+            with patch.object(mod, "auth_preflight"), patch.object(
+                    mod, "execute_batch", side_effect=fake_execute) as execute:
+                summary = mod.run(root, 1, 1, 30, recover_completed_v4=True)
+                self.assertEqual(execute.call_count, 1)
+                self.assertTrue(summary["all_validated"])
+                self.assertEqual(summary["observed_new_usage"]["input_tokens"], 7)
+                self.assertEqual(summary["preserved_invalid_usage"]["input_tokens"], 42)
+                self.assertEqual(summary["lineage_codex_usage"]["input_tokens"], 59)
+                mod.run(root, 1, None, 30, recover_completed_v4=True)
+                self.assertEqual(execute.call_count, 1)
+            for path, value in originals.items():
+                self.assertEqual(path.read_bytes(), value)
+            # An uncertain transmission is not the terminal-invalid exception.
+            events.write_text(json.dumps({"type": "turn.started"}) + "\n")
+            separate = root / "data/research/uncertain_recovery"
+            with self.assertRaises(RuntimeError):
+                mod.import_completed_v4(root, separate, batches, inv, 1, "new_contract")
+
     def test_result_provenance_private_modes_and_single_writer_lock(self):
         import fcntl
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             synthetic(root)
-            output = root / "data/research/image_descriptions_v4"
+            output = root / "data/research/image_descriptions_v4_1"
             mod.private_dir(output)
             with (output / "runner.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

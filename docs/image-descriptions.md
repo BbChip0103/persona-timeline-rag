@@ -1,4 +1,4 @@
-# Private original-image annotations: v4 execution, generic v3 policy
+# Private original-image annotations: v4 structural repair, generic v3 policy
 
 This stdlib runner prepares licensed selected-post images, **not RAG integration**. Original sources,
 posts/captions, personas, database, index and chat are unchanged. Generated creative images,
@@ -10,7 +10,8 @@ other-person images and orphan files are excluded. Sources, targets and original
   `codex exec`. No alternative model research, fallback, API keys or paid API requests. Codex plan
   usage is separate from the unchanged paid API budget; dollar cost is not invented.
 - Execution variant: `v4-luna-medium-five-lanes`; private paths:
-  `data/research/image_descriptions_v4/` and `reports/image-description-v4/`.
+  `data/research/image_descriptions_v4_1/` and `reports/image-description-v4_1/`.
+  Original v4 outputs remain immutable in their previous paths.
 - The generic core policy remains `original-image-ko-v3`: identify the photo's central communicated
   content/emphasis; include only details materially contributing to understanding, interpretation or
   memory. No predetermined genres, subject categories, examples, blacklists or intent taxonomy.
@@ -75,16 +76,33 @@ subprocess group, never unrelated Codex sessions. Default timeout is 900 seconds
 All prior state is validated **before any new submission**. Successful compatible batches are
 skipped; unresolved submitted/unknown/failed batches halt all lanes, never silently retried. Model,
 effort, input/context hashes, policy/schema, lane count, associations and batch size enter compatibility.
-Each original image gets new v4 annotations, including previously annotated v1/v2/v3 images: this is
-an explicit new execution/input variant, not retrying old unresolved requests or mixing old usage.
+Original V4 annotations remain accepted only when their exact semantic contract, result/state hashes
+and original source associations validate. The structural repair adopts those records unchanged.
+Only explicitly authorized terminal validation failures may receive one corrective attempt; a missing
+terminal event, live previous child or consumed attempt blocks resubmission. Unsubmitted batches use
+the new structural adapter. This does not retry uncertain transports or regenerate successful images.
+
+### Structural response repair
+
+`required-maps-evidence-indices-v1` preserves the core and source-context instructions byte-for-byte.
+Each batch has required image-keyed objects and each image has required context-keyed objects.
+Hypotheses refer to observed emphasis with integer evidence indices; the wrapper validates indices
+and copies canonical strings. Missing/extra keys and invalid references are rejected, never repaired.
+The response-adapter hash enters compatibility separately from the unchanged semantic policy.
+
+A private `corrective-authorization.json` records the preserved source contract, explicit batch indices
+and `max_attempts=1`. Import requires exactly one terminal `turn.completed`, an actual invalid raw
+response, no tool execution and a dead previous process. Old invalid states/results/events remain
+unchanged and new correction states link their original hashes and observed usage. Another failure
+stops dispatch without further retries.
 
 ## Commands
 
 Run from the repository root:
 
 ```sh
-# Single-session actual new-model preflight.
-PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --max-batches 1
+# Single-session authorized corrective preflight, importing accepted V4 successes unchanged.
+PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --recover-completed-v4 --max-batches 1
 # Resume all remaining independent lane queues.
 PYTHONPATH=src python -m persona_timeline_rag.image_descriptions
 # Read-only latest atomic snapshot, safe while a supervisor holds the lock.
@@ -120,6 +138,9 @@ Short opaque image/context aliases avoid copying long hashes; full original SHA2
 person/post/image-position/source-ID/source-hash association remain in the wrapper. Identical images
 can share core visual descriptions but preserve every source-specific caption context.
 
+Repair accounting reports `adopted_success_usage`, `preserved_invalid_usage`, `observed_new_usage`
+and their non-duplicated `lineage_codex_usage` separately. Adoption does not incur new model usage.
+
 Accounting sums exact observed Codex `turn.completed` usage once, including available unsuccessful
 usage. Cached input and reasoning output are subsets, not extra tokens. Missing usage is reported,
 not invented. Separate CLI sessions may not appear in the orchestrator descendant tree: do not
@@ -139,4 +160,7 @@ scope/hash/mapping, short-ID dedup/all associations, full hashtags/newlines, exp
 context, source-context order and rejected face-identity/origin fields, generic core-policy invariance,
 disjoint/exhaustive five-lane partition, five-session bound/no lane overlap, race-free readable atomic
 progress, global lock, unknown-state no-resubmission and compatibility/provenance tampering.
+Repair tests additionally cover required exact keys, canonical evidence indices, successful-result
+adoption, terminal-only bounded correction, preserved originals, one-attempt resume guards and
+non-duplicated lineage accounting.
 These tests do not replace the actual single-session model preflight or human semantic review.
