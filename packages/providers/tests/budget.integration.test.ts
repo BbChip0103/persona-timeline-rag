@@ -1,0 +1,44 @@
+import { createLocalPool } from '@ptr/storage';
+import { PostgresBudgetLedger } from '../src';
+
+// Explicit test-only credential injection; never searches env files or touches shared DBs.
+const databaseUrl=process.env.GOAL1_TEST_DATABASE_URL;
+const enabled=process.env.GOAL1_TEST_BUDGET_DB==='true'&&Boolean(databaseUrl);
+(enabled?describe:describe.skip)('dedicated local Postgres durable aggregate budget',()=>{
+  const prefix=`synthetic-provider-test-${process.pid}-${Date.now()}-`;
+  const pool=enabled?createLocalPool(databaseUrl!):undefined;
+  const ledger=enabled?new PostgresBudgetLedger(pool!,databaseUrl!):undefined;
+  beforeAll(async()=>{await ledger!.initialize();});
+  afterAll(async()=>{
+    // Only this run's synthetic, never-submitted/nonbillable test rows are removed.
+    await pool!.query('DELETE FROM ptr_provider_requests WHERE key LIKE $1',[`${prefix}%`]);
+    await pool!.end();
+  });
+  test('concurrent independent connections cannot reserve beyond the singleton cap',async()=>{
+    const result=await pool!.query("SELECT COALESCE(SUM(CASE WHEN state='settled' THEN actual_microusd ELSE GREATEST(reserved_microusd,COALESCE(actual_microusd,0)) END),0) AS committed FROM ptr_provider_requests");
+    const available=1_000_000-Number(result.rows[0].committed);
+    expect(available).toBeGreaterThan(10);
+    const amount=Math.ceil(available*0.6);
+    const reservations=await Promise.allSettled([ledger!.reserve(prefix+'a',amount),ledger!.reserve(prefix+'b',amount)]);
+    expect(reservations.filter(value=>value.status==='fulfilled')).toHaveLength(1);
+    expect(reservations.filter(value=>value.status==='rejected')).toHaveLength(1);
+    for(const key of [prefix+'a',prefix+'b']) if(await ledger!.get(key)) await ledger!.finish(key,0,null,null);
+  });
+  test('duplicates are atomic; unknown and cached completed data survive new ledger instance',async()=>{
+    const key=prefix+'durable';
+    const results=await Promise.all([ledger!.reserve(key,100),ledger!.reserve(key,100)]);
+    expect(results.filter(value=>value.created)).toHaveLength(1);
+    await ledger!.submitted(key);
+    await ledger!.finish(key,null,{synthetic:'cached-result'},'synthetic-generation-id');
+    const restarted=new PostgresBudgetLedger(pool!,databaseUrl!);
+    const duplicate=await restarted.reserve(key,100);
+    expect(duplicate.created).toBe(false);
+    expect(duplicate.request).toMatchObject({state:'unknown',reservedMicrousd:100,actualMicrousd:null,response:{synthetic:'cached-result'},generationId:'synthetic-generation-id'});
+    await restarted.finish(key,1,null,null);
+    expect((await ledger!.get(key))?.actualMicrousd).toBe(1);
+  });
+  test('cap cannot be bypassed with unsafe pools or invalid reservation amounts',async()=>{
+    expect(()=>new PostgresBudgetLedger({options:{connectionString:'postgresql://unsafe:unsafe@external/x'}} as never,databaseUrl!)).toThrow('UNSAFE_DATABASE_POOL');
+    for(const amount of [0,-1,0.1,1_000_001,Number.NaN]) await expect(ledger!.reserve(prefix+'invalid',amount)).rejects.toThrow('BUDGET_EXCEEDED');
+  });
+});

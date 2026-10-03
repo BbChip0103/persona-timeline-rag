@@ -1,0 +1,26 @@
+# DB-only local Supabase distribution; no Auth, Storage, API, or other projects' resources.
+name: ptr_goal1
+services:
+  db:
+    image: public.ecr.aws/supabase/postgres:15.8.1.085
+    container_name: ptr_goal1_db
+    restart: "no"
+    environment:
+      # Keep the distribution's bootstrap role; its peer-map/extensions require it.
+      POSTGRES_DB: postgres
+      POSTGRES_USER: supabase_admin
+      POSTGRES_PASSWORD: ${PTR_DB_PASSWORD:?Generate the private infra/.env.db first}
+    command: [postgres, -D, /var/lib/postgresql/data, -c, config_file=/etc/postgresql/postgresql.conf, -c, log_statement=none, -c, log_min_error_statement=panic, -c, log_min_duration_statement=-1, -c, pgaudit.log=none]
+    ports:
+      - "127.0.0.1:56432:5432"
+    volumes:
+      - ptr_goal1_db_data:/var/lib/postgresql/data
+      - ./init-research-db.sh:/docker-entrypoint-initdb.d/99-ptr-research.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U supabase_admin -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  ptr_goal1_db_data:
+    name: ptr_goal1_db_data

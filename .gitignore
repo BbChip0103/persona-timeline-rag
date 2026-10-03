@@ -30,3 +30,9 @@ build/
 dist/
 .omx/
 .DS_Store
+# Node workspace and browser build outputs
+node_modules/
+.next/
+playwright-report/
+test-results/
+*.tsbuildinfo

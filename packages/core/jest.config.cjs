@@ -1,0 +1,1 @@
+module.exports={testEnvironment:'node',testMatch:['<rootDir>/tests/**/*.test.ts'],moduleNameMapper:{'^@ptr/contracts$':'<rootDir>/../contracts/src/index.ts'},transform:{'^.+\\.tsx?$':['ts-jest',{tsconfig:{target:'ES2022',module:'CommonJS',esModuleInterop:true,strict:true}}]}};

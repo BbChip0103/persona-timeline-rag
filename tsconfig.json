@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "types": [
+      "node",
+      "jest"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@ptr/contracts": [
+        "packages/contracts/src/index.ts"
+      ],
+      "@ptr/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@ptr/storage": [
+        "packages/storage/src/index.ts"
+      ],
+      "@ptr/providers": [
+        "packages/providers/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "packages/**/*.ts",
+    "apps/api/**/*.ts",
+    "scripts/**/*.ts",
+    "e2e/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "apps/web",
+    ".omx"
+  ]
+}
