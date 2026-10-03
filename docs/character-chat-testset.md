@@ -95,3 +95,29 @@ Previously explored sources and old probe responses informed curation. This is
 not a blind unseen benchmark, representative traffic sample or human validation.
 Only synthetic fixtures/public tooling are committed. Actual cases, quotations,
 private reports and identifying datasets remain ignored.
+
+## Execute the small natural-chat comparison
+
+With the already-authorized private local environment and existing global budget:
+
+```sh
+GOAL1_LIVE_ENABLED=true GOAL1_ALLOW_EXTERNAL_DATA=true \
+  node --env-file=.env.local --import tsx scripts/evaluate-character-chat.ts --live --smoke
+```
+
+This runs8 conversations ×3 evolving user turns ×3 RAG conditions (72 turns),
+using the same core/SQL/provider path as chat. Only user text is submitted; no
+evaluator intent, query, date filter or expected answer is passed to the model.
+The runner validates frozen exports/assets, registered personas and retrieval
+corpus, rotates condition order, preserves every result privately, and checks
+code/corpus invariance. It never resets the global $1/1000-request ledger or
+automatically retries a failed turn. A rerun can replay settled provider cache;
+unknown/submitted requests remain protected. Full32-conversation execution is
+intentionally unsupported in this bounded runner.
+
+`reports/character-chat/latest.json` points to a completed private report. A
+stopped run retains `progress.json`/`failure.json` in its own run directory.
+Operational status, quote integrity, latency and cost are **not** quality scores;
+claim-level conversational review remains a separate, explicitly typed artifact.
+The testset's relative-time evaluation date is recorded, not injected into the
+unchanged model prompt. No new human validation is implied by executing smoke.
