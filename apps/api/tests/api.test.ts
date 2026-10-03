@@ -84,3 +84,25 @@ test('draft provider failure is sanitized 502; credential-like input rejected be
   runtime.provider={generate:async()=>{throw new Error('sk-synthetic_secret_do_not_expose');}};
   const failed=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 이야기'}});expect(failed.status).toBe(502);expect(failed.body).toEqual({error:{code:'TURN_FAILED'}});expect(artifacts).toEqual([]);
 });
+
+test('explicit conditions persist, default algorithm consistently, reject contradictions and stay owner-private',async()=>{
+  for(const ragCondition of ['off','caption','caption_image']) {
+    const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition}});
+    expect(created.status).toBe(201);expect(created.body.session.ragCondition).toBe(ragCondition);
+    expect(created.body.session.retrievalMode).toBe(ragCondition==='off'?'off':'semantic');
+    expect((await call(`sessions/${created.body.session.id}`)).body.session.ragCondition).toBe(ragCondition);
+    expect((await call(`sessions/${created.body.session.id}`,{owner:'synthetic-other'})).status).toBe(404);
+  }
+  for(const body of [{ragCondition:'off',retrievalMode:'semantic'},{ragCondition:'caption',retrievalMode:'off'},{ragCondition:'caption_image',retrievalMode:'off'}]) expect((await call('sessions',{method:'POST',body:{personId:persona.personId,...body}})).status).toBe(400);
+});
+test('explicit off invokes provider for factual comparison and exposes unverified actual answer without evidence',async()=>{
+  const provider={generate:jest.fn(async()=>JSON.stringify({status:'answered',answer:'이 모델 응답은 실제 방문 사실로 검증되지 않았습니다.',evidenceRefs:[]}))};
+  const retrieval={search:jest.fn(async()=>[])};
+  runtime.chat=new ChatService({store:new InMemoryConversationStore(),personas:runtime.personas,provider,retrieval});
+  const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'off'}});const id=created.body.session.id;
+  const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'experiment-off',text:'2020년 어디 여행했어?'}});
+  const final=await waitTurn(sent.body.turn.id);
+  expect(final.reply?.content).toContain('이 모델 응답');expect(final.reply?.grounding).toBe('unverified_model');expect(final.reply?.evidence).toEqual([]);expect(final.reply?.claims).toEqual([]);
+  expect(provider.generate).toHaveBeenCalledTimes(1);expect(retrieval.search).not.toHaveBeenCalled();
+  expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'override',text:'hello',ragCondition:'caption_image'}})).status).toBe(400);
+});

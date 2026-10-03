@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, type ConversationStore, type PersonaRepository, type Retrieval, type TextProvider } from './ports';
-import { buildPrompt } from './prompts';
+import { buildExperimentPrompt, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { containsCredentialPattern, containsUngroundedBiography, isBiographicalRequest, isExplicitlyCreativeRequest } from './safety';
-import { filterEvidence, validateSourceBoundReply } from './evidence';
+import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number}
 const activeStates=['pending','retrieving','generating','validating'] as const;
 export class ChatService {
@@ -20,7 +20,7 @@ export class ChatService {
     if(!result.success) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=result.data;
     if(persona.id !== value.personaId || persona.revision !== value.personaRevision || persona.personId !== value.personId) throw new CoreError('FORBIDDEN');
-    const session:ChatSession={id:randomUUID(),ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,createdAt:new Date().toISOString()};
+    const session:ChatSession={id:randomUUID(),ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:{}),createdAt:new Date().toISOString()};
     await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:`AI 연구용 시뮬레이션입니다. ${persona.greeting}`,createdAt:session.createdAt});
     return session;
   }
@@ -48,11 +48,12 @@ export class ChatService {
     const checked=SendTurnSchema.safeParse(input);
     if(!checked.success) throw new CoreError('INVALID_INPUT');
     const value=checked.data;
+    if(containsCredentialPattern(value.text)) throw new CoreError('INVALID_INPUT');
     const session=await this.getSession(ownerId,value.sessionId);
     // Verify structured ranges before reserving a turn or calling any external port.
     const queryResult=TimelineQuerySchema.safeParse({personId:session.personId,query:value.timeline?.query ?? value.text.slice(0,500),start:value.timeline?.start,end:value.timeline?.end,dateBasis:value.timeline?.dateBasis ?? 'posted',timezone:session.timezone,limit:value.timeline?.limit ?? 5});
-    if(!queryResult.success) throw new CoreError('INVALID_INPUT');
-    const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value));
+    if(!queryResult.success || containsCredentialPattern(queryResult.data.query??'')) throw new CoreError('INVALID_INPUT');
+    const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition));
     onReserved?.(structuredClone(reserved.turn));
     if(!reserved.created) return reserved.turn;
     const turn=reserved.turn;
@@ -85,25 +86,27 @@ export class ChatService {
     // Explicit small_talk still cannot downgrade an obviously factual request.
     const intent=sensitive || value.intent==='unsupported' ? 'unsupported'
       : value.intent==='clarification' ? 'clarification'
-      : value.timeline || inferred==='timeline' ? 'timeline' : value.intent ?? inferred;
-    let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'>;
+      : value.timeline || inferred==='timeline' || session.ragCondition && /image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i.test(value.text) ? 'timeline' : value.intent ?? inferred;
+    let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
     let sources:SourcePost[]=[];
     if(intent==='clarification' || intent==='unsupported') {
       output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':'이 연구 자료 범위에서는 확인할 수 없어요.',claims:[],evidence:[],limitations:[]};
     } else if(intent==='timeline' && session.retrievalMode !== 'off' && query.dateBasis==='event' && query.start && query.timezone !== 'UTC') {
       output={status:'needs_clarification',content:'사건 날짜의 현지 시간대가 확인되지 않았어요. 게시일 기준으로 확인할까요?',claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
-    } else if(intent==='timeline' && session.retrievalMode==='off') {
+    } else if(intent==='timeline' && session.retrievalMode==='off' && session.ragCondition===undefined) {
       output={status:'insufficient_evidence',content:'검색을 끈 상태에서는 실제 활동 근거를 확인할 수 없어요.',claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
     } else {
-      if(intent==='timeline') {
+      if(intent==='timeline' && session.retrievalMode!=='off') {
         if(!this.options.retrieval) throw new CoreError('TURN_FAILED');
         if(!await this.options.store.transitionTurn(turn.id,['pending'],'retrieving') || controller.signal.aborted) return;
-        sources=filterEvidence(await this.options.retrieval.search(query,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic'}),query,session.personId);
+        sources=filterEvidence(await this.options.retrieval.search(query,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic',...(session.ragCondition && session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})}),query,session.personId);
+        if(session.ragCondition==='caption') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
       if(!await this.options.store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
-      const result=await this.options.provider.generate(buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
+      const result=await this.options.provider.generate(session.ragCondition ? buildExperimentPrompt(persona,history,value.text,sources) : buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
       if(controller.signal.aborted) return;
-      if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
+      if(session.ragCondition) output=validateExperimentReply(result,sources,session.personId,session.ragCondition);
+      else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
       else {
         const safe=result.trim();
         if(!safe || safe.length>8000 || containsCredentialPattern(safe)) throw new CoreError('TURN_FAILED');

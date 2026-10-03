@@ -18,3 +18,8 @@ export function containsUngroundedBiography(text:string):boolean {
   return /\bI (?:was born|used to (?:live|work|study)|attended|grew up|was raised|spent my childhood|graduated|studied at|worked at|lived in|got married|went to (?:school|college|university))\b|\bmy (?:birthplace|hometown|childhood|parents?|mother|father|siblings?)\b/i.test(text)
     ||/(?:저는|나는|제가|내가)[^.!?\n]{0,120}(?:태어났|자랐|출생했|졸업했|다녔|나왔|살았|근무했|결혼했)|(?:제|나의|내)\s?(?:고향|출생지|어린\s?시절|부모님|어머니|아버지)/.test(text);
 }
+
+/** Narrow internal filesystem path guard; not a comprehensive privacy classifier. */
+export function containsInternalPathPattern(text:string):boolean {
+  return /(?:file:\/\/|(?:^|[\s"'(])\/(?:home|Users|tmp|private|var|etc|root|mnt)\/|\b[A-Za-z]:\\(?:Users|Windows|Temp)\\)/i.test(text);
+}
