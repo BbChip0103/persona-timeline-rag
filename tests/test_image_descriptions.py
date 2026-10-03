@@ -25,7 +25,8 @@ def synthetic(root):
                 "source_file": f"{person}/metadata/{person}-{index}.info",
                 "caption": "synthetic\u2028caption"}
         posts.append(post)
-        sources.append({"id": f"{person}:{index}", "personId": person, "hash": str(index)})
+        sources.append({"id": f"{person}:{index}", "personId": person, "hash": str(index),
+                        "caption": post["caption"], "unsafe": False})
         mapping[f"{person}-{index}.info"] = [filename]
     mod.atomic_json(root / "data/manifests/targets.json",
                     {"people": [{"username": person} for person in people]})
@@ -44,6 +45,16 @@ def rows_for(batch):
                                       "hypotheses": []}} for image in batch]
 
 
+def annotations_for(batch):
+    rows = rows_for(batch)
+    for row, image in zip(rows, batch, strict=True):
+        row["context_interpretations"] = [
+            {"contextId": context["contextId"], "claim_origin": mod.CONTEXT_ORIGIN,
+             "caption_based_summary_ko": "", "contextual_interpretation_ko": "",
+             "uncertainty_ko": ""} for context in image["contexts"]]
+    return rows
+
+
 class ImageDescriptionTests(unittest.TestCase):
     def test_inventory_sha_dedup_associations_unicode_and_orphan_exclusion(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -56,7 +67,8 @@ class ImageDescriptionTests(unittest.TestCase):
             self.assertEqual(len(inv["images"]), 2)
             self.assertEqual(sum(len(row["associations"]) for row in inv["images"]), 4)
             self.assertEqual(len(inv["images"][0]["sha256"]), 64)
-            self.assertNotIn("caption", json.dumps(inv))
+            self.assertEqual(inv["images"][0]["imageId"], "img_000000")
+            self.assertEqual(sum(len(row["contexts"]) for row in inv["images"]), 4)
 
     def test_scope_mapping_source_and_path_guards(self):
         for mutation in ("person", "source", "path", "mapping", "missing"):
@@ -177,10 +189,13 @@ class ImageDescriptionTests(unittest.TestCase):
             v2_report = root / "reports/image-description-v2"
             mod.atomic_json(v2 / "batch-0000/result.json", {"preserved": "synthetic v2 preflight"})
             mod.atomic_json(v2_report / "summary.json", {"input_tokens": 101})
-            originals = {path: path.read_bytes() for directory in (v1, v1_report, v2, v2_report)
+            v3 = root / "data/research/image_descriptions_v3"
+            mod.atomic_json(v3 / "batch-0000/result.json", {"preserved": "synthetic v3"})
+            originals = {path: path.read_bytes() for directory in
+                         (v1, v1_report, v2, v2_report, v3)
                          for path in directory.rglob("*") if path.is_file()}
-            def fake_execute(workspace, batch, root, timeout):
-                return {"descriptions": rows_for(batch), "usage": {"input_tokens": 10}}
+            def fake_execute(workspace, batch, root, timeout, on_started=None):
+                return {"descriptions": annotations_for(batch), "usage": {"input_tokens": 10}}
             with patch.object(mod, "auth_preflight"), patch.object(
                     mod, "execute_batch", side_effect=fake_execute) as execute:
                 summary = mod.run(root, 1, None, 30)
@@ -213,13 +228,13 @@ class ImageDescriptionTests(unittest.TestCase):
         for domain_example in ("scenery", "landscape", "makeup", "cream", "product label",
                                "blue shirt", "pink cafe", "passerby"):
             self.assertNotIn(domain_example, prompt)
-        self.assertEqual(mod.OUTPUT_DIRECTORY, "data/research/image_descriptions_v3")
-        self.assertEqual(mod.REPORT_DIRECTORY, "reports/image-description-v3")
+        self.assertEqual(mod.OUTPUT_DIRECTORY, "data/research/image_descriptions_v4")
+        self.assertEqual(mod.REPORT_DIRECTORY, "reports/image-description-v4")
 
     def test_command_fixed_model_auth_disabled_tools_and_clean_env(self):
         args = mod.command(Path("/private"), [Path("/private/img_a.jpg")], Path("/output"))
-        self.assertEqual(args[args.index("-m") + 1], "gpt-6.1-sol")
-        self.assertIn('model_reasoning_effort="high"', args)
+        self.assertEqual(args[args.index("-m") + 1], "gpt-6-luna")
+        self.assertIn('model_reasoning_effort="medium"', args)
         self.assertIn('forced_login_method="chatgpt"', args)
         self.assertIn("features.shell_tool=false", args)
         self.assertIn("--ignore-user-config", args)
@@ -233,8 +248,8 @@ class ImageDescriptionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             synthetic(root)
-            def fake_execute(workspace, batch, root, timeout):
-                return {"descriptions": rows_for(batch),
+            def fake_execute(workspace, batch, root, timeout, on_started=None):
+                return {"descriptions": annotations_for(batch),
                         "usage": {"input_tokens": 10, "cached_input_tokens": 2,
                                   "output_tokens": 5}}
             with patch.object(mod, "auth_preflight"), patch.object(
@@ -250,7 +265,7 @@ class ImageDescriptionTests(unittest.TestCase):
                 self.assertEqual(execute.call_count, 2)
                 with self.assertRaises(ValueError):
                     mod.run(root, 2, None, 30)
-                result = root / "data/research/image_descriptions_v3/batch-0000/result.json"
+                result = root / "data/research/image_descriptions_v4/lane-0/batch-0000/result.json"
                 value = mod.load_json(result)
                 value["images"][0]["source"]["sha256"] = "tampered"
                 mod.atomic_json(result, value)
@@ -264,11 +279,11 @@ class ImageDescriptionTests(unittest.TestCase):
             with patch.object(mod, "auth_preflight"), patch.object(
                     mod, "execute_batch", side_effect=TimeoutError) as execute:
                 with self.assertRaises(TimeoutError):
-                    mod.run(root, 1, None, 30)
+                    mod.run(root, 1, 1, 30)
                 with self.assertRaises(RuntimeError):
                     mod.run(root, 1, None, 30)
                 self.assertEqual(execute.call_count, 1)
-            state = mod.load_json(root / mod.OUTPUT_DIRECTORY / "batch-0000/state.json")
+            state = mod.load_json(root / mod.OUTPUT_DIRECTORY / "lane-0/batch-0000/state.json")
             self.assertEqual(state["status"], "unknown")
             mod.ensure_resumable({"contract": "x", "status": "pending"}, "x")
             for status in ("submitted", "unknown", "failed"):
@@ -299,8 +314,8 @@ class ImageDescriptionTests(unittest.TestCase):
             with patch.object(mod, "auth_preflight"), patch.object(
                     mod, "execute_batch", side_effect=TimeoutError):
                 with self.assertRaises(TimeoutError):
-                    mod.run(root, 1, None, 30)
-                state_path = root / "data/research/image_descriptions_v3/batch-0000/state.json"
+                    mod.run(root, 1, 1, 30)
+                state_path = root / mod.OUTPUT_DIRECTORY / "lane-0/batch-0000/state.json"
                 state = mod.load_json(state_path)
                 state["contract"] = "wrong_contract"
                 mod.atomic_json(state_path, state)
@@ -309,12 +324,139 @@ class ImageDescriptionTests(unittest.TestCase):
                     mod.run(root, 1, None, 30, reconcile=True)
                 self.assertEqual(state_path.read_bytes(), before)
 
+    def test_full_caption_hashtags_newlines_safe_and_unavailable_context(self):
+        caption = "합성 본문 @synthetic\n#A #생일파티 🎉\n마지막 #해시태그"
+        source = {"id": "synthetic_a:1", "hash": "synthetic_hash",
+                  "personId": "synthetic_a", "caption": caption, "unsafe": False}
+        context = mod.source_context(source, "synthetic_category", "ctx_0000")
+        self.assertEqual(context["caption"], caption)
+        batch = [{"imageId": "img_000000", "contexts": [context]}]
+        transmitted = json.loads(mod.build_prompt(batch).split(mod.CONTEXT_ADAPTER)[1])
+        self.assertEqual(transmitted[0]["contexts"][0]["caption"], caption)
+        self.assertEqual(transmitted[0]["contexts"][0]["author_label"], "synthetic_a")
+        self.assertNotIn("source_id", transmitted[0]["contexts"][0])
+        self.assertIn("NOT any person depicted", mod.CONTEXT_ADAPTER)
+        for changes, reason in (({"unsafe": True}, "source_flagged_unsafe"),
+                                ({"caption": "x" * 4097}, "caption_exceeds_bound_not_truncated"),
+                                ({"caption": "password=synthetic_dummy"},
+                                 "credential_like_source_content")):
+            unsafe = mod.source_context({**source, **changes}, "synthetic", "ctx_0000")
+            self.assertIsNone(unsafe["caption"])
+            self.assertEqual(unsafe["caption_unavailable_reason"], reason)
+            annotated = annotations_for([{"imageId": "img_000000", "contexts": [unsafe]}])
+            mod.validate_annotation({"images": annotated},
+                                    [{"imageId": "img_000000", "contexts": [unsafe]}])
+            annotated[0]["context_interpretations"][0]["caption_based_summary_ko"] = "invented"
+            with self.assertRaises(ValueError):
+                mod.validate_annotation({"images": annotated},
+                                        [{"imageId": "img_000000", "contexts": [unsafe]}])
+
+    def test_contexts_preserve_post_separation_and_reject_order_or_identity_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            synthetic(root)
+            batch = mod.inventory(root)["images"][:1]
+            self.assertEqual(len(batch[0]["contexts"]), 2)
+            self.assertEqual(len({x["source_id"] for x in batch[0]["contexts"]}), 2)
+            annotated = annotations_for(batch)
+            mod.validate_annotation({"images": annotated}, batch)
+            for mutation in ("order", "origin", "identity"):
+                changed = copy.deepcopy(annotated)
+                if mutation == "order":
+                    changed[0]["context_interpretations"].reverse()
+                elif mutation == "origin":
+                    changed[0]["context_interpretations"][0]["claim_origin"] = "verified_photo_fact"
+                else:
+                    changed[0]["context_interpretations"][0]["face_identity"] = "synthetic_a"
+                with self.assertRaises(ValueError):
+                    mod.validate_annotation({"images": changed}, batch)
+
+    def test_partition_is_disjoint_exhaustive_exact_five_and_policy_unchanged(self):
+        numbers = list(range(298))
+        partitions = mod.partition_numbers(numbers)
+        self.assertEqual(len(partitions), 5)
+        self.assertEqual(sorted(number for lane in partitions for number in lane), numbers)
+        for lane, partition in enumerate(partitions):
+            self.assertTrue(all(number % 5 == lane for number in partition))
+        for bad_numbers, lanes in (([0, 0], 5), ([-1], 5), ([0], 6)):
+            with self.assertRaises(ValueError):
+                mod.partition_numbers(bad_numbers, lanes)
+        self.assertEqual(mod.PROMPT_HASH,
+                         "81dc2ce6733134f908dbaa3292261a9c73ce33441110c9cc4e0f7e3fda72f3fa")
+        self.assertEqual(mod.canonical_hash(mod.SCHEMA),
+                         "38105d5e10359939e30e7b6c66a1c3b2e6306e1c03c627ed0afe006f73c11f60")
+        self.assertEqual(mod.MODEL, "gpt-6-luna")
+        self.assertEqual(mod.EFFORT, "medium")
+
+    def test_five_independent_lanes_bound_no_overlap_and_atomic_progress(self):
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inv = {"persons": ["a", "b", "c", "d"], "posts": 15, "referenced_files": 15,
+                   "images": [{"imageId": f"img_{index:06d}", "sha256": f"{index:064x}",
+                               "files": [f"synthetic_{index}.jpg"], "associations": [],
+                               "contexts": []} for index in range(15)]}
+            barrier = threading.Barrier(5)
+            mutex = threading.Lock()
+            active, maximum, seen, active_lanes, reads = 0, 0, [], set(), []
+            reader_errors = []
+            done = threading.Event()
+            def fake_execute(workspace, batch, root, timeout, on_started=None):
+                nonlocal active, maximum
+                number = int(workspace.parent.name.split("-")[1])
+                lane = int(workspace.parent.parent.name.split("-")[1])
+                with mutex:
+                    self.assertNotIn(lane, active_lanes)
+                    active_lanes.add(lane)
+                    active += 1
+                    maximum = max(maximum, active)
+                    self.assertNotIn(number, seen)
+                    seen.append(number)
+                if number < 5:
+                    barrier.wait(timeout=5)
+                time.sleep(0.03)
+                with mutex:
+                    active -= 1
+                    active_lanes.remove(lane)
+                return {"descriptions": annotations_for(batch),
+                        "usage": {"input_tokens": 10, "output_tokens": 2}}
+            def read_progress():
+                path = root / mod.OUTPUT_DIRECTORY / "progress.json"
+                while not done.is_set():
+                    if path.exists():
+                        try:
+                            reads.append(mod.load_json(path))
+                        except Exception as error:
+                            reader_errors.append(type(error).__name__)
+                    time.sleep(0.001)
+            reader = threading.Thread(target=read_progress)
+            reader.start()
+            try:
+                with patch.object(mod, "inventory", return_value=inv), patch.object(
+                        mod, "auth_preflight"), patch.object(mod, "execute_batch",
+                                                             side_effect=fake_execute):
+                    summary = mod.run(root, 1, None, 30)
+            finally:
+                done.set()
+                reader.join(timeout=2)
+            self.assertEqual(maximum, 5)
+            self.assertEqual(sorted(seen), list(range(15)))
+            self.assertTrue(reads)
+            self.assertEqual(reader_errors, [])
+            self.assertTrue(summary["all_validated"])
+            self.assertEqual(summary["validated_files"], 15)
+            self.assertEqual(summary["observed_codex_usage"]["input_tokens"], 150)
+            self.assertEqual(summary["concurrency"], 5)
+            self.assertEqual([lane["succeeded"] for lane in summary["lane_statistics"]], [3]*5)
+            self.assertTrue(all(value["validated_files"] <= 15 for value in reads))
+
     def test_result_provenance_private_modes_and_single_writer_lock(self):
         import fcntl
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             synthetic(root)
-            output = root / "data/research/image_descriptions_v3"
+            output = root / "data/research/image_descriptions_v4"
             mod.private_dir(output)
             with (output / "runner.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -322,7 +464,7 @@ class ImageDescriptionTests(unittest.TestCase):
                     mod.run(root, 1, None, 30)
             inv = mod.inventory(root)
             batch = inv["images"][:1]
-            result = mod.make_result(batch, rows_for(batch), {}, "synthetic_contract")
+            result = mod.make_result(batch, annotations_for(batch), {}, "synthetic_contract")
             path = output / "result.json"
             mod.atomic_json(path, result)
             mod.validate_result(path, batch, "synthetic_contract")
