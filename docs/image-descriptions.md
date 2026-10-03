@@ -1,4 +1,4 @@
-# Original-image descriptions v2 (private, not yet RAG)
+# Original-image descriptions v3 (private, not yet RAG)
 
 This stdlib-only runner annotates only JPEGs referenced by the selected four-person target posts.
 It cross-checks the selected targets, research sources and original image mapping manifest. It
@@ -8,49 +8,50 @@ step: descriptions must not be treated as original captions, original quotes or 
 
 ## Observation versus communicative intent
 
-V2 prioritizes retrieval/story-worthy **salient memory**, not everything visible. Objective prose
-is 2–3 short sentences when useful, at most 500 characters; fewer are fine for ambiguity. Every
-detail list is at most three short strings and may be empty. Incidental passersby, shirt colors,
-background objects and microdetail are omitted unless central to the shot. Scenery focuses on
-scenery/atmosphere; makeup portraits may focus on makeup/hair/styling; presented products focus on
-product/important label. Colors/composition/text matter only when defining the presentation. The
-`uncertainties` field addresses ambiguities affecting the main point or intent, not boilerplate
-unknown dates/places or every unreadable background letter. No padded descriptions or invented
-intent for every photo; this is not a guaranteed relevance oracle.
+V3 uses a **generic** salience policy: identify the photo's central communicated content and visible
+emphasis, then include only information contributing to understanding, interpreting or remembering
+that content. Do not enumerate elements just because they are visible. Important subjects/elements
+are not predetermined by genre, a fixed subject taxonomy, an object blacklist, or examples. Position,
+size, color or focus alone do not establish significance; relevance is judged from the image itself.
+This is not a guaranteed relevance oracle.
 
-V2 saves three deliberately separate layers under each result's `images[].visual`:
+Objective prose is normally 2–3 short sentences, at most 500 characters; fewer are fine. The main-subject and
+visual-basis arrays contain at most three short strings and can be empty when ambiguous. There
+are no exhaustive object/activity/color/text inventory fields or preset photo/intent categories.
+Address relevant ambiguity concisely, not generic boilerplate. Never invent purpose for every photo.
 
-1. `description_ko` and visible detail fields: grounded observation, not inferred motive.
+V3 saves three deliberately separate layers under each result's `images[].visual`:
+
+1. `description_ko`: concise grounded observation, not inferred motive.
 2. `observed_emphasis`: visible `main_subjects` and `visual_basis` about framing, position, label
    orientation, size, contrast, color or focus: at most three subjects and three basis strings.
    An identified emphasized subject needs visible basis.
 3. `communicative_intent`: `epistemic_status=tentative_not_author_fact` with zero to two hypotheses.
-   Each has `kind`, tentative Korean `hypothesis_ko`, nonempty `visual_basis` copied verbatim from
+   Each has tentative Korean `hypothesis_ko`, nonempty `visual_basis` copied verbatim from
    the observed basis, qualitative `confidence` (`low` or `medium`), `uncertainty_ko`, and at least
    one alternative (at most two). Basis strings reference at most two observed cues per hypothesis.
    Prefer one hypothesis when helpful; no hypothesis is required when intent is unclear.
 
-Detail/subject/basis strings are at most 120 characters; hypothesis/uncertainty/alternative strings
+Subject/basis strings are at most 120 characters; hypothesis/uncertainty/alternative strings
 are at most 180. The prompt requests a model self-check for central focus, omission of incidental
 details, brevity and inference separation. Provenance records the checklist as **AI self-check, not
 human verification**, and retains `human_reviewed=false`. These limits and labels are structural
 checks, not an independent semantic relevance assessment.
 
 This considers what the **photo's presentation could communicate**, including a plausible reason
-for making/posting that kind of image, not what the actual author thought or intended. A centered
-cream container/forward-facing label can support possible product presentation, not paid advertising
-or endorsement certainty. Scenery with feet in frame can support scenic-experience framing, not
-verified travel motive, location, date or emotions. Psychology, personality, identity and private
-beliefs are outside the annotation contract. Intent hypotheses must never become original quotes
-or factual event/author claims. Structural validation checks labels, basis references and bounds;
-it does not prove that every natural-language interpretation is visually correct. Human semantic
-review remains necessary.
+for making/posting that kind of image, only when visually grounded—not what the actual author
+thought or intended. There is no intent-kind taxonomy. Actual motives, psychology, personality,
+identity, private beliefs, sponsorship/ad certainty and unverified event facts are outside the
+contract. Hypotheses never become original quotes or factual event/author claims. Structural
+validation checks labels, evidence references and bounds; it does not independently prove every
+natural-language interpretation or relevance judgment. Human semantic review remains necessary.
 
-The fixed v2 variant re-annotates **every** referenced image, even those with existing v1 objective
-captions. It is a deliberate prompt/schema change, not a retry of unresolved v1 work. V1 outputs,
-state and observed Codex usage stay in their old directories untouched; no annotations or usage
-from the two variants are silently mixed. The v2 manifest includes its prompt version and variant
-policy; incompatible output/config cannot be reused.
+The fixed v3 variant re-annotates **every** referenced image, even those with existing v1 objective
+captions. It is a deliberate prompt/schema change, not a retry of unresolved old work. V1 objective
+annotations and the single v2 domain-guided preflight retain their original state, prompt/schema,
+provenance and observed usage in separate directories. No v1/v2 results or usage are silently reused
+or mixed into v3. The v3 manifest includes its prompt version and variant policy; incompatible
+output/config cannot be reused.
 
 ## Fixed execution contract
 
@@ -75,8 +76,8 @@ policy; incompatible output/config cannot be reused.
 
 ## Commands
 
-The current module defaults to `original-image-ko-v2`,
-`data/research/image_descriptions_v2/`, and `reports/image-description-v2/`.
+The current module defaults to `original-image-ko-v3`,
+`data/research/image_descriptions_v3/`, and `reports/image-description-v3/`.
 From the repository root:
 
 ```sh
@@ -88,9 +89,11 @@ PYTHONPATH=src python -m persona_timeline_rag.image_descriptions
 PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --status
 ```
 
-To inspect archived v1 progress, read `data/research/image_descriptions/progress.json` or
-`reports/image-description/summary.json` directly; the current CLI does not resume or mutate v1.
-Do not start v2 full generation until the prior v1 runner's bounded current session has settled.
+To inspect archived progress, read `data/research/image_descriptions/progress.json` /
+`reports/image-description/summary.json` for v1, or
+`data/research/image_descriptions_v2/progress.json` /
+`reports/image-description-v2/summary.json` for v2. The current CLI never resumes or mutates them.
+Old variants must be settled/preserved; only the current generic v3 variant proceeds to a full run.
 
 `--status` does not rehash originals or claim a fresh full validation. Its `observed_at` identifies
 snapshot freshness. Every successful batch is validated again when resuming. Changed source hashes,
@@ -114,8 +117,8 @@ No credentials or API budget are adjusted by this operational launch.
 
 ## Private output and provenance
 
-All outputs are ignored by Git: `data/research/image_descriptions_v2/` and
-`reports/image-description-v2/`. Directories are mode 700 and files mode 600 (process umask 077).
+All outputs are ignored by Git: `data/research/image_descriptions_v3/` and
+`reports/image-description-v3/`. Directories are mode 700 and files mode 600 (process umask 077).
 Original licensed images are unchanged. The inventory stores original SHA256, relative file paths,
 and **all** person/post/image-position/source-ID/source-hash associations. Identical file contents
 can share one visual annotation without dropping any source associations.
@@ -128,7 +131,7 @@ can share one visual annotation without dropping any source associations.
 - `batch-NNNN/workspace/`: anonymous copies, schema, raw response, private CLI events/stderr,
   child process identity, exact CLI argv/runner-source hash, observed usage. These are not public
   fixtures or documentation.
-- `progress.json` and `reports/image-description-v2/summary.json`: validated referenced-file/content
+- `progress.json` and `reports/image-description-v3/summary.json`: validated referenced-file/content
   totals, status counts, timestamps, observed Codex usage and explicit incomplete/complete status.
 
 Accounting sums exact observed `turn.completed` usage, including available unsuccessful-batch
@@ -147,8 +150,9 @@ this runner does not insert descriptions into original sources or start the LLMO
 `make check` runs synthetic unit tests, existing regressions, ruff and mypy. Synthetic tests cover
 count/order/schema, source scope/path/mapping, SHA256 dedup associations, Unicode caption parsing,
 fixed auth/model/tool settings, compatible resume, unknown-state no-retry, provenance tampering,
-private modes, the single-writer lock, v2 emphasis/intent separation and bounds, rejected
-unsupported motive/ad-fact kinds, required evidence/uncertainty/alternatives, qualitative confidence,
-concise salience bounds/empty irrelevant fields, complete v2 regeneration, and byte-preserved v1
+private modes, the single-writer lock, v3 emphasis/intent separation and bounds, rejected
+absence of prompt domain examples/fixed intent taxonomy, required evidence/uncertainty/alternatives,
+qualitative confidence and rejected actual-author epistemic labels,
+concise salience bounds/no exhaustive inventory fields, complete v3 regeneration, and byte-preserved v1/v2
 artifacts. Passing tests is not a substitute for an actual small requested-model image session
 before a full run.
