@@ -179,3 +179,39 @@ adoption, terminal-only bounded correction, immutable attempt journals, five-bat
 rejection, corrective second-failure stop, preserved originals, one-attempt resume guards and
 non-duplicated lineage accounting.
 These tests do not replace the actual single-session model preflight or human semantic review.
+
+
+## Declarative intent style derivative (v5)
+
+`persona_timeline_rag.rewrite_image_intents` uses the validated v4_1 aggregate as immutable input.
+It sends only existing hypothesis sentences and opaque IDs to text-only `gpt-6-luna` / `medium`.
+No image, original caption, account context, new visual judgment or external paid API is submitted.
+Required keyed outputs are batched at80 hypotheses (CLI range60–100) across five independently
+session-led sequential lanes, globally capped by one supervisor lock.
+
+Only existing `hypothesis_ko` values change. Empty hypothesis arrays, descriptions, observed basis,
+confidence, uncertainty, alternatives, caption context, source mappings and original visual provenance
+remain byte-value equivalent. Top-level `intent_style_derivation` separately records version/hash,
+model/effort, immutable prior aggregate/record hashes and private result references. Completed sentence
+syntax is checked, not repaired with regex. Syntax and field-preservation checks do not prove human
+semantic equivalence. Declarative wording remains a hypothesis under unchanged epistemic metadata;
+it must not be presented as an actual author's intent or original-source quote.
+
+```sh
+# One80-hypothesis actual text-only preflight.
+PYTHONPATH=src python -m persona_timeline_rag.rewrite_image_intents --max-batches 1
+# Five independent CLI lanes; optional explicit bounded corrective authority.
+PYTHONPATH=src python -m persona_timeline_rag.rewrite_image_intents --bounded-corrections
+PYTHONPATH=src python -m persona_timeline_rag.rewrite_image_intents --status
+```
+
+Outputs are private `data/research/image_descriptions_v5_declarative/` and
+`reports/image-description-v5-declarative/`, mode700 directories/mode600 files. Final `images.jsonl`
+is assembled only after every existing hypothesis validates. Compatible successful results are skipped;
+completed final aggregates are verified without rewriting timestamps. Uncertain submissions halt.
+The optional private `corrective-authorization.json` requires the exact contract, known-terminal-
+validation-only scope, at most5 batches and one attempt per batch. Original failed state/raw/events/
+usage stay unchanged; corrections use their own hash-linked workspace/state/result. A second failure,
+uncertain transport, tools, changed inputs or exhausted allowance halts without further submissions.
+Observed usage includes failed attempts once and is separate from original visual-annotation usage.
+This script neither imports RAG nor calls chat providers; those are independent integration work.
