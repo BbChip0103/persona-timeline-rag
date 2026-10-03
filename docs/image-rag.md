@@ -84,3 +84,42 @@ pnpm lint
 Public fixtures are synthetic. SQL tests add uniquely scoped synthetic records;
 they do not drop, truncate or mutate original data. This is unreviewed prototype
 retrieval; it does not establish annotation accuracy or faithful real-person intent.
+
+## Three-condition chat and controlled probes
+
+The chat UI pins `off`, `caption`, or `caption_image` to each new session. Explicit
+`off` now asks the same model without retrieval and labels responses unverified;
+legacy sessions without a condition retain their previous abstention behavior.
+The two RAG conditions share semantic top-5 retrieval by default. Original caption
+quotes and AI image-annotation quotes have distinct provenance cards. Exact quote
+binding is not validation of answer truth, intent, or semantic entailment.
+
+The common experimental prompt budgets the complete JSON messages at 30,000
+UTF-8 bytes. It keeps original captions/history/user input intact and allocates
+whole image annotations round-robin. Omitted counts and actually supplied IDs are
+reported in `promptEvidence`; quotes from omitted annotations are rejected.
+Oversize base context fails before text generation with `CONTEXT_LIMIT`.
+
+```sh
+# Freeze private assets and source-derived silver probes before seeing answers:
+pnpm exec tsx scripts/evaluate-image-rag.ts --prepare
+# Explicit approved live flags/environment required; three initial model turns:
+pnpm exec tsx scripts/evaluate-image-rag.ts --live --pilot
+# 24 single-turn probes x 3, then 4 three-turn conversations x 3 = 108 turns:
+pnpm exec tsx scripts/evaluate-image-rag.ts --live
+```
+
+Each condition uses the same persona revision, questions, model and system policy;
+only evidence differs. Condition order rotates. Conversation histories evolve and
+therefore diverge. Frozen question/asset/code hashes and before/after exact parent,
+annotation revision/content and vector-readiness snapshots prevent silent corpus
+changes or partially indexed trials. Raw replies, provenance, costs, request IDs,
+exposure and citation hits remain private under ignored `reports/image-rag/`.
+No unknown external request is automatically retried. Model-format/evidence errors
+are reported separately from transport/runtime failures.
+
+These are source/AI-description-derived **silver** probes, partly date-scoped—not
+human-gold factual accuracy. Annotation generation already included original
+caption context. This experiment compares combined retrieval/context pipelines;
+it cannot isolate image-only information, the wording rewrite, or genuine author
+intent. Human semantic review remains pending.

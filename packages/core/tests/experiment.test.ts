@@ -1,5 +1,5 @@
 import { CreateSessionSchema, type Persona, type SourcePost, type RagCondition, type ProviderMessage } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, buildExperimentPrompt, requestFingerprint, validateExperimentReply, validateSourceBoundReply } from '../src';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, buildExperimentPrompt, buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT, requestFingerprint, validateExperimentReply, validateSourceBoundReply } from '../src';
 const persona:Persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['declarative'],boundaries:['AI research'],sourceRefs:[],greeting:'안녕하세요.'};
 const annotation={id:'synthetic-annotation',imageHash:'synthetic-image-hash',annotationHash:'synthetic-annotation-hash',revision:'v1',text:'파란 화면에 노란 형태가 보입니다. 😀',model:'synthetic-model',humanReviewed:false as const};
 const source:SourcePost={id:'synthetic-post',personId:persona.personId,caption:'합성 전시를 소개합니다.',postedAt:'2020-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post',hash:'synthetic-source-hash',snapshot:'v1',unsafe:false,imageAnnotations:[annotation]};
@@ -22,6 +22,7 @@ test('explicit off factual model baseline runs exactly once without retrieval an
   const session=await h.service.createSession('synthetic-owner',{...query,ragCondition:'off'});
   const input={sessionId:session.id,clientRequestId:'request',text:'당신의 출생지는 어디야?'};
   const first=await h.service.sendTurn('synthetic-owner',input);
+  expect(first.reply?.promptEvidence).toMatchObject({sourceIds:[],annotationIds:[],omittedAnnotations:0});
   expect(first.reply?.content).toContain('모델 응답');expect(first.reply?.grounding).toBe('unverified_model');expect(first.reply?.claims).toEqual([]);expect(first.reply?.evidence).toEqual([]);
   expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(h.retrieval.search).not.toHaveBeenCalled();
   expect((await h.service.sendTurn('synthetic-owner',input)).id).toBe(first.id);expect(h.provider.generate).toHaveBeenCalledTimes(1);
@@ -34,6 +35,7 @@ test.each(['caption','caption_image'] as RagCondition[])('%s pins scope and uses
   const final=await h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'request',text:'이미지와 작업 의도를 설명해 줘'});
   expect(final.reply?.content).toBe('자연스러운 답변을 그대로 렌더링합니다.');expect(final.reply?.grounding).toBe('source_bound_quotes');
   expect(final.reply?.evidence[0].origin).toBe('source_caption');
+  expect(final.reply?.promptEvidence?.annotationIds).toEqual(condition==='caption_image'?[annotation.id]:[]);
   expect(h.retrieval.search).toHaveBeenCalledWith(expect.objectContaining({personId:persona.personId}),{personId:persona.personId},expect.objectContaining({mode:'semantic',evidenceScope:condition}));
   const messages=h.provider.generate.mock.calls[0] as unknown as [ProviderMessage[]];
   const evidence=messages[0].find(message=>message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!.content;
@@ -102,4 +104,41 @@ test('experimental provider paths and credentials in structured search text neve
   const h=setup();const session=await h.service.createSession('synthetic-owner',{...query,ragCondition:'caption'});
   await expect(h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'secret-query',text:'이미지 설명',timeline:{dateBasis:'posted',query:'api_key=synthetic-secret'}})).rejects.toMatchObject({code:'INVALID_INPUT'});
   expect(h.provider.generate).not.toHaveBeenCalled();expect(h.retrieval.search).not.toHaveBeenCalled();
+});
+
+test('whole UTF8 annotations are budgeted round-robin with captions and omission counts preserved',()=>{
+  const raw=Array.from({length:5},(_,personIndex)=>({...source,id:`synthetic-post-${personIndex}`,imageAnnotations:Array.from({length:10},(_,index)=>({...annotation,id:`a-${personIndex}-${index}`,text:`사진${index} ${'합성 😀'.repeat(350)}`}))}));
+  const context=buildExperimentContext(persona,[],'Synthetic allocation check',raw);
+  expect(Buffer.byteLength(JSON.stringify(context.messages),'utf8')).toBeLessThanOrEqual(EXPERIMENT_PROMPT_BYTE_LIMIT);
+  expect(context.omittedAnnotations).toBeGreaterThan(0);
+  expect(context.sources.every(parent=>parent.imageAnnotations!.length>=1)).toBe(true);
+  const data=JSON.parse(context.messages[2]!.content.replace('UNTRUSTED_EVIDENCE_JSON_DATA ',''));
+  for(const [index,parent]of context.sources.entries()) {
+    expect(parent.caption).toBe(raw[index]!.caption);
+    expect(data[index].annotationOmittedCount).toBe(10-parent.imageAnnotations!.length);
+    for(const item of parent.imageAnnotations!)expect(raw[index]!.imageAnnotations.some(original=>original.id===item.id&&original.text===item.text)).toBe(true);
+  }
+  const omitted=raw[0]!.imageAnnotations.find(item=>!context.sources[0]!.imageAnnotations!.some(included=>included.id===item.id))!;
+  expect(validateExperimentReply(reply([{sourceId:raw[0]!.id,annotationId:omitted.id,quote:omitted.text}]),context.sources,persona.personId,'caption_image').limitations).toContain('INVALID_MODEL_EVIDENCE');
+});
+
+test('over-budget base history is rejected instead of slicing captions or user input',()=>{
+  expect(()=>buildExperimentPrompt(persona,[{id:'h',sessionId:'s',turnId:null,role:'user',content:'😀'.repeat(12000),createdAt:'2020-01-01T00:00:00Z'}],'user input',[source])).toThrow(expect.objectContaining({code:'CONTEXT_LIMIT'}));
+});
+
+test('service exposes safe context limit without invoking provider or leaking errors',async()=>{
+  const h=setup();h.retrieval.search.mockResolvedValue([{...source,caption:'😀'.repeat(10000)}]);
+  const session=await h.service.createSession('synthetic-owner',{...query,ragCondition:'caption'});
+  const turn=await h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'oversize',text:'이미지 설명'});
+  expect(turn.state).toBe('failed');expect(turn.errorCode).toBe('CONTEXT_LIMIT');expect(h.provider.generate).not.toHaveBeenCalled();
+});
+
+test('experimental output guidance bounds prose and supplies exact short annotation quotes',()=>{
+  const visual={...source,imageAnnotations:[{...annotation,text:'AI unreviewed.\nVisual description: '+ '선명한 형태가 보인다. 😀'.repeat(10)}]};
+  const messages=buildExperimentPrompt(persona,[],'short output',[visual]);
+  expect(messages[0]!.content).toContain('at most TWO evidenceRefs');expect(messages[0]!.content).toContain('512-token');
+  const data=JSON.parse(messages[2]!.content.replace('UNTRUSTED_EVIDENCE_JSON_DATA ',''));
+  const candidate=data[0].imageAnnotations[0].quoteCandidate;
+  // Repeated/ambiguous prefixes are deliberately not offered as unique candidates.
+  if(candidate){expect(candidate.length).toBeLessThanOrEqual(96);expect(visual.imageAnnotations[0]!.text.includes(candidate)).toBe(true);}
 });

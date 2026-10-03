@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 const password='synthetic-ui-password-only';
-type Session={id:string;personId:string;personaRevision:string;retrievalMode:string;createdAt:string};
+type Session={id:string;personId:string;personaRevision:string;retrievalMode:string;ragCondition?:string;createdAt:string};
 type Message={id:string;turnId:string|null;role:string;content:string};
 type Turn={id:string;sessionId:string;clientRequestId:string;userText:string;state:string;reply?:Record<string,unknown>};
 async function fixtures(page:Page) {
@@ -10,7 +10,7 @@ async function fixtures(page:Page) {
     let value:unknown;
     if(path==='personas')value={personas:['a','b','c','d'].map((id,index)=>({id:'synthetic-persona-'+id,personId:'synthetic-person-'+id,label:`합성 페르소나 ${index+1}`,language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',aiDisclosure:'연구용 AI 시뮬레이션 · 비공식'}))};
     else if(path==='sessions'&&!body)value={sessions};
-    else if(path==='sessions'&&body){const session={id:'synthetic-session-'+(++counter),personId:String(body.personId),personaRevision:'synthetic-v1',retrievalMode:String(body.retrievalMode),createdAt:'2026-01-01T00:00:00Z'};sessions.unshift(session);histories.set(session.id,[{id:'synthetic-greeting-'+counter,turnId:null,role:'assistant',content:'합성 연구 페르소나입니다. 편하게 이야기해 주세요.'}]);value={session};}
+    else if(path==='sessions'&&body){const session={id:'synthetic-session-'+(++counter),personId:String(body.personId),personaRevision:'synthetic-v1',retrievalMode:String(body.retrievalMode),ragCondition:String(body.ragCondition),createdAt:'2026-01-01T00:00:00Z'};sessions.unshift(session);histories.set(session.id,[{id:'synthetic-greeting-'+counter,turnId:null,role:'assistant',content:'합성 연구 페르소나입니다. 편하게 이야기해 주세요.'}]);value={session};}
     else if(/^sessions\/[^/]+$/.test(path)){const id=path.split('/')[1]!;value={session:sessions.find(session=>session.id===id),history:histories.get(id)??[]};}
     else if(/^sessions\/[^/]+\/turns$/.test(path)&&body){sentBodies.push(body);const id=String(body.clientRequestId);let turn=requestIds.get(id);
       if(!turn){turn={id:'synthetic-turn-'+(++counter),sessionId:path.split('/')[1]!,clientRequestId:id,userText:String(body.text),state:'generating'};turns.set(turn.id,turn);requestIds.set(id,turn);histories.get(turn.sessionId)!.push({id:'synthetic-user-'+counter,turnId:turn.id,role:'user',content:turn.userText});}
@@ -18,7 +18,7 @@ async function fixtures(page:Page) {
     }
     else if(/^turns\/[^/]+\/cancel$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;turn.state='cancelled';value={cancelled:true};}
     else if(/^turns\/[^/]+$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;const count=(polls.get(turn.id)??0)+1;polls.set(turn.id,count);
-      if(turn.state==='generating'&&count>=2){turn.state='completed';const timeline=sentBodies.find(body=>body.clientRequestId===turn.clientRequestId)?.intent==='timeline';turn.reply={content:timeline?'캡션 원문: 합성 기록입니다.':'합성 응답입니다. 대화를 이어 가요.',status:'answered',evidence:timeline?[{sourceId:'synthetic-source',sourceUrl:'https://example.com/synthetic',postedAt:'2026-01-02T00:00:00Z',eventDate:null,quote:'합성 기록입니다.'},{sourceId:'synthetic-unsafe-url',sourceUrl:'javascript:alert(1)',postedAt:'2026-01-02T00:00:00Z',eventDate:'2026-01-01',quote:'안전한 텍스트만 표시합니다.'}]:[],limitations:timeline?['합성 테스트 캡션이며 실제 활동 근거가 아닙니다.']:[]};histories.get(turn.sessionId)!.push({id:'synthetic-assistant-'+turn.id,turnId:turn.id,role:'assistant',content:String(turn.reply.content)});}
+      if(turn.state==='generating'&&count>=2){turn.state='completed';const timeline=sentBodies.find(body=>body.clientRequestId===turn.clientRequestId)?.intent==='timeline';const image=sessions.find(item=>item.id===turn.sessionId)?.ragCondition==='caption_image';turn.reply={content:timeline?'캡션 원문: 합성 기록입니다.':'합성 응답입니다. 대화를 이어 가요.',status:'answered',evidence:timeline?[{...(image?{origin:'ai_image_annotation',annotationId:'synthetic-image-description',annotationRevision:'synthetic-v5',annotationHash:'a'.repeat(64),imageHash:'b'.repeat(64)}:{origin:'source_caption'}),sourceId:'synthetic-source',sourceUrl:'https://example.com/synthetic',postedAt:'2026-01-02T00:00:00Z',eventDate:null,quote:'합성 기록입니다.'},{sourceId:'synthetic-unsafe-url',sourceUrl:'javascript:alert(1)',postedAt:'2026-01-02T00:00:00Z',eventDate:'2026-01-01',quote:'안전한 텍스트만 표시합니다.'}]:[],limitations:timeline?['합성 테스트 캡션이며 실제 활동 근거가 아닙니다.']:[]};histories.get(turn.sessionId)!.push({id:'synthetic-assistant-'+turn.id,turnId:turn.id,role:'assistant',content:String(turn.reply.content)});}
       value={turn};
     }
     else if(/^sessions\/[^/]+\/drafts$/.test(path))value={artifact:{content:'[가상 포스트 초안 · AI 생성]\n합성 창작 초안입니다.'},image:{code:'IMAGE_RUNNER_ONLY'}};
@@ -27,16 +27,16 @@ async function fixtures(page:Page) {
   });
   return {sentBodies,turns,abortOnce:()=>{abortNext=true;}};
 }
-async function login(page:Page) {await page.goto('/login');await page.getByLabel('연구 공간 비밀번호').fill(password);const responsePromise=page.waitForResponse('**/api/auth');await page.getByRole('button',{name:'로그인',exact:true}).click();const response=await responsePromise;expect(response.status()).toBe(200);await expect(page.getByRole('heading',{name:'대화 공간'})).toBeVisible();}
-async function newSession(page:Page) {await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');await page.getByRole('button',{name:'새 대화 시작'}).click();await expect(page.getByText('합성 연구 페르소나입니다. 편하게 이야기해 주세요.')).toBeVisible();}
+async function login(page:Page) {await page.goto('/login');await page.getByLabel('연구 공간 비밀번호').fill(password);const responsePromise=page.waitForResponse('**/api/auth');await page.getByRole('button',{name:'로그인',exact:true}).click();const response=await responsePromise;expect(response.status()).toBe(200);await expect(page.getByRole('heading',{name:'대화 공간'})).toBeVisible();await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');}
+async function newSession(page:Page) {await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');await page.getByRole('button',{name:'새 대화 시작'}).click();await expect(page.getByText('합성 연구 페르소나입니다. 편하게 이야기해 주세요.').last()).toBeVisible();}
 
 test('SYNTHETIC ONLY: five turns persist on reload and session mode stays pinned',async({page})=>{
   await fixtures(page);await login(page);await newSession(page);
   await expect(page.getByText('연구용 AI 시뮬레이션 · 비공식',{exact:true})).toBeVisible();
   for(let index=1;index<=5;index++){await page.getByLabel('메시지',{exact:true}).fill(`합성 메시지 ${index}`);await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.locator('.message.assistant').filter({hasText:'합성 응답입니다.'})).toHaveCount(index);}
-  await page.getByLabel('새 세션의 검색 방식').selectOption('lexical');await expect(page.getByTestId('session-mode')).toHaveText('RAG off · 검색 없음');
+  await page.getByLabel('새 세션의 RAG 조건').selectOption('caption');await page.getByLabel('검색 알고리즘').selectOption('lexical');await expect(page.getByTestId('session-mode')).toHaveText('RAG 없음');
   await page.reload();await expect(page.getByText('합성 메시지 5',{exact:true})).toBeVisible();await expect(page.locator('.message.assistant').filter({hasText:'합성 응답입니다.'})).toHaveCount(5);
-  await expect(page.getByTestId('session-mode')).toHaveText('RAG off · 검색 없음');
+  await expect(page.getByTestId('session-mode')).toHaveText('RAG 없음');
 });
 test('SYNTHETIC ONLY: cancellation and failed transport reuse idempotency key',async({page})=>{
   const state=await fixtures(page);await login(page);await newSession(page);
@@ -46,7 +46,7 @@ test('SYNTHETIC ONLY: cancellation and failed transport reuse idempotency key',a
   expect(state.sentBodies[1]!.clientRequestId).toBe(state.sentBodies[2]!.clientRequestId);expect(state.turns.size).toBe(2);
 });
 test('SYNTHETIC ONLY: explicit UTC filters, safe links and fictional draft boundary',async({page})=>{
-  const state=await fixtures(page);await login(page);await page.getByLabel('새 세션의 검색 방식').selectOption('lexical');await newSession(page);
+  const state=await fixtures(page);await login(page);await page.getByLabel('새 세션의 RAG 조건').selectOption('caption');await page.getByLabel('검색 알고리즘').selectOption('lexical');await newSession(page);
   await page.getByLabel('대화 종류').selectOption('timeline');await page.getByLabel('타임라인 검색어').fill('합성');await page.getByLabel('날짜 기준',{exact:true}).selectOption('posted');await page.getByLabel('시작일 포함',{exact:true}).fill('2026-01-01');await page.getByLabel('종료일 제외',{exact:true}).fill('2026-02-01');
   await page.getByLabel('메시지',{exact:true}).fill('합성 캡션 근거를 보여 주세요.');await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.getByText('기록 없음 · 게시일로 추정하지 않음')).toBeVisible();
   expect(state.sentBodies[0]!.timeline).toEqual({query:'합성',start:'2026-01-01',end:'2026-02-01',dateBasis:'posted',limit:5});await expect(page.getByRole('link',{name:'원본 링크 ↗'})).toHaveAttribute('href','https://example.com/synthetic');await expect(page.locator('a[href^="javascript:"]')).toHaveCount(0);
@@ -63,4 +63,21 @@ test('real BFF boundary: HttpOnly signed cookie, origin restriction and fixed ro
   await page.context().addCookies([{...cookie,value:cookie.value+'tampered'}]);
   const forged=await page.evaluate(async()=>(await fetch('/api/proxy/personas')).status);expect(forged).toBe(403);
   expect((await request.post('/api/auth',{headers:{Origin:'https://untrusted.example'},data:{password}})).status()).toBe(403);
+});
+
+test('SYNTHETIC ONLY: three condition controls persist and image provenance card stays distinct',async({page})=>{
+  await fixtures(page);await login(page);
+  for(const condition of ['off','caption','caption_image']){
+    await page.getByLabel('새 세션의 RAG 조건').selectOption(condition);
+    if(condition!=='off')await page.getByLabel('검색 알고리즘').selectOption('semantic');
+    await newSession(page);
+    await expect(page.getByTestId('session-mode')).toHaveText(condition==='off'?'RAG 없음':condition==='caption'?'본문만 · semantic':'본문 + 이미지 설명 · semantic');
+  }
+  await page.getByLabel('대화 종류').selectOption('timeline');
+  await page.getByLabel('메시지',{exact:true}).fill('합성 이미지 설명을 보여 줘');await page.getByRole('button',{name:'보내기',exact:true}).click();
+  await expect(page.locator('[data-evidence-origin="ai_image_annotation"]')).toHaveCount(1);
+  await expect(page.getByText('AI 이미지 설명 · 검수되지 않은 파생 근거')).toBeVisible();
+  await expect(page.getByText('synthetic-image-description / synthetic-v5')).toBeVisible();
+  await page.reload();await expect(page.getByTestId('session-mode')).toHaveText('본문 + 이미지 설명 · semantic');
+  await expect(page.locator('[data-evidence-origin="ai_image_annotation"]')).toHaveCount(1);
 });

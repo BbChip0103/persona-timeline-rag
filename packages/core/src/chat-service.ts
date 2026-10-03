@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, type ConversationStore, type PersonaRepository, type Retrieval, type TextProvider } from './ports';
-import { buildExperimentPrompt, buildPrompt } from './prompts';
+import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { containsCredentialPattern, containsUngroundedBiography, isBiographicalRequest, isExplicitlyCreativeRequest } from './safety';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
@@ -66,9 +66,9 @@ export class ChatService {
         controller.signal.addEventListener('abort',()=>reject(new CoreError('TURN_FAILED')),{once:true});
       });
       await Promise.race([execution,timeout]);
-    } catch {
+    } catch (error) {
       // Never persist/return provider error strings: they can contain raw keys, prompts or paths.
-      await this.options.store.transitionTurn(turn.id,[...activeStates],'failed','TURN_FAILED');
+      await this.options.store.transitionTurn(turn.id,[...activeStates],'failed',error instanceof CoreError && error.code==='CONTEXT_LIMIT'?'CONTEXT_LIMIT':'TURN_FAILED');
     } finally { if(timer) clearTimeout(timer); this.controllers.delete(turn.id); }
     return this.getTurn(ownerId,turn.id);
   }
@@ -89,6 +89,7 @@ export class ChatService {
       : value.timeline || inferred==='timeline' || session.ragCondition && /image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i.test(value.text) ? 'timeline' : value.intent ?? inferred;
     let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
     let sources:SourcePost[]=[];
+    let promptEvidence:ChatReply['promptEvidence'];
     if(intent==='clarification' || intent==='unsupported') {
       output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':'이 연구 자료 범위에서는 확인할 수 없어요.',claims:[],evidence:[],limitations:[]};
     } else if(intent==='timeline' && session.retrievalMode !== 'off' && query.dateBasis==='event' && query.start && query.timezone !== 'UTC') {
@@ -103,9 +104,15 @@ export class ChatService {
         if(session.ragCondition==='caption') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
       if(!await this.options.store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
-      const result=await this.options.provider.generate(session.ragCondition ? buildExperimentPrompt(persona,history,value.text,sources) : buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
+      const experiment=session.ragCondition?buildExperimentContext(persona,history,value.text,sources):undefined;
+      if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
+        omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
+      const result=await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
       if(controller.signal.aborted) return;
-      if(session.ragCondition) output=validateExperimentReply(result,sources,session.personId,session.ragCondition);
+      if(session.ragCondition) {
+        output=validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition);
+        if(experiment!.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${experiment!.omittedAnnotations}`);
+      }
       else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
       else {
         const safe=result.trim();
@@ -116,7 +123,7 @@ export class ChatService {
       }
     }
     if(controller.signal.aborted || !await this.options.store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
-    const reply:ChatReply={...output,sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await this.options.store.completeTurn(turn.id,reply);
   }
 }

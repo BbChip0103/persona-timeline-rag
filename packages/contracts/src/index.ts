@@ -47,6 +47,7 @@ export interface ChatReply {
   sessionId:string; turnId:string; messageId:string; personId:string; personaRevision:string;
   responseKind:'small_talk'|'timeline'|'clarification'|'unsupported'; status:ReplyStatus;
   grounding?:'unverified_model'|'source_bound_quotes'; content:string; claims:FactualClaim[]; evidence:EvidenceCard[]; limitations:string[];
+  promptEvidence?:{sourceIds:string[];annotationIds:string[];omittedAnnotations:number;promptBytes:number};
 }
 export interface ProviderMessage { role:'system'|'user'|'assistant'; content:string }
 export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'completed'|'failed'|'cancelled';
