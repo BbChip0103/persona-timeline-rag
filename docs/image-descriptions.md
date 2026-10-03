@@ -104,10 +104,24 @@ Run from the repository root:
 # Single-session authorized corrective preflight, importing accepted V4 successes unchanged.
 PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --recover-completed-v4 --max-batches 1
 # Resume all remaining independent lane queues.
-PYTHONPATH=src python -m persona_timeline_rag.image_descriptions
+PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --bounded-corrections
 # Read-only latest atomic snapshot, safe while a supervisor holds the lock.
 PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --status
 ```
+
+`--bounded-corrections` is opt-in and requires the private `bounded-corrective-authorization.json`
+for the exact existing contract, `scope=known_terminal_validation_only`, `max_batches=5` and
+`max_attempts_per_batch=1`. This is an explicitly authorized exception for fully settled invalid
+responses, not a transport retry. No semantic validation is relaxed and no indices/observations are
+edited or padded. The existing response adapter/model/context contract remains unchanged.
+
+Before a correction, every submitted child must settle. Its original state/raw response/events/usage
+are immutable, still recording failure. `recovery.json` links their SHA256 values and the authorization;
+`corrective-attempt-1/` contains separate state, workspace and result. Pending corrections precede
+never-submitted batches. Success is reported through that verified journal, not by replacing the
+original failed state. A second failure, unconfirmed transport, tool use, incompatible authority or
+exhausted five-batch allowance halts without more submissions. Global lock and five-session cap still
+apply across recovery waves. Progress includes each journaled attempt and consumed allowance.
 
 `--max-batches` limits the total newly scheduled batches, not each lane or skipped successes.
 `--status` reports the snapshot's `observed_at`; it does not freshly rehash originals. To recover an
@@ -161,6 +175,7 @@ context, source-context order and rejected face-identity/origin fields, generic 
 disjoint/exhaustive five-lane partition, five-session bound/no lane overlap, race-free readable atomic
 progress, global lock, unknown-state no-resubmission and compatibility/provenance tampering.
 Repair tests additionally cover required exact keys, canonical evidence indices, successful-result
-adoption, terminal-only bounded correction, preserved originals, one-attempt resume guards and
+adoption, terminal-only bounded correction, immutable attempt journals, five-batch cap, uncertain/tool-use
+rejection, corrective second-failure stop, preserved originals, one-attempt resume guards and
 non-duplicated lineage accounting.
 These tests do not replace the actual single-session model preflight or human semantic review.

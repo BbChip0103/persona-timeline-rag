@@ -536,6 +536,91 @@ class ImageDescriptionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 mod.import_completed_v4(root, separate, batches, inv, 1, "new_contract")
 
+    def test_immutable_journal_corrects_once_and_accounts_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            synthetic(root)
+            calls = []
+            def failing(workspace, batch, root, timeout, on_started=None):
+                mod.atomic_json(workspace / "process.json", {"pid": 999999999})
+                mod.atomic_json(workspace / "response.json", {"images": {}})
+                event = {"type": "turn.completed", "usage": {"input_tokens": 42}}
+                (workspace / "events.jsonl").write_text(json.dumps(event) + "\n")
+                mod.atomic_json(workspace / "usage.json", {"observed_usage": [event["usage"]]})
+                raise ValueError("missing required keys")
+            with patch.object(mod, "auth_preflight"), patch.object(
+                    mod, "execute_batch", side_effect=failing):
+                with self.assertRaises(ValueError):
+                    mod.run(root, 1, 1, 30)
+            output = root / mod.OUTPUT_DIRECTORY
+            directory = mod.batch_directory(output, 0)
+            originals = {p: p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+            manifest = mod.load_json(output / "manifest.json")
+            authority = root / mod.REPORT_DIRECTORY / "bounded-corrective-authorization.json"
+            mod.atomic_json(authority, {"contract": manifest["contract"], "max_batches": 5,
+                "max_attempts_per_batch": 1, "scope": "known_terminal_validation_only"})
+            def succeeding(workspace, batch, root, timeout, on_started=None):
+                calls.append(workspace)
+                return {"descriptions": annotations_for(batch), "usage": {"input_tokens": 7}}
+            with patch.object(mod, "auth_preflight"), patch.object(
+                    mod, "execute_batch", side_effect=succeeding):
+                summary = mod.run(root, 1, 1, 30, bounded_corrections=True)
+                self.assertEqual(len(calls), 1)
+                self.assertIn("corrective-attempt-1", str(calls[0]))
+                self.assertEqual(summary["preserved_invalid_usage"]["input_tokens"], 42)
+                self.assertEqual(summary["lineage_codex_usage"]["input_tokens"], 49)
+                self.assertEqual(mod.load_json(directory / "state.json")["status"], "unknown")
+                mod.run(root, 1, None, 30, bounded_corrections=True)
+                self.assertEqual(len(calls), 2)  # Only the other previously unsubmitted image.
+            for path, data in originals.items():
+                self.assertEqual(path.read_bytes(), data)
+            result_path = directory / "corrective-attempt-1/result.json"
+            result = mod.load_json(result_path)
+            self.assertEqual(result["corrective_lineage"]["original_status"], "completed_invalid")
+            result.pop("corrective_lineage")
+            mod.atomic_json(result_path, result)
+            with self.assertRaises(ValueError):
+                mod.validate_result(result_path, [manifest["inventory"]["images"][0]],
+                                    manifest["contract"])
+
+    def test_journal_rejects_uncertain_tools_cap_and_second_attempt(self):
+        for case in ("uncertain", "tools", "cap", "second_attempt"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                synthetic(root)
+                output, reports = root / mod.OUTPUT_DIRECTORY, root / mod.REPORT_DIRECTORY
+                batches = [[image] for image in mod.inventory(root)["images"]]
+                directory = mod.batch_directory(output, 0)
+                mod.atomic_json(directory / "state.json", {"status": "unknown",
+                    "contract": "contract", "error_type": "ValueError"})
+                workspace = directory / "workspace"
+                mod.atomic_json(workspace / "process.json", {"pid": 999999999})
+                mod.atomic_json(workspace / "response.json", {"images": {}})
+                events = [{"type": "turn.completed", "usage": {"input_tokens": 42}}]
+                if case == "uncertain":
+                    events = [{"type": "turn.started"}]
+                if case == "tools":
+                    events.append({"type": "item.completed", "item": {"type": "command_execution"}})
+                (workspace / "events.jsonl").write_text(
+                    "".join(json.dumps(event) + "\n" for event in events))
+                mod.atomic_json(workspace / "usage.json",
+                                {"observed_usage": [{"input_tokens": 42}]})
+                mod.atomic_json(reports / "bounded-corrective-authorization.json", {
+                    "contract": "contract", "max_batches": 5, "max_attempts_per_batch": 1,
+                    "scope": "known_terminal_validation_only"})
+                if case == "cap":
+                    for number in range(50, 55):
+                        mod.atomic_json(mod.batch_directory(output, number) / "recovery.json", {})
+                if case == "second_attempt":
+                    self.assertEqual(
+                        mod.journal_corrections(output, reports, batches, "contract"), 1)
+                    attempt = directory / "corrective-attempt-1/state.json"
+                    state = mod.load_json(attempt)
+                    state["status"] = "unknown"
+                    mod.atomic_json(attempt, state)
+                with self.assertRaises(RuntimeError):
+                    mod.journal_corrections(output, reports, batches, "contract")
+
     def test_result_provenance_private_modes_and_single_writer_lock(self):
         import fcntl
         with tempfile.TemporaryDirectory() as temporary:

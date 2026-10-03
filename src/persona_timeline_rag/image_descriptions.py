@@ -321,6 +321,105 @@ def import_completed_v4(root: Path, output: Path, batches: list[list[dict[str, A
 
 
 
+
+def effective_directory(directory: Path) -> Path:
+    link_path = directory / "recovery.json"
+    if not link_path.exists():
+        return directory
+    link = load_json(link_path)
+    if link.get("attempt") != 1 or link.get("original_status") != "completed_invalid":
+        raise ValueError("Invalid corrective attempt journal")
+    required = {"state.json", "workspace/response.json", "workspace/events.jsonl",
+                "workspace/usage.json", "workspace/process.json"}
+    if set(link["original_sha256"]) != required:
+        raise ValueError("Incomplete original artifact hashes")
+    original_state = load_json(directory / "state.json")
+    if (original_state.get("status") != "unknown"
+            or original_state.get("contract") != link["contract"]):
+        raise ValueError("Original corrective state mismatch")
+    for relative, expected in link["original_sha256"].items():
+        if relative not in {"state.json", "workspace/response.json", "workspace/events.jsonl",
+                            "workspace/usage.json", "workspace/process.json"}:
+            raise ValueError("Unexpected original artifact path")
+        if digest(directory / relative) != expected:
+            raise ValueError("Original failed attempt changed")
+    authorization = (directory.parents[4] / REPORT_DIRECTORY /
+                     "bounded-corrective-authorization.json")
+    if digest(authorization) != link["authorization_sha256"]:
+        raise ValueError("Corrective authorization changed")
+    return directory / "corrective-attempt-1"
+
+
+def journal_corrections(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
+                        contract: str) -> int:
+    authorization_path = reports / "bounded-corrective-authorization.json"
+    authorization = load_json(authorization_path)
+    if (authorization.get("contract") != contract or authorization.get("max_batches") != 5
+            or authorization.get("max_attempts_per_batch") != 1
+            or authorization.get("scope") != "known_terminal_validation_only"):
+        raise ValueError("Invalid bounded corrective authority")
+    used = len(list(output.glob("lane-*/batch-*/recovery.json")))
+    candidates = []
+    for number, batch in enumerate(batches):
+        directory = batch_directory(output, number)
+        state_path = directory / "state.json"
+        if not state_path.exists():
+            continue
+        state = load_json(state_path)
+        if state["status"] == "submitted":
+            raise RuntimeError("Wait for every submitted attempt to settle before recovery")
+        effective = effective_directory(directory)
+        if effective != directory:
+            recovered = load_json(effective / "state.json")
+            if recovered["status"] not in {"pending", "succeeded"}:
+                raise RuntimeError("Corrective attempt failed or is uncertain; no second attempt")
+            continue
+        if state["status"] == "unknown":
+            if (state.get("contract") != contract or state.get("error_type") != "ValueError"
+                    or state.get("corrective_attempt")):
+                raise RuntimeError("Uncertain or previously corrected failure cannot be retried")
+            workspace = directory / "workspace"
+            process = load_json(workspace / "process.json")
+            try:
+                os.kill(process["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise RuntimeError("Previous child is live")
+            events = [json.loads(line) for line in (workspace / "events.jsonl").open()]
+            completed = [event for event in events if event["type"] == "turn.completed"]
+            if (len(completed) != 1 or any(event["type"] == "item.completed" and
+                    event.get("item", {}).get("type") not in {"agent_message", "reasoning"}
+                    for event in events)):
+                raise RuntimeError("Unconfirmed completion or tool use prevents correction")
+            usage = load_json(workspace / "usage.json")
+            if usage["observed_usage"] != [completed[0]["usage"]]:
+                raise ValueError("Terminal usage evidence mismatch")
+            try:
+                normalize_wire(load_json(workspace / "response.json"), batch)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError("Valid original output should be reconciled, not regenerated")
+            candidates.append((number, directory, completed[0]["usage"]))
+    if used + len(candidates) > 5:
+        raise RuntimeError("Bounded corrective batch cap reached")
+    for number, directory, usage in candidates:
+        if (directory / "corrective-attempt-1").exists():
+            raise RuntimeError("Unjournaled corrective artifacts must not be overwritten")
+        link = {"attempt": 1, "batch": number, "contract": contract,
+                "original_status": "completed_invalid", "observed_at": utc_now(),
+                "authorization_sha256": digest(authorization_path),
+                "original_sha256": {relative: digest(directory / relative) for relative in (
+                    "state.json", "workspace/response.json", "workspace/events.jsonl",
+                    "workspace/usage.json", "workspace/process.json")}}
+        atomic_json(directory / "recovery.json", link)
+        atomic_json(directory / "corrective-attempt-1/state.json", {
+            "status": "pending", "contract": contract, "corrective_attempt": 1,
+            "corrective_lineage": link, "prior_observed_usage": usage})
+    return len(candidates)
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.UTC).isoformat()
 
@@ -514,6 +613,11 @@ def validate_annotation(value: Any, batch: list[dict[str, Any]]) -> list[dict[st
 def validate_result(path: Path, batch: list[dict[str, Any]], contract: str,
                     legacy: bool = False) -> dict[str, Any]:
     value = load_json(path)
+    if path.parent.name == "corrective-attempt-1":
+        original = path.parent.parent
+        if (effective_directory(original) != path.parent
+                or value.get("corrective_lineage") != load_json(original / "recovery.json")):
+            raise ValueError("Corrective result lineage mismatch")
     if value.get("contract") != contract or value.get("model") != MODEL:
         raise ValueError("Incompatible stored result")
     if "adopted_from" in value:
@@ -694,7 +798,7 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
         {"lane": lane, "pending": 0, "submitted": 0, "succeeded": 0, "unknown": 0,
          "durations_seconds": [], "active_child_pid": None} for lane in range(LANES)]
     for number, batch in enumerate(batches):
-        directory = batch_directory(output, number)
+        directory = effective_directory(batch_directory(output, number))
         state_path = directory / "state.json"
         state = load_json(state_path) if state_path.exists() else {"status": "pending"}
         status = state["status"]
@@ -763,6 +867,13 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
         "concurrency": LANES, "execution_variant": EXECUTION_VARIANT,
         "active_lanes": sum(lane["active_child_pid"] is not None for lane in lane_statistics),
         "lane_statistics": lane_statistics,
+        "bounded_corrective_batches_used": len(list(
+            output.glob("lane-*/batch-*/recovery.json"))),
+        "bounded_corrective_journal": [
+            {"batch": load_json(path)["batch"], "original_status": "completed_invalid",
+             "attempt": 1, "attempt_status": load_json(
+                 path.parent / "corrective-attempt-1/state.json")["status"]}
+            for path in sorted(output.glob("lane-*/batch-*/recovery.json"))],
         "context_version": CONTEXT_VERSION, "context_adapter_hash": CONTEXT_HASH,
         "lane_status": {str(lane): load_json(output / f"lane-{lane}/status.json")
                         for lane in range(LANES)
@@ -786,6 +897,7 @@ def partition_numbers(numbers: list[int], lanes: int = LANES) -> list[list[int]]
 
 def prepare_batch(directory: Path, batch: list[dict[str, Any]], contract: str,
                   reconcile: bool) -> dict[str, Any]:
+    directory = effective_directory(directory)
     state_path, result_path = directory / "state.json", directory / "result.json"
     state = load_json(state_path) if state_path.exists() else {
         "status": "pending", "contract": contract,
@@ -809,7 +921,10 @@ def prepare_batch(directory: Path, batch: list[dict[str, Any]], contract: str,
             usages = record_usage(directory / "workspace")
             if len(usages) != 1:
                 raise RuntimeError("Cannot reconcile without exact successful usage event")
-            atomic_json(result_path, make_result(batch, rows, usages[0], contract))
+            result = make_result(batch, rows, usages[0], contract)
+            if state.get("corrective_lineage"):
+                result["corrective_lineage"] = state["corrective_lineage"]
+            atomic_json(result_path, result)
         state.update(status="succeeded", result_sha256=digest(result_path),
                      ended_at=utc_now(), reconciled=True)
         atomic_json(state_path, state)
@@ -821,7 +936,7 @@ def prepare_batch(directory: Path, batch: list[dict[str, Any]], contract: str,
     return state
 
 
-def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
+def _run_once(root: Path, batch_size: int, max_batches: int | None, timeout: int,
         status_only: bool = False, reconcile: bool = False,
         recover_completed_v4: bool = False) -> dict[str, Any]:
     os.umask(0o077)
@@ -866,6 +981,10 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
         pending = [number for number, batch in enumerate(batches)
                    if prepare_batch(batch_directory(output, number), batch, contract,
                                     reconcile)["status"] == "pending"]
+        pending.sort(key=lambda number: (not load_json(
+            effective_directory(batch_directory(output, number)) / "state.json").get(
+                "corrective_attempt") if (effective_directory(batch_directory(
+                    output, number)) / "state.json").exists() else True, number))
         if max_batches is not None:
             pending = pending[:max_batches]
         assignments = partition_numbers(pending)
@@ -890,7 +1009,7 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
                     atomic_json(lane_dir / "status.json", lane_state)
                     publish()
                 for number in numbers:
-                    directory = batch_directory(output, number)
+                    directory = effective_directory(batch_directory(output, number))
                     state_path, result_path = directory / "state.json", directory / "result.json"
                     with progress_lock:
                         if stop.is_set():
@@ -907,9 +1026,11 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
                     try:
                         result = execute_batch(directory / "workspace", batches[number],
                                                root, timeout, on_started=publish)
-                        atomic_json(result_path, make_result(batches[number],
-                                                            result["descriptions"],
-                                                            result["usage"], contract))
+                        record = make_result(batches[number], result["descriptions"],
+                                             result["usage"], contract)
+                        if state.get("corrective_lineage"):
+                            record["corrective_lineage"] = state["corrective_lineage"]
+                        atomic_json(result_path, record)
                         validate_result(result_path, batches[number], contract)
                         state.update(status="succeeded", result_sha256=digest(result_path),
                                      ended_at=utc_now())
@@ -949,6 +1070,33 @@ def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
         return publish()
 
 
+
+def run(root: Path, batch_size: int, max_batches: int | None, timeout: int,
+        status_only: bool = False, reconcile: bool = False,
+        recover_completed_v4: bool = False, bounded_corrections: bool = False) -> dict[str, Any]:
+    for _ in range(6):  # Five authorized corrective batches, never an unbounded retry loop.
+        try:
+            return _run_once(root, batch_size, max_batches, timeout, status_only,
+                             reconcile, recover_completed_v4)
+        except Exception:
+            if not bounded_corrections:
+                raise
+            output, reports = root / OUTPUT_DIRECTORY, root / REPORT_DIRECTORY
+            # _run_once has settled all submitted children and released its global lock.
+            with (output / "runner.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                manifest = load_json(output / "manifest.json")
+                if (inventory(root) != manifest["inventory"]
+                        or manifest["batch_size"] != batch_size):
+                    raise ValueError("Changed inputs cannot consume corrective authority")
+                images = manifest["inventory"]["images"]
+                batches = [images[index:index + batch_size]
+                           for index in range(0, len(images), batch_size)]
+                if not journal_corrections(output, reports, batches, manifest["contract"]):
+                    raise
+    raise RuntimeError("Bounded corrective recovery rounds exhausted")
+
+
 def make_result(batch: list[dict[str, Any]], rows: list[dict[str, Any]],
                 usage: dict[str, Any], contract: str) -> dict[str, Any]:
     return {"contract": contract, "model": MODEL, "observed_at": utc_now(), "usage": usage,
@@ -980,6 +1128,7 @@ def main() -> None:
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--reconcile", action="store_true")
     parser.add_argument("--recover-completed-v4", action="store_true")
+    parser.add_argument("--bounded-corrections", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.batch_size <= 8 or not 30 <= args.timeout <= 1800:
         parser.error("batch-size must be 1..8 and timeout 30..1800 seconds")
@@ -991,7 +1140,7 @@ def main() -> None:
         return
     print(json.dumps(run(args.root.resolve(), args.batch_size, args.max_batches,
                          args.timeout, args.status, args.reconcile,
-                         args.recover_completed_v4)), flush=True)
+                         args.recover_completed_v4, args.bounded_corrections)), flush=True)
 
 
 if __name__ == "__main__":
