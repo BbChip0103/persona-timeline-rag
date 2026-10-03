@@ -229,3 +229,21 @@ test('timeline deterministic candidates preserve bounded UTF16 selectors and rem
   expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v1-source-quotes');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v2-timeline-quote-candidates');
   expect(buildPrompt(persona,[],'hello',[],false)[0].content).not.toContain('quoteCandidate');
 });
+
+describe('explicit conservative intent wins over date/factual heuristic',()=>{
+  test.each(['off','lexical','semantic'] as const)('clarification with ambiguous EN/Korean date words makes zero calls in %s',async mode=>{
+    const h=harness();const session=await h.create('owner_synthetic_a',mode);
+    const inputs=['When should we use the posted date or event date?','Which date do you mean: yesterday or last year?','언제를 기준으로 볼까요? 게시일과 활동일 중 어떤 날짜인가요?'];
+    for(const [index,text] of inputs.entries()) {
+      const turn=await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:`clarify-${mode}-${index}`,text,intent:'clarification',...(index===2?{timeline:{dateBasis:'posted' as const,query:'ambiguous synthetic date'}}:{})});
+      expect(turn.reply?.status).toBe('needs_clarification');expect(turn.reply?.responseKind).toBe('clarification');expect(turn.reply?.claims).toEqual([]);expect(turn.reply?.evidence).toEqual([]);
+    }
+    expect(h.provider.generate).not.toHaveBeenCalled();expect(h.retrieval.search).not.toHaveBeenCalled();
+  });
+  test.each(['off','lexical','semantic'] as const)('explicit unsupported remains nonanswering despite date words in %s',async mode=>{
+    const h=harness();const session=await h.create('owner_synthetic_a',mode);
+    const turn=await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:`unsupported-${mode}`,text:'When did that happen? 언제였나요?',intent:'unsupported',timeline:{dateBasis:'posted',query:'synthetic date'}});
+    expect(turn.reply?.status).toBe('out_of_scope');expect(turn.reply?.responseKind).toBe('unsupported');expect(turn.reply?.claims).toEqual([]);expect(turn.reply?.evidence).toEqual([]);
+    expect(h.provider.generate).not.toHaveBeenCalled();expect(h.retrieval.search).not.toHaveBeenCalled();
+  });
+});

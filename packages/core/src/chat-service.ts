@@ -81,8 +81,11 @@ export class ChatService {
     if(persona.id !== session.personaId || persona.personId !== session.personId || persona.revision !== session.personaRevision) throw new CoreError('PERSONA_UNAVAILABLE');
     const sensitive=/phone number|home address|private address|real.time location|rumou?r|secret relationship|연락처|전화번호|집 주소|주거지|실시간 위치|사생활|루머|미성년/i.test(value.text);
     const inferred=isExplicitlyCreativeRequest(value.text) ? 'small_talk' : isBiographicalRequest(value.text) || /\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i.test(value.text) ? 'timeline' : 'small_talk';
-    // Explicit small_talk cannot downgrade an obviously factual request.
-    const intent=sensitive ? 'unsupported' : value.timeline || inferred==='timeline' ? 'timeline' : value.intent ?? inferred;
+    // Conservative explicit clarification/unsupported routes never answer or retrieve.
+    // Explicit small_talk still cannot downgrade an obviously factual request.
+    const intent=sensitive || value.intent==='unsupported' ? 'unsupported'
+      : value.intent==='clarification' ? 'clarification'
+      : value.timeline || inferred==='timeline' ? 'timeline' : value.intent ?? inferred;
     let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'>;
     let sources:SourcePost[]=[];
     if(intent==='clarification' || intent==='unsupported') {

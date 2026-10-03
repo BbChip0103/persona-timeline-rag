@@ -18,11 +18,12 @@ async function main():Promise<void>{
       await page.getByRole('button',{name:'새 대화 시작',exact:true}).click();await expect(page.locator('.message.assistant')).toHaveCount(1);
       const texts=p.language==='ko'?['안녕! 이 대화에서 내 별명은 Blue야.','가상의 편안한 아침 아이디어를 추천해줘.','이 대화에서 내 별명이 뭐였지?','분위기 좋은 가상 포스트 아이디어 하나만 더.','고마워. 이 연구 대화는 실제 인물이 아니지?']:['Hello! My nickname in this conversation is Blue.','Suggest a fictional relaxing morning idea.','What nickname did I give in this conversation?','Suggest one more imaginary creative post idea.','Thank you. This is an AI research conversation, not the real person, right?'];
       const began=Date.now();
-      for(const [index,text] of texts.entries()){
+      for(const [index,text] of texts.entries()){stage=`persona-${personIndex}-turn-${index}`;
         await page.getByLabel('메시지').fill(text);await page.getByRole('button',{name:'보내기',exact:true}).click();
         await expect(page.locator('.message.assistant:not(.pending)')).toHaveCount(index+2,{timeout:45000});
         await expect(page.getByLabel('메시지',{exact:true})).toBeEnabled({timeout:5000});
-        if(await page.locator('[role=alert]').count())throw new Error('UI returned a sanitized error');
+        // Next's hidden route announcer also has role=alert; only the visible app error is failure.
+        if(await page.locator('.error[role=alert]').count())throw new Error((await page.locator('.error[role=alert]').innerText()).match(/\b[A-Z][A-Z0-9_]{3,60}\b/)?.[0]??'UI_SANITIZED_ERROR');
       }
       await page.reload();await expect(page.locator('.message.assistant:not(.pending)')).toHaveCount(6,{timeout:15000});
       await expect(page.locator('.message.user')).toHaveCount(5);
