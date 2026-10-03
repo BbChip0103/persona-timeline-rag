@@ -1,0 +1,22 @@
+{
+  "selection_file": "data/manifests/targets.json",
+  "subset_root": "data/subsets/instagram",
+  "normalized_posts": "data/processed/target_posts.jsonl",
+  "max_people": 4,
+  "human_review_sample_size": 50,
+  "event_date_policy": "unknown unless supported by explicit evidence",
+  "evaluation_baselines": [
+    "model_less_lexical",
+    "no_retrieval",
+    "lexical_rag",
+    "semantic_rag"
+  ],
+  "deferred_baselines": [
+    "caption_image_rag",
+    "web_search"
+  ],
+  "poc_goal": "influencer_persona_chat",
+  "persona_definitions": "data/personas",
+  "chat_evaluation_scenarios": 12,
+  "user_turns_per_scenario": 5
+}
