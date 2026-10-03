@@ -2,7 +2,7 @@
 
 ## 범위
 
-- 최종 PoC는4명 연구용 AI 페르소나의 멀티턴 채팅과 대화 속 타임라인 근거 활용이다. 현재 상태/계약은 README와 docs의 명세를 따른다.
+- 최종 PoC는4명 연구용 AI 페르소나의 멀티턴 채팅과 대화 속 타임라인 근거 활용이다. 순서는 채팅환경→4명채팅/가상포스트·External image 이미지표현 검증(RAG off)→timeline RAG/비교다. 생성물은 실제활동근거로 재유입하지 않는다. 현재상태/계약은README와docs를 따른다.
 - 기존 Python ingestion은 유지하고 서비스는 reference agent loop 호환 계열로 독립 구현한다. 다른 프로젝트 소스/seed/prompt/credentials/운영·staging·공유DB를 사용하거나 변경하지 않는다.
 - 연구 DB는 전용 로컬 Supabase와 검증된 loopback 연결만 허용한다. 외부 모델 전송/비용/개인자격 조건은 실행 전 확인한다.
 

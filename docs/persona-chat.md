@@ -7,6 +7,10 @@
 
 개인 PoC의 `person_id`, `persona_id`, `persona_revision`, `session_id`는 서로 다른 식별자다. 추후 다른 프로젝트 bot/template/room ID 대응은 adapter의 별도 매핑이며 지금 다른 프로젝트 ID를 발급하거나 사용하지 않는다.
 
+### 단계와 retrieval mode
+
+먼저 합성캐릭터 채팅 환경을 만들고4명 persona로 채팅/포스트초안/이미지 표현을 검증한 뒤 timeline RAG를 추가한다. 세션/run은 `retrieval_mode: off | lexical | semantic`을 기록한다. `off`는 tool/embedding 호출0회이고, 구체적인 실제활동은 검수된 정적profile 근거 밖이면 미답이다. 같은 persona revision/model/history를 고정한 후 RAG를 켠다. [창작물 계약](creative-artifacts.md).
+
 ## 2. 공개 프로필과 비공개 정의
 
 | 계층 | 내용 | 규칙 |
@@ -69,7 +73,7 @@ trusted caller → owned session/persona revision 확인
 
 - policy/AI 표시/인물 scope는 persona보다 우선한다. persona는 표현을, timeline은 사실 근거를 담당한다. 검색 텍스트를 system 명령으로 섞지 않는다.
 - intent는 `small_talk | timeline | clarification | unsupported | policy_rejection`이다. 모델이 추출해도 Zod 등으로 검증하고 실제 권한은 서버가 확정한다.
-- 일반 인사는 검색 없이 가능하다. 실제 활동·과거 사건 질문은 retrieval을 사용한다. 검수된 정적 profile 사실은 field provenance로 지원한다. provider 일반 지식으로 구체적 자전적 사실을 보완하지 않는다.
+- 일반 인사는 검색 없이 가능하다. 실제 활동·과거 사건 질문은 RAG on에서는 retrieval을 사용한다. off baseline에는 몰래 tool을 호출하지 않고 정적profile 근거 밖이면 미답으로 처리한다. 검수된 정적 profile 사실은 field provenance로 지원한다. provider 일반 지식으로 구체적 자전적 사실을 보완하지 않는다.
 - model tool arguments에 person_id를 공개하지 않는 최소 wrapper를 우선한다. 내부 request의 person_id는 owned session에서 주입한다. 모델이 다른 인물을 요구하면 조용히 선택 인물로 바꿔 검색하지 않고 명시적 policy rejection으로 종료한다.
 - 후속 “그 여행”은 같은 세션의 명시적 reference로만 해석한다. 여러 후보/날짜 기준 미상은 한 가지 명확화 질문을 한다. 기본 timezone은 세션 설정으로 명시하되 사건 현지 날짜가 미상이면 보완하지 않는다.
 - 이 PoC는 현시점에서 과거 자료를 이야기하는 모드다. 캐릭터 시계를 과거로 돌리는 historical roleplay/as_of 재현은 미지원이며 그런 요구는 명확화한다. 향후 지원 시 게시 시점 cutoff도 별도 계약으로 필요하다.

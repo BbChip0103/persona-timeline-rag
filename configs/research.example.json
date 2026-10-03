@@ -18,5 +18,21 @@
   "poc_goal": "influencer_persona_chat",
   "persona_definitions": "data/personas",
   "chat_evaluation_scenarios": 12,
-  "user_turns_per_scenario": 5
+  "user_turns_per_scenario": 5,
+  "phases": [
+    "character_chat_environment",
+    "persona_chat_and_creative_baseline",
+    "timeline_rag_and_comparison"
+  ],
+  "creative_baseline": {
+    "retrieval_mode": "off",
+    "post_briefs_per_person": 3,
+    "image_briefs_per_person": 1,
+    "image_provider": "external-image",
+    "model": "GPT Image 2",
+    "quality": "medium",
+    "resolution": "1K",
+    "aspectRatio": "4:5",
+    "generateCount": 1
+  }
 }

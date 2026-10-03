@@ -58,6 +58,7 @@ Next.js 채팅 → NestJS turn API → trusted session context
 | timeline core | 원본·사건·관찰·임베딩, 인물/기간 검색과4상태, 게시일≠사건일 |
 | conversation core | owner/person/revision 고정, 메시지·후속 reference·turn idempotency·tool trace |
 | model/provider | intent/답변 생성 경계. 권한/DB/현실 이력 결정자 아님 |
+| creative/provider | 가상포스트/이미지 job·External image·생성물 origin·비용. 원본사건과분리 |
 | API/UI | 검증된 코어 호출, 인물 선택·채팅·근거 카드·재접속 |
 | evaluation | 추출50게시물/질문50개/대화12개, 사실·표현·미답·비용 분리 |
 
@@ -66,12 +67,10 @@ Next.js 채팅 → NestJS turn API → trusted session context
 
 DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard로 격리한다. 다른 프로젝트 stage/prod/공유 DB나 Cloud 연결/remote migration은 하지 않는다. 현재 local stack과 guard는 아직 미구현이다.
 
-### 구현 게이트
+### 구현 게이트 — 세 단계
 
-1.4명 persona 작성/검수와 세션/응답 계약을 정하고 독립 TS/DB/import 기반을 준비한다. 모델 미정이어도 합성 계약과 lexical 기준선부터 검증한다.
-2.1,189건 import·중복/인물 격리·날짜 경계·모델 없는 검색을 확인한다. 이것만으로 최종 PoC 완료라고 하지 않는다.
-3. reviewed persona→owned session→provider→lexical timeline tool→최종 대화 답변→최소UI를 한 vertical slice로 연결한다. 일반 대화·후속 질문·미답·저장/reload가 필수다.
-4. semantic retrieval과 사건 추출50게시물 검수,50질문/12대화 비교를 완주한다. 같은 persona/model/history의 통제 비교와 각자history를 누적하는 실제 대화 비교를 구분한다.
-5. 작은 이미지 표본 보강은 추가 실험이다. 필요한 텍스트 채팅/평가를 먼저 완주하며 효과·조건을 확인한 뒤 확대와 다른 프로젝트 통합 여부를 별도 결정한다.
+1. **채팅 환경:** TS/contracts·NestJS/Next.js·전용 local DB의세션/메시지·provider로 합성캐릭터 일반대화/reload/owner와person격리를 검증한다. source corpus/검색/embedding은 아직 요구하지 않는다.
+2. **persona 표현 기준선:**4명 검수/버전persona의 실제대화와Instagram 가상포스트초안·External image GPT Image2 medium 이미지생성을 RAG off로 검증한다. 생성물은별도CreativeArtifact/job/provider이며실제SourcePost/Event로유입시키지않는다. 실제provider조건은호출전확정한다.
+3. **RAG:**1,189건source import→lexical→semantic과사건추출표본/질문/대화평가. 같은persona/model/prefix의 off/lexical/semantic과각자누적history를구분해비교한다. 원본사진VLM 근거보강은그뒤선택이다.
 
-[PRD](prd.md) · [페르소나·채팅](persona-chat.md) · [근거 계약](evidence-schema.md) · [평가](evaluation.md). 실제 대상 정보와 다른 프로젝트 파일 근거/필드 매핑은 비공개 데이터/호환 명세에 둔다.
+[PRD](prd.md) · [페르소나·채팅](persona-chat.md) · [창작물](creative-artifacts.md) · [근거 계약](evidence-schema.md) · [평가](evaluation.md). 실제 대상/다른 프로젝트참고경로는비공개명세에 둔다.

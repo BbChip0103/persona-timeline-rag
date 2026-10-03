@@ -10,7 +10,8 @@
 - 같은 페르소나/모델에서 timeline RAG가 무검색 대화보다 과거 활동 답변을 정확하게 만드는가?
 - 후속 질문에서도 인물·기간·근거를 유지하고, 자료가 없으면 자연스럽게 모른다고 답하는가?
 - 인물/대화 세션을 바꾸었을 때 다른 인물의 자료나 다른 대화가 섞이지 않는가?
-- 사진이 추가 근거를 주는가? 이는 확장 실험이며, 사진 효과가 없어도 검수된 caption 기반 채팅을 완주한다.
+- RAG 없이도 persona가 채팅·포스트 초안·이미지 brief에서 일관적인가? 생성물과 실제 활동을 구분하는가?
+- 원본사진이 추가 근거를 주는가는 이후 선택실험이며 새이미지생성과 별개다.
 
 대상은 선택 manifest의4명, 입력은1,189게시물이다. 실제 명단/범위는 [비공개 데이터 명세](dataset.private.md)에 둔다.4명은 제품의 상한이 아니며 추가 합성 인물은 등록으로 지원한다. 과거 snapshot의 날짜를 현재 기억/일정처럼 말하지 않는다.
 
@@ -27,31 +28,28 @@
 
 합성 예시: 인사 → “2018년6월에 올린 여행 이야기가 궁금해” → “그 중 자전거가 나온 건?” → “그 여행은 정확히 언제였어?” → 근거가 없는 최근 활동 질문. 모든 턴에 검색을 강제하지는 않지만 실제 활동 회상은 검색된 근거 또는 검수된 정적 사실 provenance를 요구한다.
 
-## 3. 필수 구성과 구현 순서
+## 3. 구현 순서 — 채팅 → 페르소나 창작 기준선 → RAG
 
-### A. 인물·페르소나 정의
+### 1단계: 캐릭터 채팅 환경
 
-- reference agent loop의 인물 입력/템플릿/런타임 구조를 읽기 전용으로 확인한 의미적 호환 계약을 독립 구현한다. 다른 프로젝트 코드·기존 페르소나 문구를 복사하지 않는다.
-- 4명 각각 identity/공개 활동 분야, 대화 concept, 행동 guideline, speech style, 짧은 예시 대화, greeting, 자료 범위·금지 추론을 정의하고 검수한다.
-- 게시물만으로 실제 성격·친밀 관계·구어 억양을 확정하지 않는다. 자료 기반 관찰, 연구용 표현 설계, 미상을 필드별로 구분한다. 미확인 reference agent loop 입력 항목을 억지로 채우지 않는다.
-- 동적 사건은 persona prompt에 모두 넣지 않고 timeline 근거로 조회한다. 실제본인 여부·민감/사적 사실·모델의 기억을 persona가 덮어쓰지 못한다.
+- 독립 TS/pnpm 코어, NestJS/Next.js 최소 화면, 전용 로컬 Supabase의 세션/메시지 저장, provider 경계를 먼저 연결한다.
+- 합성 캐릭터로 일반 대화·history·재접속·AI 표시·owner/person 격리·턴 상태를 검증한다. 같은 모델을 연결할 구조를 먼저 만들며 실제 모델 조건은 별도 확정한다.
+- 아직 corpus import/검색/임베딩을 선행조건으로 두지 않는다. `retrieval_mode=off`로 검색이 실제0회인지 테스트한다.
 
-### B. 독립 기반과 모델 없는 검색 검증
+### 2단계:4명 persona와 채팅·포스트/이미지 검증 — RAG off
 
-- 기존 JSONL을 전용 로컬 DB로 import하고 인물·UTC게시기간·literal 키워드 검색과 템플릿 답변을 검증한다. Python ingestion과 원본은 유지한다.
-- 이 단계는 중간 통과 기준이며 채팅 PoC 완료 또는 의미 검색 성능으로 보고하지 않는다.
+- reference persona authoring의 authoring 차원을 참고하되 다른 프로젝트 코드/문구를 복사하지 않고4명 각각 persona를 작성/검수한다. 정체성/분야·concept·behavior·speech·합성예시·greeting·boundary와 관찰/설계/미상 provenance를 구분한다.
+- 실제 모델로 일반 대화/후속 질문, Instagram 형식의 **AI 가상 포스트 초안**과 이미지 생성을 검증한다. 원본게시물/실제활동 회상과 창작brief는 구분하며 실제Instagram 게시/계정연결은 하지 않는다.
+- 이미지 provider는 External image GPT Image 2 `medium`. 공식API 독립adapter의 job/상태/다운로드/비용을 검증한다. [창작물 계약](creative-artifacts.md).
+- 기존 Python 데이터는 persona 스타일/정적profile provenance 검수에 활용하되 runtime timeline RAG는 끈다. 검수된 정적사실 밖의 구체적인 과거활동은 미답으로 처리한다.
+- persona/model/settings와 채팅/창작 baseline을 고정한다. 생성된포스트/이미지/대화를 실제SourcePost/사건/gold로 재사용하지 않는다.
 
-### C. 최소 채팅 vertical slice — 필수
+### 3단계: timeline RAG 구축과 개선 비교
 
-- 버전 있는 persona, 세션/턴 저장, provider 경계, 일반 대화/활동 조회 해석, `search_timeline`, 근거가 연결된 assistant 답변을 한 흐름으로 연결한다.
-- NestJS API와 최소 Next.js/React 화면은 **PoC 필수**다. 인물 선택·AI 표시·대화·근거 카드·오류/명확화 표시를 제공한다.
-- 4명 각각 일반 대화→과거 질문→후속 질문→미답이 가능한지 검증한다. 모델 연결 조건이 미정이면 이 부분은 미완료로 남기며 합성 fake provider를 실제 채팅 성능으로 주장하지 않는다.
-
-### D. 텍스트 RAG와 대화 효과 평가 — 필수
-
-- 같은 persona revision·model·history에서 무검색/lexical/semantic RAG 대화를 비교한다.
-- 50게시물 추출 검수,50개 단일 질문 평가, 별도 멀티턴 대화 평가를 구분한다. [평가 명세](evaluation.md).
-- 이미지 보강은 이후 작은 표본에서 추가 비교한다. 전체 이미지 분석은 채팅의 선행조건이 아니다.
+- 기존1,189건 JSONL을 전용 DB의 불변 source/매체로 import한다. 인물/게시기간/lexical 검색을 먼저 검증하고 임베딩/semantic 검색을 추가한다.
+- 고정한같은 persona/model/history에 `off | lexical | semantic`을 연결하고 최종 대화발화에서 기억/날짜/근거/미답이 어떻게 달라지는지 비교한다.
+- 50게시물 추출 검수·50질문·별도12대화의 효과/실패/비용/지연을 기록한다. RAG로 말투가 좋아졌다고 사실성 효과를 대신하지 않는다.
+- 원본사진의 VLM/RAG 근거보강은 이후 선택실험이다.2단계 새이미지생성과는 별개이며 전체JPEG 분석을 선행하지 않는다.
 
 ## 4. 사실·표현·대화 규칙
 
@@ -82,10 +80,11 @@
 4. 활동 질문의 요청/도구 결과/최종 답변을 추적할 수 있고, 답변 근거 카드가 실제 같은 인물의 출처를 가리킨다. 표현 후 무근거 사실 추가0건, 게시일/사건일 혼동0건을 목표로 검수한다.
 5. 인물 혼합·세션간 history 유출0건. 인물 변경은 새 세션이며 다른 인물 tool 요청, prompt injection, invalid/미답, 중단/재시도 중복 방지 회귀를 통과한다.
 6. 50게시물 추출 검수와50질문 평가에 더해4명×3개×5user turns=12개 대화 시나리오를 검수한다. 실제 같은 persona/model/history에서 RAG on/off의 사실성·말투 일관성·미답·지연·비용을 보고한다. recall@5≥90% 등은 제안 목표이며 성능 향상을 완료의 전제로 꾸미지 않는다.
-7. 이미지 보강은 선택 확장이다. 필수 텍스트 채팅/평가가 끝나야 PoC 완료라고 부르며, 다른 프로젝트 통합은 그 후 별도 판단한다.
+7. RAG off 상태의4명 채팅/포스트초안·External image 이미지 검증과 그 baseline 버전/비용을 기록한다. 실제호출 미수행/fake를 구분하고 생성물이 실제SourcePost로 들어가지 않는지 확인한다. 원본사진 VLM 근거보강은 선택확장이다.
+8. 최종완료는1~3단계 필수흐름/검수/비교보고서이며 다른 프로젝트통합은 이후 별도판단이다.
 
 ## 관련 계약
 
-[페르소나·채팅](persona-chat.md) · [근거 스키마](evidence-schema.md) · [평가](evaluation.md) · [아키텍처](architecture.md) · 현재 [`Post`](../src/persona_timeline_rag/schemas.py)
+[페르소나·채팅](persona-chat.md) · [창작물](creative-artifacts.md) · [근거 스키마](evidence-schema.md) · [평가](evaluation.md) · [아키텍처](architecture.md) · 현재 [`Post`](../src/persona_timeline_rag/schemas.py)
 
 기술 선택·논의 과정의 기준 이력은 코드 프로젝트 밖 작업 이슈 문서에서 관리한다. 이 문서는 현재 제품 계약이다.

@@ -1,6 +1,6 @@
 # persona-timeline-rag
 
-승인받은 Instagram 자료를 바탕으로 **인플루언서 AI 페르소나와 채팅하면서 과거 활동 타임라인 근거를 활용하는** 독립 개인 연구 프로젝트입니다. 검색 질의는 중간 단계이며,4명 페르소나 정의·멀티턴 채팅·최소 화면·RAG on/off 대화 평가까지가 PoC 목표입니다. 실제 본인/공식 계정이 아닌 연구용 AI 시뮬레이션으로 표시합니다.
+승인받은 Instagram 자료를 바탕으로 **인플루언서 AI 페르소나와 채팅하면서 과거 활동 타임라인 근거를 활용하는** 독립 개인 연구 프로젝트입니다. 채팅 환경 →4명 페르소나 채팅·가상포스트/이미지 표현 검증(RAG off) →timeline RAG 구축/비교 순서가 PoC 목표입니다. 실제 본인/공식 계정이 아닌 연구용 AI 시뮬레이션으로 표시합니다.
 
 ## 현재 구현 범위
 
@@ -68,7 +68,7 @@ reports/        # 실제 계정·다운로드·평가 보고서: Git 제외
 
 [로컬 재현](docs/local-setup.md) · [아키텍처](docs/architecture.md) · [데이터 정책](docs/data-policy.md) · [원본 데이터셋 소개](https://sites.google.com/site/sbkimcv/dataset/instagram-influencer-dataset)
 
-구현 전 명세: [PRD](docs/prd.md) · [페르소나·채팅](docs/persona-chat.md) · [근거 스키마](docs/evidence-schema.md) · [평가 명세](docs/evaluation.md). 실제 인물·수량·파일 연결은 Git에서 제외되는 `docs/dataset.private.md`에 기록합니다. 명세 작성은 검색·모델·DB 구현 완료나 성능 달성을 의미하지 않습니다.
+구현 전 명세: [PRD](docs/prd.md) · [페르소나·채팅](docs/persona-chat.md) · [창작물](docs/creative-artifacts.md) · [근거 스키마](docs/evidence-schema.md) · [평가 명세](docs/evaluation.md). 실제 인물·수량·파일 연결은 Git에서 제외되는 `docs/dataset.private.md`에 기록합니다. 명세 작성은 검색·모델·DB 구현 완료나 성능 달성을 의미하지 않습니다.
 
 ## 라이선스와 한계
 
@@ -83,4 +83,4 @@ reports/        # 실제 계정·다운로드·평가 보고서: Git 제외
 - 검색 tool의 근거가 최종 페르소나 발화에 쓰이고 말투 변환으로 사실/날짜를 만들지 않음. 인물·세션 격리.
 - 50게시물 추출 검수·50질문 평가와 별도12개 멀티턴 시나리오에서 같은 persona/model의 RAG on/off 비교.
 
-DB/API/페르소나/모델/UI는 아직 미구현입니다. 이미지/VLM은 채팅 완주 후 선택 확장이며 검색 CLI만으로 완료라고 하지 않습니다.
+DB/API/페르소나/모델/UI는 아직 미구현입니다. RAG off에서 채팅/가상포스트 초안과 External image GPT Image2 medium 이미지 표현을 먼저 검증합니다. 생성물은 실제게시물/활동근거가 아닙니다. 원본사진의 VLM/RAG 보강은 별도 선택확장이며 실제Instagram 게시/검색CLI만으로완료는 하지 않습니다.

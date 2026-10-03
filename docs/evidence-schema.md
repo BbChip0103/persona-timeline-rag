@@ -34,6 +34,7 @@
 - `platform_id + account_id + platform_post_id`는 논리적 원본 게시물 키다. 동일 키·내용 hash의 재import는 중복 0건이어야 한다. 같은 논리적 키의 내용 hash가 달라지면 원본을 덮어쓰지 않고 새 snapshot/version과 이전 snapshot 연결을 남긴다.
 - `source_post_id`는 특정 불변 snapshot/version을 식별한다. 내용이 바뀌면 새 `source_post_id`/`snapshot_revision`을 부여하고 `supersedes_source_post_id`로 이전 버전을 참조한다(최초 버전은 null). 근거의 quote 위치·이미지·embedding·gold는 이 버전 ID를 가리키며 “최신 게시물” pointer로 자동 재해석하지 않는다.
 - 원본 게시물·매체 내용은 불변이다. 추출 결과·검수 상태·매핑 변경은 별도 version 레코드로 기록한다. 최소 보존/삭제 정책에 따른 명시적 삭제는 가능하지만 근거가 삭제·손실되면 그 근거를 사용하는 답변은 다시 검증해야 한다.
+- AI가 만든 포스트 초안/이미지/대화는 `CreativeArtifact(origin=generated)`이며 SourcePost/실제 Event/평가 gold로 승격하거나 원본 검색 corpus에 넣지 않는다. importer는 원본 provenance와 generated 유형을 검증한다. [창작물 계약](creative-artifacts.md).
 - `source_file`, `local_ref`는 로컬 비공개 참조다. 공개 답변에서 절대 경로·원본 파일명·저장소 내부 위치를 노출하지 않는다. `source_url`이 있어도 현재 접근 가능성이나 내용 일치를 보장하지 않는다.
 - `local_ref`는 해당 subset root 내부의 상대 경로다. 절대 경로·`..` traversal·symlink를 통한 root 이탈을 거부한다. root 안에서 resolve한 파일과 원본 게시물 매핑이 모두 확인되어야 적격 근거다. 디렉터리에 있는 JPEG라는 이유만으로 게시물에 연결하지 않고, 미참조 파일에 가짜 게시물을 만들지 않는다.
 - `kind`는 현재 `image | video_thumbnail | unknown`, `kind_basis`는 `child_metadata | reviewed | unknown`, `kind_confidence`는 `confirmed | uncertain`이다. carousel 자식의 원본 유형/검수 근거로 결정하며 불명확하면 `unknown/uncertain`이다. 부모 `Post.is_video=false`는 자식에 영상이 없다는 뜻이 아니다. `availability`는 `available | missing | rejected`이며 손실/검수 제외 매체는 답변 근거로 사용하지 않는다.
