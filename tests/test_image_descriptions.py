@@ -39,7 +39,10 @@ def synthetic(root):
 
 def rows_for(batch):
     return [{"imageId": image["imageId"], "description_ko": "합성 사물이 보인다.",
-             **{field: [] for field in mod.DETAIL_FIELDS}} for image in batch]
+             **{field: [] for field in mod.DETAIL_FIELDS},
+             "observed_emphasis": {"main_subjects": [], "visual_basis": []},
+             "communicative_intent": {"epistemic_status": mod.INTENT_STATUS,
+                                      "hypotheses": []}} for image in batch]
 
 
 class ImageDescriptionTests(unittest.TestCase):
@@ -93,14 +96,103 @@ class ImageDescriptionTests(unittest.TestCase):
         rows = rows_for(batch)
         self.assertEqual(mod.validate_descriptions({"images": rows}, ["img_a", "img_b"]), rows)
         bad = [rows[:1], list(reversed(rows))]
-        for field, value in (("description_ko", ""), ("visible_text", ["x" * 301]),
-                             ("uncertainties", ["x"] * 21), ("extra", "x")):
+        for field, value in (("description_ko", ""), ("description_ko", "x" * 501),
+                             ("visible_text", ["x" * 121]),
+                             ("uncertainties", ["x"] * 4), ("extra", "x")):
             changed = copy.deepcopy(rows)
             changed[0][field] = value
             bad.append(changed)
         for value in bad:
             with self.assertRaises(ValueError):
                 mod.validate_descriptions({"images": value}, ["img_a", "img_b"])
+
+    def test_v2_separates_observed_emphasis_and_tentative_intent(self):
+        row = rows_for([{"imageId": "img_a"}])[0]
+        row["observed_emphasis"] = {
+            "main_subjects": ["합성 크림 용기"],
+            "visual_basis": ["용기가 화면 중앙에 있고 라벨이 정면을 향한다."]}
+        hypothesis = {
+            "kind": "product_presentation",
+            "hypothesis_ko": "제품 외관을 보여주는 구도일 가능성이 있다.",
+            "visual_basis": row["observed_emphasis"]["visual_basis"].copy(),
+            "confidence": "medium",
+            "uncertainty_ko": "실제 촬영·게시 목적이나 광고 여부는 알 수 없다.",
+            "alternatives": ["제품 외관의 개인 기록일 수도 있다."]}
+        row["communicative_intent"]["hypotheses"] = [hypothesis]
+        mod.validate_descriptions({"images": [row]}, ["img_a"])
+        self.assertEqual(row["description_ko"], "합성 사물이 보인다.")
+        variants = []
+        for field, value in (("confidence", "high"), ("confidence", 0.9),
+                             ("kind", "paid_advertisement"), ("kind", "author_psychology"),
+                             ("visual_basis", []), ("visual_basis", ["캡션에서 알 수 있다."]),
+                             ("uncertainty_ko", ""), ("alternatives", [])):
+            changed = copy.deepcopy(row)
+            changed["communicative_intent"]["hypotheses"][0][field] = value
+            variants.append(changed)
+        changed = copy.deepcopy(row)
+        changed["communicative_intent"]["epistemic_status"] = "actual_author_motive"
+        variants.append(changed)
+        changed = copy.deepcopy(row)
+        changed["observed_emphasis"]["visual_basis"] = []
+        variants.append(changed)
+        changed = copy.deepcopy(row)
+        changed["communicative_intent"]["hypotheses"] *= 3
+        variants.append(changed)
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                mod.validate_descriptions({"images": [variant]}, ["img_a"])
+        # Unclear intent remains valid, including completely ambiguous emphasis.
+        mod.validate_descriptions({"images": rows_for([{"imageId": "img_a"}])}, ["img_a"])
+
+    def test_concise_salience_bounds_allow_irrelevant_fields_empty(self):
+        row = rows_for([{"imageId": "img_scenery"}])[0]
+        row["description_ko"] = ("산과 호수가 넓게 펼쳐진 풍경이다. "
+                                 "수면 반사와 산의 윤곽이 중심이다.")
+        row["observed_emphasis"] = {
+            "main_subjects": ["산과 호수 풍경"],
+            "visual_basis": ["풍경이 화면 대부분을 차지하고 수면에 산이 비친다."]}
+        mod.validate_descriptions({"images": [row]}, ["img_scenery"])
+        self.assertEqual(row["visible_objects"], [])
+        self.assertEqual(row["colors"], [])
+        self.assertEqual(row["communicative_intent"]["hypotheses"], [])
+        for field in ("main_subjects", "visual_basis"):
+            changed = copy.deepcopy(row)
+            changed["observed_emphasis"][field] = ["합성 정보"] * 4
+            with self.assertRaises(ValueError):
+                mod.validate_descriptions({"images": [changed]}, ["img_scenery"])
+        self.assertIn("NOT an exhaustive forensic inventory", mod.PROMPT)
+        self.assertIn("incidental passerby's blue shirt", mod.PROMPT)
+        self.assertIn("Never invent intention for every", mod.PROMPT.replace("\n", " "))
+        self.assertIn("NOT human verification", mod.PROMPT)
+
+    def test_v2_regenerates_all_targets_and_preserves_v1_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            synthetic(root)
+            v1 = root / "data/research/image_descriptions"
+            v1_report = root / "reports/image-description"
+            mod.atomic_json(v1 / "manifest.json", {"contract": "synthetic_v1"})
+            mod.atomic_json(v1 / "batch-0000/result.json", {"preserved": "v1 result and usage"})
+            mod.atomic_json(v1_report / "summary.json", {"input_tokens": 99})
+            originals = {path: path.read_bytes() for directory in (v1, v1_report)
+                         for path in directory.rglob("*") if path.is_file()}
+            def fake_execute(workspace, batch, root, timeout):
+                return {"descriptions": rows_for(batch), "usage": {"input_tokens": 10}}
+            with patch.object(mod, "auth_preflight"), patch.object(
+                    mod, "execute_batch", side_effect=fake_execute) as execute:
+                summary = mod.run(root, 1, None, 30)
+                self.assertEqual(execute.call_count, 2)
+                self.assertEqual(summary["validated_files"], 4)
+                self.assertEqual(summary["prompt_version"], "original-image-ko-v2")
+            for path, original in originals.items():
+                self.assertEqual(path.read_bytes(), original)
+            self.assertTrue((root / mod.OUTPUT_DIRECTORY / "manifest.json").exists())
+            self.assertTrue((root / mod.REPORT_DIRECTORY / "summary.json").exists())
+            old_row = rows_for([{"imageId": "img_a"}])[0]
+            old_row.pop("observed_emphasis")
+            old_row.pop("communicative_intent")
+            with self.assertRaises(ValueError):
+                mod.validate_descriptions({"images": [old_row]}, ["img_a"])
 
     def test_command_fixed_model_auth_disabled_tools_and_clean_env(self):
         args = mod.command(Path("/private"), [Path("/private/img_a.jpg")], Path("/output"))
@@ -136,7 +228,7 @@ class ImageDescriptionTests(unittest.TestCase):
                 self.assertEqual(execute.call_count, 2)
                 with self.assertRaises(ValueError):
                     mod.run(root, 2, None, 30)
-                result = root / "data/research/image_descriptions/batch-0000/result.json"
+                result = root / "data/research/image_descriptions_v2/batch-0000/result.json"
                 value = mod.load_json(result)
                 value["images"][0]["source"]["sha256"] = "tampered"
                 mod.atomic_json(result, value)
@@ -154,7 +246,7 @@ class ImageDescriptionTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     mod.run(root, 1, None, 30)
                 self.assertEqual(execute.call_count, 1)
-            state = mod.load_json(root / "data/research/image_descriptions/batch-0000/state.json")
+            state = mod.load_json(root / mod.OUTPUT_DIRECTORY / "batch-0000/state.json")
             self.assertEqual(state["status"], "unknown")
             mod.ensure_resumable({"contract": "x", "status": "pending"}, "x")
             for status in ("submitted", "unknown", "failed"):
@@ -186,7 +278,7 @@ class ImageDescriptionTests(unittest.TestCase):
                     mod, "execute_batch", side_effect=TimeoutError):
                 with self.assertRaises(TimeoutError):
                     mod.run(root, 1, None, 30)
-                state_path = root / "data/research/image_descriptions/batch-0000/state.json"
+                state_path = root / "data/research/image_descriptions_v2/batch-0000/state.json"
                 state = mod.load_json(state_path)
                 state["contract"] = "wrong_contract"
                 mod.atomic_json(state_path, state)
@@ -200,7 +292,7 @@ class ImageDescriptionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             synthetic(root)
-            output = root / "data/research/image_descriptions"
+            output = root / "data/research/image_descriptions_v2"
             mod.private_dir(output)
             with (output / "runner.lock").open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

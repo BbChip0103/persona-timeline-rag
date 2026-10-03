@@ -1,10 +1,56 @@
-# Original-image descriptions (private, not yet RAG)
+# Original-image descriptions v2 (private, not yet RAG)
 
 This stdlib-only runner annotates only JPEGs referenced by the selected four-person target posts.
 It cross-checks the selected targets, research sources and original image mapping manifest. It
 never glob-selects orphan images, other persons or generated creative artifacts. Original sources,
 captions, personas, database, index and chat remain unchanged. Annotation is a separate preparation
 step: descriptions must not be treated as original captions, original quotes or actual event truth.
+
+## Observation versus communicative intent
+
+V2 prioritizes retrieval/story-worthy **salient memory**, not everything visible. Objective prose
+is 2–3 short sentences when useful, at most 500 characters; fewer are fine for ambiguity. Every
+detail list is at most three short strings and may be empty. Incidental passersby, shirt colors,
+background objects and microdetail are omitted unless central to the shot. Scenery focuses on
+scenery/atmosphere; makeup portraits may focus on makeup/hair/styling; presented products focus on
+product/important label. Colors/composition/text matter only when defining the presentation. The
+`uncertainties` field addresses ambiguities affecting the main point or intent, not boilerplate
+unknown dates/places or every unreadable background letter. No padded descriptions or invented
+intent for every photo; this is not a guaranteed relevance oracle.
+
+V2 saves three deliberately separate layers under each result's `images[].visual`:
+
+1. `description_ko` and visible detail fields: grounded observation, not inferred motive.
+2. `observed_emphasis`: visible `main_subjects` and `visual_basis` about framing, position, label
+   orientation, size, contrast, color or focus: at most three subjects and three basis strings.
+   An identified emphasized subject needs visible basis.
+3. `communicative_intent`: `epistemic_status=tentative_not_author_fact` with zero to two hypotheses.
+   Each has `kind`, tentative Korean `hypothesis_ko`, nonempty `visual_basis` copied verbatim from
+   the observed basis, qualitative `confidence` (`low` or `medium`), `uncertainty_ko`, and at least
+   one alternative (at most two). Basis strings reference at most two observed cues per hypothesis.
+   Prefer one hypothesis when helpful; no hypothesis is required when intent is unclear.
+
+Detail/subject/basis strings are at most 120 characters; hypothesis/uncertainty/alternative strings
+are at most 180. The prompt requests a model self-check for central focus, omission of incidental
+details, brevity and inference separation. Provenance records the checklist as **AI self-check, not
+human verification**, and retains `human_reviewed=false`. These limits and labels are structural
+checks, not an independent semantic relevance assessment.
+
+This considers what the **photo's presentation could communicate**, including a plausible reason
+for making/posting that kind of image, not what the actual author thought or intended. A centered
+cream container/forward-facing label can support possible product presentation, not paid advertising
+or endorsement certainty. Scenery with feet in frame can support scenic-experience framing, not
+verified travel motive, location, date or emotions. Psychology, personality, identity and private
+beliefs are outside the annotation contract. Intent hypotheses must never become original quotes
+or factual event/author claims. Structural validation checks labels, basis references and bounds;
+it does not prove that every natural-language interpretation is visually correct. Human semantic
+review remains necessary.
+
+The fixed v2 variant re-annotates **every** referenced image, even those with existing v1 objective
+captions. It is a deliberate prompt/schema change, not a retry of unresolved v1 work. V1 outputs,
+state and observed Codex usage stay in their old directories untouched; no annotations or usage
+from the two variants are silently mixed. The v2 manifest includes its prompt version and variant
+policy; incompatible output/config cannot be reused.
 
 ## Fixed execution contract
 
@@ -29,6 +75,8 @@ step: descriptions must not be treated as original captions, original quotes or 
 
 ## Commands
 
+The current module defaults to `original-image-ko-v2`,
+`data/research/image_descriptions_v2/`, and `reports/image-description-v2/`.
 From the repository root:
 
 ```sh
@@ -39,6 +87,10 @@ PYTHONPATH=src python -m persona_timeline_rag.image_descriptions
 # Safe while a runner is active: read the most recent atomic progress snapshot only.
 PYTHONPATH=src python -m persona_timeline_rag.image_descriptions --status
 ```
+
+To inspect archived v1 progress, read `data/research/image_descriptions/progress.json` or
+`reports/image-description/summary.json` directly; the current CLI does not resume or mutate v1.
+Do not start v2 full generation until the prior v1 runner's bounded current session has settled.
 
 `--status` does not rehash originals or claim a fresh full validation. Its `observed_at` identifies
 snapshot freshness. Every successful batch is validated again when resuming. Changed source hashes,
@@ -56,14 +108,14 @@ than `unknown`; the same no-resubmission rule applies.
 
 For a durable local job, launch the already-tested resume command using a detached subprocess with
 `start_new_session=True`, `stdin=DEVNULL`, and a private log, and retain its PID/start time/command
-in a private launch receipt. The runner owns only its child subprocess group. On timeout/interruption
-SIGTERM is handled as a bounded interruption; it terminates only that group; it never kills unrelated Codex sessions. No credentials or API budget
-are adjusted by this operational launch.
+in a private launch receipt. The runner owns only its child subprocess group. SIGTERM and timeout
+are handled as bounded interruptions: it terminates only that group, never unrelated Codex sessions.
+No credentials or API budget are adjusted by this operational launch.
 
 ## Private output and provenance
 
-All outputs are ignored by Git: `data/research/image_descriptions/` and
-`reports/image-description/`. Directories are mode 700 and files mode 600 (process umask 077).
+All outputs are ignored by Git: `data/research/image_descriptions_v2/` and
+`reports/image-description-v2/`. Directories are mode 700 and files mode 600 (process umask 077).
 Original licensed images are unchanged. The inventory stores original SHA256, relative file paths,
 and **all** person/post/image-position/source-ID/source-hash associations. Identical file contents
 can share one visual annotation without dropping any source associations.
@@ -71,10 +123,12 @@ can share one visual annotation without dropping any source associations.
 - `manifest.json`: compatibility hash, full original mapping, initial start time and batch size.
 - `batch-NNNN/state.json`: submitted/succeeded/unknown, times, runner PID and result checksum.
 - `batch-NNNN/result.json`: validated structured visuals, original mappings, observation timestamp,
-  `origin=image_derived`, fixed model/effort, prompt version/hash, `human_reviewed=false`.
+  separated visual observation/emphasis/intent, `origin=image_derived`, fixed model/effort,
+  prompt version/hash, `human_reviewed=false`.
 - `batch-NNNN/workspace/`: anonymous copies, schema, raw response, private CLI events/stderr,
-  child process identity, exact CLI argv/runner-source hash, observed usage. These are not public fixtures or documentation.
-- `progress.json` and `reports/image-description/summary.json`: validated referenced-file/content
+  child process identity, exact CLI argv/runner-source hash, observed usage. These are not public
+  fixtures or documentation.
+- `progress.json` and `reports/image-description-v2/summary.json`: validated referenced-file/content
   totals, status counts, timestamps, observed Codex usage and explicit incomplete/complete status.
 
 Accounting sums exact observed `turn.completed` usage, including available unsuccessful-batch
@@ -93,5 +147,8 @@ this runner does not insert descriptions into original sources or start the LLMO
 `make check` runs synthetic unit tests, existing regressions, ruff and mypy. Synthetic tests cover
 count/order/schema, source scope/path/mapping, SHA256 dedup associations, Unicode caption parsing,
 fixed auth/model/tool settings, compatible resume, unknown-state no-retry, provenance tampering,
-private modes and the single-writer lock. Passing tests is not a substitute for an actual small
-requested-model image session before a full run.
+private modes, the single-writer lock, v2 emphasis/intent separation and bounds, rejected
+unsupported motive/ad-fact kinds, required evidence/uncertainty/alternatives, qualitative confidence,
+concise salience bounds/empty irrelevant fields, complete v2 regeneration, and byte-preserved v1
+artifacts. Passing tests is not a substitute for an actual small requested-model image session
+before a full run.
