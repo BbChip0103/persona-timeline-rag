@@ -1,6 +1,6 @@
 # Architecture
 
-## 현재: 데이터 준비
+## 데이터 준비(구현됨)
 
 ```text
 승인 배포 자료 + 로컬 계정 선택 manifest
@@ -38,9 +38,9 @@
 
 이미지 경로 존재 확인과 JPEG 시그니처 검사는 전체 이미지 디코딩·인물 동일성 검증을 대체하지 않습니다. 사진 속 대상이 계정 소유자라는 추론도 자동으로 하지 않습니다.
 
-## 계획: 인플루언서 클론 채팅과 타임라인 근거
+## 인플루언서 AI 채팅과 타임라인 근거(구현됨)
 
-아래는 **미구현 계획**이다. 최종 PoC는 인물별 페르소나로 일반 대화·과거 활동·후속 질문을 나누고, 실제 답변에 근거를 쓰는 채팅이다. 검색/CLI 질의는 중간 게이트다.
+아래 서비스 경계는 구현돼 있다. 실제 사람 검수/사건 정확도와 배포 성능은 아직 별도 검증이다. [runbook](runbook.md)이 현재 실행 계약이다. 최종 PoC는 인물별 페르소나로 일반 대화·과거 활동·후속 질문을 나누고, 실제 답변에 근거를 쓰는 채팅이다. 검색/CLI 질의는 중간 게이트다.
 
 ```text
 기존 Python ingestion → immutable source posts/media → 전용 local Supabase
@@ -65,7 +65,7 @@ Next.js 채팅 → NestJS turn API → trusted session context
 서비스/코어는 TypeScript/Node.js·pnpm, API는 NestJS, 필수 최소 화면은 Next.js/React다. 전용 로컬 Supabase/PostgreSQL·pgvector와 SQL migrations를 사용하고 Python ingestion은 유지한다. 모델은 provider/worker 경계로 분리하며 필요한 경우 GPU worker만 Python을 고려한다.
 
 
-DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard로 격리한다. 다른 프로젝트 stage/prod/공유 DB나 Cloud 연결/remote migration은 하지 않는다. 현재 local stack과 guard는 아직 미구현이다.
+DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard로 격리한다. 다른 프로젝트 stage/prod/공유 DB나 Cloud 연결/remote migration은 하지 않는다. 현재 전용 DB-only local Supabase와 연결 guard/limited app role가 구현돼 있다. Auth/Storage/Studio 전체 스택은 아니다.
 
 ### 구현 게이트 — 세 단계
 

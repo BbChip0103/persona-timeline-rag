@@ -1,6 +1,7 @@
 # licensed-dataset persona research Chat PoC — 제품 명세
 
-상태: 구현 전 명세. 현재 구현된 기능은 Python 데이터 준비뿐이며 페르소나 정의·채팅·DB·RAG는 미구현이다. 아래 수용 기준은 달성 결과가 아니다.
+> 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
+상태: 최소 TS채팅/DB/API/UI와 silver페르소나·RAG·자동평가 하네스가 구현됐다. 아래 전체 수용 기준은 자동 달성 결과가 아니다. 사람검수·독립 사건 truth·semantic entailment와 Goal2는 별도 잔여 gate다.
 
 ## 1. 목적과 완료 단위
 

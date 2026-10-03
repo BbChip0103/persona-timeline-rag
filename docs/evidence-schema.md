@@ -1,10 +1,11 @@
 # 근거·타임라인 계약
 
+> 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
 ## 1. 상태와 범위
 
-이 문서는 **제안 명세이며 미구현**이다. 현재 구현된 것은 Python 표준 라이브러리 기반 ingestion과 `src/persona_timeline_rag/schemas.py`의 `Post` 정규화 레코드다. 아래의 인물 registry, importer, 검색 계약, 사건 추출, 검증기, 임베딩 저장소와 DB guard가 이미 존재하거나 검증되었다고 읽으면 안 된다.
+최소 `SourcePost`/`Persona` Zod 계약, 불변 importer·scoped검색·인용검증·1536dim embedding/DBguard는 구현됐다. 기존 Python ingestion/`Post` 정규화도 유지한다. 아래 상세 Event/Observation·사건 병합·사람 검수 truth 모델 전체가 구현된 것은 아니다.
 
-계획한 코어는 독립 TypeScript이며, Zod 검증·NestJS adapter·프로젝트 전용 로컬 Supabase/PostgreSQL·pgvector를 후속 단계에서 구현한다. reference agent loop와의 접합은 일반 JSON 계약/adapter로 제한하고 다른 프로젝트 코드·패키지·credentials를 import하지 않는다. 이 명세 작성은 설치·서비스 시작·DB 생성·migration·외부 모델 전송을 승인하거나 수행하는 단계가 아니다.
+구현 코어는 독립 TypeScript이며 Zod·NestJS adapter·프로젝트 전용 DB-only 로컬 Supabase/PostgreSQL·pgvector를 사용한다. reference agent loop와의 접합은 일반 JSON 계약/adapter로 제한하고 다른 프로젝트 코드·패키지·credentials를 import하지 않는다. 이 명세 작성은 설치·서비스 시작·DB 생성·migration·외부 모델 전송을 승인하거나 수행하는 단계가 아니다.
 
 - 제품 범위: [prd.md](./prd.md).
 - 최종 페르소나 채팅/세션·tool wrapper: [persona-chat.md](./persona-chat.md). 이 문서는 검색/근거 코어 계약이며 단독으로 최종 PoC를 완료하지 않는다.
@@ -298,3 +299,7 @@ ID 존재, 파일 존재, JPEG 시그니처, 높은 검색 점수만으로 `supp
 12. 다른 model revision/dimension/chunking 공간은 혼합되지 않고 vector 길이 불일치는 거부된다. lexical 기준선은 임베딩 없이 실행 가능하다.
 13. 원격 IP·LAN·Supabase Cloud·loopback 위장/redirect 연결을 guard가 거부하고 SQL 실행 0건을 증명한다. 허용 loopback도 프로젝트 전용 자원인지 별도로 검증한다.
 14. 공개 결과/로그/fixture 및 합성 회귀 산출물에는 실제 이름·handle·원본 이미지·배포 ID·절대 비공개 경로가 없다. 승인된 비공개 연구 결과의 최소 근거 인용은 데이터 사용 정책을 따르며, credentials는 어떤 결과/로그에도 포함하지 않는다. 테스트는 합성 입력으로 재현된다.
+
+## 최소 실행 인용 계약
+
+모델의 `{sourceId, quote}` 선택은 동일 인물의 safe 검색 원문에서 **정확히 한 번** 나타나는 substring일 때만 수락한다. 서버가 UTF-16 `start/end`를 결정해 최종 EvidenceRef에 넣는다. 모호한 중복/허위/다른 인물/credential 패턴은 거부한다. 기존 모델 응답에 start/end가 있으면 둘 다 정수·원문 길이 이내·정확 일치여야 하며 잘못된 selector를 자동수선하지 않는다. 인용의 출처/위치 검증일 뿐 의미적 지지/사건 날짜/실제 사실의 증명이 아니다. [코어 계약](../packages/core/README.md).

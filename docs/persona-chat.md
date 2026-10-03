@@ -1,6 +1,7 @@
 # 페르소나 정의·멀티턴 채팅 계약
 
-상태: **제안 명세, 미구현**. 실제4명 persona 작성/검수, TS 코드·DB/API/UI·모델 실행은 아직 없다. [PRD](prd.md)의 필수 PoC 완료 단위이며 [근거 계약](evidence-schema.md)을 사용한다.
+> 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
+상태: 최소 persona/sessions/turns와 TS core·DB/API/UI·모델 경계가 구현됐다. 실제 persona는 **silver 초안, 사람검수 pending**이다. 아래 풍부한 authoring/reference 설계 전체가 구현된 것은 아니다. [PRD](prd.md)의 필수 PoC 완료 단위이며 [근거 계약](evidence-schema.md)을 사용한다.
 
 ## 1. 호환 범위
 

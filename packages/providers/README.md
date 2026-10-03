@@ -36,8 +36,9 @@ prices. Unsupported combinations fail rather than weaken restrictions.
 
 A generation with a known id may be explicitly reconciled using GET-only
 `reconcile(requestKey, signal)`. Missing ids need manual accounting; no restart or
-retry recovers them through a new POST. No External image adapter is provided: this task
-permits free-only image use, not paid or prohibited free-account automation.
+retry recovers them through a new POST. This text/embedding package has no paid image adapter. The separate
+`packages/images` module contains the narrowly authorized free-only account experiment;
+it is not a supported general production integration and never switches to credit mode.
 
 Official contracts checked for this implementation:
 - [Provider routing](https://openrouter.ai/docs/guides/routing/provider-selection)

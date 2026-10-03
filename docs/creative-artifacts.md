@@ -1,6 +1,6 @@
 # 페르소나 포스트 초안·이미지 생성 계약
 
-상태: **구현 전 명세**. 실제 persona/모델/External image 호출·업로드·과금 검증은 없다. [PRD](prd.md)의2단계에서 RAG를 끈 상태의 표현 기준선을 만들며, 최종 사실 조회는3단계에서 검증한다.
+상태: post draft와 별도 free-only image runner가 구현돼 있다. 실제 완료 파일/잔액 검증은 private run 보고서로 확인한다. API의 draft 버튼은 이미지 runner를 호출하지 않으며 창작물은 근거 코퍼스로 들어가지 않는다. [PRD](prd.md)의2단계에서 RAG를 끈 상태의 표현 기준선을 만들며, 최종 사실 조회는3단계에서 검증한다.
 
 ## 1. 창작물과 사실의 분리
 
@@ -18,13 +18,14 @@
 - persona·brief·prompt/model/settings/hash를 보존하여 같은 조건의 재평가를 가능하게 한다. profile 사실 refs와 창작 brief refs는 구분한다.
 - 화면에는 AI/가상 초안 표시와 실패/대기/완료를 표시한다. 내부prompt/API key/절대 private 경로/서명URL을 공개하지 않는다.
 
-## 3. provider 선택과 API 계약
+## 3. 공개 API 설계와 현재 free-only 웹 transport 구분
 
-선택은 **External image GPT Image 2, quality medium**이다. 프로젝트 내부 model alias를 `gpt-image-2`로 쓰더라도 **공식API 전송값은 `model: "GPT Image 2"`**로 명시한다. quality, model, resolution, aspect ratio는 별도 필드다.
+
+아래 공개 Bearer API는 별도 설계이고 현재 free runner에 섞지 않는다. 선택은 **External image GPT Image 2, quality medium**이다. 프로젝트 내부 model alias를 `gpt-image-2`로 쓰더라도 **공식API 전송값은 `model: "GPT Image 2"`**로 명시한다. quality, model, resolution, aspect ratio는 별도 필드다.
 
 공식 [이미지 API 사용 문서](https://docs.external-image.ai/reference/text-to-image-image-edit-task-api-usage), [submit](https://docs.external-image.ai/reference/text_to_image_submit_task), [query](https://docs.external-image.ai/reference/text_to_image_query_task), [upload](https://docs.external-image.ai/reference/upload-api-usage)에 근거한 구현 계획:
 
-1. 프로젝트 전용 개인 API key/user ID를 서버 쪽에서만 읽는다. 요청은 `Authorization: Bearer <apiKey>`와 `External image-Uid`를 사용한다. 다른 프로젝트 cookie/key/user ID를 사용하지 않는다.
+1. 프로젝트 전용 개인 API key/user ID를 서버 쪽에서만 읽는다. 요청은 `Authorization: Bearer <apiKey>`와 `External image-Uid`를 사용한다. 연구에 명시 허용되지 않은 다른 프로젝트 cookie/key/user ID를 사용하지 않는다. 현재 사용자의 cookie 예외는 free 웹 runner에만 적용한다.
 2. 텍스트 생성은 `POST /v1/common_task/text2image/task/submit`, 편집은 `/v1/common_task/image_edit/task/submit`. 반환 taskId를 저장하고 해당 `/task/query`로 상태를 확인한다.
 3. 상태 `init/running/success/fail`과 **이미지별 subtask status/error**를 검사한다. HTTP200/submit 성공/parent success만으로 파일 생성을 완료 처리하지 않는다.
 6. 완성 결과의 per-image fileId/filePath/크기·실제 bytes를 확인하고 private 파일로 저장한다. 공급자 download URL의 만료/다운로드 host는 실제 응답 계약을 확인한 allowlist로 다룬다. 모델이 제시한 임의 URL/local 경로를 fetch하지 않는다.
