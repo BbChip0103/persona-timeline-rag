@@ -223,10 +223,10 @@ test('timeline deterministic candidates preserve bounded UTF16 selectors and rem
   expect(capped.quote.length).toBeLessThanOrEqual(160);expect(capped.quote).toBe('x'.repeat(159));
   const messages=buildPrompt(persona,[],'합성 질문',[source],true);
   const data=messages.find(message=>message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!;
-  expect(data.role).toBe('user');expect(JSON.parse(data.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length))[0].quoteCandidate).toEqual(candidate);
+  expect(data.role).toBe('user');expect(JSON.parse(data.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length))[0].quoteCandidate).toBe(candidate.quote);
   expect(messages[0].content).toContain('not semantic entailment');
   const raw=JSON.stringify({status:'answered',answer:'',evidenceRefs:[candidate]});expect(validateSourceBoundReply(raw,[source],persona.personId).status).toBe('answered');
-  expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v1-source-quotes');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v2-timeline-quote-candidates');
+  expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v1-source-quotes');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v3-offsetless-quotes');
   expect(buildPrompt(persona,[],'hello',[],false)[0].content).not.toContain('quoteCandidate');
 });
 
@@ -245,5 +245,56 @@ describe('explicit conservative intent wins over date/factual heuristic',()=>{
     const turn=await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:`unsupported-${mode}`,text:'When did that happen? 언제였나요?',intent:'unsupported',timeline:{dateBasis:'posted',query:'synthetic date'}});
     expect(turn.reply?.status).toBe('out_of_scope');expect(turn.reply?.responseKind).toBe('unsupported');expect(turn.reply?.claims).toEqual([]);expect(turn.reply?.evidence).toEqual([]);
     expect(h.provider.generate).not.toHaveBeenCalled();expect(h.retrieval.search).not.toHaveBeenCalled();
+  });
+});
+
+describe('offsetless exact quote canonicalization (timeline v3)',()=>{
+  const raw=(selection:Record<string,unknown>)=>JSON.stringify({status:'answered',answer:'Untrusted factual prose is discarded',evidenceRefs:[selection]});
+  test.each([
+    {caption:'Synthetic prefix. Unique English quote. End.',quote:'Unique English quote.',start:18},
+    {caption:'합성 앞말. 고유한 한국어 인용. 뒷말.',quote:'고유한 한국어 인용.',start:7},
+    {caption:'🌱 앞말. 🎨 고유 인용 🌻. 끝.',quote:'🎨 고유 인용 🌻.',start:7},
+  ])('derives canonical UTF16 selectors for an exact unique quote: $quote',({caption,quote,start})=>{
+    const source={...post,caption};const result=validateSourceBoundReply(raw({sourceId:source.id,quote}),[source],persona.personId);
+    expect(result.status).toBe('answered');expect(result.content).not.toContain('Untrusted');
+    expect(result.claims[0].evidenceRefs).toEqual([{sourceId:source.id,quote,start,end:start+quote.length}]);
+    expect(source.caption.slice(start,start+quote.length)).toBe(quote);expect(result.evidence[0].quote).toBe(quote);
+  });
+  test('missing, cross-person, unsafe, credential-shaped and fabricated offsetless quotes reject',()=>{
+    for(const [source,selection] of [
+      [post,{sourceId:'missing',quote:post.caption}],
+      [{...post,personId:'other'},{sourceId:post.id,quote:post.caption}],
+      [{...post,unsafe:true},{sourceId:post.id,quote:post.caption}],
+      [{...post,caption:'synthetic password=not-a-secret'},{sourceId:post.id,quote:'password=not-a-secret'}],
+      [post,{sourceId:post.id,quote:'Fabricated synthetic quote'}],
+    ] as const) {
+      const result=validateSourceBoundReply(raw(selection),[source],persona.personId);
+      expect(result.status).toBe('insufficient_evidence');expect(result.claims).toEqual([]);expect(result.evidence).toEqual([]);
+    }
+  });
+  test('nonunique offsetless quotes reject, including overlapping repeated substrings',()=>{
+    for(const [caption,quote] of [['Repeat. Repeat.','Repeat.'],['aaaa','aaa'],['🌱 합성 🌱 합성','🌱 합성']]) {
+      expect(validateSourceBoundReply(raw({sourceId:post.id,quote}),[{...post,caption}],persona.personId).status).toBe('insufficient_evidence');
+    }
+  });
+  test('provided selectors must both be valid; wrong/missing/bounded selectors are never repaired',()=>{
+    const source={...post,caption:'🌱 unique synthetic quote'};const quote='unique synthetic quote';const start=3;const end=source.caption.length;
+    for(const selectors of [{start},{end},{start:null,end:null},{start:'3',end},{start:3.1,end},{start:-1,end},{start:4,end},{start,end:end+100},{start:end,end:start},{start,end,extra:'not allowed'}]) {
+      expect(validateSourceBoundReply(raw({sourceId:source.id,quote,...selectors}),[source],persona.personId).status).toBe('insufficient_evidence');
+    }
+    const valid=validateSourceBoundReply(raw({sourceId:source.id,quote,start,end}),[source],persona.personId);
+    expect(valid.status).toBe('answered');expect(valid.claims[0].evidenceRefs[0]).toEqual({sourceId:source.id,quote,start,end});
+  });
+  test('valid legacy positions can select one occurrence of a repeated quote',()=>{
+    const source={...post,caption:'Repeat. Repeat.'};
+    const result=validateSourceBoundReply(raw({sourceId:source.id,quote:'Repeat.',start:8,end:15}),[source],persona.personId);
+    expect(result.status).toBe('answered');expect(result.claims[0].evidenceRefs[0].start).toBe(8);
+  });
+  test('timeline prompt requests offsetless refs and provides no candidate arithmetic',()=>{
+    const messages=buildPrompt(persona,[],'합성 질문',[post],true);
+    expect(messages[0].content).toContain('omit start/end and do not calculate offsets');
+    expect(messages[0].content).not.toContain('"start":');expect(messages[0].content).not.toContain('"end":');
+    const data=JSON.parse(messages.find(message=>message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length));
+    expect(typeof data[0].quoteCandidate).toBe('string');expect(data[0]).not.toHaveProperty('start');expect(data[0]).not.toHaveProperty('end');
   });
 });

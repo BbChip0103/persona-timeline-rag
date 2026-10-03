@@ -1,11 +1,13 @@
 import { z } from 'zod';
-import { EvidenceRefSchema, SourcePostSchema, TimelineQuerySchema, type ChatReply, type SourcePost, type TimelineQuery } from '@ptr/contracts';
+import { EvidenceRefSchema, SourcePostSchema, TimelineQuerySchema, type ChatReply, type EvidenceRef, type SourcePost, type TimelineQuery } from '@ptr/contracts';
 import { CoreError } from './ports';
 import { containsCredentialPattern } from './safety';
+// Offsetless selections are exact quotes, not instructions to repair supplied selectors.
+const ModelSelectionSchema=z.union([EvidenceRefSchema,EvidenceRefSchema.omit({start:true,end:true})]);
 export const ModelReplySchema=z.object({
   status:z.enum(['answered','insufficient_evidence','needs_clarification','out_of_scope']),
   answer:z.string().max(8000),
-  evidenceRefs:z.array(EvidenceRefSchema).max(100),
+  evidenceRefs:z.array(ModelSelectionSchema).max(100),
 }).strict();
 /** Calendar-day filtering handles DST via Intl, without assuming a 24-hour local day. */
 function postedDay(postedAt:string,timezone:string):string {
@@ -38,12 +40,25 @@ export function validateSourceBoundReply(raw:string,sources:SourcePost[],personI
   }
   if(!result.evidenceRefs.length) return fallback;
   const evidence:ChatReply['evidence']=[];
-  for(const ref of result.evidenceRefs) {
-    const source=sources.find(s=>s.id===ref.sourceId && s.personId===personId && !s.unsafe);
-    if(!source || ref.start >= ref.end || ref.end>source.caption.length || containsCredentialPattern(ref.quote) || source.caption.slice(ref.start,ref.end)!==ref.quote) return fallback;
+  const canonicalRefs:EvidenceRef[]=[];
+  for(const selection of result.evidenceRefs) {
+    const source=sources.find(s=>s.id===selection.sourceId && s.personId===personId && !s.unsafe);
+    if(!source || containsCredentialPattern(selection.quote)) return fallback;
+    let ref:EvidenceRef;
+    if('start' in selection) {
+      // Strict legacy mode: the schema requires both integer selectors; do not repair either.
+      if(selection.start>=selection.end || selection.end>source.caption.length || source.caption.slice(selection.start,selection.end)!==selection.quote) return fallback;
+      ref=selection;
+    } else {
+      // indexOf/slice offsets are UTF16 code units. Require one exact occurrence, including overlaps.
+      const start=source.caption.indexOf(selection.quote);
+      if(start<0 || source.caption.indexOf(selection.quote,start+1)!==-1) return fallback;
+      ref={...selection,start,end:start+selection.quote.length};
+    }
+    canonicalRefs.push(ref);
     evidence.push({sourceId:source.id,personId,sourceUrl:source.sourceUrl,postedAt:source.postedAt,eventDate:source.eventDate,snapshot:source.snapshot,hash:source.hash,quote:ref.quote});
   }
   // This proves source/selector binding, NOT semantic entailment or actual real-world activity.
-  const claims=result.evidenceRefs.map(ref=>({text:`캡션 원문: ${ref.quote}`,evidenceRefs:[ref]}));
+  const claims=canonicalRefs.map(ref=>({text:`캡션 원문: ${ref.quote}`,evidenceRefs:[ref]}));
   return {status:'answered',content:claims.map(c=>c.text).join('\n'),claims,evidence,limitations:['캡션의 진술이며 실제 활동일은 게시일과 다를 수 있습니다.','원문 인용 일치 검사는 의미적 사실 검수와 다릅니다.']};
 }

@@ -42,11 +42,11 @@ describe('disabled and deterministic adapters',()=>{
     expect(()=>client(fetcher,new MemoryLedger(),{databaseUrl:'postgresql://x:y@remote:5432/x'})).toThrow();
     expect(fetcher).not.toHaveBeenCalled();
   });
-  test('fake text is deterministic and structured quotes preserve UTF16 offsets',async()=>{
+  test('fake text is deterministic and structured quotes are offsetless',async()=>{
     const fake=new FakeTextProvider();
     expect(await fake.generate(messages,{signal:signal()})).toBe(await fake.generate(messages,{signal:signal()}));
     const result=JSON.parse(await fake.generate([{role:'system',content:'TIMELINE_JSON_REPLY'},{role:'user',content:'UNTRUSTED_EVIDENCE_JSON_DATA '+JSON.stringify([{sourceId:'synthetic',caption:'🌱 합성 원문'}])}],{signal:signal()}));
-    expect(result.evidenceRefs).toEqual([{sourceId:'synthetic',quote:'🌱 합성 원문',start:0,end:8}]);
+    expect(result.evidenceRefs).toEqual([{sourceId:'synthetic',quote:'🌱 합성 원문'}]);
     const embedding=new FakeEmbeddingProvider();
     const vectors=await embedding.embed(['synthetic'],{signal:signal()});
     expect(vectors[0]).toHaveLength(1536);
@@ -179,4 +179,14 @@ describe('live adapter with fake network only',()=>{
       await expect(client(fetcher).embed(['synthetic'],{signal:signal()})).rejects.toThrow('INVALID_EMBEDDINGS');
     }
   });
+});
+
+test('offsetless fake reply produces canonical UTF16 refs through the same core validator',async()=>{
+  const {validateSourceBoundReply}=await import('@ptr/core');
+  const source={id:'synthetic-offsetless-source',personId:'synthetic-person',caption:'🌱 합성 원문',postedAt:'2026-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.com/synthetic',hash:'synthetic-hash',snapshot:'synthetic-v1',unsafe:false};
+  const fake=new FakeTextProvider();
+  const raw=await fake.generate([{role:'system',content:'TIMELINE_JSON_REPLY'},{role:'user',content:'UNTRUSTED_EVIDENCE_JSON_DATA '+JSON.stringify([{sourceId:source.id,caption:source.caption}])}],{signal:signal()});
+  expect(JSON.parse(raw).evidenceRefs[0]).not.toHaveProperty('start');expect(JSON.parse(raw).evidenceRefs[0]).not.toHaveProperty('end');
+  const result=validateSourceBoundReply(raw,[source],source.personId);
+  expect(result.status).toBe('answered');expect(result.claims[0].evidenceRefs).toEqual([{sourceId:source.id,quote:source.caption,start:0,end:source.caption.length}]);
 });

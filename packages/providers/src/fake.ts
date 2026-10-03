@@ -15,7 +15,7 @@ export class FakeTextProvider implements TextProvider {
       let sources:unknown=[];
       try { sources=input?JSON.parse(input.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length)):[]; } catch { /* No fabricated evidence. */ }
       const source=Array.isArray(sources)?sources.find(value=>value&&typeof value.sourceId==='string'&&typeof value.caption==='string'&&value.caption.length):undefined;
-      if(source) return JSON.stringify({status:'answered',answer:'',evidenceRefs:[{sourceId:source.sourceId,quote:source.caption,start:0,end:source.caption.length}]});
+      if(source) return JSON.stringify({status:'answered',answer:'',evidenceRefs:[{sourceId:source.sourceId,quote:source.caption}]});
       return JSON.stringify({status:'insufficient_evidence',answer:'',evidenceRefs:[]});
     }
     const last=messages.filter(message=>message.role==='user').at(-1)?.content??'';
