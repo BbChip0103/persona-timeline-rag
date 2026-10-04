@@ -51,19 +51,40 @@ async function seed(directory:string):Promise<{personas:number;posts:number;file
 }
 
 interface ApiJson {session?:{id:string};turn?:{id:string;state:string;errorCode?:string|null};error?:{code?:string}}
+export interface Topology {execution:'inline'|'queue';workers:number;workerConcurrency:number;queueMax:number;poolMax:number;leaseMs:number}
 class Api {
   private child?:ChildProcess;
+  private workers:ChildProcess[]=[];
   readonly token=randomBytes(24).toString('hex');
-  constructor(readonly port:number,private readonly personasFile:string,private readonly latency:string|null,private readonly log:string) {}
+  constructor(readonly port:number,private readonly personasFile:string,private readonly latency:string|null,private readonly log:string,readonly topology:Topology) {}
+  get workerPids() {return this.workers.flatMap(worker=>worker.exitCode===null&&worker.pid?[worker.pid]:[]);}
+  private env():NodeJS.ProcessEnv {
+    // Explicit env: never inherit research/live credentials (runtime prefers GOAL1_DATABASE_URL).
+    const t=this.topology;
+    return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',DATABASE_URL:loadtestUrl(),
+      PTR_API_TOKEN:this.token,PTR_API_PORT:String(this.port),PTR_PERSONAS_FILE:this.personasFile,PTR_CHAT_PROVIDER:'fake',
+      PTR_EXECUTION:t.execution,PTR_QUEUE_MAX_DEPTH:String(t.queueMax),PTR_DB_POOL_MAX:String(t.poolMax),
+      PTR_WORKER_CONCURRENCY:String(t.workerConcurrency),PTR_LEASE_MS:String(t.leaseMs),
+      ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
+  }
+  async startWorkers():Promise<void> {
+    if(this.topology.execution!=='queue') return;
+    const {openSync}=await import('node:fs');const out=openSync(this.log.replace(/api\.log$/,'workers.log'),'a');
+    for(let i=this.workers.filter(w=>w.exitCode===null).length;i<this.topology.workers;i++)
+      this.workers.push(spawn(process.execPath,['--import','tsx','apps/api/src/worker.ts'],{env:{...this.env(),PTR_WORKER_ID:`lt-worker-${randomUUID().slice(0,6)}`},stdio:['ignore',out,out]}));
+    this.workers=this.workers.filter(w=>w.exitCode===null);
+  }
+  killWorkers(signal:NodeJS.Signals):Promise<void> {
+    const live=this.workers.filter(w=>w.exitCode===null);
+    return Promise.all(live.map(w=>new Promise<void>(resolve=>{w.once('exit',()=>resolve());w.kill(signal);}))).then(()=>{this.workers=[];});
+  }
   get base() {return `http://127.0.0.1:${this.port}/api`;}
   get pid() {return this.child?.pid;}
   async start():Promise<void> {
-    // Explicit env: never inherit research/live credentials (runtime prefers GOAL1_DATABASE_URL).
-    const env:NodeJS.ProcessEnv={PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',DATABASE_URL:loadtestUrl(),
-      PTR_API_TOKEN:this.token,PTR_API_PORT:String(this.port),PTR_PERSONAS_FILE:this.personasFile,PTR_CHAT_PROVIDER:'fake',
-      ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
+    const env=this.env();
     const {openSync}=await import('node:fs');const out=openSync(this.log,'a');
-    this.child=spawn(join('node_modules','.bin','tsx'),['apps/api/src/main.ts'],{env,stdio:['ignore',out,out]});
+    // Run node directly (tsx as an import hook) so the sampled PID is the server itself, not a wrapper.
+    this.child=spawn(process.execPath,['--import','tsx','apps/api/src/main.ts'],{env,stdio:['ignore',out,out]});
     for(let i=0;i<200;i++) {
       try {if((await fetch(`${this.base}/health`)).ok) return;} catch {/* starting */}
       await sleep(100);
@@ -84,8 +105,14 @@ class Api {
 /** /proc sampling of the API process plus database connection count, once per second. */
 function startResourceSampler(api:Api) {
   const pool=createLocalPool(loadtestUrl());
-  const rows:{t:number;cpuPct:number|null;rssMb:number|null;dbConnections:number|null}[]=[];
+  const rows:{t:number;cpuPct:number|null;rssMb:number|null;workerCpuPct:number|null;workerRssMb:number|null;dbConnections:number|null}[]=[];
   let last:{t:number;ticks:number}|undefined;let stopped=false;
+  const lastWorker=new Map<number,{t:number;ticks:number}>();
+  const procStat=async(pid:number)=>{
+    const stat=(await readFile(`/proc/${pid}/stat`,'utf8')).split(') ')[1]!.split(' ');
+    const rss=Number((await readFile(`/proc/${pid}/status`,'utf8')).match(/VmRSS:\s+(\d+)/)?.[1]??0)/1024;
+    return {ticks:Number(stat[11])+Number(stat[12]),rss};
+  };
   const tick=async()=>{
     while(!stopped) {
       const t=Date.now();let cpuPct:number|null=null, rssMb:number|null=null, dbConnections:number|null=null;
@@ -99,8 +126,16 @@ function startResourceSampler(api:Api) {
           rssMb=Math.round(Number((await readFile(`/proc/${pid}/status`,'utf8')).match(/VmRSS:\s+(\d+)/)?.[1]??0)/1024);
         }
       } catch {last=undefined;}
+      let workerCpuPct:number|null=null, workerRssMb:number|null=null;
+      for(const pid of api.workerPids) {
+        try {
+          const {ticks,rss}=await procStat(pid);const prev=lastWorker.get(pid);
+          if(prev) workerCpuPct=(workerCpuPct??0)+Math.round((ticks-prev.ticks)/((t-prev.t)/1000));
+          workerRssMb=Math.round((workerRssMb??0)+rss);lastWorker.set(pid,{t,ticks});
+        } catch {lastWorker.delete(pid);}
+      }
       try {dbConnections=Number((await pool.query("SELECT count(*) AS n FROM pg_stat_activity WHERE datname='ptr_loadtest'")).rows[0].n);} catch {/* db busy */}
-      rows.push({t,cpuPct,rssMb,dbConnections});
+      rows.push({t,cpuPct,rssMb,workerCpuPct,workerRssMb,dbConnections});
       await sleep(1000);
     }
   };
@@ -156,10 +191,13 @@ async function main():Promise<void> {
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
   const latency=options.latency==='none'?null:options.latency??DEFAULT_LATENCY;
-  const api=new Api(Number(options.port??56451),seeded.file,latency,join(directory,'api.log'));
-  const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,dbPoolMax:8,
+  const topology:Topology={execution:options.execution==='queue'?'queue':'inline',workers:Number(options.workers??2),
+    workerConcurrency:Number(options['worker-concurrency']??128),queueMax:Number(options['queue-max']??2048),
+    poolMax:Number(options['pool-max']??8),leaseMs:Number(options['lease-ms']??5000)};
+  const api=new Api(Number(options.port??56451),seeded.file,latency,join(directory,'api.log'),topology);
+  const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
     note:'Fake model with injected latency on synthetic data: serving-architecture limits, not LLM throughput.'};
-  await api.start();
+  await api.start();await api.startWorkers();
   const sampler=startResourceSampler(api);
   try {
     if(mode==='ramp') {
@@ -174,14 +212,16 @@ async function main():Promise<void> {
     } else if(mode==='crash') {
       // Kill the API mid-flight, restart it, and see what happens to in-flight turns and their sessions.
       const users=Number(options.users??16);
+      // inline: kill the API (execution lives there). queue: kill every worker, keep the API accepting.
       const stage=runStage(api,users,30);
       await sleep(10_000);
       const before=await activeTurns();
-      await api.kill('SIGKILL');const killedAt=Date.now();
-      await sleep(2000);await api.start();
+      if(topology.execution==='queue') await api.killWorkers('SIGKILL'); else await api.kill('SIGKILL');
+      await sleep(2000);
+      if(topology.execution==='queue') await api.startWorkers(); else await api.start();
       const result=await stage;
-      await sleep(50_000); // longer than any turn timeout: anything still active now is orphaned
-      report.crash={users,activeAtKill:before,restartAfterMs:Date.now()-killedAt,stage:result,orphanedActiveTurns:await activeTurns()};
+      await sleep(50_000); // longer than turn timeout + lease: anything still active now is orphaned
+      report.crash={users,killed:topology.execution==='queue'?'all workers':'api',activeAtKill:before,downtimeMs:2000,stage:result,orphanedActiveTurns:await activeTurns()};
       console.log(JSON.stringify(report.crash));
     } else if(mode==='faults') {
       report.faults=await runStage(api,Number(options.users??16),Number(options['stage-seconds']??60));
@@ -196,7 +236,7 @@ async function main():Promise<void> {
       report.sameSession={trials,statusPairs:outcomes};console.log(JSON.stringify(report.sameSession));
     } else throw new Error(`unknown mode ${mode}`);
   } finally {
-    await sampler.stop();await api.kill();
+    await sampler.stop();await api.killWorkers('SIGTERM');await api.kill();
     report.resources=sampler.rows;report.finishedAt=new Date().toISOString();
     await writeFile(join(directory,'report.json'),JSON.stringify(report,null,1),{mode:0o600});
     console.log(`report: ${join(directory,'report.json')}`);
