@@ -5,3 +5,4 @@ export * from './evidence';
 export * from './chat-service';
 export * from './request-fingerprint';
 export * from './safety';
+export * from './conversation-context';

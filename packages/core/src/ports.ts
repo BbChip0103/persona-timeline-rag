@@ -1,6 +1,9 @@
-import type { ChatMessage, ChatReply, ChatSession, ChatTurn, Persona, ProviderMessage, SourcePost, TimelineQuery, TurnState } from '@ptr/contracts';
+import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Persona, ProviderMessage, SourcePost, TimelineQuery, TurnState } from '@ptr/contracts';
 export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> }
-export interface Retrieval { search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]> }
+export interface Retrieval {
+  search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
+  resolve?(references:EvidenceCard[],trusted:{personId:string},options:{signal:AbortSignal;evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
+}
 export interface PersonaRepository { get(id:string,revision?:string):Promise<Persona|undefined> }
 export interface ConversationStore {
   create(session:ChatSession,greeting:ChatMessage):Promise<void>;

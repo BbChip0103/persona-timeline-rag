@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
-import type { SourcePost, TimelineQuery } from '@ptr/contracts';
+import type { EvidenceCard, SourcePost, TimelineQuery } from '@ptr/contracts';
 import { createLocalPool, PostgresSourceRepository, imageAnnotationHash, type ImageAnnotationInput } from '../src';
 const enabled = process.env.RUN_STORAGE_DB_TESTS === '1' && Boolean(process.env.DATABASE_URL);
 (enabled ? describe : describe.skip)('local image annotation SQL (synthetic only, additive)', () => {
@@ -78,4 +78,20 @@ const enabled = process.env.RUN_STORAGE_DB_TESTS === '1' && Boolean(process.env.
     const afterVector = await sources.searchSemantic(query, { personId }, axis(1), 'synthetic-embedding', { signal, evidenceScope: 'caption_image' });
     expect(afterVector[0].imageAnnotations?.[0].revision).toBe('synthetic-v6');
   });
+  it('rehydrates pinned old evidence after newer revision, drops stale references and strips images in caption mode', async () => {
+    const parent = posts[0]; const image = annotation(parent);
+    const captionRef: EvidenceCard = { sourceId: parent.id, personId, sourceUrl: parent.sourceUrl, postedAt: parent.postedAt,
+      eventDate: null, snapshot: parent.snapshot, hash: parent.hash, quote: '합성 캡션', origin: 'source_caption' };
+    const imageRef: EvidenceCard = { ...captionRef, quote: '빨간 의자', origin: 'ai_image_annotation', annotationId: image.id,
+      annotationRevision: image.revision, imageHash: image.imageHash, annotationHash: image.annotationHash };
+    const options = { signal, evidenceScope: 'caption_image' as const };
+    const remembered = await sources.resolveEvidence([captionRef, imageRef, imageRef], { personId }, options);
+    expect(remembered).toHaveLength(1); expect(remembered[0].imageAnnotations?.map(row => row.revision)).toEqual(['synthetic-v5']);
+    expect((await sources.resolveEvidence([imageRef], { personId }, { signal, evidenceScope: 'caption' }))[0].imageAnnotations).toBeUndefined();
+    for (const mutation of [{ snapshot: 'missing' }, { hash: 'wrong' }, { annotationRevision: 'synthetic-v6' }, { imageHash: 'b'.repeat(64) }, { annotationHash: 'b'.repeat(64) }, { annotationId: `${posts[1].id}-synthetic-v5` }])
+      expect(await sources.resolveEvidence([{ ...imageRef, ...mutation }], { personId }, options)).toEqual([]);
+    expect(await sources.resolveEvidence([{ ...captionRef, sourceId: posts[2].id, hash: posts[2].hash }], { personId }, options)).toEqual([]);
+    expect(await sources.resolveEvidence([{ ...captionRef, sourceId: posts[1].id, hash: posts[1].hash }], { personId }, options)).toEqual([]);
+  });
+
 });

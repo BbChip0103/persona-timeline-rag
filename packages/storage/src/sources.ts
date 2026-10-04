@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Pool } from 'pg';
-import { SourcePostSchema, TimelineQuerySchema, type SourcePost, type TimelineQuery } from '@ptr/contracts';
+import { SourcePostSchema, TimelineQuerySchema, type EvidenceCard, type SourcePost, type TimelineQuery } from '@ptr/contracts';
 import { CoreError, type Retrieval } from '@ptr/core';
 import { transaction } from './pool.js';
 import { ImageAnnotationInputSchema, imageAnnotationHash, imageAnnotationEvidence, type ImageAnnotationInput, type EvidenceScope } from './image-annotations.js';
@@ -122,6 +122,57 @@ export class PostgresSourceRepository {
       }
     });
   }
+  /** Rehydrate only previously bound immutable evidence, never the latest annotation revision. */
+  async resolveEvidence(references: EvidenceCard[], trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
+    options.signal.throwIfAborted();
+    if (!Array.isArray(references) || references.length > 20) throw new CoreError('INVALID_INPUT', 'At most 20 remembered evidence references');
+    const identifier = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 200 && value.trim() === value;
+    const pinned = references.map((reference, index) => {
+      if (!reference || !identifier(reference.personId) || !identifier(reference.sourceId) || !identifier(reference.hash) || !identifier(reference.snapshot) || typeof reference.quote !== 'string' || !reference.quote.length)
+        throw new CoreError('INVALID_INPUT', 'Invalid remembered evidence reference');
+      if (reference.personId !== trusted.personId) throw new CoreError('FORBIDDEN', 'Remembered evidence person scope mismatch');
+      const hasAnnotation = [reference.annotationId, reference.annotationRevision, reference.imageHash, reference.annotationHash].some(value => value !== undefined);
+      if (hasAnnotation && ![reference.annotationId, reference.annotationRevision, reference.imageHash, reference.annotationHash].every(identifier)
+        || reference.origin === 'ai_image_annotation' && !hasAnnotation || reference.origin === 'source_caption' && hasAnnotation)
+        throw new CoreError('INVALID_INPUT', 'Incomplete remembered annotation identity');
+      return { index, source_id: reference.sourceId, source_hash: reference.hash, snapshot: reference.snapshot,
+        annotation_id: reference.annotationId ?? null, revision: reference.annotationRevision ?? null,
+        image_hash: reference.imageHash ?? null, annotation_hash: reference.annotationHash ?? null };
+    });
+    if (!pinned.length) return [];
+    const result = await this.pool.query(`WITH refs AS (
+      SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(index integer,source_id text,source_hash text,snapshot text,
+        annotation_id text,revision text,image_hash text,annotation_hash text)
+    ) SELECT refs.index,p.document,a.document AS annotation FROM refs
+      JOIN source_posts p ON p.id=refs.source_id AND p.source_hash=refs.source_hash AND p.document->>'snapshot'=refs.snapshot
+        AND p.person_id=$1 AND NOT p.unsafe
+      LEFT JOIN source_image_revisions r ON r.source_id=p.id AND r.revision=refs.revision AND r.person_id=$1 AND r.source_hash=p.source_hash
+      LEFT JOIN source_image_annotations a ON a.source_id=r.source_id AND a.revision=r.revision
+        AND a.id=refs.annotation_id AND a.image_hash=refs.image_hash AND a.annotation_hash=refs.annotation_hash
+      WHERE refs.annotation_id IS NULL OR a.id IS NOT NULL ORDER BY refs.index`, [trusted.personId, JSON.stringify(pinned)]);
+    options.signal.throwIfAborted();
+    const sources = new Map<string, SourcePost>();
+    for (const row of result.rows) {
+      const reference = references[row.index];
+      if (!reference) continue;
+      const post = SourcePostSchema.parse(row.document);
+      if (post.personId !== trusted.personId || post.id !== reference.sourceId || post.hash !== reference.hash || post.snapshot !== reference.snapshot || post.unsafe) continue;
+      let annotation;
+      if (reference.annotationId) {
+        const parsed = SourcePostSchema.safeParse({ ...post, imageAnnotations: row.annotation ? [row.annotation] : [] });
+        annotation = parsed.success ? parsed.data.imageAnnotations?.[0] : undefined;
+        if (!annotation || annotation.id !== reference.annotationId || annotation.revision !== reference.annotationRevision
+          || annotation.imageHash !== reference.imageHash || annotation.annotationHash !== reference.annotationHash || !annotation.text.includes(reference.quote)) continue;
+      } else if (!post.caption.includes(reference.quote)) continue;
+      // The original source document normally has no annotations; strip defensively in caption mode.
+      const { imageAnnotations: _annotations, ...parent } = post;
+      const existing: SourcePost = sources.get(post.id) ?? parent;
+      if (options.evidenceScope === 'caption_image' && annotation && !existing.imageAnnotations?.some(value => value.id === annotation.id))
+        existing.imageAnnotations = [...(existing.imageAnnotations ?? []), annotation];
+      sources.set(post.id, existing);
+    }
+    return [...sources.values()];
+  }
   async searchLexical(query: TimelineQuery, trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
     options.signal.throwIfAborted();
     const values = parameters(query, trusted);
@@ -178,12 +229,18 @@ export class PostgresSourceRepository {
 }
 export class PostgresLexicalRetrieval implements Retrieval {
   constructor(private readonly sources: PostgresSourceRepository) {}
+  resolve(references: EvidenceCard[], trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
+    return this.sources.resolveEvidence(references, trusted, options);
+  }
   search(query: TimelineQuery, trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
     return this.sources.searchLexical(query, trusted, options);
   }
 }
 export class PostgresSemanticRetrieval implements Retrieval {
   constructor(private readonly sources: PostgresSourceRepository, private readonly embed: QueryEmbedder, private readonly modelRevision: string) {}
+  resolve(references: EvidenceCard[], trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
+    return this.sources.resolveEvidence(references, trusted, options);
+  }
   async search(query: TimelineQuery, trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
     parameters(query, trusted); // reject invalid scope before any embedding/provider call
     options.signal.throwIfAborted();
@@ -195,6 +252,9 @@ export class PostgresSemanticRetrieval implements Retrieval {
 export class PostgresRetrieval implements Retrieval {
   constructor(private readonly sources: PostgresSourceRepository,
     private readonly semantic?: { embed: QueryEmbedder; modelRevision: string }) {}
+  resolve(references: EvidenceCard[], trusted: { personId: string }, options: { signal: AbortSignal; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
+    return this.sources.resolveEvidence(references, trusted, options);
+  }
   async search(query: TimelineQuery, trusted: { personId: string }, options: { signal: AbortSignal; mode: 'lexical' | 'semantic'; evidenceScope?: EvidenceScope }): Promise<SourcePost[]> {
     parameters(query, trusted);
     options.signal.throwIfAborted();
