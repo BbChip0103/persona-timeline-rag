@@ -51,7 +51,9 @@ async function seed(directory:string):Promise<{personas:number;posts:number;file
 }
 
 interface ApiJson {session?:{id:string};turn?:{id:string;state:string;errorCode?:string|null};error?:{code?:string}}
-export interface Topology {execution:'inline'|'queue';workers:number;workerConcurrency:number;queueMax:number;poolMax:number;leaseMs:number}
+export interface Topology {execution:'inline'|'queue';workers:number;workerConcurrency:number;queueMax:number;poolMax:number;leaseMs:number;
+  /** fake (optionally latency-injected) or a self-hosted engine behind an SSH tunnel */
+  provider:'fake'|'selfhosted';selfhostedBaseUrl?:string;selfhostedModel?:string}
 class Api {
   private child?:ChildProcess;
   private workers:ChildProcess[]=[];
@@ -62,10 +64,11 @@ class Api {
     // Explicit env: never inherit research/live credentials (runtime prefers GOAL1_DATABASE_URL).
     const t=this.topology;
     return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',DATABASE_URL:loadtestUrl(),
-      PTR_API_TOKEN:this.token,PTR_API_PORT:String(this.port),PTR_PERSONAS_FILE:this.personasFile,PTR_CHAT_PROVIDER:'fake',
+      PTR_API_TOKEN:this.token,PTR_API_PORT:String(this.port),PTR_PERSONAS_FILE:this.personasFile,PTR_CHAT_PROVIDER:t.provider,
+      ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:{}),
       PTR_EXECUTION:t.execution,PTR_QUEUE_MAX_DEPTH:String(t.queueMax),PTR_DB_POOL_MAX:String(t.poolMax),
       PTR_WORKER_CONCURRENCY:String(t.workerConcurrency),PTR_LEASE_MS:String(t.leaseMs),
-      ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
+      ...(this.latency&&t.provider==='fake'?{PTR_FAKE_LATENCY:this.latency}:{})};
   }
   async startWorkers():Promise<void> {
     if(this.topology.execution!=='queue') return;
@@ -194,10 +197,11 @@ async function main():Promise<void> {
   const runStarted=new Date();
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
-  const latency=options.latency==='none'?null:options.latency??DEFAULT_LATENCY;
+  const latency=options.latency==='none'||options.provider==='selfhosted'?null:options.latency??DEFAULT_LATENCY;
   const topology:Topology={execution:options.execution==='queue'?'queue':'inline',workers:Number(options.workers??2),
     workerConcurrency:Number(options['worker-concurrency']??128),queueMax:Number(options['queue-max']??2048),
-    poolMax:Number(options['pool-max']??8),leaseMs:Number(options['lease-ms']??5000)};
+    poolMax:Number(options['pool-max']??8),leaseMs:Number(options['lease-ms']??5000),
+    provider:options.provider==='selfhosted'?'selfhosted':'fake',selfhostedBaseUrl:options['base-url']??'http://127.0.0.1:18000/v1',selfhostedModel:options.model??'gemma-4-e4b'};
   const api=new Api(Number(options.port??56451),seeded.file,latency,join(directory,'api.log'),topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
     note:'Fake model with injected latency on synthetic data: serving-architecture limits, not LLM throughput.'};

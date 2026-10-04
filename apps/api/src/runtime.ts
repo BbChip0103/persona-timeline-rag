@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { ChatService, CoreError, type PersonaRepository, type TextProvider, type TurnQueue } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
+import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
   id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
   kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
@@ -51,6 +51,11 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     const embedding=new OpenRouterEmbeddingProvider(client);
     provider=client;model=liveEnv.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL;embeddingModel=embedding.model;
     embed=(text,options)=>embedding.embed([text],options).then(vectors=>vectors[0]!);
+  } else if(providerName==='selfhosted') {
+    // Goal2: self-hosted vLLM/SGLang through an SSH tunnel. Chat only; embeddings stay on the fake space.
+    const baseUrl=env.PTR_SELFHOSTED_BASE_URL, selfModel=env.PTR_SELFHOSTED_MODEL;
+    if(!baseUrl||!selfModel) throw new CoreError('INVALID_INPUT');
+    provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000});model=`selfhosted/${selfModel}`;
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
   const queue=execution==='queue'?store:undefined;

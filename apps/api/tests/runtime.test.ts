@@ -1,4 +1,4 @@
-import { FakeTextProvider, LatencyInjectedTextProvider } from '@ptr/providers';
+import { FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
 import { createRuntime } from '../src/runtime';
 
 // Pools are lazy: no connection is opened by composition alone.
@@ -26,4 +26,12 @@ test('PTR_EXECUTION=queue exposes the durable queue and validates its knobs',asy
   const inline=createRuntime({DATABASE_URL:databaseUrl});expect(inline.queue).toBeUndefined();await inline.close?.();
   for(const env of [{PTR_EXECUTION:'threads'},{PTR_EXECUTION:'queue',PTR_QUEUE_MAX_DEPTH:'0'},{PTR_DB_POOL_MAX:'0'}])
     expect(()=>createRuntime({DATABASE_URL:databaseUrl,...env})).toThrow();
+});
+test('PTR_CHAT_PROVIDER=selfhosted uses the loopback OpenAI-compatible engine and never the billable client',async()=>{
+  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'http://127.0.0.1:18000/v1',PTR_SELFHOSTED_MODEL:'gemma-4-e4b'});
+  expect(runtime.provider).toBeInstanceOf(OpenAICompatibleTextProvider);
+  expect(runtime.providerName).toBe('selfhosted');expect(runtime.model).toBe('selfhosted/gemma-4-e4b');
+  await runtime.close?.();
+  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'https://api.example.com/v1',PTR_SELFHOSTED_MODEL:'m'})).toThrow();
+  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_CHAT_PROVIDER:'selfhosted'})).toThrow();
 });
