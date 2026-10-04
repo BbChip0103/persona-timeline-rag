@@ -81,7 +81,7 @@ export function regradeAnswers(referenceInput: unknown, reviewInput: unknown, re
     assert(factual ? judgement.coreVerdict !== 'not_applicable' : judgement.coreVerdict === 'not_applicable', 'Factual and rubric denominators must remain separate');
     assert(item.kind === 'creative' ? judgement.creative !== 'not_applicable' : judgement.creative === 'not_applicable', 'Creative rubric binding changed');
     assert(item.kind === 'interpretive' ? judgement.interpretive !== 'not_applicable' : judgement.interpretive === 'not_applicable', 'Interpretive rubric binding changed');
-    const operationalError = row.trace.state !== 'completed' || !row.reply || row.reply.limitations.includes('INVALID_MODEL_EVIDENCE');
+    const operationalError = row.trace.state !== 'completed' || !row.reply || row.reply.limitations.some(value=>['INVALID_MODEL_EVIDENCE','AGENT_TOOL_UNAVAILABLE'].includes(value));
     if (operationalError) {
       assert(['operational_error', 'not_observed'].includes(judgement.disposition), 'Operational fallback cannot be scored as an answered success');
       assert(!judgement.requiredFactIdsCovered.length && !judgement.claims.length && judgement.coreVerdict !== 'correct', 'Operational fallback has no accepted facts');

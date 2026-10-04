@@ -79,3 +79,11 @@ test('a true reference fact is not automatically supported by unoffered sources'
   const f = fixture(); f.review.rows[1]!.claims[0]!.sourceIds = ['unoffered-source'];
   expect(() => regradeAnswers(f.reference, f.review, f.report)).toThrow('not offered');
 });
+
+
+test('unavailable tool service notice is operational, not a correct fact or appropriate memory abstention',()=>{
+  const f=fixture();f.report.rows[0]!.reply.limitations=['AGENT_TOOL_UNAVAILABLE'];f.review.reportHash=testsetHash(f.report);
+  expect(()=>regradeAnswers(f.reference,f.review,f.report)).toThrow('fallback');
+  Object.assign(f.review.rows[0]!,{disposition:'operational_error',appropriateAbstention:false});
+  expect(regradeAnswers(f.reference,f.review,f.report).summary.off).toMatchObject({operationalErrors:1,appropriateAbstentions:0,cleanFactualAnswers:0});
+});

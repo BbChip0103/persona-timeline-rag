@@ -88,7 +88,7 @@ Runtime revision은 `agent-loop-json-action-v1`이다. 한국어 baseline과 회
 
 이 수치는 cache를 포함한 실제 개발 실행이다. 한국어 baseline 일부 기억 답변18개는 이전 동일 요청 cache였다. cache 없는 운영 단가/모델 순수 지연/서빙 throughput/전후 속도 개선으로 일반화하지 않는다. wall에는 로컬SQL·cache·대기·중단/복구 등이 포함되며 병렬 작업시간을 합산하지 않는다. 사람의 읽기·타이핑·관리 시간과 Codex dollar 청구액은 미측정이다. 회상 실행의 요청→계측 snapshot은31분8.108초, Codex4 lanes 관측합15,062,933 tokens(캐시 입력 부분집합 포함)이며 모델 run224.798초와 다른 범위다.
 
-회상 당시 합성 전체 검증은252pass/28opt-in skip·typecheck/lint, 독립 SQL 감사45/45였다. SQL 통과는24세션/71턴·160visible messages, scope/재전송/예산·원자료 불변 검증이지 의미 정답률이 아니다. 현재 마감의 검증은280unit pass/28opt-in skip·typecheck/lint·웹 typecheck/build, 로컬 storage46pass·합성 UI6pass다. 실제 새 페르소나4명×3조건×2턴의 fake-only 로컬24턴/148assertion도 통과했으며 외부 provider0회다. fake 답변으로 개성/사실 정확도가 좋아졌다고 주장하지 않는다.
+회상 당시 합성 전체 검증은252pass/28opt-in skip·typecheck/lint, 독립 SQL 감사45/45였다. SQL 통과는24세션/71턴·160visible messages, scope/재전송/예산·원자료 불변 검증이지 의미 정답률이 아니다. 현재 마감의 검증은281unit pass/28opt-in skip·typecheck/lint·웹 typecheck/build, 로컬 storage46pass·합성 UI6pass다. 실제 새 페르소나4명×3조건×2턴의 fake-only 로컬24턴/148assertion도 통과했으며 외부 provider0회다. fake 답변으로 개성/사실 정확도가 좋아졌다고 주장하지 않는다.
 
 ## 6. 기술 오류와 잔여 gate
 

@@ -37,7 +37,7 @@ reference to favor an answer.
 - Interpretive and creative questions: distinct rubrics, not factual truth
   scores. General atmosphere or fictional preferences are not actual intentions
   or real events. Multi-turn continuity and naturalness remain separate.
-- Operational fallback/failure: no factual success, no invented accepted claims;
+- Operational fallback/failure (including `INVALID_MODEL_EVIDENCE` and `AGENT_TOOL_UNAVAILABLE` service notices): no factual success or appropriate memory abstention, no invented accepted claims;
   remains in the planned denominator. Never silently remove poor observations.
 
 ## Explicit local execution
