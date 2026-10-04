@@ -1,6 +1,6 @@
 import type { Persona } from '@ptr/contracts';
 import type { UserConversation } from '../evaluate-character-chat';
-import { KOREAN_LIMITS, prepareKoreanStudy, validateKoreanBudget } from '../evaluate-korean-chat';
+import { KOREAN_LIMITS, RECOLLECTION_LIMITS, prepareKoreanStudy, validateKoreanBudget } from '../evaluate-korean-chat';
 import { testsetHash } from '../prepare-character-chat-testset';
 function fixture() {
   const personas: Persona[] = [0, 1, 2, 3].map(i => ({ id: `synthetic-persona-${i}`, personId: `synthetic-person-${i}`, revision: 'synthetic-v1',
@@ -40,4 +40,13 @@ test('Korean pilot requires90existing slots, not a budget reset or guaranteed co
   for (const patch of [{ calls: 911 }, { call_cap: 1001 }, { cap_microusd: '1000001' }, { unresolved_microusd: 'NaN' }, { calls: -1 }, { actual_microusd: '1000000' }])
     expect(() => validateKoreanBudget({ ...budget, ...patch })).toThrow();
   expect(KOREAN_LIMITS.freshRequests).toBeLessThan(102);
+});
+
+test('paired recollection pilot uses only60 existing slots and rejects invalid per-run limits', () => {
+  const budget = { cap_microusd: '1000000', call_cap: 1000, calls: 937, actual_microusd: '307994', unresolved_microusd: '7625' };
+  expect(() => validateKoreanBudget(budget)).toThrow();
+  expect(() => validateKoreanBudget(budget, RECOLLECTION_LIMITS.freshRequests)).not.toThrow();
+  expect(RECOLLECTION_LIMITS.turns).toBe(72);expect(RECOLLECTION_LIMITS.freshRequests).toBe(60);
+  expect(() => validateKoreanBudget({ ...budget, calls: 941 }, 60)).toThrow();
+  for (const limit of [0, -1, 91, 1.5, NaN]) expect(() => validateKoreanBudget(budget, limit)).toThrow();
 });

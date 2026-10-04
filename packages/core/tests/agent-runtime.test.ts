@@ -1,5 +1,5 @@
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT } from '../src';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION } from '../src';
 const persona:Persona={id:'agent-synthetic',personId:'agent-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
 const source:SourcePost={id:'agent-post',personId:persona.personId,caption:'합성 숲을 그렸어요.',postedAt:'2024-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/synthetic',hash:'synthetic-hash',snapshot:'v1',unsafe:false,imageAnnotations:[{id:'agent-photo',imageHash:'ih',annotationHash:'ah',revision:'v1',text:'짙은 초록의 숲.',model:'synthetic',humanReviewed:false}]};
 const final=(patch:object={})=>JSON.stringify({status:'answered',message:'편하게 이야기해요.',evidenceRefs:[],variableUpdates:{},...patch});
@@ -13,6 +13,33 @@ function setup(outputs:string[]=[]) {
 }
 async function send(h:ReturnType<typeof setup>,sessionId:string,text='안녕',clientRequestId='req') {return h.chat.sendTurn('owner',{sessionId,text,clientRequestId});}
 function state(messages:ProviderMessage[]) {return JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length));}
+
+test.each(['off','caption','caption_image'] as const)('recollection voice reaches %s agent policy without removing safety or changing user/history',async condition=>{
+  const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
+  await send(h,session.id,'그 합성 그림 기억나?');
+  const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v2-recollection');
+  expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
+  expect(policy).toContain('supports the requested post, event AND actor');
+  expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('그건 잘 기억 안 나');
+  expect(policy).toContain('NOT the actual person');expect(policy).toContain('History is conversation context, NEVER factual evidence');
+  expect(policy).toContain('Technical validation failures are service errors');expect(policy).toContain('AGENT_JSON_REPLY');
+  expect(messages.at(-1)).toEqual({role:'user',content:'그 합성 그림 기억나?'});
+});
+test('supported first-person message is preserved with exact refs, without a prose rewrite or extra model call',async()=>{
+  const message='아 그때 합성 숲 그렸었지!';
+  const h=setup([final({message,evidenceRefs:[{sourceId:source.id,quote:source.caption}]})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'}),turn=await send(h,session.id,'그 그림 얘기해줘');
+  expect(turn.reply?.content).toBe(message);expect(turn.reply?.evidence[0].sourceId).toBe(source.id);
+  expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(turn.reply?.agent?.promptRevision).toBe(AGENT_PROMPT_REVISION);
+});
+test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs retain technical fallback',async()=>{
+  const h=setup([final({status:'insufficient_evidence',message:'그건 잘 기억 안 나. 어느 그림 말하는 거야?'}),final({message:'아 기억나!',evidenceRefs:[{sourceId:'invented',quote:'invented'}]})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
+  const first=await send(h,session.id);expect(first.reply?.content).toBe('그건 잘 기억 안 나. 어느 그림 말하는 거야?');expect(first.reply?.evidence).toEqual([]);
+  const second=await send(h,session.id,'계속','req2');expect(second.reply?.content).toBe('응답의 근거 형식을 확인하지 못했어요.');
+  expect(second.reply?.limitations).toContain('INVALID_MODEL_EVIDENCE');expect(second.reply?.content).not.toContain('기억');
+});
 
 test('one-call structured final: state, compact decision summary, public message-only history and immutable profile',async()=>{
   const h=setup([final({reasoning:'합성 응답 요약',variableUpdates:{conversationTopic:'그림',tone:'warm'}}),final()]);

@@ -32,3 +32,25 @@ offsets. The model selects exact text without arithmetic. The small-talk message
 bytes and `persona-chat-v1-source-quotes` revision are unchanged. The v3 timeline
 prompt is an explicit variant; earlier study results must not be relabeled as if
 they used it. `PROMPT_REVISION` currently denotes the v3 timeline revision.
+
+## agent-loop recollection voice
+
+`character-agent-context-v2-recollection` adds first-person author-role narration
+only for relevant source-supported episodes and actors in the disclosed research
+AI simulation. Missing details use natural uncertainty; ambiguous posts prompt a
+brief clarification. Author, companion and user roles stay distinct. Persona,
+history and AI-inferred intent are not factual evidence. This is a prompt policy,
+not a new semantic validator or proof of real-person personality fidelity.
+
+Exact-reference validation and technical fallback wording are unchanged. The
+legacy prompts above are unaffected. No prose rewrite or extra judging call is
+added. Stored old sessions/results retain their original prompt revisions.
+
+The paired Korean regression runs with
+`node --env-file=.env.local -r tsx/cjs scripts/evaluate-korean-chat.ts --live --recollection`
+and the existing explicit live/external-data environment opt-ins. It requires
+the archived 72-turn Korean baseline and a separately frozen private recollection
+rubric. New results use `reports/recollection-chat/`, leaving the prior Korean
+pointer unchanged. It plans 72 turns, prioritizes memory conversations, limits
+fresh requests to 60, and preserves the existing global $1/1000-request ledger.
+Budget/port exhaustion produces an explicitly partial report, not a reset or retry.
