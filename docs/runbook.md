@@ -99,3 +99,9 @@ status, bytes and balance checks are required. No duplicate submit on timeout/un
 [Effort accounting](effort-accounting.md) separates Codex cached/uncached tokens and wall intervals
 from provider dollars. Human reading/typing/management time remains unknown if not measured.
 Historical decisions/time checkpoints live beside the external issue, not duplicated here.
+
+## Goal2 serving (queue/workers, load tests, engines)
+
+Queued execution (`PTR_EXECUTION=queue` + `apps/api/src/worker.ts`), the synthetic load/failure harness on `ptr_loadtest`,
+self-hosted engines over an SSH tunnel and the GPU benchmark scripts are documented in [goal2-serving.md](goal2-serving.md).
+Apply migrations 0005/0006 before using queue mode.
