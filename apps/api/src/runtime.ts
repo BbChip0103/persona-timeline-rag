@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { ChatService, CoreError, type PersonaRepository, type TextProvider } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment } from '@ptr/providers';
+import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
   id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
   kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
@@ -32,6 +32,11 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env):ApiRuntime {
   let embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
   let model='synthetic/fake-text-v1';let embeddingModel=fakeEmbedding.model;
   const providerName=env.PTR_CHAT_PROVIDER??'fake';
+  // Load tests only: delay/failure injection is never allowed to wrap a billable provider.
+  if(env.PTR_FAKE_LATENCY!==undefined) {
+    if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
+    provider=new LatencyInjectedTextProvider(fakeText,parseLatencyProfile(env.PTR_FAKE_LATENCY));model=`${model}+latency`;
+  }
   if(providerName==='openrouter') {
     const ledger=new PostgresBudgetLedger(pool,databaseUrl);
     const liveEnv={...env,GOAL1_DATABASE_URL:databaseUrl,GOAL1_TEXT_MODEL:env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL};
