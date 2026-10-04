@@ -78,4 +78,4 @@ DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard�
 
 ### 캐릭터 에이전트 실행 profile
 
-새 API 세션은 `agent_loop` 독립 structured-response/state/readonly-tool loop를 사용한다. 옛 세션과 기존 core/evaluation 기본값은 `legacy`로 유지한다. 전체 다른 프로젝트 engine/운영 설정 재현이 아니며, 범위·비용·남은 차이·검증은 [character-agent.md](character-agent.md)를 따른다.
+새 API 세션은 `agent_loop` 독립 structured-response/state/readonly-tool loop를 사용한다. 옛 세션과 저수준 core 기본값은 호환성을 유지하고, 향후 자연대화 평가는 `agent_loop`로 고정해 RAG 3조건만 비교한다. 전체 다른 프로젝트 engine/운영 설정 재현이 아니며, 범위·비용·남은 차이·검증은 [character-agent.md](character-agent.md)를 따른다.

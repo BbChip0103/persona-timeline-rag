@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ChatReply, ExecutionProfile, Persona, RagCondition, SourcePost } from '@ptr/contracts';
-import { EXPERIMENT_PROMPT_REVISION } from '@ptr/core';
+import { AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION } from '@ptr/core';
 import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL } from '@ptr/providers';
 import { createHarnessRuntime, type HarnessRuntime, type TurnTrace } from './evaluate';
 import { CONDITIONS, validateCorpus, type CorpusRow } from './evaluate-image-rag';
@@ -27,9 +27,9 @@ export function validateUserExport(testset: ChatTestset, value: unknown): UserCo
   return expected.conversations.filter(item => expected.smokeConversationIds.includes(item.id));
 }
 export async function executeNaturalConversation(runtime: Pick<HarnessRuntime, 'chat' | 'setTrace'>, owner: string,
-  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile?:ExecutionProfile): Promise<void> {
+  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile:ExecutionProfile = 'agent_loop'): Promise<void> {
   const session = await runtime.chat.createSession(owner, { personId: conversation.personId, personaId: conversation.personaId,
-    personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic',...(executionProfile?{executionProfile}:{}) });
+    personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic',executionProfile });
   for (const [turnIndex, input] of conversation.turns.entries()) {
     const trace: TurnTrace = { id: `${input.id}-${condition}`, stage: 'natural-character-chat', mode: condition === 'off' ? 'off' : 'semantic',
       historyKind: 'evolving', personId: conversation.personId, goldSourceIds: [], retrievedIds: [], promptHashes: [], latencyMs: 0,
@@ -129,14 +129,15 @@ export async function runNaturalChat(args: string[]): Promise<void> {
   const rows: NaturalChatRow[] = []; const before = await codeFingerprint(); const owner = `natural-chat-${randomUUID()}`;
   try {
     const budgetBefore = await budgetSnapshot(runtime);
-    // At most72 text+48 embedding calls. Individual USD reservations remain enforced by the existing global ledger.
+    // Require120 available slots, not a completion guarantee: agent-loop tool rounds can add calls.
+    // Existing global reservations enforce the unchanged budget and stop without retry.
     if (Number(budgetBefore.call_cap) - Number(budgetBefore.calls) < 120 || Number(budgetBefore.cap_microusd) > 1_000_000)
       throw new Error('Insufficient existing request slots or unsafe budget');
     const corpusBefore = await corpusSnapshot(runtime, sources, plan);
     for (const persona of personas) if (testsetHash(await runtime.personas.get(persona.id, persona.revision)) !== testsetHash(persona))
       throw new Error('Registered persona differs from frozen assets');
     await privateJson(`${directory}/preflight.json`, { startedAt, revision: evaluator.revision, codeFingerprint: before, budgetBefore,
-      corpusFingerprint: testsetHash(corpusBefore), corpusBefore, planned: 72, noForcedIntentOrQuery: true });
+      corpusFingerprint: testsetHash(corpusBefore), corpusBefore, planned: 72, executionProfile: 'agent_loop', noForcedIntentOrQuery: true });
     for (const [index, conversation] of conversations.entries()) {
       for (const condition of CONDITIONS.map((_, offset) => CONDITIONS[(index + offset) % 3]!)) {
         await executeNaturalConversation(runtime, owner, conversation, condition, async row => {
@@ -150,11 +151,12 @@ export async function runNaturalChat(args: string[]): Promise<void> {
     const after = await codeFingerprint(); const corpusAfter = await corpusSnapshot(runtime, sources, plan);
     if (before !== after || testsetHash(corpusBefore) !== testsetHash(corpusAfter)) throw new Error('Code or retrieval corpus changed during trial');
     const report = { execution: 'live', label: 'natural-chat-smoke', startedAt, finishedAt: new Date().toISOString(), completed: rows.length, planned: 72,
-      revision: evaluator.revision, promptRevision: EXPERIMENT_PROMPT_REVISION, model: runtime.model, embeddingModel: EMBEDDING_MODEL,
+      revision: evaluator.revision, executionProfile: 'agent_loop', promptRevision: AGENT_PROMPT_REVISION, agentRevision: AGENT_RUNTIME_REVISION, model: runtime.model, embeddingModel: EMBEDDING_MODEL,
       codeFingerprint: before, codeUnchanged: true, corpusFingerprint: testsetHash(corpusBefore), corpusUnchanged: true,
       budgetBefore, budgetAfter: await budgetSnapshot(runtime), summary: summarizeNaturalRows(rows), rows,
       humanReview: 'pending', limitations: [...evaluator.limitations,
         'Eight scripted conversations only; operational measures are not quality scores or causal accuracy estimates.',
+        'agent-loop profile fixed across three conditions; tool rounds can add text/embedding calls within the unchanged global budget.',
         'Natural inputs only. Evaluator asOf is recorded, not injected into the unchanged production prompt.',
         'Three real evolving turns per condition; no fixed/oracle assistant history or forced retrieval.',
         'Latency includes SQL and persistent provider caches; 750ms inter-turn cooldown is excluded.',
@@ -164,7 +166,7 @@ export async function runNaturalChat(args: string[]): Promise<void> {
     console.log(JSON.stringify({ directory, completed: rows.length, summary: report.summary }));
   } catch (error) {
     await privateJson(`${directory}/failure.json`, { startedAt, observedAt: new Date().toISOString(), completed: rows.length, planned: 72, rows,
-      summary: summarizeNaturalRows(rows), codeFingerprint: before, noImplicitRetry: true });
+      summary: summarizeNaturalRows(rows), executionProfile: 'agent_loop', codeFingerprint: before, noImplicitRetry: true });
     throw error;
   } finally { await runtime.close(); }
 }

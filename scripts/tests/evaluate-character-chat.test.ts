@@ -70,3 +70,17 @@ test('agent-loop evaluation pins profile only at session creation, never leaks i
   expect(f.createSession.mock.calls[0][1]).toMatchObject({executionProfile:'agent_loop'});
   for(const input of f.inputs)expect(Object.keys(input as object).sort()).toEqual(['clientRequestId','sessionId','text']);
 });
+
+
+test.each(['off', 'caption', 'caption_image'] as const)('forward natural evaluation pins agent-loop in %s', async condition => {
+  const f = runtimeFixture();
+  await executeNaturalConversation(f.runtime, 'synthetic-owner', conversation, condition, async () => {});
+  expect(f.createSession.mock.calls[0][1]).toMatchObject({ executionProfile: 'agent_loop', ragCondition: condition });
+  for (const input of f.inputs) expect(Object.keys(input as object).sort()).toEqual(['clientRequestId', 'sessionId', 'text']);
+});
+
+test('historical legacy evaluation requires an explicit profile, without altering old sessions', async () => {
+  const f = runtimeFixture();
+  await executeNaturalConversation(f.runtime, 'synthetic-owner', conversation, 'caption', async () => {}, 0, 'legacy');
+  expect(f.createSession.mock.calls[0][1]).toMatchObject({ executionProfile: 'legacy', ragCondition: 'caption' });
+});

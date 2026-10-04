@@ -3,8 +3,8 @@
 
 ## Profiles
 
-- `legacy`: existing server-routed RAG → `answer/evidenceRefs` generation. Existing sessions without `executionProfile`, and direct core calls without an explicit profile, remain legacy. Existing evaluation scripts retain this baseline.
-- `agent_loop`: default for **new API sessions**; persists the profile and RAG condition at creation. Missing condition becomes `off` for retrieval off, otherwise `caption`. Opt into the same profile explicitly in a direct core/evaluation run. Profile cannot change mid-session.
+- `legacy`: existing server-routed RAG → `answer/evidenceRefs` generation. Existing sessions without `executionProfile`, and direct core calls without an explicit profile, remain legacy. Historical baseline runners retain this profile explicitly; they are not the forward evaluation path.
+- `agent_loop`: default for **new API sessions**; persists the profile and RAG condition at creation. Missing condition becomes `off` for retrieval off, otherwise `caption`. Forward natural-character-chat evaluation pins this same profile across `off`, `caption`, and `caption_image`. Low-level direct core callers must still set it explicitly for backward compatibility. Profile cannot change mid-session.
 
 ```json
 {"personId":"synthetic-person","executionProfile":"agent_loop","ragCondition":"caption_image"}
@@ -43,7 +43,16 @@ RUN_STORAGE_DB_TESTS=1 pnpm exec jest --runInBand packages/storage/test/agent-ru
 Synthetic regressions cover multi-search evidence retention, state restart, scope isolation, malformed/repeated actions, cancellation, idempotency, off zero retrieval, validator outcomes and HTTP redaction. They are control-flow tests, not a real-person chat-quality benchmark.
 
 
-## Paired profile regression
+## Forward three-condition evaluation
+
+`evaluate-character-chat.ts --live --smoke` uses only `agent_loop` for all three
+conditions: no RAG, caption RAG, and caption plus image-description RAG. Profile
+and agent prompt/runtime revisions are recorded in new reports. It requires
+explicit existing live/data opt-ins and available budget; do not run it merely
+to update defaults. Tool rounds may add calls, so completion is not guaranteed.
+Do not reset the global budget or migrate existing legacy sessions.
+
+## Historical paired profile regression (not the forward evaluation path)
 
 `node --env-file=.env.local -r tsx/cjs scripts/evaluate-agent-profile.ts --live`
 runs the frozen four-conversation memory pilot in both profiles and all three

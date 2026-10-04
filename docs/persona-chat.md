@@ -132,4 +132,4 @@ owner 확인 후 owned session 응답 projection이며 구현된 API가 아니�
 
 ## 실행 profile
 
-새 API 세션의 `agent_loop` 응답은 사용자 message와 비공개 결정 요약/대화 변수/action을 분리한다. 이전 세션과 기존 직접 core/evaluation 경로는 `legacy`를 유지한다. 상세 [character-agent.md](character-agent.md). persona 및 대화 변수는 실제 활동 근거나 인물 정체성 인증이 아니다.
+새 API 세션의 `agent_loop` 응답은 사용자 message와 비공개 결정 요약/대화 변수/action을 분리한다. 기존 세션과 저수준 core 기본값은 호환성을 유지하며, 향후 자연대화 평가는 `agent_loop`를 고정하고 RAG 3조건만 비교한다. 상세 [character-agent.md](character-agent.md). persona 및 대화 변수는 실제 활동 근거나 인물 정체성 인증이 아니다.

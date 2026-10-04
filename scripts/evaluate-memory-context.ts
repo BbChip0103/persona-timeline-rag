@@ -1,3 +1,4 @@
+/** Historical legacy regression only; forward three-condition evaluation uses evaluate-character-chat.ts. */
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFile, readdir } from 'node:fs/promises';
@@ -147,17 +148,17 @@ export async function runMemoryPilot(args: string[]): Promise<void> {
     const corpusBefore = await corpusSnapshot(runtime.pool, sources, plan);
     for (const persona of personas) if (testsetHash(await runtime.personas.get(persona.id, persona.revision)) !== testsetHash(persona)) throw new Error('Registered persona differs from frozen assets');
     await privateJson(`${directory}/preflight.json`, { startedAt, testsetRevision: evaluator.revision, codeCommit, codeFingerprint: before, corpusFingerprint: testsetHash(corpusBefore), budgetBefore,
-      limits: PILOT_LIMITS, noForcedIntentOrQuery: true, conditionOrder: 'rotating', selectedConversationIds: conversations.map(item => item.id) });
+      limits: PILOT_LIMITS, executionProfile: 'legacy', noForcedIntentOrQuery: true, conditionOrder: 'rotating', selectedConversationIds: conversations.map(item => item.id) });
     for (const [index, conversation] of conversations.entries()) for (const condition of CONDITIONS.map((_, offset) => CONDITIONS[(index + offset) % 3]!)) {
       await executeNaturalConversation(runtime, owner, conversation, condition, async row => {
         rows.push(row); await privateJson(`${directory}/progress.json`, { startedAt, observedAt: new Date().toISOString(), planned: PILOT_LIMITS.turns, completed: rows.length, rows, summary: summarizeNaturalRows(rows) });
         console.log(JSON.stringify({ completed: rows.length, planned: PILOT_LIMITS.turns, condition, state: row.trace.state, status: row.reply?.status,
           action: row.reply?.retrievalContext?.action, textCalls: row.trace.textCalls, embeddingCalls: row.trace.embeddingCalls, sourceLookupCalls: (row.trace as MemoryTrace).sourceLookupCalls, errors: row.trace.errors }));
-      }, 750);
+      }, 750, 'legacy');
     }
     const after = await codeFingerprint(), corpusAfter = await corpusSnapshot(runtime.pool, sources, plan);
     if (before !== after || testsetHash(corpusBefore) !== testsetHash(corpusAfter)) throw new Error('Code or retrieval corpus changed during pilot');
-    const report = { execution: 'live', label: 'memory-context-pilot', startedAt, finishedAt: new Date().toISOString(), completed: rows.length, planned: PILOT_LIMITS.turns,
+    const report = { execution: 'live', label: 'memory-context-pilot', executionProfile: 'legacy', startedAt, finishedAt: new Date().toISOString(), completed: rows.length, planned: PILOT_LIMITS.turns,
       revision: evaluator.revision, promptRevision: EXPERIMENT_PROMPT_REVISION, contextRevision: RETRIEVAL_CONTEXT_REVISION, model: runtime.model, embeddingModel: EMBEDDING_MODEL,
       codeCommit, codeFingerprint: before, codeUnchanged: true, corpusFingerprint: testsetHash(corpusBefore), corpusUnchanged: true, budgetBefore, budgetAfter: await budgetSnapshot(runtime.pool),
       limits: PILOT_LIMITS, rows, summary: summarizeNaturalRows(rows), humanReview: 'pending', limitations: [...evaluator.limitations,

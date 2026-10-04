@@ -1,3 +1,5 @@
+> Historical legacy pilot only. Forward agent-loop three-condition evaluation is documented in [character-agent.md](character-agent.md).
+
 # Conversation-context retrieval
 
 ## Reproduce the bounded live regression pilot
