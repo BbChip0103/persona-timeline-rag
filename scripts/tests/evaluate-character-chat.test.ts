@@ -84,3 +84,25 @@ test('historical legacy evaluation requires an explicit profile, without alterin
   await executeNaturalConversation(f.runtime, 'synthetic-owner', conversation, 'caption', async () => {}, 0, 'legacy');
   expect(f.createSession.mock.calls[0][1]).toMatchObject({ executionProfile: 'legacy', ragCondition: 'caption' });
 });
+
+test('explicit continuation verifies completed real history and never resends earlier questions', async () => {
+  const f = runtimeFixture();
+  Object.assign(f.runtime.chat, {
+    getSession: jest.fn(async () => ({ id: 'synthetic-session', personId: conversation.personId, personaId: conversation.personaId,
+      personaRevision: conversation.personaRevision, ragCondition: 'off', executionProfile: 'agent_loop' })),
+    history: jest.fn(async () => [{ role: 'assistant', content: 'Greeting', turnId: null },
+      { role: 'user', content: conversation.turns[0]!.text, turnId: 'prior' }, { role: 'assistant', content: reply.content, turnId: 'prior' }]),
+  });
+  const rows: NaturalChatRow[] = [];
+  await executeNaturalConversation(f.runtime, 'owner', conversation, 'off', async row => { rows.push(row); }, 0, 'agent_loop', { sessionId: 'synthetic-session', completedTurns: 1 });
+  expect(f.createSession).not.toHaveBeenCalled(); expect(f.startTurn).toHaveBeenCalledTimes(2);
+  expect(rows.map(row => row.turnIndex)).toEqual([1, 2]);
+  expect(f.inputs).not.toContainEqual(expect.objectContaining({ text: conversation.turns[0]!.text }));
+});
+
+test('continuation fails before submission on mismatched condition or incomplete history', async () => {
+  const f = runtimeFixture();
+  Object.assign(f.runtime.chat, { getSession: async () => ({ id: 'session', personId: 'wrong-person' }) });
+  await expect(executeNaturalConversation(f.runtime, 'owner', conversation, 'off', async () => {}, 0, 'agent_loop', { sessionId: 'session', completedTurns: 1 })).rejects.toThrow('binding');
+  expect(f.startTurn).not.toHaveBeenCalled();
+});

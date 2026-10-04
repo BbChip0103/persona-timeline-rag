@@ -27,10 +27,26 @@ export function validateUserExport(testset: ChatTestset, value: unknown): UserCo
   return expected.conversations.filter(item => expected.smokeConversationIds.includes(item.id));
 }
 export async function executeNaturalConversation(runtime: Pick<HarnessRuntime, 'chat' | 'setTrace'>, owner: string,
-  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile:ExecutionProfile = 'agent_loop'): Promise<void> {
-  const session = await runtime.chat.createSession(owner, { personId: conversation.personId, personaId: conversation.personaId,
+  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile:ExecutionProfile = 'agent_loop',
+  resume?: { sessionId: string; completedTurns: number }): Promise<void> {
+  const session = resume ? await runtime.chat.getSession(owner, resume.sessionId) : await runtime.chat.createSession(owner, { personId: conversation.personId, personaId: conversation.personaId,
     personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic',executionProfile });
+  if (resume) {
+    if (!Number.isSafeInteger(resume.completedTurns) || resume.completedTurns < 0 || resume.completedTurns > conversation.turns.length ||
+      session.personId !== conversation.personId || session.personaId !== conversation.personaId || session.personaRevision !== conversation.personaRevision ||
+      session.ragCondition !== condition || session.executionProfile !== executionProfile) throw new Error('Unsafe session continuation binding');
+    const history = await runtime.chat.history(owner, session.id);
+    if (history.length !== 1 + resume.completedTurns * 2) throw new Error('Continuation requires exact completed visible history');
+    for (let i = 0; i < resume.completedTurns; i++) {
+      const user = history[1 + i * 2], assistant = history[2 + i * 2];
+      if (user?.role !== 'user' || user.content !== conversation.turns[i]!.text || assistant?.role !== 'assistant' || user.turnId !== assistant.turnId || !user.turnId)
+        throw new Error('Continuation history mismatch');
+      const turn = await runtime.chat.getTurn(owner, user.turnId);
+      if (turn.state !== 'completed' || turn.reply?.content !== assistant.content) throw new Error('Only completed turns can precede continuation');
+    }
+  }
   for (const [turnIndex, input] of conversation.turns.entries()) {
+    if (resume && turnIndex < resume.completedTurns) continue;
     const trace: TurnTrace = { id: `${input.id}-${condition}`, stage: 'natural-character-chat', mode: condition === 'off' ? 'off' : 'semantic',
       historyKind: 'evolving', personId: conversation.personId, goldSourceIds: [], retrievedIds: [], promptHashes: [], latencyMs: 0,
       state: 'pending', status: null, errors: [], textCalls: 0, embeddingCalls: 0, retrievalCalls: 0, requests: [], sourceRecallAt5: null,
