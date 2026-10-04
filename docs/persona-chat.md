@@ -1,7 +1,7 @@
 # 페르소나 정의·멀티턴 채팅 계약
 
 > 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
-상태: 최소 persona/sessions/turns와 TS core·DB/API/UI·모델 경계가 구현됐다. 실제 persona는 **silver 초안, 사람검수 pending**이다. 아래 풍부한 authoring/reference 설계 전체가 구현된 것은 아니다. [PRD](prd.md)의 필수 PoC 완료 단위이며 [근거 계약](evidence-schema.md)을 사용한다.
+상태: 최소 persona/sessions/turns와 TS core·DB/API/UI·모델 경계가 구현됐다. 실제 persona는 **silver 초안, 사람검수 pending**이다. 개발 캡션의 관찰 통계와 독립 작성한 대화 설계를 분리하는 offline refinement가 구현됐으며, 새 revision의 모델 성능이나 실존 인물 말투 충실도가 검증됐다는 뜻은 아니다. 아래 풍부한 authoring/reference 설계 전체가 구현된 것은 아니다. [PRD](prd.md)의 필수 PoC 완료 단위이며 [근거 계약](evidence-schema.md)을 사용한다.
 
 ## 1. 호환 범위
 
@@ -79,7 +79,7 @@ trusted caller → owned session/persona revision 확인
 - 후속 “그 여행”은 같은 세션의 명시적 reference로만 해석한다. 여러 후보/날짜 기준 미상은 한 가지 명확화 질문을 한다. 기본 timezone은 세션 설정으로 명시하되 사건 현지 날짜가 미상이면 보완하지 않는다.
 - 이 PoC는 현시점에서 과거 자료를 이야기하는 모드다. 캐릭터 시계를 과거로 돌리는 historical roleplay/as_of 재현은 미지원이며 그런 요구는 명확화한다. 향후 지원 시 게시 시점 cutoff도 별도 계약으로 필요하다.
 - 최대 tool 호출3회/turn, timeout과 결과 상한을 설정한다. timeout/연결 장애를 “자료 없음”으로 위장하지 않는다. `TURN_FAILED` 등 운영 오류와 검색의4status는 별도다.
-- 생성 결과가 schema/인용/같은 인물 scope 검증에 실패하면 안전한 설명으로 fallback하거나 turn failure로 처리한다. 검증된 원자 claim만 최종 답변에 사용하고 이후 말투 변환에서도 새 factual claim을 추가하지 않는다. 내용상 지원은 구현 가능한 검사와 사람 평가를 구분하며 ID 검사만으로 해결했다고 주장하지 않는다.
+- 생성 결과가 schema/인용/같은 인물 scope 검증에 실패하면 안전한 설명으로 fallback하거나 turn failure로 처리한다. 핵심 사건·인물 역할·인용은 출처와 일치해야 한다. 가벼운 반응·유머·비유·가상 분위기는 대화 표현으로 허용하지만 검증된 현실 사실로 승격하거나 핵심 사건을 뒤집지 않는다. 내용상 지원은 구현 가능한 검사와 사람 평가를 구분하며 ID 검사만으로 해결했다고 주장하지 않는다.
 
 ## 5. 채팅 응답과 stream
 
@@ -133,3 +133,55 @@ owner 확인 후 owned session 응답 projection이며 구현된 API가 아니�
 ## 실행 profile
 
 새 API 세션의 `agent_loop` 응답은 사용자 message와 비공개 결정 요약/대화 변수/action을 분리한다. 기존 세션과 저수준 core 기본값은 호환성을 유지하며, 향후 자연대화 평가는 `agent_loop`를 고정하고 RAG 3조건만 비교한다. 상세 [character-agent.md](character-agent.md). persona 및 대화 변수는 실제 활동 근거나 인물 정체성 인증이 아니다.
+
+
+## 개발 캡션 기반 대화 설계 refinement
+
+`pnpm exec tsx scripts/refine-personas.ts --offline`은 외부 모델·이미지·DB 호출 없이 별도 revision을 생성한다. 입력은 private 원본 `data/research/{personas,sources,split}.json` 및 선택 manifest다. 같은 인물의 `dev` 분할에서 unsafe 플래그·기존 보수적 screening·빈 캡션을 제외한다. 원본 persona의 근거가 이 범위 밖이면 거부한다. 평가 질문·정답·test 캡션·이미지 설명을 설계 근거로 사용하지 않는다. 입력 전체를 읽되 원문 캡션을 새 persona prompt나 provenance에 복사하지 않고, 개발 전용 길이/emoji/hashtag 비율과 일반 주제 cue만 집계한다. screening과 cue 매칭은 heuristic이며 포괄적인 보안/개인정보 검수가 아니다.
+
+네 가지 **대화 설계**는 다음과 같다. 실제 인물의 내면·구어 말투를 발견했다는 의미가 아니다.
+
+| 설계 | 대화 초점 | 구분 근거 |
+|---|---|---|
+| beauty-practical | 가벼운 실험, 선택 비교, 실용적인 한 가지 제안 | manifest의 beauty 주제; 구체적인 리듬/태도는 독립 작성 |
+| lifestyle-everyday | 일상 선택, 편안한 반응, 접근하기 쉬운 소소한 제안 | manifest의 food/lifestyle 계열과 개발 내용 폭; 따뜻함은 설계 |
+| travel-narrative | 발견과 이동의 작은 흐름, 행동 중심 여행 아이디어 | 개발 캡션의 narrative cue가 visual cue보다 많은 경우 |
+| travel-visual | 분위기·구도·한 가지 시각적 초점, 선택적인 묘사 | 개발 캡션의 visual cue가 narrative cue 이상인 경우 |
+
+동일 관찰을 임의로 네 종류에 배정하지 않는다. 네 선택 persona가 모두 다른 설계를 지원하지 못하거나 안전한 개발 자료가 5개 미만이면 생성은 실패한다. 이 PoC용 엄격한 4인 제한은 대규모 persona authoring 도구의 일반 계약이 아니다.
+
+### 비공개 산출물과 provenance
+
+- `data/research/persona-variants/<bundle-sha256>/personas.json`: 기존 스키마와 호환되는 새 silver 정의.
+- 같은 디렉토리 `originals.json`: 입력 원본 정의의 보존본.
+- 같은 디렉토리 `provenance.json`: persona 필드·style 항목별 값 hash와 `observed_development_style | authored_dialogue_design | unknown`, 개발 source IDs, 관찰 통계·설계 사유. 실제 성격·실제 구어 말투는 명시적으로 unknown이다.
+- `reports/persona-refinement/<bundle-sha256>/validation.json`: revision/binding/hash, 개발 자료 수, 네 설계 구분, 외부 호출·DB 쓰기 0 및 한계.
+
+파일은 gitignored, mode `0600`이며 새 디렉토리는 `0700`이다. 동일 입력의 재실행은 동일 revision/산출물을 확인한다. 버전 경로의 내용이 다르면 덮어쓰지 않고 거부한다. 원본 `personas.json`, 기존 한국어 study variant, 평가 결과, 최신 평가 pointer, DB를 자동으로 변경하지 않는다.
+
+### 언어·활성화·기존 세션
+
+ID/person ID, 원래 언어, AI 공개 identity/greeting, 기존 boundaries를 유지한다. 국내·해외를 이유로 새 한국어 variant를 몰래 만들거나 기존 한국어 실험과 동등한 조건이라고 표시하지 않는다. 한국어로만 비교할 경우는 별도의 명시적인 언어 revision이 필요하며 이전 연구 정의는 그대로 보존한다.
+
+생성 명령은 활성화하지 않는다. 검토 후 **독립 로컬 DB의 loopback 자격**을 확인한 활성화 작업에서 `PostgresPersonaRepository.importPersona()`에 versioned 파일을 전달할 수 있다. 저장소는 새 version을 보존하고 현재 revision만 바꾸며 기존 세션은 저장된 `personaRevision`으로 이전 정의를 계속 조회한다. 같은 revision의 내용 변경 및 다른 person에 대한 ID 재사용은 거부된다. 실제 DB 활성화의 성공/원본 보존은 별도 SQL 검증이 필요하다. API 프로세스나 UI의 새 세션 선택 상태도 확인해야 하며 offline 파일 생성만으로 실제 채팅에 적용됐다고 주장하지 않는다.
+
+평가는 **핵심 기억 일치·정정 후 복구**와 **말투·설계 일관성·재미**를 분리한다. 이 버전 생성과 합성 회귀 통과는 실제 모델 비교나 사람검수 결과가 아니며 이전 엄격한 사실 점수를 새 기준으로 조용히 변경하지 않는다. 가상 반응/분위기는 허용되지만 생성물은 원본 이력이나 RAG 근거로 재유입하지 않는다.
+
+
+### Atomic isolated-local activation
+
+After generating a frozen bundle, publish it with:
+
+```bash
+node --env-file=.env.local -r tsx/cjs scripts/activate-persona-refinement.ts --activate <bundle-sha256>
+```
+
+The command recomputes the development-only definition and verifies the frozen
+bundle before opening the guarded loopback pool. All four versions/current
+pointers publish in one transaction. A mismatched original/current binding or
+immutable revision conflict rolls back the batch. Old versions, session-pinned
+revisions, corpus and provider ledger are not rewritten. Repeating the same
+published bundle is idempotent. Set `PTR_PERSONAS_FILE` to the new bundle's
+`personas.json` and restart only the owned local API so its catalogue cache uses
+that registry; keep the original registry as the reproducible baseline.
+Activation and fake-provider checks do not measure actual model character quality.
