@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { ChatService, CoreError, type PersonaRepository, type TextProvider } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment } from '@ptr/providers';
+import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment } from '@ptr/providers';
 export interface CreativeArtifact {
   id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
   kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
@@ -37,7 +37,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env):ApiRuntime {
     const liveEnv={...env,GOAL1_DATABASE_URL:databaseUrl,GOAL1_TEXT_MODEL:env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL};
     const client=new OpenRouterClient(liveOptionsFromEnvironment(liveEnv,ledger));
     const embedding=new OpenRouterEmbeddingProvider(client);
-    provider=client;model=liveEnv.GOAL1_TEXT_MODEL??'google/gemini-2.5-flash-lite';embeddingModel=embedding.model;
+    provider=client;model=liveEnv.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL;embeddingModel=embedding.model;
     embed=(text,options)=>embedding.embed([text],options).then(vectors=>vectors[0]!);
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const chat=new ChatService({store:new PostgresConversationStore(pool),personas,provider,

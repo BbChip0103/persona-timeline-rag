@@ -5,7 +5,7 @@ import { assertLocalDatabaseUrl } from '@ptr/storage';
 import { ProviderError, type BudgetLedger } from './budget';
 
 const API='https://openrouter.ai/api/v1';
-export const DEFAULT_TEXT_MODEL='google/gemini-2.5-flash-lite';
+export const DEFAULT_TEXT_MODEL='google/gemini-3-flash-preview';
 export const EMBEDDING_MODEL='openai/text-embedding-3-small';
 export const EMBEDDING_DIMENSIONS=1536;
 /** Observed upstream alias is explicitly allowlisted; never accept arbitrary vendor/suffix matches. */
@@ -20,7 +20,13 @@ function reportedCostMicrousd(result:Json):number|null {
   // Unrepresentable accounting values cannot release a conservative reservation.
   return Number.isSafeInteger(microusd)?microusd:null;
 }
-const TEXT_MODELS=[DEFAULT_TEXT_MODEL,'openai/gpt-4.1-nano'];
+// Price ceilings in USD per million tokens (OpenRouter max_price unit) and per-model reasoning.
+// Gemini 3 Flash cannot disable reasoning, only minimize it.
+const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json}>={
+  [DEFAULT_TEXT_MODEL]:{prompt:0.5,completion:3,reasoning:{effort:'minimal'}},
+  'google/gemini-2.5-flash-lite':{prompt:0.1,completion:0.4,reasoning:{enabled:false}},
+  'openai/gpt-4.1-nano':{prompt:0.1,completion:0.4},
+};
 const SCHEMA_REVISION='goal1-provider-v1';
 type Fetch=typeof fetch;
 type Json=Record<string,unknown>;
@@ -47,7 +53,7 @@ export class OpenRouterClient {
     if (!options.liveEnabled||!options.allowExternalData||!options.apiKey.trim()) throw new ProviderError('LIVE_DISABLED');
     assertLocalDatabaseUrl(options.databaseUrl);
     this.model=options.textModel??DEFAULT_TEXT_MODEL;
-    if (!TEXT_MODELS.includes(this.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
+    if (!Object.hasOwn(TEXT_MODELS,this.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
     this.outputTokens=options.maxOutputTokens??512;
     this.inputBytes=options.maxInputBytes??32768;
     this.timeoutMs=options.timeoutMs??30000;
@@ -91,7 +97,8 @@ export class OpenRouterClient {
   private async checkPrices(signal:AbortSignal):Promise<void> {
     const chat=await this.checkedFetch(`${API}/models`,{},signal);
     const embeddings=await this.checkedFetch(`${API}/embeddings/models`,{},signal);
-    for (const [catalog,model,prompt,completion] of [[chat,this.model,0.0000001,0.0000004],[embeddings,EMBEDDING_MODEL,0.00000002,0]] as const) {
+    const text=TEXT_MODELS[this.model]!;
+    for (const [catalog,model,prompt,completion] of [[chat,this.model,text.prompt*1e-6,text.completion*1e-6],[embeddings,EMBEDDING_MODEL,0.00000002,0]] as const) {
       if (!Array.isArray(catalog.data)) throw new ProviderError('PRICING_UNVERIFIED');
       const entry=catalog.data.find((value:unknown)=>object(value).id===model);
       if (!entry) throw new ProviderError('PRICING_UNVERIFIED');
@@ -112,8 +119,9 @@ export class OpenRouterClient {
     }
   }
   private provider(embedding:boolean):Json {
+    const text=TEXT_MODELS[this.model]!;
     return {require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,
-      max_price:{prompt:embedding?0.02:0.1,completion:embedding?0:0.4,request:0}};
+      max_price:{prompt:embedding?0.02:text.prompt,completion:embedding?0:text.completion,request:0}};
   }
   private async request(body:Json,endpoint:string,reservation:number,signal:AbortSignal):Promise<Json> {
     aborted(signal);
@@ -155,12 +163,13 @@ export class OpenRouterClient {
     if (bytes>this.inputBytes) throw new ProviderError('INPUT_LIMIT');
     const timeline=messages.some(message=>message.role==='system'&&message.content.includes('TIMELINE_JSON_REPLY'));
     const body:Json={model:this.model,messages:messages.map(({role,content})=>({role,content})),max_tokens:this.outputTokens,temperature:0,stream:false,provider:this.provider(false),
-      ...(this.model===DEFAULT_TEXT_MODEL?{reasoning:{enabled:false}}:{}),
+      ...(TEXT_MODELS[this.model]!.reasoning?{reasoning:TEXT_MODELS[this.model]!.reasoning}:{}),
       ...(timeline?{response_format:{type:'json_object'}}:{})};
     // UTF8 bytes upper-bound content tokenization; generous per-message + fixed envelope overhead.
     const inputUpperBound=bytes+messages.length*64+1024;
     // Reserve both full prompt and maximum cache-write price, even if automatic caching occurs.
-    const reserved=Math.ceil(inputUpperBound*0.2+this.outputTokens*0.4);
+    const {prompt,completion}=TEXT_MODELS[this.model]!;
+    const reserved=Math.ceil(inputUpperBound*2*prompt+this.outputTokens*completion);
     const result=await this.request(body,'chat/completions',reserved,options.signal);
     if (result.model!==undefined&&result.model!==this.model) throw new ProviderError('MODEL_MISMATCH');
     if (!Array.isArray(result.choices)||result.choices.length!==1) throw new ProviderError('INVALID_PROVIDER_RESPONSE');

@@ -8,7 +8,7 @@ import type { Pool } from 'pg';
 import { CalendarDateSchema, PersonaSchema, SourcePostSchema, TimezoneSchema, type ChatMessage, type ChatReply, type ChatSession, type Persona, type ProviderMessage, type RetrievalMode, type SourcePost } from '@ptr/contracts';
 import { ChatService, PROMPT_REVISION, type ConversationStore, type Retrieval, type TextProvider } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { EMBEDDING_MODEL, FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
+import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL, FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 
 const identifier = z.string().min(1).max(200);
 const timeline = z.object({ query: z.string().min(1).max(500).optional(), start: CalendarDateSchema.optional(), end: CalendarDateSchema.optional(), dateBasis: z.enum(['posted','event']), limit: z.literal(5).optional() }).strict();
@@ -104,7 +104,7 @@ export function createHarnessRuntime(env:NodeJS.ProcessEnv,live:boolean):Harness
   const fakeEmbedding=new FakeEmbeddingProvider();
   let provider:TextProvider=new FakeTextProvider();
   let embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
-  const model=live?(env.GOAL1_TEXT_MODEL??'google/gemini-2.5-flash-lite'):'synthetic/fake-text-v1';
+  const model=live?(env.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL):'synthetic/fake-text-v1';
   const embeddingModel=live?EMBEDDING_MODEL:fakeEmbedding.model;
   if (live) {
     const ledger=new TracedLedger(new PostgresBudgetLedger(pool,databaseUrl),()=>contexts.getStore());

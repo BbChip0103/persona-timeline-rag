@@ -22,8 +22,9 @@ stored response or reject an unresolved request; they never automatically submit
 again. Response caches and ledger rows belong only in the private research DB,
 not public fixtures, browser output, or traces. No key/input/body is logged here.
 
-Chat defaults to `google/gemini-2.5-flash-lite`; selecting
-`openai/gpt-4.1-nano` is explicit. Embeddings use
+Chat defaults to `google/gemini-3-flash-preview` (reasoning effort `minimal`);
+selecting `google/gemini-2.5-flash-lite` (earlier Goal1 baseline) or
+`openai/gpt-4.1-nano` is explicit. Price ceilings are per model. Embeddings use
 `openai/text-embedding-3-small`, float vectors, 1536 dimensions, validated index
 ordering/count/finiteness. Embedding API schema does not promise `usage.cost`: an explicitly returned finite,
 nonnegative numeric cost settles the ledger (rounded up to integer microUSD), while

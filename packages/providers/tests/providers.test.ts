@@ -20,10 +20,12 @@ class MemoryLedger implements BudgetLedger {
   async get(key:string):Promise<BudgetRequest|undefined> { return this.requests.get(key); }
 }
 const reply=(value:unknown,status=200)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json'}});
-function fakeFetch(post:(body:Record<string,unknown>)=>Response|Promise<Response>=()=>reply({id:'gen-synthetic',model:'google/gemini-2.5-flash-lite',choices:[{message:{content:'synthetic answer'}}],usage:{cost:0.000001}})) {
+const textCatalog=[{id:'google/gemini-3-flash-preview',pricing:{prompt:'0.0000005',completion:'0.000003',request:'0'}},
+  {id:'google/gemini-2.5-flash-lite',pricing:{prompt:'0.0000001',completion:'0.0000004',request:'0'}}];
+function fakeFetch(post:(body:Record<string,unknown>)=>Response|Promise<Response>=body=>reply({id:'gen-synthetic',model:body.model,choices:[{message:{content:'synthetic answer'}}],usage:{cost:0.000001}})) {
   return jest.fn(async (url: string|URL|Request,init?:RequestInit)=>{
     if(String(url).endsWith('/embeddings/models')) return reply({data:[{id:'openai/text-embedding-3-small',pricing:{prompt:'0.00000002',completion:'0',request:'0'}}]});
-    if(String(url).endsWith('/models')) return reply({data:[{id:'google/gemini-2.5-flash-lite',pricing:{prompt:'0.0000001',completion:'0.0000004',request:'0'}}]});
+    if(String(url).endsWith('/models')) return reply({data:textCatalog});
     return post(JSON.parse(String(init?.body??'{}')));
   });
 }
@@ -61,7 +63,9 @@ describe('live adapter with fake network only',()=>{
     expect(posts(fetcher)).toHaveLength(1);
     expect(fetcher.mock.calls.slice(0,2).every(([,init])=>!init?.headers)).toBe(true);
     const body=JSON.parse(String(posts(fetcher)[0]![1]!.body));
-    expect(body.provider).toEqual({require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,max_price:{prompt:0.1,completion:0.4,request:0}});
+    expect(body.model).toBe('google/gemini-3-flash-preview');
+    expect(body.reasoning).toEqual({effort:'minimal'});
+    expect(body.provider).toEqual({require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,max_price:{prompt:0.5,completion:3,request:0}});
     expect(body.max_tokens).toBe(512);
     expect([...ledger.requests.values()][0]).toMatchObject({state:'settled',actualMicrousd:1});
     expect(JSON.stringify([...ledger.requests.values()])).not.toContain('synthetic-private-key');
@@ -102,16 +106,16 @@ describe('live adapter with fake network only',()=>{
     expect(results.filter(value=>value.status==='fulfilled')).toHaveLength(1);expect(posts(fetcher)).toHaveLength(1);
   });
   test('changed catalog price or new fee refuses POST',async()=>{
-    for(const pricing of [{prompt:'0.01',completion:'0.0000004'},{prompt:'0.0000001',completion:'0.0000004',unknown_fee:'0.1'}]) {
-      const fetcher=fakeFetch();fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemini-2.5-flash-lite',pricing}]}));
+    for(const pricing of [{prompt:'0.000001',completion:'0.000003'},{prompt:'0.0000005',completion:'0.000003',unknown_fee:'0.1'}]) {
+      const fetcher=fakeFetch();fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemini-3-flash-preview',pricing}]}));
       await expect(client(fetcher).generate(messages,{signal:signal()})).rejects.toThrow('PRICING_CHANGED_OR_UNKNOWN_FEE');expect(posts(fetcher)).toHaveLength(0);
     }
   });
   test('catalog optional events are disabled and unknown message features rejected',async()=>{
     const fetcher=fakeFetch();
-    fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemini-2.5-flash-lite',pricing:{prompt:'0.0000001',completion:'0.0000004',image:'0.0000001',audio:'0.0000003',input_audio_cache:'0.00000003',web_search:'0.014',internal_reasoning:'0.0000004',input_cache_read:'0.00000001',input_cache_write:'0.0000000833333333333333'}}]}));
+    fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemini-3-flash-preview',pricing:{prompt:'0.0000005',completion:'0.000003',image:'0.0000005',audio:'0.000001',input_audio_cache:'0.0000001',web_search:'0.014',internal_reasoning:'0.000003',input_cache_read:'0.00000005',input_cache_write:'0.0000000833333333333333'}}]}));
     await client(fetcher).generate(messages,{signal:signal()});
-    expect(JSON.parse(String(posts(fetcher)[0]![1]!.body)).reasoning).toEqual({enabled:false});
+    expect(JSON.parse(String(posts(fetcher)[0]![1]!.body)).reasoning).toEqual({effort:'minimal'});
     const invalid=fakeFetch();
     await expect(client(invalid).generate([{role:'user',content:'Synthetic',tools:[]} as never],{signal:signal()})).rejects.toThrow('INVALID_INPUT');
     expect(invalid).not.toHaveBeenCalled();
@@ -125,6 +129,16 @@ describe('live adapter with fake network only',()=>{
     expect([...ledger.requests.values()][0]!.state).toBe('unknown');
     const oversized=fakeFetch(()=>new Response('synthetic-private-key',{headers:{'content-length':String(3*1024*1024)}}));
     await expect(client(oversized).generate(messages,{signal:signal()})).rejects.toThrow('PROVIDER_RESPONSE_LIMIT');
+  });
+  test('explicit gemini-2.5-flash-lite keeps the previous baseline request policy',async()=>{
+    const ledger=new MemoryLedger();const fetcher=fakeFetch();
+    await client(fetcher,ledger,{textModel:'google/gemini-2.5-flash-lite'}).generate(messages,{signal:signal()});
+    const body=JSON.parse(String(posts(fetcher)[0]![1]!.body));
+    expect(body.model).toBe('google/gemini-2.5-flash-lite');expect(body.reasoning).toEqual({enabled:false});
+    expect(body.provider.max_price).toEqual({prompt:0.1,completion:0.4,request:0});
+    // Same input reserves ~5x more under the default model's higher prices.
+    const defaultLedger=new MemoryLedger();await client(fakeFetch(),defaultLedger).generate(messages,{signal:signal()});
+    expect([...defaultLedger.requests.values()][0]!.reservedMicrousd).toBeGreaterThan(4*[...ledger.requests.values()][0]!.reservedMicrousd);
   });
   test('input/output caps and unapproved models reject locally',async()=>{
     const fetcher=fakeFetch();expect(()=>client(fetcher,new MemoryLedger(),{maxOutputTokens:2048})).toThrow('INVALID_LIMIT');

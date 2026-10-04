@@ -63,7 +63,7 @@ vendorless response alias is accepted, no arbitrary model substitution. Explicit
 is settled; missing/invalid cost keeps reservation. Timeout/ambiguous submission does not auto-retry.
 Persistent response hashes reuse known output without another POST. Failed source vector imports
 can resume from existing immutable vectors; do not change model space under the same revision.
-Text defaults to Gemini2.5 Flash-Lite, temperature0. No automatic model fallback.
+Text defaults to Gemini 3 Flash Preview (reasoning effort minimal), temperature0. Earlier Goal1 results used Gemini2.5 Flash-Lite. No automatic model fallback.
 
 Private reports record actual/fake mode, settings, revision, source IDs, errors, latency and costs.
 Silver questions are caption-derived keyword/date probes, not independently authored human gold.
