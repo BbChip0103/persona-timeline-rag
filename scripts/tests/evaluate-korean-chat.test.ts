@@ -37,7 +37,8 @@ test('persona or memory binding mismatch is rejected before generation', () => {
 test('Korean pilot requires90existing slots, not a budget reset or guaranteed completion', () => {
   const budget = { cap_microusd: '1000000', call_cap: 1000, calls: 898, actual_microusd: '274453', unresolved_microusd: '7625' };
   expect(() => validateKoreanBudget(budget)).not.toThrow();
-  for (const patch of [{ calls: 911 }, { call_cap: 1001 }, { cap_microusd: '1000001' }, { unresolved_microusd: 'NaN' }, { calls: -1 }, { actual_microusd: '1000000' }])
+  expect(() => validateKoreanBudget({ ...budget, cap_microusd: '2000000', call_cap: 10000 })).not.toThrow();
+  for (const patch of [{ calls: 911 }, { call_cap: 10001 }, { cap_microusd: '2000001' }, { unresolved_microusd: 'NaN' }, { calls: -1 }, { actual_microusd: '1000000' }])
     expect(() => validateKoreanBudget({ ...budget, ...patch })).toThrow();
   expect(KOREAN_LIMITS.freshRequests).toBeLessThan(102);
 });

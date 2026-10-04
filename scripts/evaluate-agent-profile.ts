@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import type { ExecutionProfile, Persona, SourcePost } from '@ptr/contracts';
 import { AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION, EXPERIMENT_PROMPT_REVISION, RETRIEVAL_CONTEXT_REVISION } from '@ptr/core';
-import { EMBEDDING_MODEL } from '@ptr/providers';
+import { EMBEDDING_MODEL, MAX_PROVIDER_CALLS, MAX_TOTAL_MICROUSD } from '@ptr/providers';
 import { privateJson } from './prepare-research';
 import { prepareChatTestset, testsetHash, type ChatTestset } from './prepare-character-chat-testset';
 import { prepareImageAnnotations } from './import-image-annotations';
@@ -15,8 +15,8 @@ export const PROFILE_LIMITS={turns:72,textCalls:144,embeddingCalls:96,freshReque
 export interface ProfileRow extends NaturalChatRow {executionProfile:ExecutionProfile}
 export function validateProfileBudget(budget:Record<string,number|string>):void {
   const cap=Number(budget.cap_microusd),calls=Number(budget.calls),callCap=Number(budget.call_cap),actual=Number(budget.actual_microusd),unresolved=Number(budget.unresolved_microusd);
-  if(![cap,calls,callCap,actual,unresolved].every(Number.isSafeInteger)||cap<1||cap>1_000_000||callCap>1000||calls<0||callCap-calls<PROFILE_LIMITS.freshRequests||actual<0||unresolved<0||actual+unresolved>=cap)
-    throw new Error('Existing $1/1000 global budget must retain 120 request slots; no reset allowed');
+  if(![cap,calls,callCap,actual,unresolved].every(Number.isSafeInteger)||cap<1||cap>MAX_TOTAL_MICROUSD||callCap>MAX_PROVIDER_CALLS||calls<0||callCap-calls<PROFILE_LIMITS.freshRequests||actual<0||unresolved<0||actual+unresolved>=cap)
+    throw new Error('Existing global budget must retain 120 request slots; no reset allowed');
 }
 export function matchedProfileRows(rows:ProfileRow[]):ProfileRow[] {
   const key=(row:ProfileRow)=>`${row.conversationId}:${row.userTurnId}:${row.condition}`;

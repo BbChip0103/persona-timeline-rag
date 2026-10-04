@@ -30,9 +30,10 @@ test('live pilot requires explicit opt-ins and preserves the original model', ()
   expect(() => validatePilotArguments(['--live'], { ...env, GOAL1_ALLOW_EXTERNAL_DATA: 'false' })).toThrow();
   expect(() => validatePilotArguments(['--live'], { ...env, GOAL1_TEXT_MODEL: 'other-model' })).toThrow('baseline');
 });
-test('existing global budget needs all 60 slots without enlarging its $1 or 1000-call limits', () => {
+test('existing global budget needs all 60 slots within the $2 / 10000-call ceilings', () => {
   expect(() => validatePilotBudget(budget)).not.toThrow();
-  for (const change of [{ calls: 941 }, { call_cap: 1001 }, { cap_microusd: 1_000_001 }, { actual_microusd: 1_000_000 }, { unresolved_microusd: 'NaN' }, { calls: -1 }])
+  expect(() => validatePilotBudget({ ...budget, cap_microusd: 2_000_000, call_cap: 10_000 })).not.toThrow();
+  for (const change of [{ calls: 941 }, { call_cap: 10_001 }, { cap_microusd: 2_000_001 }, { actual_microusd: 1_000_000 }, { unresolved_microusd: 'NaN' }, { calls: -1 }])
     expect(() => validatePilotBudget({ ...budget, ...change })).toThrow();
 });
 function ledgerFixture() {

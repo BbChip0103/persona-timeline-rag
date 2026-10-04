@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import { PersonaSchema, type Persona, type SourcePost } from '@ptr/contracts';
 import { AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION } from '@ptr/core';
-import { EMBEDDING_MODEL } from '@ptr/providers';
+import { EMBEDDING_MODEL, MAX_PROVIDER_CALLS, MAX_TOTAL_MICROUSD } from '@ptr/providers';
 import { executeNaturalConversation, summarizeNaturalRows, validateUserExport, type UserConversation, type NaturalChatRow } from './evaluate-character-chat';
 import { budgetSnapshot, codeFingerprint, corpusSnapshot, createMemoryPilotRuntime, selectMemoryPilot, validatePilotArguments } from './evaluate-memory-context';
 import { CONDITIONS } from './evaluate-image-rag';
@@ -53,8 +53,8 @@ export function prepareKoreanStudy(personaInputs: Persona[], memories: UserConve
 export function validateKoreanBudget(budget: Record<string, string | number>, freshLimit: number = KOREAN_LIMITS.freshRequests) {
   if (!Number.isSafeInteger(freshLimit) || freshLimit < 1 || freshLimit > KOREAN_LIMITS.freshRequests) throw new Error('Invalid bounded Korean request limit');
   const { cap_microusd: cap, call_cap: max, calls, actual_microusd: actual, unresolved_microusd: unresolved } = budget;
-  if (![cap, max, calls, actual, unresolved].map(Number).every(n => Number.isSafeInteger(n) && n >= 0) || Number(cap) < 1 || Number(cap) > 1_000_000 || Number(max) > 1000 ||
-    Number(max) < 1 || Number(max) - Number(calls) < freshLimit || Number(actual) + Number(unresolved) >= Number(cap)) throw new Error('Existing $1/1000 budget must retain requested slots; never reset');
+  if (![cap, max, calls, actual, unresolved].map(Number).every(n => Number.isSafeInteger(n) && n >= 0) || Number(cap) < 1 || Number(cap) > MAX_TOTAL_MICROUSD || Number(max) > MAX_PROVIDER_CALLS ||
+    Number(max) < 1 || Number(max) - Number(calls) < freshLimit || Number(actual) + Number(unresolved) >= Number(cap)) throw new Error('Existing global budget must retain requested slots; never reset');
 }
 export async function runKoreanChat(args: string[], recollection = false) {
   validatePilotArguments(args, process.env);

@@ -7,7 +7,7 @@ import type { Pool } from 'pg';
 import type { Persona, SourcePost } from '@ptr/contracts';
 import { ChatService, EXPERIMENT_PROMPT_REVISION, RETRIEVAL_CONTEXT_REVISION, type Retrieval } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { EMBEDDING_MODEL, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
+import { EMBEDDING_MODEL, MAX_PROVIDER_CALLS, MAX_TOTAL_MICROUSD, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 import type { RequestTrace, TurnTrace } from './evaluate';
 import { executeNaturalConversation, summarizeNaturalRows, validateUserExport, type NaturalChatRow, type UserConversation } from './evaluate-character-chat';
 import { CONDITIONS, validateCorpus, type CorpusRow } from './evaluate-image-rag';
@@ -38,8 +38,8 @@ export function validatePilotBudget(budget: Record<string, number | string>): vo
   const cap = Number(budget.cap_microusd), calls = Number(budget.calls), callCap = Number(budget.call_cap);
   const actual = Number(budget.actual_microusd), unresolved = Number(budget.unresolved_microusd);
   if (![actual, unresolved].every(value => Number.isSafeInteger(value) && value >= 0)) throw new Error('Invalid existing budget accounting');
-  if (![cap, calls, callCap].every(Number.isSafeInteger) || cap < 1 || cap > 1_000_000 || calls < 0 || callCap < 1 || callCap > 1000 || callCap - calls < PILOT_LIMITS.freshRequests)
-    throw new Error('Existing global budget must have 60 request slots and remain within $1 / 1000 calls');
+  if (![cap, calls, callCap].every(Number.isSafeInteger) || cap < 1 || cap > MAX_TOTAL_MICROUSD || calls < 0 || callCap < 1 || callCap > MAX_PROVIDER_CALLS || callCap - calls < PILOT_LIMITS.freshRequests)
+    throw new Error('Existing global budget must have 60 request slots within its USD and call caps');
   if (actual + unresolved >= cap) throw new Error('Existing global budget exhausted');
 }
 /** Uses only the existing global ledger: no initialization, reset or independent allowance. */

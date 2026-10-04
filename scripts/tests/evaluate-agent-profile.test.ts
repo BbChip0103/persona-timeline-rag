@@ -3,7 +3,8 @@ const budget={cap_microusd:1_000_000,call_cap:1000,calls:880,actual_microusd:'23
 test('paired pilot preserves global budget and does not pretend worst-case calls fit120fresh cap',()=>{
   expect(()=>validateProfileBudget(budget)).not.toThrow();
   expect(PROFILE_LIMITS).toEqual({turns:72,textCalls:144,embeddingCalls:96,freshRequests:120});
-  for(const patch of [{calls:881},{call_cap:1001},{cap_microusd:1_000_001},{actual_microusd:1_000_000},{unresolved_microusd:'NaN'},{calls:-1}])expect(()=>validateProfileBudget({...budget,...patch})).toThrow();
+  expect(()=>validateProfileBudget({...budget,cap_microusd:2_000_000,call_cap:10_000})).not.toThrow();
+  for(const patch of [{calls:881},{call_cap:10_001},{cap_microusd:2_000_001},{actual_microusd:1_000_000},{unresolved_microusd:'NaN'},{calls:-1}])expect(()=>validateProfileBudget({...budget,...patch})).toThrow();
 });
 test('summaries separate profiles, operational completion and failed observations, never accuracy',()=>{
   const row={executionProfile:'agent_loop',condition:'off',trace:{state:'failed',requests:[],textCalls:1,retrievalCalls:0,embeddingCalls:0,crossPersonEvidence:0,latencyMs:1}} as unknown as ProfileRow;

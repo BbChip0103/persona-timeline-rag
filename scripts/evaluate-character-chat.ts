@@ -3,7 +3,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { ChatReply, ExecutionProfile, Persona, RagCondition, SourcePost } from '@ptr/contracts';
 import { AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION } from '@ptr/core';
-import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL } from '@ptr/providers';
+import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL, MAX_TOTAL_MICROUSD } from '@ptr/providers';
 import { createHarnessRuntime, type HarnessRuntime, type TurnTrace } from './evaluate';
 import { CONDITIONS, validateCorpus, type CorpusRow } from './evaluate-image-rag';
 import { prepareImageAnnotations, type AnnotationPlan } from './import-image-annotations';
@@ -147,7 +147,7 @@ export async function runNaturalChat(args: string[]): Promise<void> {
     const budgetBefore = await budgetSnapshot(runtime);
     // Require120 available slots, not a completion guarantee: agent-loop tool rounds can add calls.
     // Existing global reservations enforce the unchanged budget and stop without retry.
-    if (Number(budgetBefore.call_cap) - Number(budgetBefore.calls) < 120 || Number(budgetBefore.cap_microusd) > 1_000_000)
+    if (Number(budgetBefore.call_cap) - Number(budgetBefore.calls) < 120 || Number(budgetBefore.cap_microusd) > MAX_TOTAL_MICROUSD)
       throw new Error('Insufficient existing request slots or unsafe budget');
     const corpusBefore = await corpusSnapshot(runtime, sources, plan);
     for (const persona of personas) if (testsetHash(await runtime.personas.get(persona.id, persona.revision)) !== testsetHash(persona))

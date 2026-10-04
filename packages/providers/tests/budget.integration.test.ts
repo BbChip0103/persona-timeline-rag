@@ -1,5 +1,5 @@
 import { createLocalPool } from '@ptr/storage';
-import { PostgresBudgetLedger } from '../src';
+import { MAX_TOTAL_MICROUSD, PostgresBudgetLedger } from '../src';
 
 // Explicit test-only credential injection; never searches env files or touches shared DBs.
 const databaseUrl=process.env.GOAL1_TEST_DATABASE_URL;
@@ -16,7 +16,7 @@ const enabled=process.env.GOAL1_TEST_BUDGET_DB==='true'&&Boolean(databaseUrl);
   });
   test('concurrent independent connections cannot reserve beyond the singleton cap',async()=>{
     const result=await pool!.query("SELECT COALESCE(SUM(CASE WHEN state='settled' THEN actual_microusd ELSE GREATEST(reserved_microusd,COALESCE(actual_microusd,0)) END),0) AS committed FROM ptr_provider_requests");
-    const available=1_000_000-Number(result.rows[0].committed);
+    const available=MAX_TOTAL_MICROUSD-Number(result.rows[0].committed);
     expect(available).toBeGreaterThan(10);
     const amount=Math.ceil(available*0.6);
     const reservations=await Promise.allSettled([ledger!.reserve(prefix+'a',amount),ledger!.reserve(prefix+'b',amount)]);
@@ -39,6 +39,6 @@ const enabled=process.env.GOAL1_TEST_BUDGET_DB==='true'&&Boolean(databaseUrl);
   });
   test('cap cannot be bypassed with unsafe pools or invalid reservation amounts',async()=>{
     expect(()=>new PostgresBudgetLedger({options:{connectionString:'postgresql://unsafe:unsafe@external/x'}} as never,databaseUrl!)).toThrow('UNSAFE_DATABASE_POOL');
-    for(const amount of [0,-1,0.1,1_000_001,Number.NaN]) await expect(ledger!.reserve(prefix+'invalid',amount)).rejects.toThrow('BUDGET_EXCEEDED');
+    for(const amount of [0,-1,0.1,MAX_TOTAL_MICROUSD+1,Number.NaN]) await expect(ledger!.reserve(prefix+'invalid',amount)).rejects.toThrow('BUDGET_EXCEEDED');
   });
 });

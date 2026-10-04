@@ -12,13 +12,14 @@ export interface BudgetLedger {
   finish(key:string,costMicrousd:number|null,response:unknown|null,generationId:string|null):Promise<void>;
   get(key:string):Promise<BudgetRequest|undefined>;
 }
-export const MAX_TOTAL_MICROUSD=1_000_000;
+export const MAX_TOTAL_MICROUSD=2_000_000;
+export const MAX_PROVIDER_CALLS=10_000;
 // Never reset this singleton budget between runs: all live callers share its ledger.
 export const BUDGET_SCHEMA_SQL=`
 CREATE TABLE IF NOT EXISTS ptr_provider_budget (
- id text PRIMARY KEY CHECK(id='global'), cap_microusd bigint NOT NULL CHECK(cap_microusd BETWEEN 0 AND 1000000),
- call_cap integer NOT NULL CHECK(call_cap BETWEEN 0 AND 1000));
-INSERT INTO ptr_provider_budget VALUES ('global',1000000,1000) ON CONFLICT DO NOTHING;
+ id text PRIMARY KEY CHECK(id='global'), cap_microusd bigint NOT NULL CHECK(cap_microusd BETWEEN 0 AND ${MAX_TOTAL_MICROUSD}),
+ call_cap integer NOT NULL CHECK(call_cap BETWEEN 0 AND ${MAX_PROVIDER_CALLS}));
+INSERT INTO ptr_provider_budget VALUES ('global',${MAX_TOTAL_MICROUSD},${MAX_PROVIDER_CALLS}) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS ptr_provider_requests (
  key text PRIMARY KEY, state text NOT NULL CHECK(state IN ('reserved','submitted','settled','unknown')),
  reserved_microusd bigint NOT NULL CHECK(reserved_microusd >= 0),

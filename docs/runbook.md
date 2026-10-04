@@ -46,8 +46,8 @@ statistics and manifest categories. Same-day/person chronological dev/test is on
 ## Live research (explicit, shared cap)
 
 Provider authorization and external processing permission must be established before enabling live.
-All live text/embedding callers share durable PostgreSQL reservations with a **US$1 aggregate cap**
-and 1000-call limit. This is not a per-run/provider budget. Never reset budget rows between reruns.
+All live text/embedding callers share durable PostgreSQL reservations with a **US$2 aggregate cap**
+and 10000-call limit (raised by the user on 2026-10-05 from the agent-chosen US$1/1000). This is not a per-run/provider budget. Never reset budget rows between reruns.
 Model prices are verified from public OpenRouter catalogs. Unknown prices fail closed.
 
 ```sh
