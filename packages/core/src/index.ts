@@ -6,3 +6,5 @@ export * from './chat-service';
 export * from './request-fingerprint';
 export * from './safety';
 export * from './conversation-context';
+export * from './agent-protocol';
+export * from './agent-runtime';

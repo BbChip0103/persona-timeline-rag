@@ -5,11 +5,12 @@ import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { RagConditionSchema, RetrievalModeSchema, SendTurnSchema, TimezoneSchema, type ChatSession, type ChatTurn } from '@ptr/contracts';
+import { ExecutionProfileSchema, RagConditionSchema, RetrievalModeSchema, SendTurnSchema, TimezoneSchema, type ChatSession } from '@ptr/contracts';
 import { CoreError } from '@ptr/core';
+import { publicTurn } from './public-turn';
 import type { ApiRuntime, CreativeArtifact } from './runtime';
 const RUNTIME=Symbol('API_RUNTIME');
-const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC')}).strict();
+const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
 const draftSchema=z.object({brief:z.string().trim().min(1).max(2000)}).strict();
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
 const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason:'이 포스트 초안 요청은 이미지를 제출하지 않습니다. 무료 이미지 생성은 자격을 검증하는 별도 private runner에서 실행하며 완료 결과와 작업 상태를 별도로 기록합니다.'};
@@ -19,7 +20,7 @@ function owner(request:Request):string {
   return value;
 }
 function safeSession(session:ChatSession) { const {ownerId:_,...safe}=session;return safe; }
-function safeTurn(turn:ChatTurn) { const {ownerId:_,...safe}=turn;return safe; }
+const safeTurn=publicTurn;
 @Catch()
 class SafeErrorFilter implements ExceptionFilter {
   catch(error:unknown,host:ArgumentsHost) {

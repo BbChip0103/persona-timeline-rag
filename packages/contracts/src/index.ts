@@ -43,10 +43,21 @@ export const EvidenceRefSchema = z.object({sourceId:id,annotationId:id.optional(
 export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
 export interface EvidenceCard { sourceId:string; personId:string; sourceUrl:string; postedAt:string; eventDate:string|null; snapshot:string; hash:string; quote:string; origin?:'source_caption'|'ai_image_annotation'; annotationId?:string; imageHash?:string; annotationHash?:string; annotationRevision?:string }
 export interface FactualClaim { text:string; evidenceRefs:EvidenceRef[] }
+export interface AgentExecution {
+  revision:string; promptRevision:string; modelCalls:number; toolCalls:number;
+  variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful'};
+  decisionSummary?:string;
+  steps:Array<{phase:'context'|'model'|'tool'|'validation';iteration:number;sourceIds?:string[];query?:string}>;
+  validator:'disabled'|'skipped_tool_followup'|'accepted'|'rejected'|'error';
+}
+export const ExecutionProfileSchema=z.enum(['legacy','agent_loop']);
+export type ExecutionProfile=z.infer<typeof ExecutionProfileSchema>;
 export interface ChatReply {
   sessionId:string; turnId:string; messageId:string; personId:string; personaRevision:string;
   responseKind:'small_talk'|'timeline'|'clarification'|'unsupported'; status:ReplyStatus;
   grounding?:'unverified_model'|'source_bound_quotes'; content:string; claims:FactualClaim[]; evidence:EvidenceCard[]; limitations:string[];
+  /** Internal execution/state; must not be exposed by public API DTOs. */
+  agent?:AgentExecution;
   promptEvidence?:{sourceIds:string[];annotationIds:string[];omittedAnnotations:number;promptBytes:number};
   sourceContext?:{revision:string;references:EvidenceCard[]};
   retrievalContext?:{revision:string;action:'none'|'search'|'reuse'|'clarify';contextTurnIds:string[];query?:string;reusedSourceIds:string[]};
@@ -55,7 +66,7 @@ export interface ProviderMessage { role:'system'|'user'|'assistant'; content:str
 export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'completed'|'failed'|'cancelled';
 export interface ChatSession {
   id:string; ownerId:string; personId:string; personaId:string; personaRevision:string;
-  language:string; timezone:string; retrievalMode:RetrievalMode; ragCondition?:RagCondition; createdAt:string;
+  language:string; timezone:string; retrievalMode:RetrievalMode; ragCondition?:RagCondition; executionProfile?:ExecutionProfile; createdAt:string;
 }
 export interface ChatMessage { id:string; sessionId:string; turnId:string|null; role:'user'|'assistant'; content:string; createdAt:string }
 export interface ChatTurn {
@@ -66,7 +77,7 @@ export const SessionRetrievalSchema = z.object({retrievalMode:RetrievalModeSchem
   if(value.ragCondition==='off' && value.retrievalMode && value.retrievalMode!=='off' || value.ragCondition && value.ragCondition!=='off' && value.retrievalMode==='off')
     context.addIssue({code:z.ZodIssueCode.custom,message:'RAG condition and retrieval algorithm conflict'});
 }).transform(value=>({...value,retrievalMode:value.retrievalMode ?? (value.ragCondition && value.ragCondition!=='off' ? 'semantic' as const : 'off' as const)}));
-export const CreateSessionSchema = z.object({personId:id,personaId:id,personaRevision:id,timezone:TimezoneSchema.default('UTC'),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional()}).strict().transform((value,context)=>{
+export const CreateSessionSchema = z.object({personId:id,personaId:id,personaRevision:id,timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.optional(),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional()}).strict().transform((value,context)=>{
   const result=SessionRetrievalSchema.safeParse({retrievalMode:value.retrievalMode,ragCondition:value.ragCondition});
   if(!result.success){context.addIssue({code:z.ZodIssueCode.custom,message:'RAG condition and retrieval algorithm conflict'});return z.NEVER;}
   return {...value,...result.data};

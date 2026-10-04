@@ -5,8 +5,10 @@ import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
 import { containsCredentialPattern, containsUngroundedBiography, isBiographicalRequest } from './safety';
+import { AgentVariablesSchema } from './agent-protocol';
+import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
-export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number}
+export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator}
 const activeStates=['pending','retrieving','generating','validating'] as const;
 export class ChatService {
   private readonly controllers=new Map<string,AbortController>();
@@ -21,7 +23,7 @@ export class ChatService {
     if(!result.success) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=result.data;
     if(persona.id !== value.personaId || persona.revision !== value.personaRevision || persona.personId !== value.personId) throw new CoreError('FORBIDDEN');
-    const session:ChatSession={id:randomUUID(),ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:{}),createdAt:new Date().toISOString()};
+    const session:ChatSession={id:randomUUID(),ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString()};
     await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:`AI 연구용 시뮬레이션입니다. ${persona.greeting}`,createdAt:session.createdAt});
     return session;
   }
@@ -85,10 +87,11 @@ export class ChatService {
     if(!value.timeline)query={...query,query:context.query};
     let memoryTrace:NonNullable<ChatReply['retrievalContext']>={revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]};
     const previousMessage=[...history].reverse().find(message=>message.role==='user'&&message.turnId);
-    const previous=context.followUp&&previousMessage?.turnId?await this.options.store.getTurn(previousMessage.turnId,session.ownerId):undefined;
-    const boundPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
+    const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await this.options.store.getTurn(previousMessage.turnId,session.ownerId):undefined;
+    const ownedPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
       &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
       &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
+    const boundPrevious=context.followUp?ownedPrevious:undefined;
     const sensitive=/phone number|home address|private address|real.time location|rumou?r|secret relationship|연락처|전화번호|집 주소|주거지|실시간 위치|사생활|루머|미성년/i.test(value.text);
     const inferred=context.creative ? 'small_talk' : isBiographicalRequest(value.text) || /\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i.test(context.followUp?context.query:value.text) ? 'timeline' : 'small_talk';
     // Conservative explicit clarification/unsupported routes never answer or retrieve.
@@ -105,6 +108,7 @@ export class ChatService {
     const ambiguous=new Set(references.map(ref=>ref.sourceId)).size>1
       || /photo|picture|사진/i.test(value.text)&&new Set((boundPrevious?.evidence??[]).flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
     let promptEvidence:ChatReply['promptEvidence'];
+    let agent:ChatReply['agent'];
     if(intent==='clarification' || intent==='unsupported') {
       output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':'이 연구 자료 범위에서는 확인할 수 없어요.',claims:[],evidence:[],limitations:[]};
     } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
@@ -138,13 +142,44 @@ export class ChatService {
         if(session.ragCondition!=='caption_image') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
       if(!await this.options.store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
-      const experiment=session.ragCondition?buildExperimentContext(persona,history,value.text,sources):undefined;
+      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,history,value.text,sources):undefined;
       memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
-      const result=await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
+      const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
+        provider:this.options.provider,persona,history,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,
+        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),
+        ...(session.retrievalMode!=='off'&&!context.creative&&this.options.retrieval?{search:async(toolQuery:string)=>{
+          if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
+          const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
+          const found=filterEvidence(await this.options.retrieval!.search(scopedQuery,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic',
+            ...(session.ragCondition&&session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})}),scopedQuery,session.personId);
+          memoryTrace={...memoryTrace,action:'search',query:toolQuery};
+          return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
+        }}:{}),
+      }):undefined;
+      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
       if(controller.signal.aborted) return;
-      if(session.ragCondition) {
+      if(agentRun) {
+        agent=agentRun.agent;memorySources=agentRun.context.sources;
+        promptEvidence={sourceIds:memorySources.map(source=>source.id),annotationIds:memorySources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
+          omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8')};
+        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'));
+        if(!session.ragCondition&&intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
+        if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:'실제 생애나 과거 활동에 대한 근거 없이 이야기할 수 없어요.',claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
+        agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
+        if(this.options.agentValidator&&output.status==='answered') {
+          if(agent.toolCalls)agent.validator='skipped_tool_followup';
+          else {
+            try {agent.validator=await this.options.agentValidator.validate({question:value.text,answer:output.content,sources:memorySources,personId:session.personId,signal:controller.signal})==='accept'?'accepted':'rejected';}
+            catch {agent.validator='error';}
+            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:'지금 자료만으로는 확실하게 이야기하기 어려워요.',claims:[],evidence:[],limitations:[`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
+          }
+        }
+        if(output.status==='answered')agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
+        if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
+      }
+      else if(session.ragCondition) {
         output=validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition);
         if(experiment!.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${experiment!.omittedAnnotations}`);
       }
@@ -158,8 +193,9 @@ export class ChatService {
       }
     }
     if(controller.signal.aborted || !await this.options.store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
+    if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await this.options.store.completeTurn(turn.id,reply);
   }
 }

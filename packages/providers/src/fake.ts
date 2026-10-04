@@ -10,6 +10,12 @@ export class FakeTextProvider implements TextProvider {
   async generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> {
     if(options.signal.aborted) throw new ProviderError('CANCELLED');
     this.calls++;
+    if(messages.some(message=>message.role==='system'&&message.content.includes('AGENT_JSON_REPLY'))) {
+      const input=messages.find(message=>message.role==='user'&&message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '));
+      let data:unknown=[];try{data=input?JSON.parse(input.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length)):[];}catch{/* No synthetic evidence on malformed context. */}
+      const source=Array.isArray(data)?data.find(value=>value&&typeof value.sourceId==='string'&&typeof value.quoteCandidate==='string'&&value.quoteCandidate):undefined;
+      return JSON.stringify({status:source?'answered':'insufficient_evidence',message:source?'합성 자료의 캡션을 참고해 이야기해요.':'연구용 AI 시뮬레이션이에요. 편하게 이야기해 주세요.',evidenceRefs:source?[{sourceId:source.sourceId,quote:source.quoteCandidate}]:[],variableUpdates:{}});
+    }
     if(messages.some(message=>message.role==='system'&&message.content.includes('TIMELINE_JSON_REPLY'))) {
       const input=messages.find(message=>message.role==='user'&&message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '));
       let sources:unknown=[];

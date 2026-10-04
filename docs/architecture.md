@@ -74,3 +74,8 @@ DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard�
 3. **RAG:**1,189건source import→lexical→semantic과사건추출표본/질문/대화평가. 같은persona/model/prefix의 off/lexical/semantic과각자누적history를구분해비교한다. 원본사진VLM 근거보강은그뒤선택이다.
 
 [PRD](prd.md) · [페르소나·채팅](persona-chat.md) · [창작물](creative-artifacts.md) · [근거 계약](evidence-schema.md) · [평가](evaluation.md). 실제 대상/다른 프로젝트참고경로는비공개명세에 둔다.
+
+
+### 캐릭터 에이전트 실행 profile
+
+새 API 세션은 `agent_loop` 독립 structured-response/state/readonly-tool loop를 사용한다. 옛 세션과 기존 core/evaluation 기본값은 `legacy`로 유지한다. 전체 다른 프로젝트 engine/운영 설정 재현이 아니며, 범위·비용·남은 차이·검증은 [character-agent.md](character-agent.md)를 따른다.

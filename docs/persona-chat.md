@@ -128,3 +128,8 @@ owner 확인 후 owned session 응답 projection이며 구현된 API가 아니�
 4. tool의 검색 근거가 **최종 페르소나 답변**에 사용되고 말투 변환에서 날짜/활동이 추가되지 않는지 검증한다. 검색 hit 표시만으로 통과하지 않는다.
 5. concurrent sends, idempotent retry, tool/provider timeout, cancel/늦은 결과, stream 단절/reload, 미검증 claim 비공개.
 6. [평가 명세](evaluation.md)의12시나리오를 같은 persona/model/history에서 비교하고 사실·표현·미답을 따로 보고한다. 기반 unit test 통과를 실제4명 model 성능과 혼동하지 않는다.
+
+
+## 실행 profile
+
+새 API 세션의 `agent_loop` 응답은 사용자 message와 비공개 결정 요약/대화 변수/action을 분리한다. 이전 세션과 기존 직접 core/evaluation 경로는 `legacy`를 유지한다. 상세 [character-agent.md](character-agent.md). persona 및 대화 변수는 실제 활동 근거나 인물 정체성 인증이 아니다.
