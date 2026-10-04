@@ -3,7 +3,7 @@ import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema
 import { CoreError, type ConversationStore, type PersonaRepository, type Retrieval, type TextProvider } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
-import { isPostMemoryRequest, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
+import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
 import { containsCredentialPattern, containsUngroundedBiography, isBiographicalRequest } from './safety';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number}
@@ -98,10 +98,12 @@ export class ChatService {
       : value.timeline || inferred==='timeline' || !context.creative && (isPostMemoryRequest(value.text) || context.followUp && boundPrevious?.responseKind==='timeline') || !context.creative && session.ragCondition && /image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i.test(value.text) ? 'timeline' : value.intent ?? inferred;
     let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
     let sources:SourcePost[]=[];
+    let memorySources:SourcePost[]=[];
     const references=context.followUp&&!value.timeline&&boundPrevious?.grounding==='source_bound_quotes'&&boundPrevious.responseKind==='timeline'
-      ?boundPrevious.evidence.filter(ref=>ref.personId===session.personId):[];
+      ?(boundPrevious.sourceContext?.revision===RETRIEVAL_CONTEXT_REVISION?boundPrevious.sourceContext.references:boundPrevious.evidence)
+        .filter(ref=>ref.personId===session.personId&&boundPrevious.evidence.some(cited=>cited.sourceId===ref.sourceId&&cited.hash===ref.hash&&cited.snapshot===ref.snapshot)):[];
     const ambiguous=new Set(references.map(ref=>ref.sourceId)).size>1
-      || /photo|picture|사진/i.test(value.text)&&new Set(references.flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
+      || /photo|picture|사진/i.test(value.text)&&new Set((boundPrevious?.evidence??[]).flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
     let promptEvidence:ChatReply['promptEvidence'];
     if(intent==='clarification' || intent==='unsupported') {
       output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':'이 연구 자료 범위에서는 확인할 수 없어요.',claims:[],evidence:[],limitations:[]};
@@ -123,7 +125,7 @@ export class ChatService {
           const pinned=resolved.flatMap(source=>{
             const matching=references.filter(ref=>ref.sourceId===source.id&&ref.hash===source.hash&&ref.snapshot===source.snapshot
               &&(ref.annotationId?source.imageAnnotations?.some(annotation=>ref.annotationId===annotation.id&&ref.annotationRevision===annotation.revision&&ref.imageHash===annotation.imageHash&&ref.annotationHash===annotation.annotationHash&&annotation.text.includes(ref.quote)):source.caption.includes(ref.quote)));
-            if(!matching.length)return [];
+            if(!matching.length||references.some(ref=>ref.sourceId===source.id&&ref.annotationId&&!matching.includes(ref)))return [];
             return [{...source,...(source.imageAnnotations?{imageAnnotations:source.imageAnnotations.filter(annotation=>matching.some(ref=>ref.annotationId===annotation.id))}:{})}];
           });
           sources=filterEvidence(pinned,query,session.personId);
@@ -137,6 +139,7 @@ export class ChatService {
       }
       if(!await this.options.store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
       const experiment=session.ragCondition?buildExperimentContext(persona,history,value.text,sources):undefined;
+      memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
       const result=await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
@@ -155,7 +158,8 @@ export class ChatService {
       }
     }
     if(controller.signal.aborted || !await this.options.store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
-    const reply:ChatReply={...output,retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const remembered=rememberSourceContext(memorySources,output.evidence);
+    const reply:ChatReply={...output,...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await this.options.store.completeTurn(turn.id,reply);
   }
 }

@@ -1,5 +1,5 @@
 import type { ChatMessage, EvidenceCard, Persona, SourcePost } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, retrievalContext } from '../src';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, retrievalContext, rememberSourceContext } from '../src';
 const persona:Persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:[],boundaries:[],sourceRefs:[],greeting:'안녕하세요.'};
 const source:SourcePost={id:'synthetic-post',personId:persona.personId,caption:'합성 도예 수업에서 찻잔을 만들었다.',postedAt:'2020-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post',hash:'synthetic-hash',snapshot:'v1',unsafe:false};
 const raw=(posts=[source])=>JSON.stringify({status:'answered',answer:'합성 자료를 참고한 답변입니다.',evidenceRefs:posts.map(post=>({sourceId:post.id,quote:post.caption}))});
@@ -115,4 +115,31 @@ test('explicit topic and time changes do not inherit or reuse an earlier referen
     const context=retrievalContext([message('지난 도예 수업의 사진')],text);
     expect(context.followUp).toBe(false);expect(context.query).toBe(text);expect(context.contextTurnIds).toEqual([]);
   }
+});
+test('caption-only first citation still retains the offered image context of that same parent',async()=>{
+  const f=await fixture('caption_image');const annotation={id:'synthetic-visual',imageHash:'visual-hash',annotationHash:'annotation-hash',revision:'old-revision',text:'합성 노트북 옆에 투명한 컵이 있다.',model:'synthetic',humanReviewed:false as const};
+  const unrelated={...source,id:'synthetic-unrelated',caption:'다른 합성 행사',imageAnnotations:[{...annotation,id:'unrelated-visual'}]};
+  f.retrieval.search.mockResolvedValue([{...source,imageAnnotations:[annotation]},unrelated]);
+  const first=await f.send('도예 수업의 사진은 언제 올렸어?');
+  expect(first.reply?.evidence.map(ref=>ref.annotationId)).toEqual([undefined]);
+  expect(first.reply?.sourceContext?.references.map(ref=>ref.annotationId)).toEqual([undefined,annotation.id]);
+  f.retrieval.resolve.mockResolvedValue([{...source,imageAnnotations:[annotation]}]);
+  const second=await f.send('그 사진 옆에 뭐가 있었어?');
+  expect(second.reply?.retrievalContext?.action).toBe('reuse');expect(second.reply?.promptEvidence?.annotationIds).toEqual([annotation.id]);
+  expect(f.retrieval.search).toHaveBeenCalledTimes(1);expect(f.provider.generate).toHaveBeenCalledTimes(2);
+});
+test('caption and off never retain image references as source context',async()=>{
+  for(const condition of ['caption','off'] as const){
+    const f=await fixture(condition);const a={id:'visual',imageHash:'image-hash',annotationHash:'annotation-hash',revision:'v1',text:'합성 컵',model:'synthetic',humanReviewed:false as const};
+    f.retrieval.search.mockResolvedValue([{...source,imageAnnotations:[a]}]);
+    const turn=await f.send('사진을 언제 올렸어?');
+    expect(turn.reply?.sourceContext?.references.some(ref=>ref.annotationId)).not.toBe(true);
+  }
+});
+
+test('original context references are capped at 20 and cannot promote an uncited parent',()=>{
+  const cited={sourceId:source.id,personId:source.personId,sourceUrl:source.sourceUrl,postedAt:source.postedAt,eventDate:null,snapshot:source.snapshot,hash:source.hash,quote:source.caption};
+  const annotations=Array.from({length:30},(_,i)=>({id:`visual-${i}`,imageHash:`image-${i}`,annotationHash:`hash-${i}`,revision:'v1',text:`合成 visual ${i}`,model:'synthetic',humanReviewed:false as const}));
+  const refs=rememberSourceContext([{...source,imageAnnotations:annotations},{...source,id:'uncited-parent',imageAnnotations:annotations}], [cited]);
+  expect(refs).toHaveLength(20);expect(refs.every(ref=>ref.sourceId===source.id)).toBe(true);
 });

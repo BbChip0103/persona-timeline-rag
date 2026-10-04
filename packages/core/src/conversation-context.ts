@@ -1,6 +1,6 @@
-import type { ChatMessage } from '@ptr/contracts';
+import type { ChatMessage, EvidenceCard, SourcePost } from '@ptr/contracts';
 import { containsCredentialPattern, isExplicitlyCreativeRequest } from './safety';
-export const RETRIEVAL_CONTEXT_REVISION='user-context-v1-no-rewrite-call';
+export const RETRIEVAL_CONTEXT_REVISION='user-context-v2-pinned-source-context';
 // A bounded deterministic baseline, NOT semantic coreference or an LLM query rewrite.
 export function isContextFollowUp(text:string):boolean {
   if(/\b(?:instead|different|new topic|this week|right now)\b|말고|다른\s?(?:글|사진|주제|여행)|새로운|이번\s?주|지금/i.test(text))return false;
@@ -31,4 +31,20 @@ export function retrievalContext(history:ChatMessage[],text:string,explicitTimel
     segments.unshift(segment);selected.unshift(message);remaining-=[...segment].length+1;
   }
   return {query:[...segments,current].join('\n'),contextTurnIds:selected.map(message=>message.turnId!),followUp,creative};
+}
+
+/** Original context references, not additional model claims or assistant-generated facts. */
+export function rememberSourceContext(sources:SourcePost[],cited:EvidenceCard[]):EvidenceCard[] {
+  const references=[...cited];
+  const parents=new Set(cited.map(ref=>ref.sourceId));
+  for(const source of sources.filter(source=>parents.has(source.id))) {
+    const base={sourceId:source.id,personId:source.personId,sourceUrl:source.sourceUrl,postedAt:source.postedAt,eventDate:source.eventDate,snapshot:source.snapshot,hash:source.hash};
+    if(source.caption&&!references.some(ref=>ref.sourceId===source.id&&!ref.annotationId))references.push({...base,quote:[...source.caption].slice(0,96).join(''),origin:'source_caption'});
+    for(const annotation of source.imageAnnotations??[]) {
+      if(references.length>=20)break;
+      if(references.some(ref=>ref.sourceId===source.id&&ref.annotationId===annotation.id))continue;
+      references.push({...base,quote:[...annotation.text].slice(0,96).join(''),origin:'ai_image_annotation',annotationId:annotation.id,imageHash:annotation.imageHash,annotationHash:annotation.annotationHash,annotationRevision:annotation.revision});
+    }
+  }
+  return references.slice(0,20);
 }
