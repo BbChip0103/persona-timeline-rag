@@ -38,6 +38,10 @@ Settings: `PTR_QUEUE_MAX_DEPTH` (256), `PTR_DB_POOL_MAX` (8, per process), `PTR_
 - `openrouter`: live API through the shared US$2 / 10000-request ledger (requires `GOAL1_LIVE_ENABLED=true`).
 - `selfhosted`: `PTR_SELFHOSTED_BASE_URL` (must be `http://127.0.0.1:<port>/v1`, i.e. an SSH tunnel) and
   `PTR_SELFHOSTED_MODEL`; streams to record TTFT; no per-request billing (GPU time is accounted per run).
+  `PTR_SELFHOSTED_STRUCTURED=1` sends `AGENT_RESPONSE_JSON_SCHEMA` as `response_format: json_schema` for
+  agent_loop agent turns so the engine's guided decoding enforces the reply shape. Use it with small
+  self-hosted models: without it Gemma 4 E4B sometimes omits `evidenceRefs` and the strict no-repair
+  contract fails the turn. The zod contract is still the validator.
 
 ## Load / failure harness (synthetic only)
 
@@ -51,11 +55,12 @@ pnpm exec tsx scripts/loadtest.ts ramp --levels=1024 --execution=queue --workers
 pnpm exec tsx scripts/loadtest.ts crash --users=32 [--execution=queue --workers=2 ...]           # kill API / all workers
 pnpm exec tsx scripts/loadtest.ts faults --users=32 --latency='{"medianMs":1900,"p95Ms":3600,"error429Rate":0.1,"hangRate":0.05}'
 pnpm exec tsx scripts/loadtest.ts same-session --trials=30
-pnpm exec tsx scripts/loadtest.ts ramp --levels=16 --provider=selfhosted --base-url=http://127.0.0.1:18000/v1 --model=gemma-4-e4b-fp8
+pnpm exec tsx scripts/loadtest.ts ramp --levels=4,16,64 --execution=queue --workers=2 --turns-per-session=10 \
+  --provider=selfhosted --base-url=http://127.0.0.1:18000/v1 --model=gemma-4-e4b-fp8 --structured=1
 ```
 
-Virtual users create a session and loop POST turn → poll until terminal; rejected requests honor
-`Retry-After`. Reports (`reports/loadtest/<run>/report.json`, private) hold per-stage throughput, e2e/accept
+Virtual users create a session and loop POST turn → poll until terminal (`--turns-per-session=N` starts a new
+session every N turns); rejected requests honor `Retry-After`. Reports (`reports/loadtest/<run>/report.json`, private) hold per-stage throughput, e2e/accept
 percentiles, error codes, stuck/orphaned turns, and per-second API/worker CPU, RSS and DB connections.
 Fake-model results describe the serving architecture, never real LLM throughput.
 
