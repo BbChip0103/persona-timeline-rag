@@ -9,7 +9,7 @@ function integer(name:string,fallback:number,min:number,max:number):number {
   return value;
 }
 async function main() {
-  const runtime=createRuntime({...process.env,PTR_EXECUTION:'queue'});
+  const runtime=createRuntime({...process.env,PTR_EXECUTION:'queue'},{onTurnFailure:({code})=>process.stderr.write(`turn failed ${code}\n`)});
   if(!runtime.queue) throw new Error('QUEUE_UNAVAILABLE');
   const workerId=process.env.PTR_WORKER_ID??`worker-${randomUUID().slice(0,8)}`;
   // Lease must outlive several heartbeats (lease/3) and be shorter than recovery expectations.

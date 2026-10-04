@@ -95,10 +95,11 @@ class Api {
     const child=this.child;if(!child||child.exitCode!==null) return Promise.resolve();
     return new Promise(resolve=>{child.once('exit',()=>resolve());child.kill(signal);});
   }
-  async call(path:string,owner:string,body?:unknown):Promise<{status:number;json:ApiJson}> {
+  async call(path:string,owner:string,body?:unknown):Promise<{status:number;json:ApiJson;retryAfterMs:number|null}> {
     const response=await fetch(`${this.base}/${path}`,{method:body===undefined?'GET':'POST',
       headers:{Authorization:`Bearer ${this.token}`,'X-PTR-Owner':owner,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
-    return {status:response.status,json:await response.json().catch(()=>({})) as ApiJson};
+    const retryAfter=Number(response.headers.get('retry-after'));
+    return {status:response.status,json:await response.json().catch(()=>({})) as ApiJson,retryAfterMs:Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:null};
   }
 }
 
@@ -158,7 +159,9 @@ async function virtualUser(o:UserOptions):Promise<void> {
     try {
       const sent=await o.api.call(`sessions/${session}/turns`,owner,{clientRequestId:randomUUID(),text:LOADTEST_QUESTIONS[(o.personaIndex+n++)%LOADTEST_QUESTIONS.length]});
       acceptMs=Date.now()-started;
-      if(sent.status>=300) {o.samples.push({outcome:'rejected',acceptMs,e2eMs:null,errorCode:sent.json?.error?.code??`HTTP_${sent.status}`});await sleep(200);continue;}
+      // Well-behaved client: honor Retry-After with jitter instead of hammering a saturated API.
+      if(sent.status>=300) {o.samples.push({outcome:'rejected',acceptMs,e2eMs:null,errorCode:sent.json?.error?.code??`HTTP_${sent.status}`});
+        await sleep(sent.retryAfterMs?sent.retryAfterMs+Math.random()*sent.retryAfterMs/2:200);continue;}
       const id=sent.json.turn!.id;let state=sent.json.turn!.state, errorCode:string|null=null;
       while(!TERMINAL.includes(state) && Date.now()-started<o.turnTimeoutMs) {
         await sleep(o.pollMs);
@@ -178,9 +181,9 @@ async function runStage(api:Api,users:number,seconds:number,extra:Partial<UserOp
   await Promise.all(Array.from({length:users},(_,i)=>virtualUser({api,deadline,turnTimeoutMs:45_000,pollMs:100,thinkMs:0,samples,personaIndex:i,...extra})));
   return {users,seconds,...summarizeStage(samples,Date.now()-started),wallSeconds:(Date.now()-started)/1000};
 }
-async function activeTurns():Promise<{state:string;n:number}[]> {
+async function activeTurns(since:Date):Promise<{state:string;n:number}[]> {
   const pool=createLocalPool(loadtestUrl());
-  try {return (await pool.query(`SELECT state,count(*)::int AS n FROM turns WHERE state = ANY($1) GROUP BY state`,[ACTIVE])).rows;}
+  try {return (await pool.query(`SELECT state,count(*)::int AS n FROM turns WHERE state = ANY($1) AND created_at >= $2 GROUP BY state`,[ACTIVE,since])).rows;}
   finally {await pool.end();}
 }
 
@@ -188,6 +191,7 @@ async function main():Promise<void> {
   const mode=process.argv[2];const options=args();
   const runId=`${new Date().toISOString().replace(/[:.]/g,'-')}-${mode}`;
   const directory=join('reports','loadtest',runId);await mkdir(directory,{recursive:true,mode:0o700});
+  const runStarted=new Date();
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
   const latency=options.latency==='none'?null:options.latency??DEFAULT_LATENCY;
@@ -215,13 +219,13 @@ async function main():Promise<void> {
       // inline: kill the API (execution lives there). queue: kill every worker, keep the API accepting.
       const stage=runStage(api,users,30);
       await sleep(10_000);
-      const before=await activeTurns();
+      const before=await activeTurns(runStarted);
       if(topology.execution==='queue') await api.killWorkers('SIGKILL'); else await api.kill('SIGKILL');
       await sleep(2000);
       if(topology.execution==='queue') await api.startWorkers(); else await api.start();
       const result=await stage;
       await sleep(50_000); // longer than turn timeout + lease: anything still active now is orphaned
-      report.crash={users,killed:topology.execution==='queue'?'all workers':'api',activeAtKill:before,downtimeMs:2000,stage:result,orphanedActiveTurns:await activeTurns()};
+      report.crash={users,killed:topology.execution==='queue'?'all workers':'api',activeAtKill:before,downtimeMs:2000,stage:result,orphanedActiveTurns:await activeTurns(runStarted)};
       console.log(JSON.stringify(report.crash));
     } else if(mode==='faults') {
       report.faults=await runStage(api,Number(options.users??16),Number(options['stage-seconds']??60));

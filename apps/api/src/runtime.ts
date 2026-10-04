@@ -18,7 +18,7 @@ export interface ApiRuntime {
   providerName:string;model:string;close?():Promise<void>;
 }
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
-export function createRuntime(env:NodeJS.ProcessEnv=process.env):ApiRuntime {
+export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void}={}):ApiRuntime {
   const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
   const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
   const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
@@ -56,7 +56,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env):ApiRuntime {
   const queue=execution==='queue'?store:undefined;
   const chat=new ChatService({store,personas,provider,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
-    ...(queue?{queue:{store:queue,maxDepth:queueMaxDepth}}:{})});
+    ...(queue?{queue:{store:queue,maxDepth:queueMaxDepth}}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
   return {chat,personas,provider,providerName,model,...(queue?{queue}:{}),
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');

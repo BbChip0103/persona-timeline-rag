@@ -10,7 +10,11 @@ import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type 
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Goal2 queued execution: startTurn only reserves; TurnWorker processes call executeQueued. */
-  queue?:{store:TurnQueue;maxDepth:number}}
+  queue?:{store:TurnQueue;maxDepth:number};
+  /** Observability hook: failed turns with a sanitized error class/code only (never messages or bodies). */
+  onTurnFailure?:(failure:{turnId:string;code:string})=>void}
+/** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
+const DEPTH_READING_TTL_MS=200;
 const activeStates=['pending','retrieving','generating','validating'] as const;
 /** Store view whose writes are fenced by the worker's lease; reads pass through. */
 function fencedStore(store:ConversationStore,fence?:LeaseFence):ConversationStore {
@@ -25,6 +29,8 @@ function fencedStore(store:ConversationStore,fence?:LeaseFence):ConversationStor
 }
 export class ChatService {
   private readonly controllers=new Map<string,AbortController>();
+  private depthReading?:{value:number;at:number};
+  private depthRefresh?:Promise<void>;
   constructor(private readonly options:ChatServiceOptions) {}
   async createSession(ownerId:string,input:CreateSessionInput):Promise<ChatSession> {
     if(!ownerId.trim()) throw new CoreError('FORBIDDEN');
@@ -61,11 +67,22 @@ export class ChatService {
     return new Promise((resolve,reject)=>{void this.runTurn(ownerId,input,resolve).catch(reject);});
   }
   private async enqueueTurn(ownerId:string,input:SendTurnInput,queue:NonNullable<ChatServiceOptions['queue']>):Promise<ChatTurn> {
-    const {session,value}=await this.prepare(ownerId,input);
-    // Admission control: soft bound on the unclaimed backlog, checked before any write.
-    if(await queue.store.queueDepth()>=queue.maxDepth) throw new CoreError('QUEUE_FULL');
-    const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition),value);
-    return reserved.turn;
+    // Admission control first: a rejection costs at most one shared count, no session lookup or write.
+    if(!this.depthReading||Date.now()-this.depthReading.at>=DEPTH_READING_TTL_MS) {
+      this.depthRefresh??=queue.store.queueDepth().then(value=>{this.depthReading={value,at:Date.now()};}).finally(()=>{this.depthRefresh=undefined;});
+      await this.depthRefresh;
+    }
+    // Check and take a slot with no await in between, so a concurrent burst cannot overshoot the bound.
+    const reading=this.depthReading!;
+    if(reading.value>=queue.maxDepth) throw new CoreError('QUEUE_FULL');
+    reading.value++;
+    let created=false;
+    try {
+      const {session,value}=await this.prepare(ownerId,input);
+      const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition),value);
+      created=reserved.created;
+      return reserved.turn;
+    } finally {if(!created) reading.value=Math.max(0,reading.value-1);}
   }
   /** Worker entry point: runs a claimed turn with every state write fenced by its lease. */
   async executeQueued(queued:QueuedTurn,controller:AbortController):Promise<void> {
@@ -114,6 +131,8 @@ export class ChatService {
         :providerCode==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED'
         :providerCode==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED';
       await store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
+      this.options.onTurnFailure?.({turnId:turn.id,code:typeof providerCode==='string'?providerCode
+        :error instanceof Error?error.constructor.name:'UNKNOWN'});
     } finally { if(timer) clearTimeout(timer); }
   }
   private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {

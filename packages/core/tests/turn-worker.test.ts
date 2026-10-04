@@ -101,4 +101,36 @@ describe('queued turn execution',()=>{
     await w.stop();
     expect(peak).toBe(3);
   });
+  test('admission control rejects before touching the session and reuses a short-lived depth reading',async()=>{
+    const {chat,session,store}=setup(undefined,1);
+    const s=await session();await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'fill',text:'안녕'});
+    const depth=jest.spyOn(store,'queueDepth');const lookup=jest.spyOn(store,'getOwnedSession');
+    const late=await session('owner_late');
+    for(let i=0;i<20;i++) await expect(chat.startTurn('owner_late',{sessionId:late.id,clientRequestId:`late-${i}`,text:'안녕'})).rejects.toEqual(new CoreError('QUEUE_FULL'));
+    expect(lookup).not.toHaveBeenCalled();
+    expect(depth.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+  test('turn failures are reported to the observer as a sanitized code only',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,
+      provider:{generate:async()=>{throw new Error('secret upstream body sk-abc');}},onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const turn=await chat.sendTurn('owner_q',{sessionId:s.id,clientRequestId:'boom',text:'안녕'});
+    expect(turn.state).toBe('failed');
+    expect(failures).toEqual([{turnId:turn.id,code:'Error'}]);
+  });
+  test('a concurrent burst cannot overshoot the backlog bound (slots are taken before any await)',async()=>{
+    const {chat,session}=setup(undefined,5);
+    const sessions=await Promise.all(Array.from({length:20},(_,i)=>session(`burst_${i}`)));
+    const results=await Promise.allSettled(sessions.map((s,i)=>chat.startTurn(`burst_${i}`,{sessionId:s.id,clientRequestId:`b${i}`,text:'안녕'})));
+    expect(results.filter(r=>r.status==='fulfilled')).toHaveLength(5);
+    expect(results.filter(r=>r.status==='rejected').every(r=>(r as PromiseRejectedResult).reason.code==='QUEUE_FULL')).toBe(true);
+  });
+  test('a rejected reservation gives its admission slot back',async()=>{
+    const {chat,session}=setup(undefined,1);
+    const s=await session();
+    await expect(chat.startTurn('owner_q',{sessionId:'missing-session',clientRequestId:'x',text:'안녕'})).rejects.toEqual(new CoreError('NOT_FOUND'));
+    await expect(chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'ok',text:'안녕'})).resolves.toMatchObject({state:'pending'});
+  });
 });
