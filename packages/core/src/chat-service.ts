@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
-import { CoreError, type ConversationStore, type PersonaRepository, type Retrieval, type TextProvider } from './ports';
+import { CoreError, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnQueue } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
@@ -8,8 +8,21 @@ import { containsCredentialPattern, containsUngroundedBiography, isBiographicalR
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
-export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator}
+export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
+  /** Goal2 queued execution: startTurn only reserves; TurnWorker processes call executeQueued. */
+  queue?:{store:TurnQueue;maxDepth:number}}
 const activeStates=['pending','retrieving','generating','validating'] as const;
+/** Store view whose writes are fenced by the worker's lease; reads pass through. */
+function fencedStore(store:ConversationStore,fence?:LeaseFence):ConversationStore {
+  if(!fence) return store;
+  return {
+    create:(session,greeting)=>store.create(session,greeting),getOwnedSession:(id,owner)=>store.getOwnedSession(id,owner),
+    listOwnedSessions:owner=>store.listOwnedSessions(owner),history:(id,owner)=>store.history(id,owner),
+    reserveTurn:(...args)=>store.reserveTurn(...args),getTurn:(id,owner)=>store.getTurn(id,owner),cancelTurn:(id,owner)=>store.cancelTurn(id,owner),
+    transitionTurn:(id,expected,next,errorCode)=>store.transitionTurn(id,expected,next,errorCode,fence),
+    completeTurn:(id,reply)=>store.completeTurn(id,reply,fence),
+  };
+}
 export class ChatService {
   private readonly controllers=new Map<string,AbortController>();
   constructor(private readonly options:ChatServiceOptions) {}
@@ -44,10 +57,26 @@ export class ChatService {
   }
   /** Returns the reserved/current turn immediately; final output remains private until validation. */
   startTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> {
+    if(this.options.queue) return this.enqueueTurn(ownerId,input,this.options.queue);
     return new Promise((resolve,reject)=>{void this.runTurn(ownerId,input,resolve).catch(reject);});
   }
+  private async enqueueTurn(ownerId:string,input:SendTurnInput,queue:NonNullable<ChatServiceOptions['queue']>):Promise<ChatTurn> {
+    const {session,value}=await this.prepare(ownerId,input);
+    // Admission control: soft bound on the unclaimed backlog, checked before any write.
+    if(await queue.store.queueDepth()>=queue.maxDepth) throw new CoreError('QUEUE_FULL');
+    const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition),value);
+    return reserved.turn;
+  }
+  /** Worker entry point: runs a claimed turn with every state write fenced by its lease. */
+  async executeQueued(queued:QueuedTurn,controller:AbortController):Promise<void> {
+    const store=fencedStore(this.options.store,queued.fence);
+    let prepared:Awaited<ReturnType<ChatService['prepare']>>;
+    try {prepared=await this.prepare(queued.turn.ownerId,queued.input);}
+    catch {await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');return;}
+    await this.runReserved(prepared.session,queued.turn,prepared.value,prepared.query,controller,store);
+  }
   sendTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> { return this.runTurn(ownerId,input); }
-  private async runTurn(ownerId:string,input:SendTurnInput,onReserved?:(turn:ChatTurn)=>void):Promise<ChatTurn> {
+  private async prepare(ownerId:string,input:SendTurnInput) {
     const checked=SendTurnSchema.safeParse(input);
     if(!checked.success) throw new CoreError('INVALID_INPUT');
     const value=checked.data;
@@ -56,14 +85,23 @@ export class ChatService {
     // Verify structured ranges before reserving a turn or calling any external port.
     const queryResult=TimelineQuerySchema.safeParse({personId:session.personId,query:value.timeline?.query ?? value.text.slice(0,500),start:value.timeline?.start,end:value.timeline?.end,dateBasis:value.timeline?.dateBasis ?? 'posted',timezone:session.timezone,limit:value.timeline?.limit ?? 5});
     if(!queryResult.success || containsCredentialPattern(queryResult.data.query??'')) throw new CoreError('INVALID_INPUT');
+    return {session,value,query:queryResult.data};
+  }
+  private async runTurn(ownerId:string,input:SendTurnInput,onReserved?:(turn:ChatTurn)=>void):Promise<ChatTurn> {
+    const {session,value,query}=await this.prepare(ownerId,input);
     const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition));
     onReserved?.(structuredClone(reserved.turn));
     if(!reserved.created) return reserved.turn;
     const turn=reserved.turn;
     const controller=new AbortController();this.controllers.set(turn.id,controller);
+    try {await this.runReserved(session,turn,value,query,controller,this.options.store);}
+    finally {this.controllers.delete(turn.id);}
+    return this.getTurn(ownerId,turn.id);
+  }
+  private async runReserved(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {
     let timer:ReturnType<typeof setTimeout>|undefined;
     try {
-      const execution=this.execute(session,turn,value,queryResult.data,controller);
+      const execution=this.execute(session,turn,value,query,controller,store);
       const timeout=new Promise<void>((_,reject)=>{
         timer=setTimeout(()=>{controller.abort();reject(new CoreError('TURN_FAILED'));},this.options.timeoutMs ?? 30000);
         controller.signal.addEventListener('abort',()=>reject(new CoreError('TURN_FAILED')),{once:true});
@@ -75,14 +113,13 @@ export class ChatService {
       const errorCode=error instanceof CoreError&&error.code==='CONTEXT_LIMIT'?'CONTEXT_LIMIT'
         :providerCode==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED'
         :providerCode==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED';
-      await this.options.store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
-    } finally { if(timer) clearTimeout(timer); this.controllers.delete(turn.id); }
-    return this.getTurn(ownerId,turn.id);
+      await store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
+    } finally { if(timer) clearTimeout(timer); }
   }
-  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController):Promise<void> {
-    const history=await this.options.store.history(session.id,session.ownerId);
+  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {
+    const history=await store.history(session.id,session.ownerId);
     if(history.length>(this.options.maxHistoryMessages ?? 100)) {
-      await this.options.store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT');return;
+      await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT');return;
     }
     const raw=await this.options.personas.get(session.personaId,session.personaRevision);
     const persona=PersonaSchema.parse(raw);
@@ -91,7 +128,7 @@ export class ChatService {
     if(!value.timeline)query={...query,query:context.query};
     let memoryTrace:NonNullable<ChatReply['retrievalContext']>={revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]};
     const previousMessage=[...history].reverse().find(message=>message.role==='user'&&message.turnId);
-    const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await this.options.store.getTurn(previousMessage.turnId,session.ownerId):undefined;
+    const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await store.getTurn(previousMessage.turnId,session.ownerId):undefined;
     const ownedPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
       &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
       &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
@@ -125,7 +162,7 @@ export class ChatService {
     } else {
       if(intent==='timeline' && session.retrievalMode!=='off') {
         if(!this.options.retrieval) throw new CoreError('TURN_FAILED');
-        if(!await this.options.store.transitionTurn(turn.id,['pending'],'retrieving') || controller.signal.aborted) return;
+        if(!await store.transitionTurn(turn.id,['pending'],'retrieving') || controller.signal.aborted) return;
         const lookupOptions={signal:controller.signal,...(session.ragCondition && session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})};
         if(references.length&&this.options.retrieval.resolve) {
           const resolved=await this.options.retrieval.resolve(references,{personId:session.personId},lookupOptions);
@@ -145,7 +182,7 @@ export class ChatService {
         }
         if(session.ragCondition!=='caption_image') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
-      if(!await this.options.store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
+      if(!await store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
       const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,history,value.text,sources):undefined;
       memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
@@ -197,10 +234,10 @@ export class ChatService {
           : {status:'answered',content:safe,claims:[],evidence:[],limitations:[]};
       }
     }
-    if(controller.signal.aborted || !await this.options.store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
+    if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
     const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
-    if(!controller.signal.aborted) await this.options.store.completeTurn(turn.id,reply);
+    if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
   }
 }

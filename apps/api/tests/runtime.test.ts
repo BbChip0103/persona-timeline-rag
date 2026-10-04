@@ -19,3 +19,11 @@ test('invalid latency profiles fail at startup, and are rejected for live provid
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_FAKE_LATENCY:'{"medianMs":0}'})).toThrow();
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_CHAT_PROVIDER:'openrouter',PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'})).toThrow();
 });
+test('PTR_EXECUTION=queue exposes the durable queue and validates its knobs',async()=>{
+  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_EXECUTION:'queue',PTR_QUEUE_MAX_DEPTH:'64',PTR_DB_POOL_MAX:'32'});
+  expect(runtime.queue).toBeDefined();
+  await runtime.close?.();
+  const inline=createRuntime({DATABASE_URL:databaseUrl});expect(inline.queue).toBeUndefined();await inline.close?.();
+  for(const env of [{PTR_EXECUTION:'threads'},{PTR_EXECUTION:'queue',PTR_QUEUE_MAX_DEPTH:'0'},{PTR_DB_POOL_MAX:'0'}])
+    expect(()=>createRuntime({DATABASE_URL:databaseUrl,...env})).toThrow();
+});
