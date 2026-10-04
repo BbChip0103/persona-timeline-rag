@@ -1,3 +1,11 @@
+/** Exact database/role pairs on the isolated container: research data, and synthetic-only load tests. */
+export const ISOLATED_DATABASES: ReadonlyArray<{ database: string; user: string }> = [
+  { database: 'ptr_research', user: 'ptr_researcher' },
+  { database: 'ptr_loadtest', user: 'ptr_loadtester' },
+];
+export function isIsolatedDatabaseIdentity(database: unknown, user: unknown): boolean {
+  return ISOLATED_DATABASES.some(pair => pair.database === database && pair.user === user);
+}
 /** No connection is opened until the entire private local target is validated. */
 export function assertLocalDatabaseUrl(raw: string): string {
   let url: URL;
@@ -5,8 +13,7 @@ export function assertLocalDatabaseUrl(raw: string): string {
   if (!['postgres:', 'postgresql:'].includes(url.protocol)
     || url.hostname !== '127.0.0.1'
     || url.port !== '56432'
-    || url.pathname !== '/ptr_research'
-    || decodeURIComponent(url.username) !== 'ptr_researcher'
+    || !isIsolatedDatabaseIdentity(url.pathname.slice(1), decodeURIComponent(url.username))
     || !url.password
     || url.search || url.hash) {
     throw new Error('Database target must be the isolated ptr_goal1 loopback database');

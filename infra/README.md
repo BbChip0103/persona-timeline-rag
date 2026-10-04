@@ -39,3 +39,19 @@ deterministic multilingual token/phrase substring baseline (not BM25), or exact
 1536-dimensional cosine distance over already person/date/safety-filtered rows.
 Posted-date ranges convert local midnight via PostgreSQL `AT TIME ZONE`; event
 dates remain nullable calendar dates and are never inferred from posted dates.
+
+## Goal2 synthetic load-test database
+
+Load tests must not write into `ptr_research`. The same container hosts a second,
+synthetic-only database `ptr_loadtest` owned by its own non-superuser role
+`ptr_loadtester` (PUBLIC connect revoked; the research role cannot connect, and the
+load-test role has no privileges on research tables). The URL guard accepts only these
+two exact database/role pairs. Seed it only with synthetic personas/posts.
+
+```sh
+# Private .env.local holds PTR_DB_PASSWORD (bootstrap admin), PTR_LOADTEST_DB_PASSWORD
+# and PTR_LOADTEST_DATABASE_URL. Passwords travel via environment, never argv.
+export PGPASSWORD="$PTR_DB_PASSWORD"
+docker exec -i -e PGPASSWORD -e PTR_LOADTEST_DB_PASSWORD ptr_goal1_db bash -s < infra/init-loadtest-db.sh
+DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm db:migrate
+```
