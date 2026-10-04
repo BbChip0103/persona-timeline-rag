@@ -63,3 +63,10 @@ test('operational summary separates invalid output from completion and never cla
   expect(summary.off).toMatchObject({ turns: 3, completed: 3, invalidModelEvidence: 1, statusCounts: { answered: 2, insufficient_evidence: 1 } });
   expect(JSON.stringify(summary)).not.toMatch(/accuracy|qualityScore/);
 });
+
+test('agent-loop evaluation pins profile only at session creation, never leaks it or gold into user turns',async()=>{
+  const f=runtimeFixture();
+  await executeNaturalConversation(f.runtime,'synthetic-owner',conversation,'off',async()=>{},0,'agent_loop');
+  expect(f.createSession.mock.calls[0][1]).toMatchObject({executionProfile:'agent_loop'});
+  for(const input of f.inputs)expect(Object.keys(input as object).sort()).toEqual(['clientRequestId','sessionId','text']);
+});

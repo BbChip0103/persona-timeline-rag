@@ -1,4 +1,4 @@
-import type { BudgetLedger, BudgetRequest } from '@ptr/providers';
+import { ProviderError, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 import type { TurnTrace } from '../evaluate';
 import { PILOT_LIMITS, PilotLedger, selectMemoryPilot, validatePilotArguments, validatePilotBudget } from '../evaluate-memory-context';
 import { userConversation, type ChatCase, type ChatTestset } from '../prepare-character-chat-testset';
@@ -60,4 +60,18 @@ test('fresh request cap stops before underlying reservation and never retries or
   for (let index = 0; index < 60; index++) await f.pilot.reserve(`synthetic-${index}`, 1);
   await expect(f.pilot.reserve('synthetic-extra', 1)).rejects.toThrow('PILOT_REQUEST_LIMIT');
   expect(f.ledger.reserve).toHaveBeenCalledTimes(60);
+});
+
+
+test('fresh cap still permits settled cached replay while refusing fresh keys',async()=>{
+  const f=ledgerFixture();for(let i=0;i<60;i++)await f.pilot.reserve(`synthetic-${i}`,1);
+  await expect(f.pilot.reserve('synthetic-0',1)).resolves.toMatchObject({created:false});
+  await expect(f.pilot.reserve('synthetic-new',1)).rejects.toThrow('PILOT_REQUEST_LIMIT');
+});
+
+
+test('global reservation rejection sets sticky stop even below current budget cap',async()=>{
+  const f=ledgerFixture();jest.mocked(f.ledger.reserve).mockRejectedValueOnce(new ProviderError('BUDGET_EXCEEDED'));
+  await expect(f.pilot.reserve('synthetic',900000)).rejects.toThrow('BUDGET_EXCEEDED');
+  expect(f.pilot.stoppedReason()).toBe('BUDGET_EXCEEDED');
 });

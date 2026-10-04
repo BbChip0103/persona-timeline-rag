@@ -45,10 +45,13 @@ export function validatePilotBudget(budget: Record<string, number | string>): vo
 export class PilotLedger implements BudgetLedger {
   private entries = new Map<string, RequestTrace[]>();
   private fresh = 0;
-  constructor(private ledger: BudgetLedger, private trace: () => TurnTrace | undefined, private kind: () => 'text' | 'embedding') {}
+  private stopCode:string|undefined;
+  stoppedReason():string|undefined{return this.stopCode;}
+  constructor(private ledger: BudgetLedger, private trace: () => TurnTrace | undefined, private kind: () => 'text' | 'embedding',private freshLimit:number=PILOT_LIMITS.freshRequests) {}
   async reserve(key: string, amount: number): Promise<{ created: boolean; request: BudgetRequest }> {
-    if (this.fresh >= PILOT_LIMITS.freshRequests) throw new ProviderError('PILOT_REQUEST_LIMIT');
-    const result = await this.ledger.reserve(key, amount); if (result.created) this.fresh++;
+    if (this.fresh >= this.freshLimit && !await this.ledger.get(key)){this.stopCode='PILOT_REQUEST_LIMIT';throw new ProviderError('PILOT_REQUEST_LIMIT');}
+    let result:Awaited<ReturnType<BudgetLedger['reserve']>>;
+    try{result=await this.ledger.reserve(key,amount);}catch(error){if(error instanceof ProviderError&&error.code==='BUDGET_EXCEEDED')this.stopCode=error.code;throw error;} if (result.created) this.fresh++;
     const trace = this.trace();
     if (trace) {
       const entry: RequestTrace = { key, created: result.created, submitted: false, kind: this.kind(), reservedMicrousd: result.request.reservedMicrousd,
@@ -64,14 +67,15 @@ export class PilotLedger implements BudgetLedger {
   }
   get(key: string): Promise<BudgetRequest | undefined> { return this.ledger.get(key); }
 }
-export function createMemoryPilotRuntime(env: NodeJS.ProcessEnv) {
+export function createMemoryPilotRuntime(env: NodeJS.ProcessEnv,limits:{textCalls:number;embeddingCalls:number;freshRequests:number}=PILOT_LIMITS) {
+  if(Object.values(limits).some(value=>!Number.isSafeInteger(value)||value<1||value>1000))throw new ProviderError('INVALID_PILOT_LIMITS');
   const databaseUrl = env.GOAL1_DATABASE_URL ?? env.DATABASE_URL ?? ''; const pool = createLocalPool(databaseUrl);
   const store = new PostgresConversationStore(pool), personas = new PostgresPersonaRepository(pool), sources = new PostgresSourceRepository(pool);
-  let current: MemoryTrace | undefined; let kind: 'text' | 'embedding' = 'text'; let textCalls = 0, embeddingCalls = 0;
-  const ledger = new PilotLedger(new PostgresBudgetLedger(pool, databaseUrl), () => current, () => kind);
+  let current: MemoryTrace | undefined; let kind: 'text' | 'embedding' = 'text'; let textCalls = 0, embeddingCalls = 0;let portStop:string|undefined;
+  const ledger = new PilotLedger(new PostgresBudgetLedger(pool, databaseUrl), () => current, () => kind,limits.freshRequests);
   const client = new OpenRouterClient(liveOptionsFromEnvironment({ ...env, GOAL1_DATABASE_URL: databaseUrl, GOAL1_TEXT_MODEL: env.GOAL1_TEXT_MODEL ?? env.PTR_MODEL }, ledger));
   const retrieval = new PostgresRetrieval(sources, { modelRevision: EMBEDDING_MODEL, async embed(text, options) {
-    if (++embeddingCalls > PILOT_LIMITS.embeddingCalls) throw new ProviderError('PILOT_EMBEDDING_LIMIT');
+    if (++embeddingCalls > limits.embeddingCalls){portStop='PILOT_EMBEDDING_LIMIT';throw new ProviderError(portStop);}
     if (current) current.embeddingCalls++; kind = 'embedding'; return (await client.embed([text], options))[0]!;
   } });
   const trackedRetrieval: Retrieval = {
@@ -85,21 +89,21 @@ export function createMemoryPilotRuntime(env: NodeJS.ProcessEnv) {
     },
   };
   const chat = new ChatService({ store, personas, retrieval: trackedRetrieval, provider: { async generate(messages, options) {
-    if (++textCalls > PILOT_LIMITS.textCalls) throw new ProviderError('PILOT_TEXT_LIMIT');
+    if (++textCalls > limits.textCalls){portStop='PILOT_TEXT_LIMIT';throw new ProviderError(portStop);}
     if (current) { current.textCalls++; current.promptHashes.push(testsetHash(messages)); } kind = 'text'; return client.generate(messages, options);
   } } });
   return { chat, pool, store, personas, sources, model: env.GOAL1_TEXT_MODEL ?? env.PTR_MODEL!,
     setTrace(trace?: TurnTrace) { current = trace as MemoryTrace | undefined; if (current) { current.sourceLookupCalls = 0; current.searchQueries = []; current.resolvedIds = []; } },
-    close: () => pool.end() };
+    haltedReason:()=>ledger.stoppedReason()??portStop,close: () => pool.end() };
 }
-async function budgetSnapshot(pool: Pool): Promise<Record<string, number | string>> {
+export async function budgetSnapshot(pool: Pool): Promise<Record<string, number | string>> {
   const result = await pool.query(`SELECT b.cap_microusd,b.call_cap,count(r.key)::int AS calls,
     COALESCE(sum(r.actual_microusd),0)::bigint AS actual_microusd,
     COALESCE(sum(GREATEST(r.reserved_microusd,COALESCE(r.actual_microusd,0))) FILTER(WHERE r.state<>'settled'),0)::bigint AS unresolved_microusd
     FROM ptr_provider_budget b LEFT JOIN ptr_provider_requests r ON true WHERE b.id='global' GROUP BY b.cap_microusd,b.call_cap`);
   if (result.rows.length !== 1) throw new Error('Existing global budget required; never reset it'); return result.rows[0] as Record<string, number | string>;
 }
-async function codeFingerprint(): Promise<string> {
+export async function codeFingerprint(): Promise<string> {
   const files: string[] = [];
   const walk = async (directory: string): Promise<void> => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -111,7 +115,7 @@ async function codeFingerprint(): Promise<string> {
   for (const directory of ['packages', 'apps/api', 'apps/web/app', 'scripts', 'supabase/migrations']) await walk(directory);
   return testsetHash(await Promise.all(files.sort().map(async path => [path, testsetHash(await readFile(path, 'utf8'))])));
 }
-async function corpusSnapshot(pool: Pool, sources: SourcePost[], plan: AnnotationPlan): Promise<CorpusRow[]> {
+export async function corpusSnapshot(pool: Pool, sources: SourcePost[], plan: AnnotationPlan): Promise<CorpusRow[]> {
   const result = await pool.query(`SELECT p.id,p.person_id,p.source_hash,p.content_hash,p.unsafe,
     md5(c.embedding::text) AS caption_vector_hash,r.revision AS annotation_revision,r.content_hash AS annotation_content_hash,
     md5(v.embedding::text) AS image_vector_hash FROM source_posts p

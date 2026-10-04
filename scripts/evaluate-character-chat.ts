@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ChatReply, Persona, RagCondition, SourcePost } from '@ptr/contracts';
+import type { ChatReply, ExecutionProfile, Persona, RagCondition, SourcePost } from '@ptr/contracts';
 import { EXPERIMENT_PROMPT_REVISION } from '@ptr/core';
 import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL } from '@ptr/providers';
 import { createHarnessRuntime, type HarnessRuntime, type TurnTrace } from './evaluate';
@@ -27,9 +27,9 @@ export function validateUserExport(testset: ChatTestset, value: unknown): UserCo
   return expected.conversations.filter(item => expected.smokeConversationIds.includes(item.id));
 }
 export async function executeNaturalConversation(runtime: Pick<HarnessRuntime, 'chat' | 'setTrace'>, owner: string,
-  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0): Promise<void> {
+  conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile?:ExecutionProfile): Promise<void> {
   const session = await runtime.chat.createSession(owner, { personId: conversation.personId, personaId: conversation.personaId,
-    personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic' });
+    personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic',...(executionProfile?{executionProfile}:{}) });
   for (const [turnIndex, input] of conversation.turns.entries()) {
     const trace: TurnTrace = { id: `${input.id}-${condition}`, stage: 'natural-character-chat', mode: condition === 'off' ? 'off' : 'semantic',
       historyKind: 'evolving', personId: conversation.personId, goldSourceIds: [], retrievedIds: [], promptHashes: [], latencyMs: 0,

@@ -42,3 +42,17 @@ RUN_STORAGE_DB_TESTS=1 pnpm exec jest --runInBand packages/storage/test/agent-ru
 
 Synthetic regressions cover multi-search evidence retention, state restart, scope isolation, malformed/repeated actions, cancellation, idempotency, off zero retrieval, validator outcomes and HTTP redaction. They are control-flow tests, not a real-person chat-quality benchmark.
 
+
+## Paired profile regression
+
+`node --env-file=.env.local -r tsx/cjs scripts/evaluate-agent-profile.ts --live`
+runs the frozen four-conversation memory pilot in both profiles and all three
+RAG conditions (72 planned turns). It requires existing explicit live/data
+opt-ins, the baseline Gemini model, and120 available request slots in the
+unchanged global $1/1000-request budget. No budget initialization/reset occurs.
+The run may stop at hard limits;72 planned turns are not guaranteed. A failed
+session skips its dependent followups without retry, while independent sessions
+can proceed. Completed matched pairs are summarized separately from all observed
+rows. Actual private replies/accounting go under `reports/agent-reevaluation/`;
+previous evaluation pointers are not overwritten. Cached legacy replays are not
+newly billed and cannot be compared naively to uncached latency/cost.
