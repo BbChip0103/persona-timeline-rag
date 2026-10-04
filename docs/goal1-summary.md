@@ -82,15 +82,17 @@ Runtime revision은 `agent-loop-json-action-v1`이다. 한국어 baseline과 회
 | 한국어 baseline | 81(text72/embed9) | 39 / 42 | $0.033541 | 468.444초 |
 | 회상 run | 81(text71/embed10) | 54 / 27 | $0.066661 | 224.798초 |
 
-회상 run의 새 unknown 예약은 **$0.010233**이다. 마지막 보존 ledger snapshot은 **991/1000요청, 누적 확정$0.374655 + 미확정 보수 예약$0.017858**, 총 한도US$1이다. 남은9요청을 자동 확대/초기화하지 않는다. unknown 예약은 확정 청구액도0원 확정도 아니며 실제 제출 여부/요청 키를 보존하고 무단 재전송하지 않는다.
+회상 run의 새 unknown 예약은 **$0.010233**이다. 마지막 보존 ledger snapshot은 **991/1000요청, 누적 확정$0.374655 + 미확정 보수 예약$0.017858**, 총 한도US$1이다. 이때 잔여9요청이라는 수치는 해당 과거 snapshot의 한도에 대한 값이다. unknown 예약은 확정 청구액도0원 확정도 아니며 실제 제출 여부/요청 키를 보존하고 무단 재전송하지 않는다.
+
+현재 코드/로컬 장부 한도는 별도 변경으로 US$2 / 10,000요청이다. 위 과거 run의 한도·측정치는 소급 변경하지 않으며 이 마감 작업에서는 외부 provider 호출·예산 변경·장부 초기화를 하지 않는다.
 
 이 수치는 cache를 포함한 실제 개발 실행이다. 한국어 baseline 일부 기억 답변18개는 이전 동일 요청 cache였다. cache 없는 운영 단가/모델 순수 지연/서빙 throughput/전후 속도 개선으로 일반화하지 않는다. wall에는 로컬SQL·cache·대기·중단/복구 등이 포함되며 병렬 작업시간을 합산하지 않는다. 사람의 읽기·타이핑·관리 시간과 Codex dollar 청구액은 미측정이다. 회상 실행의 요청→계측 snapshot은31분8.108초, Codex4 lanes 관측합15,062,933 tokens(캐시 입력 부분집합 포함)이며 모델 run224.798초와 다른 범위다.
 
-회상 당시 합성 전체 검증은252pass/28opt-in skip·typecheck/lint, 독립 SQL 감사45/45였다. SQL 통과는24세션/71턴·160visible messages, scope/재전송/예산·원자료 불변 검증이지 의미 정답률이 아니다. 마감 이후 코드를 바꾸면 해당 새 검증과 commit을 별도로 기록한다.
+회상 당시 합성 전체 검증은252pass/28opt-in skip·typecheck/lint, 독립 SQL 감사45/45였다. SQL 통과는24세션/71턴·160visible messages, scope/재전송/예산·원자료 불변 검증이지 의미 정답률이 아니다. 현재 마감의 검증은280unit pass/28opt-in skip·typecheck/lint·웹 typecheck/build, 로컬 storage46pass·합성 UI6pass다. 실제 새 페르소나4명×3조건×2턴의 fake-only 로컬24턴/148assertion도 통과했으며 외부 provider0회다. fake 답변으로 개성/사실 정확도가 좋아졌다고 주장하지 않는다.
 
 ## 6. 기술 오류와 잔여 gate
 
-보존 회상 run에서 인용 공백/줄바꿈 불일치가 서비스 안내5개, `off`의 미허용 도구 action이 실패1+후속skip1, 동일 unknown provider key가 두턴 실패로 관측됐다. unknown 외부 신규 제출은1번이며 동일 키를 재전송하지 않았다. 이것들은 허용 각색과 별개인 기술적 대화 끊김이다. 마감의 기술 보완/페르소나 차별화는 별도 변경이며 **이 문서의 과거 성공/실패 수치를 수정하지 않는다.** 해당 변경의 완료/검증 여부는 최종 변경 기록으로 확인하고 현재 진행 작업을 이미 해결됐다고 읽지 않는다.
+보존 회상 run에서 인용 공백/줄바꿈 불일치가 서비스 안내5개, `off`의 미허용 도구 action이 실패1+후속skip1, 동일 unknown provider key가 두턴 실패로 관측됐다. unknown 외부 신규 제출은1번이며 동일 키를 재전송하지 않았다. 이것들은 허용 각색과 별개인 기술적 대화 끊김이다. 현재 마감 변경은 offsetless 인용의 유일한 ASCII 공백 차이만 원문으로 복원하고, 미허용 도구는 추가 호출 없는 서비스 안내로 끝내며, 미확정 외부 요청은 재전송 없이 안전한 오류 안내를 표시한다. DEV 자료 기반 4종 대화 설계를 새 페르소나 버전으로 등록하고 새 세션 catalogue에 연결했다. **이 문서의 과거 성공/실패 수치는 수정하지 않는다.** 새 변경은 합성/로컬 계약 검증이며 실제 모델의 새 품질 개선을 입증하지 않는다.
 
 현재 방향:
 
@@ -98,6 +100,13 @@ Runtime revision은 `agent-loop-json-action-v1`이다. 한국어 baseline과 회
 2. **캐릭터 경험:** 자연스러운 회상·가벼운 각색·개성·정정 수용·맥락 연결·재미를 별도로 본다.
 
 전체3조건 재생성/전량 재채점은 현재 보류다. 코드 변경의 합성·필요한 로컬 표적 검증과 실제 모델 품질 평가를 구분한다. 사람 원자료/설명/페르소나 의미 검수, 실인물 말투 충실도, 정정 후 복구, unseen 일반화, 주장별 의미 검증은 남은 한계다. 목표2 LLMOps·Kubernetes·다른 프로젝트 병합/배포·추가 유료 실험은 이 마감의 완료 항목이 아니다.
+
+### 새 페르소나의 차별화/검수 범위
+
+- 미용 실험·실용 비교형, 따뜻한 일상·낮은 부담 제안형, 탐험·이야기 전개형, 분위기·시각 구성형의 4종 대화 설계다.
+- DEV 캡션의 길이/emoji/hashtag·주제 cue 관찰과 작성한 대화 성격을 field provenance로 분리했다. 기존 ID·언어·AI 고지·경계와 원본 정의는 보존했다. 실제 내면/구어/고유 말투 충실도는 unknown이다.
+- 새 immutable revision/current pointer만 원자적으로 등록하고 기존 세션은 이전 persona revision을 유지한다. 새 턴은 현재 runtime prompt를 사용하므로 과거 완료 turn의 prompt fingerprint와 구분한다.
+- 유료 재테스트/새 품질 점수/사람 의미 검수는 하지 않았다. 생성/활성화 절차는 [페르소나 계약](persona-chat.md), 현재 서비스 처리 규칙은 [core 계약](../packages/core/README.md)을 따른다.
 
 ## 7. 재현·private 결과 위치
 
@@ -108,6 +117,7 @@ Runtime revision은 `agent-loop-json-action-v1`이다. 한국어 baseline과 회
 - `reports/answer-regrading/`: 기존36 agent-loop 답변의 source-first reference/review/집계.
 - `reports/korean-chat/latest.json`: 한국어 baseline; 같은 namespace의 frozen study/rubric/private reviews.
 - `reports/recollection-chat/latest.json`: 별도 회상 run; report/preflight/실패 진단/회상·기억 리뷰/회계/SQL 검증. 이전 baseline pointer는 보존했다.
+- `reports/goal1-finish/`와 `reports/persona-refinement/`: 마감의 버전/로컬 활성화·fake 계약 검증·자료 불변 근거.
 - `reports/effort/`: 각 phase token/시간/회계 snapshot. 원문을 public Git에 복사하지 않는다.
 
 계약 상세: [캐릭터 에이전트](character-agent.md) · [근거 평가](answer-evaluation.md) · [이미지 RAG](image-rag.md) · [원이미지 설명](image-descriptions.md) · [시간/토큰 계측](effort-accounting.md).

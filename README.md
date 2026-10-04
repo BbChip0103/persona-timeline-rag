@@ -7,7 +7,7 @@
 - Python 승인 데이터 준비·검증 CLI 유지.
 - TypeScript/pnpm workspace: NestJS API, Next.js/React 채팅, shared contracts/core/providers/storage.
 - 전용 **DB-only 로컬 Supabase PostgreSQL15 + pgvector**: Auth/Storage/Studio 전체 배포가 아니다. owner/person/revision 고정 세션, history/reload, idempotency/cancel, lexical substring baseline 및1536dim exact cosine 검색.
-- fake-by-default provider와 총 **US$1 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
+- fake-by-default provider와 총 **US$2 / 10,000요청 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
 - 공개 fixture는 합성이다. 실제 persona는 개발 캡션 통계 기반 **silver**이며 사람 검수 완료/본인 복제 정확도를 주장하지 않는다. 근거 없는 사건 날짜를 게시일로 대체하지 않는다.
 - 새 API 세션은 **agent-loop 캐릭터 에이전트**다. 페르소나·실제 누적 대화·최소 대화 변수와 근거를 받아 자연어 답변을 만들고, 선택적 읽기 전용 검색 도구를 제한된 루프로 실행한다. 과거 legacy 원문 인용 renderer와 구분하며 다른 프로젝트 reference agent loop 전체 엔진의 동등성을 주장하지 않는다.
 - **RAG 없음 / 본문만 / 본문+이미지 설명**을 세션에 고정한다. 이미지 설명은 `gpt-6-luna`/`medium`으로 생성한 관찰·강조·의도 해석을 별도 출처로 색인하며, 원사진을 매 채팅 요청에 직접 넣는 방식은 아니다. 의도 해석은 단정형 어미여도 실제 작성자의 확정 의도가 아니다.
@@ -86,4 +86,4 @@ reports/        # 실제 계정·다운로드·평가 보고서: Git 제외
 
 로컬 DB/API/UI, 버전 페르소나, 원본문·이미지 설명 RAG, 멀티턴 맥락 연결과3조건 실행·기록은 구현/실행됐습니다. 가상 포스트·이미지 표현도 기준선 검증을 했으며 생성물은 실제 게시물/활동 근거로 재유입하지 않습니다.
 
-**실행 완료와 품질 목표 달성은 다릅니다.** 기술 오류의 표적 보완과 인물별 페르소나 차별화는 목표1 마감 작업이며, 사람 의미 검수·고유 말투 충실도·정정 후 다른 기억으로 복구·새 질문 일반화는 별도 잔여 gate입니다. 최초 검수/평가 목표 수량을 충족했다고 소급 주장하지 않습니다. 최신 측정 결과와 이후 미평가 변경은 [요약](docs/goal1-summary.md)에서 구분합니다. 목표2·Kubernetes·다른 프로젝트 병합/배포·추가 과금 실험으로 자동 확대하지 않습니다.
+**실행 완료와 품질 목표 달성은 다릅니다.** 인용 공백 차이의 제한적 원문 복원·미허용 도구의 서비스 안내·미확정 외부 요청 안내를 보완했고, DEV 자료 기반 4종 페르소나를 새 버전으로 분리했습니다. 이 변경은 합성/로컬 계약 검증이며 새로운 실제 모델 품질 결과가 아닙니다. 사람 의미 검수·고유 말투 충실도·정정 후 다른 기억으로 복구·새 질문 일반화는 별도 잔여 gate입니다. 최초 검수/평가 목표 수량을 충족했다고 소급 주장하지 않습니다. 최신 측정 결과와 이후 미평가 변경은 [요약](docs/goal1-summary.md)에서 구분합니다. 목표2·Kubernetes·다른 프로젝트 병합/배포·추가 과금 실험으로 자동 확대하지 않습니다.
