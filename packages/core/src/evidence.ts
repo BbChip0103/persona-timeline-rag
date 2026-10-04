@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { EvidenceRefSchema, SourcePostSchema, TimelineQuerySchema, type ChatReply, type EvidenceRef, type SourcePost, type TimelineQuery } from '@ptr/contracts';
 import { CoreError } from './ports';
 import { containsCredentialPattern, containsInternalPathPattern } from './safety';
-// Offsetless selections are exact quotes, not instructions to repair supplied selectors.
+// Legacy offsetless quotes are exact-only; experimental formatting recovery never repairs supplied selectors.
 const LegacyEvidenceRefSchema=EvidenceRefSchema.omit({annotationId:true});
 const ModelSelectionSchema=z.union([LegacyEvidenceRefSchema,LegacyEvidenceRefSchema.omit({start:true,end:true})]);
 const ExperimentSelectionSchema=z.union([EvidenceRefSchema,EvidenceRefSchema.omit({start:true,end:true})]);
@@ -66,6 +66,31 @@ export function validateSourceBoundReply(raw:string,sources:SourcePost[],personI
   return {status:'answered',content:claims.map(c=>c.text).join('\n'),claims,evidence,limitations:['캡션의 진술이며 실제 활동일은 게시일과 다를 수 있습니다.','원문 인용 일치 검사는 의미적 사실 검수와 다릅니다.']};
 }
 
+/** Collapse only ASCII formatting whitespace, retaining original UTF-16 range boundaries.
+ * No word, punctuation, Unicode normalization, fuzzy match or selector repair is allowed. */
+function formattedQuote(text:string,quote:string):{start:number;end:number;quote:string;canonicalized:boolean}|undefined {
+  if(!quote.trim())return;
+  const exact=text.indexOf(quote);
+  if(exact>=0)return text.indexOf(quote,exact+1)===-1?{start:exact,end:exact+quote.length,quote,canonicalized:false}:undefined;
+  const normalize=(value:string)=>value.replace(/[ \t\r\n]+/g,' ');
+  const needle=normalize(quote);
+  const units:string[]=[];const starts:number[]=[];const ends:number[]=[];
+  for(let index=0;index<text.length;) {
+    const start=index;
+    if(/[ \t\r\n]/.test(text[index]!)) {
+      while(index<text.length&&/[ \t\r\n]/.test(text[index]!))index++;
+      units.push(' ');
+    }else {units.push(text[index]!);index++;}
+    starts.push(start);ends.push(index);
+  }
+  const normalized=units.join('');const match=normalized.indexOf(needle);
+  if(match<0||normalized.indexOf(needle,match+1)!==-1)return;
+  const start=starts[match]!;const end=ends[match+needle.length-1]!;
+  const original=text.slice(start,end);
+  if(normalize(original)!==needle)return;
+  return {start,end,quote:original,canonicalized:true};
+}
+
 /** Experimental natural prose is explicitly unverified; quotes are validated independently. */
 export function validateExperimentReply(raw:string,sources:SourcePost[],personId:string,condition:'off'|'caption'|'caption_image'):Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'> {
   const fallback={status:'insufficient_evidence' as const,content:'응답의 근거 형식을 확인하지 못했어요.',claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE','의미적 사실 검수는 수행하지 않았습니다.']};
@@ -75,6 +100,7 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
   if(condition==='off' && result.evidenceRefs.length) return fallback;
   const evidence:ChatReply['evidence']=[];
   const refs:EvidenceRef[]=[];
+  let canonicalized=false;
   for(const selection of result.evidenceRefs) {
     const source=sources.find(item=>item.id===selection.sourceId && item.personId===personId && !item.unsafe);
     if(!source || containsCredentialPattern(selection.quote) || containsInternalPathPattern(selection.quote)) return fallback;
@@ -86,9 +112,10 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
       if(selection.start>=selection.end || selection.end>text.length || text.slice(selection.start,selection.end)!==selection.quote) return fallback;
       ref=selection;
     } else {
-      const start=text.indexOf(selection.quote);
-      if(start<0 || text.indexOf(selection.quote,start+1)!==-1) return fallback;
-      ref={...selection,start,end:start+selection.quote.length};
+      const match=formattedQuote(text,selection.quote);
+      if(!match)return fallback;
+      ref={...selection,quote:match.quote,start:match.start,end:match.end};
+      canonicalized ||= match.canonicalized;
     }
     refs.push(ref);
     evidence.push({sourceId:source.id,personId,sourceUrl:source.sourceUrl,postedAt:source.postedAt,eventDate:source.eventDate,snapshot:source.snapshot,hash:source.hash,quote:ref.quote,
@@ -99,6 +126,7 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
   const content=result.answer.trim() || (claims.length ? claims.map(claim=>claim.text).join('\n') : '확인된 자료가 없는 연구용 AI 응답입니다.');
   return {status:result.status,content,claims,evidence,grounding:evidence.length?'source_bound_quotes':'unverified_model',limitations:[
     ...(condition==='off'?['RETRIEVAL_OFF']:[]),
+    ...(canonicalized?['QUOTE_WHITESPACE_CANONICALIZED']:[]),
     ...(evidence.length?['인용은 원문 일치만 검증하며, 답변의 의미적 사실성은 검수하지 않았습니다.']:['UNVERIFIED_MODEL_RESPONSE','검색 근거가 없는 모델 생성 응답이며 실제 활동 사실로 확인되지 않았습니다.']),
     ...(evidence.some(card=>card.origin==='ai_image_annotation')?['이미지 설명과 의도 해석은 AI 파생 자료이며 실제 작가 의도나 원본 캡션이 아닙니다.']:[]),
     '게시일은 실제 활동일과 다를 수 있습니다.',

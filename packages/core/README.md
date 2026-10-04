@@ -33,18 +33,33 @@ bytes and `persona-chat-v1-source-quotes` revision are unchanged. The v3 timelin
 prompt is an explicit variant; earlier study results must not be relabeled as if
 they used it. `PROMPT_REVISION` currently denotes the v3 timeline revision.
 
-## agent-loop recollection voice
+## agent-loop conversational voice and service boundaries
 
-`character-agent-context-v2-recollection` adds first-person author-role narration
-only for relevant source-supported episodes and actors in the disclosed research
-AI simulation. Missing details use natural uncertainty; ambiguous posts prompt a
-brief clarification. Author, companion and user roles stay distinct. Persona,
-history and AI-inferred intent are not factual evidence. This is a prompt policy,
-not a new semantic validator or proof of real-person personality fidelity.
+`character-agent-context-v3-bounded-roleplay` uses first-person author-role
+narration in the disclosed research simulation. Light reactions, humour,
+atmosphere and minor scene embellishment are allowed, but are not verified
+source facts. Established core events/actors, exact quotations and important
+real-world/private events must not be contradicted or fabricated. Natural
+uncertainty and clarification stay conversational; technical errors stay
+explicit service notices. Persona/history are not source evidence, and real
+personality fidelity is not established by this policy.
 
-Exact-reference validation and technical fallback wording are unchanged. The
-legacy prompts above are unaffected. No prose rewrite or extra judging call is
-added. Stored old sessions/results retain their original prompt revisions.
+The experimental natural-prose validator first requires a unique exact quote.
+For **offsetless** selections only, a non-exact quote can be resolved if collapsing
+ASCII spaces, tabs, CR and LF produces exactly one matching substring. The server
+stores the original substring and its UTF-16 offsets, and marks
+`QUOTE_WHITESPACE_CANONICALIZED`. Words, punctuation, Unicode spacing and explicit
+selectors are never repaired. Ambiguous normalized matches and unauthorized
+parents/annotations still fail closed. The historical strict renderer above is
+unchanged. Quote binding is not semantic validation of the conversational prose.
+
+A schema-valid unavailable tool request returns an explicit service notice with
+`AGENT_TOOL_UNAVAILABLE`, empty refs, unchanged state and no tool/extra model call.
+Malformed/unknown actions, unsafe queries and tool-loop exhaustion still fail.
+Provider errors expose only allowlisted service codes; unresolved submissions
+are not retried. This is deterministic robustness, not new live quality evidence.
+Old completed sessions/results retain their recorded prompt versions; new turns
+use the current runtime prompt, while their persona revision remains pinned.
 
 The paired Korean regression runs with
 `node --env-file=.env.local -r tsx/cjs scripts/evaluate-korean-chat.ts --live --recollection`

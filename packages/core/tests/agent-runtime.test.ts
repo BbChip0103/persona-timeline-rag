@@ -18,7 +18,7 @@ test.each(['off','caption','caption_image'] as const)('recollection voice reache
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v2-recollection');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v3-bounded-roleplay');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
   expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('그건 잘 기억 안 나');
@@ -85,7 +85,7 @@ test('scoped tool cannot select different person, date or algorithm; bad sources
   const data=h.provider.generate.mock.calls[1][0].find(m=>m.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!.content;
   expect(data).not.toContain('wrong-date');expect(data).not.toContain('unsafe');expect(data).not.toContain('"sourceId":"other"');
 });
-test.each([tool(),tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('off or malformed actions fail once with no retrieval, history or state writes',async raw=>{
+test.each([tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('malformed actions fail once with no retrieval, history or state writes',async raw=>{
   const h=setup([raw]);const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const turn=await send(h,session.id);expect(turn.state).toBe('failed');expect(turn.errorCode).toBe('TURN_FAILED');
   expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(h.retrieval.search).not.toHaveBeenCalled();expect(await h.chat.history('owner',session.id)).toHaveLength(1);
@@ -130,9 +130,9 @@ test('validator disabled normally; configured post-tool skips exactly as declare
   const session=await chat.createSession('owner',{...create,ragCondition:'caption'});const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'tool',text:'안녕'});
   expect(turn.reply?.agent?.validator).toBe('skipped_tool_followup');expect(validate).not.toHaveBeenCalled();
 });
-test('creative photo requests forbid factual tool invocation',async()=>{
+test('creative photo requests report unavailable tool without any factual invocation',async()=>{
   const h=setup([tool()]);const session=await h.chat.createSession('owner',{...create,ragCondition:'caption_image'});
-  const turn=await send(h,session.id,'상상으로 새 가상 사진을 만들어 줘');expect(turn.state).toBe('failed');expect(h.retrieval.search).not.toHaveBeenCalled();
+  const turn=await send(h,session.id,'상상으로 새 가상 사진을 만들어 줘');expect(turn.state).toBe('completed');expect(turn.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE');expect(h.retrieval.search).not.toHaveBeenCalled();
 });
 test('context budgeting includes state/action transcript and whole annotations',async()=>{
   const huge={...source,imageAnnotations:Array.from({length:10},(_,i)=>({...source.imageAnnotations![0],id:`a${i}`,text:'합성 😀'.repeat(600)}))};
@@ -176,4 +176,31 @@ test('configured validator accept permits only final state patch, with no model 
   const chat=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,agentValidator:{validate}});
   const session=await chat.createSession('owner',{...create,ragCondition:'off'});const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'accept',text:'안녕'});
   expect(turn.reply?.agent?.validator).toBe('accepted');expect(turn.reply?.agent?.variables.tone).toBe('warm');expect(h.provider.generate).toHaveBeenCalledTimes(1);
+});
+
+
+test('off unavailable tool returns service notice once and permits a later normal turn without new state',async()=>{
+  const h=setup([tool(),final({message:'그래, 다른 얘기 하자ㅋㅋ'})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
+  const first=await send(h,session.id);expect(first.state).toBe('completed');
+  expect(first.reply?.status).toBe('insufficient_evidence');expect(first.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE');
+  expect(first.reply?.content).toContain('[서비스 안내]');expect(first.reply?.content).not.toContain('기억');
+  expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'',tone:'neutral'}});
+  expect(first.reply?.evidence).toEqual([]);expect(h.provider.generate).toHaveBeenCalledTimes(1);
+  const next=await send(h,session.id,'다른 얘기 하자','next');expect(next.reply?.content).toBe('그래, 다른 얘기 하자ㅋㅋ');
+  expect(h.retrieval.search).not.toHaveBeenCalled();expect(h.provider.generate).toHaveBeenCalledTimes(2);
+});
+test.each(['REQUEST_UNRESOLVED_NO_RESUBMIT','PROVIDER_REQUEST_FAILED','arbitrary-private-code'])('provider error %s is sanitized without retry or committed dialogue',async code=>{
+  const h=setup();h.provider.generate.mockRejectedValue(Object.assign(new Error('private details never leak'),{code}));
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
+  const first=await send(h,session.id);
+  expect(first.state).toBe('failed');expect(first.errorCode).toBe(code==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED':code==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED');
+  expect(JSON.stringify(first)).not.toContain('private details');expect(JSON.stringify(first)).not.toContain('arbitrary-private-code');
+  await send(h,session.id);expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(await h.chat.history('owner',session.id)).toHaveLength(1);
+});
+test('bounded roleplay policy allows light embellishment, preserves core events and source/actor boundaries',async()=>{
+  const h=setup([final({message:'그때 분위기 좋았지ㅋㅋ'})]);const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  await send(h,session.id);const policy=h.provider.generate.mock.calls[0][0][0].content;
+  expect(policy).toContain('Light roleplay embellishment');expect(policy).toContain('not a verified source claim');
+  expect(policy).toContain('Do not invert established core events');expect(policy).toContain('never request unavailable tools');
 });

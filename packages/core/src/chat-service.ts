@@ -71,7 +71,11 @@ export class ChatService {
       await Promise.race([execution,timeout]);
     } catch (error) {
       // Never persist/return provider error strings: they can contain raw keys, prompts or paths.
-      await this.options.store.transitionTurn(turn.id,[...activeStates],'failed',error instanceof CoreError && error.code==='CONTEXT_LIMIT'?'CONTEXT_LIMIT':'TURN_FAILED');
+      const providerCode=error instanceof Error&&'code' in error?error.code:undefined;
+      const errorCode=error instanceof CoreError&&error.code==='CONTEXT_LIMIT'?'CONTEXT_LIMIT'
+        :providerCode==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED'
+        :providerCode==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED';
+      await this.options.store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
     } finally { if(timer) clearTimeout(timer); this.controllers.delete(turn.id); }
     return this.getTurn(ownerId,turn.id);
   }
@@ -177,6 +181,7 @@ export class ChatService {
           }
         }
         if(output.status==='answered')agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
+        if(agentRun.serviceLimitation)output.limitations.push(agentRun.serviceLimitation);
         if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
       }
       else if(session.ragCondition) {

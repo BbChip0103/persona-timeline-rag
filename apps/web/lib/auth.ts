@@ -1,10 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { cookies } from 'next/headers';
 export const COOKIE_NAME='ptr_owner';
-const ORIGIN='http://127.0.0.1:56440';
+// Synthetic UI has an isolated port and build cache; production remains fixed loopback.
+const HOST=process.env.PTR_SYNTHETIC_UI==='1'?'127.0.0.1:56448':'127.0.0.1:56440';
+const ORIGIN=`http://${HOST}`;
 function secret():string { const value=process.env.PTR_SESSION_SECRET??''; if(value.length<32) throw new Error('AUTH_UNAVAILABLE'); return value; }
 export function equal(left:string,right:string):boolean { return timingSafeEqual(createHash('sha256').update(left).digest(),createHash('sha256').update(right).digest()); }
-export function localHost(request:Request):boolean { return request.headers.get('host')==='127.0.0.1:56440'; }
+export function localHost(request:Request):boolean { return request.headers.get('host')===HOST; }
 export function sameOrigin(request:Request):boolean {
   // Next normalizes its internal Request URL hostname; validate the actual Host header.
   return localHost(request)&&request.headers.get('origin')===ORIGIN&& !['cross-site','same-site'].includes(request.headers.get('sec-fetch-site')??'');

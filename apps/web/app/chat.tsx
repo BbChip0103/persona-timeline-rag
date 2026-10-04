@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import { turnNotice } from '../lib/turn-notice';
 
 type Mode='off'|'lexical'|'semantic';
 type RagCondition='off'|'caption'|'caption_image';
@@ -42,7 +43,7 @@ export default function Chat() {
     sessionRef.current=id;setActive(undefined);setAttempt(undefined);setError('');setNotice('');setDraft('');setBusy(true);
     try {await refreshHistory(id);localStorage.setItem('ptr-session-id',id);
       const activeId=localStorage.getItem(`ptr-active-turn-${id}`);
-      if(activeId){const value=await api<{turn:Turn}>(`turns/${activeId}`).catch(()=>undefined);if(value&&!terminal(value.turn.state))setActive(value.turn);else localStorage.removeItem(`ptr-active-turn-${id}`);}
+      if(activeId){const value=await api<{turn:Turn}>(`turns/${activeId}`).catch(()=>undefined);if(value&&!terminal(value.turn.state))setActive(value.turn);else {if(value)setNotice(turnNotice(value.turn));localStorage.removeItem(`ptr-active-turn-${id}`);}}
     }catch(e){setError((e as Error).message);sessionRef.current=undefined;setSession(undefined);}finally{setBusy(false);}
   }
   useEffect(()=>{let stopped=false;void Promise.all([api<{personas:Persona[]}>('personas'),api<{sessions:Session[]}>('sessions')]).then(async([people,stored])=>{
@@ -59,7 +60,7 @@ export default function Chat() {
       failures=0;
       if(terminal(value.turn.state)) {
         if(value.turn.reply)setReplies(previous=>({...previous,[value.turn.id]:value.turn.reply!}));
-        setNotice(value.turn.state==='cancelled'?'생성을 취소했습니다. 이미 제출된 외부 요청은 다시 전송하지 않습니다.':value.turn.state==='failed'?'생성에 실패했습니다. 자동 재전송하지 않았습니다.':'');
+        setNotice(turnNotice(value.turn));
         await refreshHistory(value.turn.sessionId);if(controller.signal.aborted)return;localStorage.removeItem(`ptr-active-turn-${value.turn.sessionId}`);setActive(undefined);setAttempt(undefined);return;
       }
       setActive(value.turn);timer=setTimeout(tick,600);
@@ -69,7 +70,7 @@ export default function Chat() {
   async function submit(value:Attempt) {
     if(!session)return;setBusy(true);setError('');setNotice('');setAttempt(value);
     try {const result=await api<{turn:Turn}>(`sessions/${session.id}/turns`,value);
-      if(terminal(result.turn.state)){await refreshHistory(session.id);setAttempt(undefined);setNotice(result.turn.state==='completed'?'':`요청 상태: ${result.turn.state}`);}else {localStorage.setItem(`ptr-active-turn-${result.turn.sessionId}`,result.turn.id);setActive(result.turn);}
+      if(terminal(result.turn.state)){await refreshHistory(session.id);setAttempt(undefined);setNotice(turnNotice(result.turn));}else {localStorage.setItem(`ptr-active-turn-${result.turn.sessionId}`,result.turn.id);setActive(result.turn);}
       setText('');
     }catch(e){setError((e as Error).message);}finally{setBusy(false);}
   }

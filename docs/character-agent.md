@@ -65,3 +65,22 @@ can proceed. Completed matched pairs are summarized separately from all observed
 rows. Actual private replies/accounting go under `reports/agent-reevaluation/`;
 previous evaluation pointers are not overwritten. Cached legacy replays are not
 newly billed and cannot be compared naively to uncached latency/cost.
+
+
+## Current conversational/service contract
+
+The prompt is `character-agent-context-v3-bounded-roleplay`: light roleplay
+embellishment is allowed without promoting it to source facts or contradicting
+established core events/actors. This is not a semantic guarantee or measured
+quality improvement. Existing completed turn reports keep their recorded prompt
+versions; new turns use the current runtime and session-pinned persona revision.
+
+Offsetless experimental quotes may be canonicalized only for a unique match
+under ASCII space/tab/CR/LF collapsing. Stored quotes and UTF-16 ranges use the
+original source bytes; `QUOTE_WHITESPACE_CANONICALIZED` records this case.
+Explicit selectors and the historical strict renderer remain exact-only.
+Unavailable tools produce `AGENT_TOOL_UNAVAILABLE` service notices with no tool,
+retry or state patch. Unknown/malformed/unsafe actions and exhausted/repeated tool
+loops still fail closed. Provider unresolved failures expose only a safe service
+code and never trigger resubmission. These service states are not persona memory
+or factual successes. See [core contract](../packages/core/README.md).

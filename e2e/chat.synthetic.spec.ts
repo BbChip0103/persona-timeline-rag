@@ -2,9 +2,9 @@ import { expect, test, type Page } from '@playwright/test';
 const password='synthetic-ui-password-only';
 type Session={id:string;personId:string;personaRevision:string;retrievalMode:string;ragCondition?:string;createdAt:string};
 type Message={id:string;turnId:string|null;role:string;content:string};
-type Turn={id:string;sessionId:string;clientRequestId:string;userText:string;state:string;reply?:Record<string,unknown>};
+type Turn={id:string;sessionId:string;clientRequestId:string;userText:string;state:string;errorCode?:string;reply?:Record<string,unknown>};
 async function fixtures(page:Page) {
-  const sessions:Session[]=[];const histories=new Map<string,Message[]>();const turns=new Map<string,Turn>();const polls=new Map<string,number>();const requestIds=new Map<string,Turn>();let counter=0;let abortNext=false;const sentBodies:Record<string,unknown>[]=[];
+  const sessions:Session[]=[];const histories=new Map<string,Message[]>();const turns=new Map<string,Turn>();const polls=new Map<string,number>();const requestIds=new Map<string,Turn>();let counter=0;let abortNext=false;let failNext:string|undefined;const sentBodies:Record<string,unknown>[]=[];
   await page.route('**/api/proxy/**',async route=>{
     const path=new URL(route.request().url()).pathname.slice('/api/proxy/'.length);const body=route.request().method()==='POST'?route.request().postDataJSON() as Record<string,unknown>:undefined;
     let value:unknown;
@@ -14,6 +14,7 @@ async function fixtures(page:Page) {
     else if(/^sessions\/[^/]+$/.test(path)){const id=path.split('/')[1]!;value={session:sessions.find(session=>session.id===id),history:histories.get(id)??[]};}
     else if(/^sessions\/[^/]+\/turns$/.test(path)&&body){sentBodies.push(body);const id=String(body.clientRequestId);let turn=requestIds.get(id);
       if(!turn){turn={id:'synthetic-turn-'+(++counter),sessionId:path.split('/')[1]!,clientRequestId:id,userText:String(body.text),state:'generating'};turns.set(turn.id,turn);requestIds.set(id,turn);histories.get(turn.sessionId)!.push({id:'synthetic-user-'+counter,turnId:turn.id,role:'user',content:turn.userText});}
+      if(failNext){turn.state='failed';turn.errorCode=failNext;failNext=undefined;}
       value={turn};if(abortNext){abortNext=false;await route.abort('failed');return;}
     }
     else if(/^turns\/[^/]+\/cancel$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;turn.state='cancelled';value={cancelled:true};}
@@ -25,7 +26,7 @@ async function fixtures(page:Page) {
     else {await route.fulfill({status:404,json:{error:{code:'NOT_FOUND'}}});return;}
     await route.fulfill({json:value});
   });
-  return {sentBodies,turns,abortOnce:()=>{abortNext=true;}};
+  return {sentBodies,turns,abortOnce:()=>{abortNext=true;},failOnce:(code:string)=>{failNext=code;}};
 }
 async function login(page:Page) {await page.goto('/login');await page.getByLabel('연구 공간 비밀번호').fill(password);const responsePromise=page.waitForResponse('**/api/auth');await page.getByRole('button',{name:'로그인',exact:true}).click();const response=await responsePromise;expect(response.status()).toBe(200);await expect(page.getByRole('heading',{name:'대화 공간'})).toBeVisible();await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');}
 async function newSession(page:Page) {await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');await page.getByRole('button',{name:'새 대화 시작'}).click();await expect(page.getByText('합성 연구 페르소나입니다. 편하게 이야기해 주세요.').last()).toBeVisible();}
@@ -80,4 +81,16 @@ test('SYNTHETIC ONLY: three condition controls persist and image provenance card
   await expect(page.getByText('synthetic-image-description / synthetic-v5')).toBeVisible();
   await page.reload();await expect(page.getByTestId('session-mode')).toHaveText('본문 + 이미지 설명 · semantic');
   await expect(page.locator('[data-evidence-origin="ai_image_annotation"]')).toHaveCount(1);
+});
+
+
+test('SYNTHETIC ONLY: unresolved provider submission shows safe notice, never auto-resends and next dialogue works',async({page})=>{
+  const state=await fixtures(page);await login(page);await newSession(page);
+  state.failOnce('PROVIDER_REQUEST_UNRESOLVED');
+  await page.getByLabel('메시지',{exact:true}).fill('합성 실패 요청');await page.getByRole('button',{name:'보내기',exact:true}).click();
+  await expect(page.getByText('이전 외부 요청의 처리 결과가 미확정이라',{exact:false})).toBeVisible();
+  expect(state.sentBodies).toHaveLength(1);await page.waitForTimeout(800);expect(state.sentBodies).toHaveLength(1);
+  await page.getByLabel('메시지',{exact:true}).fill('다른 합성 대화');await page.getByRole('button',{name:'보내기',exact:true}).click();
+  await expect(page.getByText('합성 응답입니다. 대화를 이어 가요.',{exact:true})).toBeVisible();
+  expect(state.sentBodies).toHaveLength(2);expect(state.sentBodies[0].clientRequestId).not.toBe(state.sentBodies[1].clientRequestId);
 });
