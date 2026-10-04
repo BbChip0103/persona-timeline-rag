@@ -45,3 +45,15 @@ test('HTTP errors, empty output and aborts are typed and sanitized; metrics reco
   await expect(provider(never).generate(messages,{signal:controller.signal})).rejects.toEqual(new ProviderError('CANCELLED'));
   expect(never).not.toHaveBeenCalled();
 });
+test('structured agent replies send the agent JSON Schema for guided decoding (agent prompts only)',async()=>{
+  const fetcher=jest.fn(async()=>sse([delta('{"message":"x","status":"answered","evidenceRefs":[],"variableUpdates":{}}'),'[DONE]']));
+  const structured=provider(fetcher,{structuredAgentReplies:true});
+  await structured.generate([{role:'system',content:'AGENT_JSON_REPLY'},{role:'user',content:'x'}],{signal:signal()});
+  const body=JSON.parse(((fetcher.mock.calls[0] as unknown[])[1] as RequestInit).body as string);
+  expect(body.response_format.type).toBe('json_schema');
+  expect(body.response_format.json_schema.name).toBe('agent_reply');
+  expect(body.response_format.json_schema.schema.required).toContain('evidenceRefs');
+  await structured.generate(messages,{signal:signal()});
+  const plain=JSON.parse(((fetcher.mock.calls[1] as unknown[])[1] as RequestInit).body as string);
+  expect(plain.response_format).toBeUndefined();
+});

@@ -37,6 +37,29 @@ export const AgentResponseSchema = z.object({
   }
 });
 export type AgentResponse = z.infer<typeof AgentResponseSchema>;
+/**
+ * JSON Schema mirror of AgentResponseSchema for engine-side structured output (guided decoding).
+ * It only constrains shape; the zod contract above stays the single validator (codepoint limits,
+ * function/message exclusivity, credential checks).
+ */
+export const AGENT_RESPONSE_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['message', 'status', 'evidenceRefs', 'variableUpdates'],
+  properties: {
+    message: { type: 'string', maxLength: 180 },
+    status: { type: 'string', enum: ['answered', 'insufficient_evidence', 'needs_clarification', 'out_of_scope'] },
+    evidenceRefs: { type: 'array', maxItems: 2, items: { type: 'object', additionalProperties: false, required: ['sourceId', 'quote'],
+      properties: { sourceId: { type: 'string', minLength: 1, maxLength: 200 }, annotationId: { type: 'string', minLength: 1, maxLength: 200 },
+        quote: { type: 'string', minLength: 1, maxLength: 96 } } } },
+    reasoning: { type: 'string', maxLength: 160 },
+    variableUpdates: { type: 'object', additionalProperties: false,
+      properties: { conversationTopic: { type: 'string', maxLength: 200 }, tone: { type: 'string', enum: ['neutral', 'warm', 'playful'] } } },
+    function: { type: 'object', additionalProperties: false, required: ['name', 'arguments'],
+      properties: { name: { type: 'string', enum: ['timeline_search'] },
+        arguments: { type: 'object', additionalProperties: false, required: ['query'], properties: { query: { type: 'string', minLength: 1, maxLength: 500 } } } } },
+  },
+} as const;
 export type AgentVariables = z.infer<typeof AgentVariablesSchema>;
 
 /** Inspect decoded keys and strings too, so escaped credentials cannot bypass raw-text detection. */

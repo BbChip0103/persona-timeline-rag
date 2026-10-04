@@ -81,3 +81,15 @@ test('final message hard180Unicode bound and tool updates cannot mutate state',(
   expect(()=>parseAgentResponse(JSON.stringify({...base,message:'😀'.repeat(181)}))).toThrow(CoreError);
   expect(()=>parseAgentResponse(JSON.stringify({...base,message:'',variableUpdates:{tone:'warm'},function:{name:'timeline_search',arguments:{query:'synthetic'}}}))).toThrow(CoreError);
 });
+
+describe('agent reply JSON Schema for engine-side structured output',()=>{
+  test('mirrors the zod contract keys and requires every always-present field',async()=>{
+    const {AGENT_RESPONSE_JSON_SCHEMA,AgentResponseSchema}=await import('../src');
+    const shape=Object.keys((AgentResponseSchema as unknown as {_def:{schema:{shape:Record<string,unknown>}}})._def.schema.shape);
+    expect(Object.keys(AGENT_RESPONSE_JSON_SCHEMA.properties).sort()).toEqual([...shape].sort());
+    expect(AGENT_RESPONSE_JSON_SCHEMA.additionalProperties).toBe(false);
+    expect([...AGENT_RESPONSE_JSON_SCHEMA.required].sort()).toEqual(['evidenceRefs','message','status','variableUpdates']);
+    expect(AGENT_RESPONSE_JSON_SCHEMA.properties.status.enum).toEqual(['answered','insufficient_evidence','needs_clarification','out_of_scope']);
+    expect(AGENT_RESPONSE_JSON_SCHEMA.properties.evidenceRefs.maxItems).toBe(2);
+  });
+});

@@ -53,7 +53,7 @@ async function seed(directory:string):Promise<{personas:number;posts:number;file
 interface ApiJson {session?:{id:string};turn?:{id:string;state:string;errorCode?:string|null};error?:{code?:string}}
 export interface Topology {execution:'inline'|'queue';workers:number;workerConcurrency:number;queueMax:number;poolMax:number;leaseMs:number;
   /** fake (optionally latency-injected) or a self-hosted engine behind an SSH tunnel */
-  provider:'fake'|'selfhosted';selfhostedBaseUrl?:string;selfhostedModel?:string}
+  provider:'fake'|'selfhosted';selfhostedBaseUrl?:string;selfhostedModel?:string;structured?:boolean}
 class Api {
   private child?:ChildProcess;
   private workers:ChildProcess[]=[];
@@ -65,7 +65,7 @@ class Api {
     const t=this.topology;
     return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',DATABASE_URL:loadtestUrl(),
       PTR_API_TOKEN:this.token,PTR_API_PORT:String(this.port),PTR_PERSONAS_FILE:this.personasFile,PTR_CHAT_PROVIDER:t.provider,
-      ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:{}),
+      ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel,PTR_SELFHOSTED_STRUCTURED:t.structured?'1':'0'}:{}),
       PTR_EXECUTION:t.execution,PTR_QUEUE_MAX_DEPTH:String(t.queueMax),PTR_DB_POOL_MAX:String(t.poolMax),
       PTR_WORKER_CONCURRENCY:String(t.workerConcurrency),PTR_LEASE_MS:String(t.leaseMs),
       ...(this.latency&&t.provider==='fake'?{PTR_FAKE_LATENCY:this.latency}:{})};
@@ -147,17 +147,23 @@ function startResourceSampler(api:Api) {
   return {rows,stop:async()=>{stopped=true;await running;await pool.end();}};
 }
 
-interface UserOptions {api:Api;deadline:number;turnTimeoutMs:number;pollMs:number;thinkMs:number;samples:TurnSample[];personaIndex:number}
+interface UserOptions {api:Api;deadline:number;turnTimeoutMs:number;pollMs:number;thinkMs:number;samples:TurnSample[];personaIndex:number;
+  /** 0 = one session for the whole stage; N = start a new session every N turns (realistic conversation length). */
+  turnsPerSession:number}
 async function virtualUser(o:UserOptions):Promise<void> {
   const owner=`lt-${randomUUID().slice(0,8)}`;
   let session:string|undefined;
-  try {
-    const created=await o.api.call('sessions',owner,{personId:`loadtest-person-${1+o.personaIndex%8}`,retrievalMode:'lexical'});
-    if(created.status>=300) {o.samples.push({outcome:'rejected',acceptMs:null,e2eMs:null,errorCode:`SESSION_HTTP_${created.status}`});return;}
-    session=created.json.session!.id;
-  } catch {o.samples.push({outcome:'rejected',acceptMs:null,e2eMs:null,errorCode:'SESSION_NETWORK'});return;}
+  const open=async():Promise<boolean>=>{
+    try {
+      const created=await o.api.call('sessions',owner,{personId:`loadtest-person-${1+o.personaIndex%8}`,retrievalMode:'lexical'});
+      if(created.status>=300) {o.samples.push({outcome:'rejected',acceptMs:null,e2eMs:null,errorCode:`SESSION_HTTP_${created.status}`});return false;}
+      session=created.json.session!.id;return true;
+    } catch {o.samples.push({outcome:'rejected',acceptMs:null,e2eMs:null,errorCode:'SESSION_NETWORK'});return false;}
+  };
+  if(!await open()) return;
   let n=0;
   while(Date.now()<o.deadline) {
+    if(o.turnsPerSession&&n>0&&n%o.turnsPerSession===0&&!await open()) return;
     const started=Date.now();let acceptMs:number|null=null;
     try {
       const sent=await o.api.call(`sessions/${session}/turns`,owner,{clientRequestId:randomUUID(),text:LOADTEST_QUESTIONS[(o.personaIndex+n++)%LOADTEST_QUESTIONS.length]});
@@ -179,9 +185,10 @@ async function virtualUser(o:UserOptions):Promise<void> {
     if(o.thinkMs) await sleep(o.thinkMs);
   }
 }
+let turnsPerSession=0;
 async function runStage(api:Api,users:number,seconds:number,extra:Partial<UserOptions>={}) {
   const samples:TurnSample[]=[];const started=Date.now();const deadline=started+seconds*1000;
-  await Promise.all(Array.from({length:users},(_,i)=>virtualUser({api,deadline,turnTimeoutMs:45_000,pollMs:100,thinkMs:0,samples,personaIndex:i,...extra})));
+  await Promise.all(Array.from({length:users},(_,i)=>virtualUser({api,deadline,turnTimeoutMs:45_000,pollMs:100,thinkMs:0,samples,personaIndex:i,turnsPerSession,...extra})));
   return {users,seconds,...summarizeStage(samples,Date.now()-started),wallSeconds:(Date.now()-started)/1000};
 }
 async function activeTurns(since:Date):Promise<{state:string;n:number}[]> {
@@ -195,13 +202,14 @@ async function main():Promise<void> {
   const runId=`${new Date().toISOString().replace(/[:.]/g,'-')}-${mode}`;
   const directory=join('reports','loadtest',runId);await mkdir(directory,{recursive:true,mode:0o700});
   const runStarted=new Date();
+  turnsPerSession=Number(options['turns-per-session']??0);
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
   const latency=options.latency==='none'||options.provider==='selfhosted'?null:options.latency??DEFAULT_LATENCY;
   const topology:Topology={execution:options.execution==='queue'?'queue':'inline',workers:Number(options.workers??2),
     workerConcurrency:Number(options['worker-concurrency']??128),queueMax:Number(options['queue-max']??2048),
     poolMax:Number(options['pool-max']??8),leaseMs:Number(options['lease-ms']??5000),
-    provider:options.provider==='selfhosted'?'selfhosted':'fake',selfhostedBaseUrl:options['base-url']??'http://127.0.0.1:18000/v1',selfhostedModel:options.model??'gemma-4-e4b'};
+    provider:options.provider==='selfhosted'?'selfhosted':'fake',selfhostedBaseUrl:options['base-url']??'http://127.0.0.1:18000/v1',selfhostedModel:options.model??'gemma-4-e4b',structured:options.structured==='1'};
   const api=new Api(Number(options.port??56451),seeded.file,latency,join(directory,'api.log'),topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
     note:'Fake model with injected latency on synthetic data: serving-architecture limits, not LLM throughput.'};

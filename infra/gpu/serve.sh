@@ -21,14 +21,15 @@ case $TARGET in
       --host 127.0.0.1 --port 8000 --max-model-len $CTX --gpu-memory-utilization 0.90 \
       --reasoning-parser gemma4 --limit-mm-per-prompt "{\"image\":0,\"audio\":0}" --async-scheduling ;;
   sglang-e4b-fp8)
-    # --language-model-only: SGLang 0.5.21 online FP8 crashes building the Gemma 4 audio tower; text-only skips it.
+    # SGLang 0.5.21 online FP8 crashes building the Gemma 4 audio tower; --language-model-only rejects Gemma4,
+    # so try --language-only (language-model weights only).
     exec $G/venv-sglang/bin/python -m sglang.launch_server --model-path $G/models/gemma-4-E4B-it --served-model-name gemma-4-e4b-fp8 --quantization fp8 \
-      --host 127.0.0.1 --port 30000 --context-length $CTX --mem-fraction-static 0.90 --language-model-only \
+      --host 127.0.0.1 --port 30000 --context-length $CTX --mem-fraction-static 0.90 --language-only \
       --reasoning-parser gemma4 --enable-metrics ;;
   sglang-e4b-lm)
-    # Fairness re-run: same text-only scope and memory fraction as vLLM (0.90).
+    # Fairness re-run: same memory fraction as vLLM (0.90). (--language-model-only does not support Gemma4.)
     exec $G/venv-sglang/bin/python -m sglang.launch_server --model-path $G/models/gemma-4-E4B-it --served-model-name gemma-4-e4b \
-      --host 127.0.0.1 --port 30000 --context-length $CTX --mem-fraction-static 0.90 --language-model-only \
+      --host 127.0.0.1 --port 30000 --context-length $CTX --mem-fraction-static 0.90 \
       --reasoning-parser gemma4 --enable-metrics ;;
   sglang-e4b)
     exec $G/venv-sglang/bin/python -m sglang.launch_server --model-path $G/models/gemma-4-E4B-it --served-model-name gemma-4-e4b \

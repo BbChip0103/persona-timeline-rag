@@ -55,7 +55,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     // Goal2: self-hosted vLLM/SGLang through an SSH tunnel. Chat only; embeddings stay on the fake space.
     const baseUrl=env.PTR_SELFHOSTED_BASE_URL, selfModel=env.PTR_SELFHOSTED_MODEL;
     if(!baseUrl||!selfModel) throw new CoreError('INVALID_INPUT');
-    provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000});model=`selfhosted/${selfModel}`;
+    provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_SELFHOSTED_STRUCTURED==='1'});model=`selfhosted/${selfModel}`;
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
   const queue=execution==='queue'?store:undefined;
