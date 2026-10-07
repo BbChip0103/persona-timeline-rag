@@ -1,5 +1,5 @@
 import { PersonaSchema, SourcePostSchema } from '@ptr/contracts';
-import { percentile, summarizeStage, syntheticCorpus, LOADTEST_QUESTIONS, type TurnSample } from '../loadtest-lib';
+import { percentile, summarizeStage, syntheticCorpus, LOADTEST_QUESTIONS, sseParser, type TurnSample } from '../loadtest-lib';
 
 test('percentile uses nearest-rank and handles empty input',()=>{
   expect(percentile([],50)).toBeNull();
@@ -26,4 +26,13 @@ test('synthetic corpus is deterministic, schema-valid and never claims real peop
   for(const post of a.posts){SourcePostSchema.parse(post);expect(post.sourceUrl).toMatch(/^https:\/\/example\.com\//);}
   expect(new Set(a.posts.map(post=>post.id)).size).toBe(15);
   expect(LOADTEST_QUESTIONS.length).toBeGreaterThanOrEqual(6);
+});
+
+describe('sseParser',()=>{
+  test('yields frames across chunk boundaries and drops comments and malformed data',()=>{
+    const feed=sseParser();
+    expect(feed(': ping\n\nevent: state\ndata: {"sta')).toEqual([]);
+    expect(feed('te":"generating"}\n\nevent: turn\ndata: not-json\n\nevent: turn\ndata: {"state":"completed"}\n\n')).toEqual([
+      {event:'state',data:{state:'generating'}},{event:'turn',data:{state:'completed'}}]);
+  });
 });

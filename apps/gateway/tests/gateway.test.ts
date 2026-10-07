@@ -132,3 +132,19 @@ describe('gateway upstream configuration',()=>{
     expect(()=>upstreamFromEnvironment({PTR_GATEWAY_UPSTREAM:'anthropic'})).toThrow();
   });
 });
+describe('OpenAI-compatible client when the gateway restarts',()=>{
+  test('connection refused (nothing was sent) is retried until the gateway is back; the caller signal still ends it',async()=>{
+    const probe=createServer();const base=await listen(probe);const port=Number(new URL(base).port);
+    await new Promise(r=>probe.close(r));servers.splice(servers.indexOf(probe),1); // port now refuses connections
+    const client=new OpenAICompatibleTextProvider({baseUrl:`${base}/v1`,model:'gateway',apiKey:token});
+    const pending=client.generate([{role:'user',content:'안녕'}],{signal:new AbortController().signal});
+    await new Promise(r=>setTimeout(r,300));
+    const back=createServer((req,res)=>{req.resume();req.on('end',()=>{res.writeHead(200,{'Content-Type':'text/event-stream'});res.end(`data: ${JSON.stringify({choices:[{delta:{content:'돌아왔어'}}]})}\n\ndata: [DONE]\n\n`);});});
+    servers.push(back);await new Promise<void>(r=>back.listen(port,'127.0.0.1',r));
+    expect(await pending).toBe('돌아왔어');
+    const gone=createServer();const goneBase=await listen(gone);await new Promise(r=>gone.close(r));servers.splice(servers.indexOf(gone),1);
+    const controller=new AbortController();setTimeout(()=>controller.abort(),200);
+    await expect(new OpenAICompatibleTextProvider({baseUrl:`${goneBase}/v1`,model:'gateway',apiKey:token}).generate([{role:'user',content:'x'}],{signal:controller.signal})).rejects.toMatchObject({code:'CANCELLED'});
+  });
+});
+

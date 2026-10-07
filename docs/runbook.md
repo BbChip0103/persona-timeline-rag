@@ -100,8 +100,10 @@ status, bytes and balance checks are required. No duplicate submit on timeout/un
 from provider dollars. Human reading/typing/management time remains unknown if not measured.
 Historical decisions/time checkpoints live beside the external issue, not duplicated here.
 
-## Goal2 serving (queue/workers, load tests, engines)
+## Goal2 serving (Redis queue, workers, SSE, LLM gateway, load tests, engines)
 
-Queued execution (`PTR_EXECUTION=queue` + `apps/api/src/worker.ts`), the synthetic load/failure harness on `ptr_loadtest`,
-self-hosted engines over an SSH tunnel and the GPU benchmark scripts are documented in [goal2-serving.md](goal2-serving.md).
-Apply migrations 0005/0006 before using queue mode.
+Turns always run queued: API (`pnpm dev:api`) + worker(s) (`pnpm dev:worker`) + dispatcher (`pnpm dev:dispatcher`),
+optionally the LLM gateway (`pnpm dev:gateway`, workers with `PTR_CHAT_PROVIDER=gateway`). All need the local Redis
+(`infra/compose.redis.yml`, `PTR_REDIS_URL`) and migrations through 0007; evaluation scripts need Redis too. The
+synthetic load/failure harness on `ptr_loadtest`, self-hosted engines over an SSH tunnel and the GPU benchmark
+scripts are documented in [goal2-serving.md](goal2-serving.md).

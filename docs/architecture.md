@@ -45,7 +45,8 @@
 ```text
 기존 Python ingestion → immutable source posts/media → 전용 local Supabase
 독립 persona 작성/검수 → versioned PersonaDefinition → person에 묶인 ChatSession
-Next.js 채팅 → NestJS turn API → trusted session context
+Next.js 채팅 → NestJS turn API (예약 + outbox → Redis/BullMQ) → turn worker(Postgres lease·fencing) → trusted session context
+  (진행 상태는 Redis pub/sub → SSE로 push, 모델 호출은 LLM gateway 경유 — 상세 goal2-serving.md)
   → persona/history + intent/reference
   → 필요시 scoped search_timeline → evidence/시간 한계
   → provider 생성 → claim/근거 검증 → final reply + source cards

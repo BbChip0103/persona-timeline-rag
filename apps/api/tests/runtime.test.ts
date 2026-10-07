@@ -26,7 +26,7 @@ test('turns always run through Redis workers: queue knobs are validated and the 
   const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_QUEUE_MAX_DEPTH:'64',PTR_DB_POOL_MAX:'32'});
   expect(runtime.delivery).toBeInstanceOf(BullMqTurnDelivery);expect(runtime.leases).toBeDefined();
   await runtime.close?.();
-  for(const env of [{PTR_EXECUTION:'inline'},{PTR_EXECUTION:'queue'},{PTR_QUEUE_MAX_DEPTH:'0'},{PTR_DB_POOL_MAX:'0'}])
+  for(const env of [{PTR_EXECUTION:'inline'},{PTR_EXECUTION:'queue'},{PTR_QUEUE_MAX_DEPTH:'0'},{PTR_DB_POOL_MAX:'0'},{PTR_TURN_QUEUE:'Bad:Name'},{PTR_EVENTS_NAMESPACE:'x'.repeat(41)}])
     expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,...env})).toThrow();
   for(const url of ['','redis://:x@10.0.0.5:56479/0','redis://127.0.0.1:56479/0'])
     expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:url})).toThrow();

@@ -17,8 +17,10 @@ export interface OpenAICompatibleOptions {
   /** Bearer token, e.g. for the LLM gateway. */
   apiKey?:string;
 }
-/** The gateway marks requests it refused before contacting any upstream; only those are safe to resend. */
+/** The gateway marks requests it refused before contacting any upstream; those are safe to resend. */
 const GATEWAY_REJECTED='rejected';
+/** A refused connection means the request never left this process (e.g. the gateway is restarting): also safe to resend. */
+const refused=(error:unknown)=>(error as {cause?:{code?:string}})?.cause?.code==='ECONNREFUSED';
 const sleep=(ms:number,signal:AbortSignal)=>new Promise<void>((resolve,reject)=>{
   const timer=setTimeout(resolve,ms);signal.addEventListener('abort',()=>{clearTimeout(timer);reject(new ProviderError('CANCELLED'));},{once:true});
 });
@@ -27,8 +29,9 @@ type Json=Record<string,unknown>;
 /**
  * OpenAI-compatible chat adapter for self-hosted serving engines or the LLM gateway in front of them. No billing
  * ledger here: GPU time is accounted per run, and a billable upstream behind the gateway keeps its own ledger.
- * Gateway admission rejections (429/503 marked `X-PTR-Gateway: rejected`) are retried after Retry-After until the
- * caller's signal or the timeout ends the call; every other error surfaces at once.
+ * Gateway admission rejections (429/503 marked `X-PTR-Gateway: rejected`) and refused connections are retried
+ * (Retry-After, or a short backoff) until the caller's signal or the timeout ends the call; every other error surfaces
+ * at once, because the request may already have reached a model.
  */
 export class OpenAICompatibleTextProvider implements TextProvider {
   private readonly fetcher:typeof fetch;
@@ -60,8 +63,9 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     try {
       const headers={'Content-Type':'application/json',...(this.options.apiKey?{Authorization:`Bearer ${this.options.apiKey}`}:{})};
       let response:Response;
-      for(;;) {
-        response=await this.fetcher(this.endpoint,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});
+      for(let attempt=0;;attempt++) {
+        try {response=await this.fetcher(this.endpoint,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});}
+        catch(error) {if(!refused(error)||signal.aborted) throw error;await sleep(Math.min(100*2**attempt,1000),signal);continue;}
         if((response.status===429||response.status===503)&&response.headers.get('x-ptr-gateway')===GATEWAY_REJECTED) {
           await response.body?.cancel().catch(()=>undefined);
           const after=Number(response.headers.get('retry-after'));

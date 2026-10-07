@@ -16,7 +16,7 @@ async function main() {
   const worker=new TurnWorker({chat:runtime.chat,leases:runtime.leases,workerId,leaseMs:integer('PTR_LEASE_MS',15000,300,600000),
     cancellations:runtime.eventSource,onError:phase=>process.stderr.write(`worker ${phase} error\n`)});
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
-    {concurrency:integer('PTR_WORKER_CONCURRENCY',32,1,1024),onError:()=>process.stderr.write('worker queue error\n')});
+    {concurrency:integer('PTR_WORKER_CONCURRENCY',32,1,1024),queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
   process.stdout.write(`Turn worker ${workerId} started\n`);
   // Graceful: stop taking jobs and let in-flight turns finish; a crash instead leaves them to lease recovery.
   const shutdown=()=>{void consumer.close().then(()=>worker.stop()).then(()=>runtime.close?.()).finally(()=>process.exit(0));};

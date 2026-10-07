@@ -65,8 +65,11 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1'});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
-  const delivery=new BullMqTurnDelivery(redisUrl);
-  const events=new RedisTurnEvents(redisUrl);const eventSource=new RedisTurnEventSource(redisUrl);
+  // Separate names let a load test run beside other users of the same Redis (and be wiped safely afterwards).
+  const queueName=env.PTR_TURN_QUEUE??'turns', namespace=env.PTR_EVENTS_NAMESPACE??'events';
+  if(!/^[a-z0-9-]{1,40}$/.test(queueName)||!/^[a-z0-9-]{1,40}$/.test(namespace)) throw new CoreError('INVALID_INPUT');
+  const delivery=new BullMqTurnDelivery(redisUrl,{queueName});
+  const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
     ...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});

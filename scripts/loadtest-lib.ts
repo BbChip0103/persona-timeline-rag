@@ -48,3 +48,19 @@ export function syntheticCorpus(personaCount:number,postsPerPersona:number):{per
 /** Mix of small talk and memory questions (the latter trigger retrieval), like Goal1 chat traffic. */
 export const LOADTEST_QUESTIONS=['안녕! 오늘 기분 어때?','요즘 뭐 하고 지내?','파란 책 이야기 기억나?','산책했던 날 얘기해줘',
   '커피 좋아해?','바다 갔던 게시물 있었지?','주말에 뭐 할 거야?','전시 보러 갔던 거 어땠어?'];
+
+export type SseFrame={event:string;data:unknown};
+/** Incremental SSE parser for the load client: feed text chunks, get complete `event:`/`data:` frames (comments dropped). */
+export function sseParser():(chunk:string)=>SseFrame[] {
+  let buffer='';
+  return chunk=>{
+    buffer+=chunk;const frames:SseFrame[]=[];let end:number;
+    while((end=buffer.indexOf('\n\n'))>=0) {
+      const lines=buffer.slice(0,end).split('\n');buffer=buffer.slice(end+2);
+      const event=lines.find(line=>line.startsWith('event: '))?.slice(7);const data=lines.find(line=>line.startsWith('data: '))?.slice(6);
+      if(!event||data===undefined) continue;
+      try {frames.push({event,data:JSON.parse(data)});} catch {/* malformed frame: skip */}
+    }
+    return frames;
+  };
+}
