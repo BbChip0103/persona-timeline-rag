@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type { ChatSession, Persona, ProviderMessage } from '@ptr/contracts';
-import { ChatService } from '@ptr/core';
+import { type LocalChat, createLocalChat } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository } from '../src';
 
 const enabled = process.env.RUN_STORAGE_DB_TESTS === '1' && Boolean(process.env.DATABASE_URL);
@@ -43,10 +43,10 @@ integration('dedicated loopback agent-loop agent persistence (synthetic provider
     const provider = { generate: jest.fn(async (_messages: ProviderMessage[], _options: { signal: AbortSignal }) => response) };
     const retrieval = { search: jest.fn(async () => []) };
     const store = new PostgresConversationStore(pool);
-    const service = new ChatService({ store, personas: new PostgresPersonaRepository(pool), provider, retrieval });
+    const service = createLocalChat({ store, personas: new PostgresPersonaRepository(pool), provider, retrieval });
     return { provider, retrieval, store, service };
   }
-  async function create(service: ChatService): Promise<ChatSession> {
+  async function create(service: LocalChat): Promise<ChatSession> {
     return service.createSession(owner, {
       personId: scope, personaId: persona.id, personaRevision: persona.revision, executionProfile: 'agent_loop', timezone: 'UTC',
     });

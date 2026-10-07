@@ -1,124 +1,170 @@
 import type { Persona } from '@ptr/contracts';
-import { ChatService, CoreError, InMemoryConversationStore, InMemoryPersonaRepository, TurnWorker, type TextProvider } from '../src';
+import { ChatService, CoreError, InMemoryConversationStore, InMemoryPersonaRepository, InMemoryTurnDelivery, InMemoryTurnEvents, TurnDispatcher, TurnWorker, createLocalChat, type TextProvider } from '../src';
 
 const persona:Persona={id:'persona_synthetic_q',personId:'person_synthetic_q',label:'Synthetic Q',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Queue test',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
-const until=async(check:()=>Promise<boolean>,ms=2000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
+const until=async(check:()=>Promise<boolean>|boolean,ms=2000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
 
-function setup(provider:TextProvider={generate:jest.fn(async()=> '반가워요.')},queueMaxDepth=100) {
+function setup(provider:TextProvider={generate:jest.fn(async()=> '반가워요.')},maxQueueDepth=100) {
   const store=new InMemoryConversationStore();
-  const personas=new InMemoryPersonaRepository([persona]);
-  const chat=new ChatService({store,personas,provider,timeoutMs:1000,queue:{store,maxDepth:queueMaxDepth}});
+  const delivery=new InMemoryTurnDelivery();
+  const events=new InMemoryTurnEvents();
+  const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,timeoutMs:1000,leases:store,delivery,events,maxQueueDepth});
   const session=(owner='owner_q')=>chat.createSession(owner,{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
-  const worker=(id='worker-a',overrides:Partial<ConstructorParameters<typeof TurnWorker>[0]>={})=>new TurnWorker({chat,queue:store,workerId:id,concurrency:4,leaseMs:200,pollMs:5,maxAttempts:2,...overrides});
-  return {store,chat,session,worker,provider};
+  const worker=(id='worker-a',leaseMs=200)=>new TurnWorker({chat,leases:store,workerId:id,leaseMs});
+  /** Connects a worker to the delivery queue, like a BullMQ consumer with the given concurrency. */
+  const consume=(w:TurnWorker,concurrency=4)=>delivery.consume(d=>w.handle(d).then(()=>undefined),{concurrency});
+  const dispatcher=(maxAttempts=2)=>new TurnDispatcher({leases:store,delivery,events,maxAttempts,graceMs:0,intervalMs:20});
+  return {store,delivery,events,chat,session,worker,consume,dispatcher,provider};
 }
 
-describe('queued turn execution',()=>{
-  test('queue mode only reserves; nothing runs until a worker claims the turn',async()=>{
-    const {chat,session,worker,provider}=setup();
+describe('queued turn execution (outbox → delivery → leased worker)',()=>{
+  test('startTurn reserves and hands the turn to delivery; nothing runs until a worker consumes it',async()=>{
+    const {chat,session,worker,consume,delivery,provider}=setup();
     const s=await session();
     const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'q1',text:'안녕'});
     expect(turn.state).toBe('pending');
+    expect(await delivery.backlog()).toBe(1);
     await new Promise(r=>setTimeout(r,30));
     expect(provider.generate).not.toHaveBeenCalled();
-    const w=worker();w.start();
+    const stop=consume(worker());
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');
-    await w.stop();
+    await stop();
     expect(provider.generate).toHaveBeenCalledTimes(1);
     expect((await chat.history('owner_q',s.id)).map(m=>m.role)).toEqual(['assistant','user','assistant']);
   });
   test('the original structured request (intent) survives the queue',async()=>{
-    const {chat,session,worker,provider}=setup();
+    const {chat,session,worker,consume,provider}=setup();
     const s=await session();
     const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'q-intent',text:'안녕',intent:'unsupported'});
-    const w=worker();w.start();
+    const stop=consume(worker());
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');
-    await w.stop();
+    await stop();
     expect((await chat.getTurn('owner_q',turn.id)).reply?.status).toBe('out_of_scope');
     expect(provider.generate).not.toHaveBeenCalled();
   });
-  test('backpressure: a full queue rejects new turns with QUEUE_FULL before reserving',async()=>{
-    const {chat,session,store}=setup(undefined,2);
+  test('a duplicated delivery of the same dispatch runs the turn once (claim is idempotent)',async()=>{
+    const {chat,session,worker,store,provider}=setup();
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'dup',text:'안녕'});
+    const w=worker();
+    const results=await Promise.all([w.handle(dispatch!),w.handle(dispatch!),worker('worker-b').handle(dispatch!)]);
+    expect(results.filter(r=>r==='executed')).toHaveLength(1);
+    expect(results.filter(r=>r==='skipped')).toHaveLength(2);
+    expect(provider.generate).toHaveBeenCalledTimes(1);
+    expect(await store.claimTurn(turn.id,'late-worker',200)).toBeUndefined();
+  });
+  test('state changes are published as events without any model output',async()=>{
+    const {chat,session,worker,consume,events}=setup();
+    const s=await session();
+    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'ev',text:'안녕'});
+    const stop=consume(worker());
+    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');
+    await stop();
+    const mine=events.published.filter(e=>e.turnId===turn.id);
+    expect(mine.map(e=>e.state)).toEqual(['generating','validating','completed']);
+    expect(JSON.stringify(mine)).not.toContain('반가워요');
+  });
+  test('if publishing fails after the reservation commits, the outbox lets the dispatcher deliver it later',async()=>{
+    const {chat,session,worker,consume,delivery,dispatcher}=setup();
+    const s=await session();
+    jest.spyOn(delivery,'publish').mockRejectedValueOnce(new Error('redis down'));
+    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'outbox',text:'안녕'});
+    expect(turn.state).toBe('pending');
+    expect(await delivery.backlog()).toBe(0);
+    const stop=consume(worker());const d=dispatcher();d.start();
+    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');
+    await d.stop();await stop();
+  });
+  test('backpressure: a full delivery backlog rejects new turns with QUEUE_FULL before reserving',async()=>{
+    const {chat,session,delivery}=setup(undefined,2);
     for(let i=0;i<2;i++){const s=await session(`owner_${i}`);await chat.startTurn(`owner_${i}`,{sessionId:s.id,clientRequestId:`x${i}`,text:'안녕'});}
     const s=await session('owner_late');
     await expect(chat.startTurn('owner_late',{sessionId:s.id,clientRequestId:'late',text:'안녕'})).rejects.toEqual(new CoreError('QUEUE_FULL'));
-    expect(await store.queueDepth()).toBe(2);
-    await expect(chat.startTurn('owner_late',{sessionId:s.id,clientRequestId:'late2',text:'안녕'})).rejects.toEqual(new CoreError('QUEUE_FULL'));
+    expect(await delivery.backlog()).toBe(2);
   });
-  test('a turn held by a dead worker is requeued after its lease expires and completes elsewhere',async()=>{
+  test('a turn held by a dead worker is requeued with a new dispatch after its lease expires and completes elsewhere',async()=>{
     let calls=0;
     const provider:TextProvider={generate:async()=>{calls++;if(calls===1)return new Promise<string>(()=>{});return '반가워요.';}};
-    const {chat,session,worker,store}=setup(provider);
+    const {chat,session,worker,consume,dispatcher}=setup(provider);
     const s=await session();
     const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'crash',text:'안녕'});
-    const dead=worker('worker-dead');dead.start();
+    const dead=worker('worker-dead');const stopDead=consume(dead);
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
-    dead.kill(); // simulates SIGKILL: no heartbeat, no cleanup
-    const healthy=worker('worker-b');healthy.start();
+    dead.kill(); // simulates SIGKILL: no heartbeat, no further writes
+    void stopDead();
+    const d=dispatcher();d.start();
+    const stopHealthy=consume(worker('worker-b'));
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed',3000);
-    await healthy.stop();
+    await d.stop();await stopHealthy();
     expect(calls).toBe(2);
-    expect(await store.queueDepth()).toBe(0);
   });
-  test('turns that keep losing their worker fail with WORKER_LOST after maxAttempts and unblock the session',async()=>{
+  test('turns that keep losing their worker fail with WORKER_LOST after maxAttempts, publish it, and unblock the session',async()=>{
     const provider:TextProvider={generate:()=>new Promise<string>(()=>{})};
-    const {chat,session,worker}=setup(provider);
+    const {chat,session,worker,dispatcher,store,events}=setup(provider);
     const s=await session();
-    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'lost',text:'안녕'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'lost',text:'안녕'});
+    let next=dispatch!;
     for(const id of ['w1','w2']) {
-      const w=worker(id);w.start();
+      const w=worker(id);void w.handle(next);
       await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
       w.kill();
       await new Promise(r=>setTimeout(r,250)); // let the lease expire
+      if(id==='w1') {
+        expect((await store.recoverExpired(2)).requeued).toEqual([turn.id]);
+        next=(await store.pendingDispatches(0,10)).find(p=>p.turnId===turn.id)!;expect(next.seq).toBe(1);
+      }
     }
-    const sweeper=worker('w3');sweeper.start();
-    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='failed',3000);
-    await sweeper.stop();
-    expect((await chat.getTurn('owner_q',turn.id)).errorCode).toBe('WORKER_LOST');
+    const d=dispatcher();await d.tick();
+    expect((await chat.getTurn('owner_q',turn.id))).toMatchObject({state:'failed',errorCode:'WORKER_LOST'});
+    expect(events.published).toContainEqual({turnId:turn.id,state:'failed',errorCode:'WORKER_LOST'});
     await expect(chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'next',text:'다시'})).resolves.toMatchObject({state:'pending'});
   });
-  test('user cancellation stops the in-flight provider call through the lease heartbeat',async()=>{
+  test('user cancellation stops the in-flight provider call through the lease heartbeat and is published',async()=>{
     let aborted=false;
     const provider:TextProvider={generate:(_m,{signal})=>new Promise<string>((_,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(new Error('aborted'));}))};
-    const {chat,session,worker}=setup(provider);
+    const {chat,session,worker,consume,events}=setup(provider);
     const s=await session();
     const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'cancel',text:'안녕'});
-    const w=worker();w.start();
+    const stop=consume(worker());
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
     expect(await chat.cancelTurn('owner_q',turn.id)).toBe(true);
-    await until(async()=>aborted);
-    await w.stop();
+    await until(()=>aborted);
+    await stop();
     expect((await chat.getTurn('owner_q',turn.id)).state).toBe('cancelled');
+    expect(events.published).toContainEqual({turnId:turn.id,state:'cancelled'});
   });
-  test('worker concurrency bounds in-flight provider calls',async()=>{
+  test('a worker watching events aborts on cancellation at once, without waiting for its heartbeat',async()=>{
+    let aborted=false;
+    const provider:TextProvider={generate:(_m,{signal})=>new Promise<string>((_,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(new Error('aborted'));}))};
+    const {chat,session,store,consume,events}=setup(provider);
+    const s=await session();
+    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'cancel-fast',text:'안녕'});
+    // A one-minute lease means the heartbeat would only notice after 20 s.
+    const stop=consume(new TurnWorker({chat,leases:store,workerId:'w-fast',leaseMs:60_000,cancellations:events}));
+    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
+    await chat.cancelTurn('owner_q',turn.id);
+    await until(()=>aborted,200);
+    await stop();
+  });
+  test('consumer concurrency bounds in-flight provider calls',async()=>{
     let inFlight=0,peak=0;
     const provider:TextProvider={generate:async()=>{inFlight++;peak=Math.max(peak,inFlight);await new Promise(r=>setTimeout(r,30));inFlight--;return '반가워요.';}};
-    const {chat,session,worker}=setup(provider);
+    const {chat,session,worker,consume}=setup(provider);
     const turns:(readonly [string,string])[]=[];
     for(let i=0;i<10;i++){const s=await session(`o${i}`);turns.push([`o${i}`,(await chat.startTurn(`o${i}`,{sessionId:s.id,clientRequestId:`c${i}`,text:'안녕'})).id] as const);}
-    const w=worker('w',{concurrency:3});w.start();
+    const stop=consume(worker('w'),3);
     await until(async()=>(await Promise.all(turns.map(([o,id])=>chat.getTurn(o,id)))).every(t=>t.state==='completed'),3000);
-    await w.stop();
+    await stop();
     expect(peak).toBe(3);
   });
-  test('admission control rejects before touching the session and reuses a short-lived depth reading',async()=>{
-    const {chat,session,store}=setup(undefined,1);
+  test('admission control rejects before touching the session and reuses a short-lived backlog reading',async()=>{
+    const {chat,session,store,delivery}=setup(undefined,1);
     const s=await session();await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'fill',text:'안녕'});
-    const depth=jest.spyOn(store,'queueDepth');const lookup=jest.spyOn(store,'getOwnedSession');
+    const backlog=jest.spyOn(delivery,'backlog');const lookup=jest.spyOn(store,'getOwnedSession');
     const late=await session('owner_late');
     for(let i=0;i<20;i++) await expect(chat.startTurn('owner_late',{sessionId:late.id,clientRequestId:`late-${i}`,text:'안녕'})).rejects.toEqual(new CoreError('QUEUE_FULL'));
     expect(lookup).not.toHaveBeenCalled();
-    expect(depth.mock.calls.length).toBeLessThanOrEqual(2);
-  });
-  test('turn failures are reported to the observer as a sanitized code only',async()=>{
-    const failures:{turnId:string;code:string}[]=[];
-    const store=new InMemoryConversationStore();
-    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,
-      provider:{generate:async()=>{throw new Error('secret upstream body sk-abc');}},onTurnFailure:failure=>failures.push(failure)});
-    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
-    const turn=await chat.sendTurn('owner_q',{sessionId:s.id,clientRequestId:'boom',text:'안녕'});
-    expect(turn.state).toBe('failed');
-    expect(failures).toEqual([{turnId:turn.id,code:'Error'}]);
+    expect(backlog.mock.calls.length).toBeLessThanOrEqual(2);
   });
   test('a concurrent burst cannot overshoot the backlog bound (slots are taken before any await)',async()=>{
     const {chat,session}=setup(undefined,5);
@@ -132,5 +178,15 @@ describe('queued turn execution',()=>{
     const s=await session();
     await expect(chat.startTurn('owner_q',{sessionId:'missing-session',clientRequestId:'x',text:'안녕'})).rejects.toEqual(new CoreError('NOT_FOUND'));
     await expect(chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'ok',text:'안녕'})).resolves.toMatchObject({state:'pending'});
+  });
+  test('turn failures are reported to the observer as a sanitized code only',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();
+    const local=createLocalChat({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,
+      provider:{generate:async()=>{throw new Error('secret upstream body sk-abc');}},onTurnFailure:failure=>failures.push(failure)});
+    const s=await local.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const turn=await local.sendTurn('owner_q',{sessionId:s.id,clientRequestId:'boom',text:'안녕'});
+    expect(turn.state).toBe('failed');
+    expect(failures).toEqual([{turnId:turn.id,code:'Error'}]);
   });
 });

@@ -9,6 +9,7 @@
     "@ptr/contracts": "workspace:*",
     "@ptr/core": "workspace:*",
     "bullmq": "6.3.11",
-    "ioredis": "6.0.0"
+    "ioredis": "6.0.0",
+    "zod": "3.24.2"
   }
 }

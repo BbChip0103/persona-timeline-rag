@@ -1,5 +1,5 @@
 import type { ChatMessage, EvidenceCard, Persona, SourcePost } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, retrievalContext, rememberSourceContext } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, retrievalContext, rememberSourceContext, createLocalChat } from '../src';
 const persona:Persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:[],boundaries:[],sourceRefs:[],greeting:'안녕하세요.'};
 const source:SourcePost={id:'synthetic-post',personId:persona.personId,caption:'합성 도예 수업에서 찻잔을 만들었다.',postedAt:'2020-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post',hash:'synthetic-hash',snapshot:'v1',unsafe:false};
 const raw=(posts=[source])=>JSON.stringify({status:'answered',answer:'합성 자료를 참고한 답변입니다.',evidenceRefs:posts.map(post=>({sourceId:post.id,quote:post.caption}))});
@@ -7,7 +7,7 @@ async function fixture(condition:'off'|'caption'|'caption_image'='caption') {
   const store=new InMemoryConversationStore();
   const provider={generate:jest.fn(async()=>raw())};
   const retrieval={search:jest.fn(async()=>[source]),resolve:jest.fn(async(_refs:EvidenceCard[])=>[source])};
-  const service=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
+  const service=createLocalChat({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
   const session=await service.createSession('owner',{personId:persona.personId,personaId:persona.id,personaRevision:'v1',ragCondition:condition});
   let request=0;const send=(text:string)=>service.sendTurn('owner',{sessionId:session.id,clientRequestId:`request-${++request}`,text});
   return {store,provider,retrieval,service,session,send};

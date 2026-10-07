@@ -1,7 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
-import { ChatService, CoreError, type PersonaRepository, type TextProvider, type TurnQueue } from '@ptr/core';
+import { ChatService, CoreError, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
+import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
@@ -11,8 +12,8 @@ export interface CreativeArtifact {
 }
 export interface ApiRuntime {
   chat:ChatService;personas:PersonaRepository;provider:TextProvider;
-  /** Present when PTR_EXECUTION=queue: the API only enqueues and worker processes execute. */
-  queue?:TurnQueue;
+  /** Queued execution: the API reserves and publishes; worker processes execute; the dispatcher recovers. */
+  leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;eventSource:TurnEventSource;
   listPersonas():Promise<Persona[]>;
   saveArtifact(artifact:CreativeArtifact):Promise<void>;
   providerName:string;model:string;close?():Promise<void>;
@@ -22,8 +23,9 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
   const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
   const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
-  const execution=env.PTR_EXECUTION??'inline';
-  if(execution!=='inline'&&execution!=='queue') throw new CoreError('INVALID_INPUT');
+  // Inline and Postgres-polling execution were removed; fail loudly instead of silently ignoring an old setting.
+  if(env.PTR_EXECUTION!==undefined) throw new CoreError('INVALID_INPUT','PTR_EXECUTION was removed: turns always run through Redis workers');
+  const redisUrl=env.PTR_REDIS_URL??'';
   const queueMaxDepth=Number(env.PTR_QUEUE_MAX_DEPTH??256);
   if(!Number.isInteger(queueMaxDepth)||queueMaxDepth<1) throw new CoreError('INVALID_INPUT');
   const personas=new PostgresPersonaRepository(pool);
@@ -58,11 +60,12 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_SELFHOSTED_STRUCTURED==='1'});model=`selfhosted/${selfModel}`;
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
-  const queue=execution==='queue'?store:undefined;
-  const chat=new ChatService({store,personas,provider,
+  const delivery=new BullMqTurnDelivery(redisUrl);
+  const events=new RedisTurnEvents(redisUrl);const eventSource=new RedisTurnEventSource(redisUrl);
+  const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
-    ...(queue?{queue:{store:queue,maxDepth:queueMaxDepth}}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
-  return {chat,personas,provider,providerName,model,...(queue?{queue}:{}),
+    ...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
+  return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');
       const registry=await approvedPersonas();
@@ -72,6 +75,6 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
       const directory=join(process.cwd(),'data','generated');await mkdir(directory,{recursive:true,mode:0o700});
       await writeFile(join(directory,`${artifact.id}.json`),JSON.stringify(artifact,null,2),{flag:'wx',mode:0o600});
     },
-    close:()=>pool.end(),
+    async close() {await Promise.allSettled([delivery.close(),events.close(),eventSource.close()]);await pool.end();},
   };
 }

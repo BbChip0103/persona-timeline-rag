@@ -6,7 +6,8 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { Pool } from 'pg';
 import { CalendarDateSchema, PersonaSchema, SourcePostSchema, TimezoneSchema, type ChatMessage, type ChatReply, type ChatSession, type Persona, type ProviderMessage, type RetrievalMode, type SourcePost } from '@ptr/contracts';
-import { ChatService, PROMPT_REVISION, type ConversationStore, type Retrieval, type TextProvider } from '@ptr/core';
+import { PROMPT_REVISION, type ConversationStore, type Retrieval, type TextProvider, type TurnLeaseStore } from '@ptr/core';
+import { createQueuedChat, type QueuedChat } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DEFAULT_TEXT_MODEL, EMBEDDING_MODEL, FakeEmbeddingProvider, FakeTextProvider, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 
@@ -86,7 +87,8 @@ class TracedLedger implements BudgetLedger {
   get(key:string):Promise<BudgetRequest|undefined> { return this.ledger.get(key); }
 }
 export interface HarnessRuntime {
-  chat:ChatService; pool:Pool; store:PostgresConversationStore; personas:PostgresPersonaRepository; sources:PostgresSourceRepository;
+  /** Turns run through Redis with the worker in this process (tracing sees every provider call). */
+  chat:QueuedChat; pool:Pool; store:PostgresConversationStore; personas:PostgresPersonaRepository; sources:PostgresSourceRepository;
   model:string; embeddingModel:string; providerName:'fake'|'openrouter'; setTrace(trace?:TurnTrace):void;
   setFixedHistory(history?:Array<{role:'user'|'assistant';content:string}>):void;
   generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string>;
@@ -133,7 +135,7 @@ export function createHarnessRuntime(env:NodeJS.ProcessEnv,live:boolean):Harness
   }};
   // Controlled fixed history is injected through the same store port, never user text.
   // Each fixed trial still owns a normal SQL session and commits validated messages.
-  const historyStore:ConversationStore=new Proxy(store,{get(target,key) {
+  const historyStore:ConversationStore&TurnLeaseStore=new Proxy(store,{get(target,key) {
     if(key==='history') return async(sessionId:string,ownerId:string):Promise<ChatMessage[]>=> {
       const history=await target.history(sessionId,ownerId);
       if (fixedHistory===undefined) return history;
@@ -143,7 +145,7 @@ export function createHarnessRuntime(env:NodeJS.ProcessEnv,live:boolean):Harness
     };
     const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
   }});
-  const chat=new ChatService({store:historyStore,personas,provider:trackedProvider,retrieval:trackedRetrieval});
+  const chat=createQueuedChat({store:historyStore,personas,provider:trackedProvider,retrieval:trackedRetrieval,redisUrl:env.PTR_REDIS_URL??''});
   return {chat,pool,store,personas,sources,model,embeddingModel,providerName:live?'openrouter':'fake',
     setTrace(trace) {current=trace;},setFixedHistory(history) {fixedHistory=history;},generate:(messages,options)=>trackedProvider.generate(messages,options),
     async indexFake(inputs) {
@@ -156,7 +158,7 @@ export function createHarnessRuntime(env:NodeJS.ProcessEnv,live:boolean):Harness
         for(let index=0;index<batch.length;index++) await sources.importVector(batch[index]!.id,embeddingModel,vectors[index]!);
       }
       return calls;
-    },close:()=>pool.end(),
+    },async close() {await chat.close();await pool.end();},
   };
 }
 export function sourceRecall(goldIds:string[],retrievedIds:string[]):number|null {

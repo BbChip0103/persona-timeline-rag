@@ -84,6 +84,9 @@ importers:
       '@ptr/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@ptr/messaging':
+        specifier: workspace:*
+        version: link:../../packages/messaging
       '@ptr/providers':
         specifier: workspace:*
         version: link:../../packages/providers
@@ -157,6 +160,9 @@ importers:
       ioredis:
         specifier: 6.0.0
         version: 6.0.0
+      zod:
+        specifier: 3.24.2
+        version: 3.24.2
 
   packages/providers:
     dependencies:

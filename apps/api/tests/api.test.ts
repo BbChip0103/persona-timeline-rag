@@ -1,6 +1,6 @@
 import type { INestApplication } from '@nestjs/common';
 import type { Persona, ChatSession, ChatTurn, ChatMessage } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository } from '@ptr/core';
+import { InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat } from '@ptr/core';
 import { FakeTextProvider } from '@ptr/providers';
 import { createApiApplication } from '../src/app';
 import type { ApiRuntime, CreativeArtifact } from '../src/runtime';
@@ -17,7 +17,7 @@ async function waitTurn(id:string):Promise<ChatTurn> {
 }
 beforeEach(async()=>{
   const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();artifacts=[];
-  runtime={chat:new ChatService({store,personas,provider}),personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[persona],saveArtifact:async artifact=>{artifacts.push(artifact);}};
+  const chat=createLocalChat({store,personas,provider});runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[persona],saveArtifact:async artifact=>{artifacts.push(artifact);}};
   app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
 });
 afterEach(async()=>{await app.close();});
@@ -68,7 +68,7 @@ test('malformed/oversize body and provider errors do not reveal raw data',async(
 test('pending-start API supports poll/cancel, and late provider output never reaches history',async()=>{
   let resolve!:(value:string)=>void;let signal!:AbortSignal;
   const provider={generate:(_messages:unknown,_options:{signal:AbortSignal})=>{signal=_options.signal;return new Promise<string>(r=>{resolve=r;});}};
-  runtime.chat=new ChatService({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
+  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   const pending=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'pending_synthetic',text:'안녕'}});
   expect(['pending','generating']).toContain(pending.body.turn.state);expect(pending.body.turn.reply).toBeUndefined();
@@ -98,7 +98,7 @@ test('explicit conditions persist, default algorithm consistently, reject contra
 test('explicit off invokes provider for factual comparison and exposes unverified actual answer without evidence',async()=>{
   const provider={generate:jest.fn(async()=>JSON.stringify({status:'answered',answer:'이 모델 응답은 실제 방문 사실로 검증되지 않았습니다.',evidenceRefs:[]}))};
   const retrieval={search:jest.fn(async()=>[])};
-  runtime.chat=new ChatService({store:new InMemoryConversationStore(),personas:runtime.personas,provider,retrieval});
+  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider,retrieval});
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'off',executionProfile:'legacy'}});const id=created.body.session.id;
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'experiment-off',text:'2020년 어디 여행했어?'}});
   const final=await waitTurn(sent.body.turn.id);
@@ -110,7 +110,7 @@ test('explicit off invokes provider for factual comparison and exposes unverifie
 test('new API sessions default agent_loop; explicit legacy remains pinned; internal agent fields never leave poll/replay/history',async()=>{
   const secretSummary='synthetic-internal-summary';const privateTopic='synthetic-internal-topic';
   const provider={generate:async()=>JSON.stringify({status:'answered',message:'안녕! 편하게 이야기해요.',evidenceRefs:[],reasoning:secretSummary,variableUpdates:{conversationTopic:privateTopic,tone:'warm'}})};
-  runtime.chat=new ChatService({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
+  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'off'}});
   expect(created.body.session.executionProfile).toBe('agent_loop');const sessionId=created.body.session.id;
   const input={clientRequestId:'internal-fields',text:'안녕'};

@@ -5,7 +5,8 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Pool } from 'pg';
 import type { Persona, SourcePost } from '@ptr/contracts';
-import { ChatService, EXPERIMENT_PROMPT_REVISION, RETRIEVAL_CONTEXT_REVISION, type Retrieval } from '@ptr/core';
+import { EXPERIMENT_PROMPT_REVISION, RETRIEVAL_CONTEXT_REVISION, type Retrieval } from '@ptr/core';
+import { createQueuedChat } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { EMBEDDING_MODEL, MAX_PROVIDER_CALLS, MAX_TOTAL_MICROUSD, OpenRouterClient, PostgresBudgetLedger, ProviderError, liveOptionsFromEnvironment, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 import type { RequestTrace, TurnTrace } from './evaluate';
@@ -89,13 +90,13 @@ export function createMemoryPilotRuntime(env: NodeJS.ProcessEnv,limits:{textCall
       current?.resolvedIds.push(...found.map(item => item.id)); return found;
     },
   };
-  const chat = new ChatService({ store, personas, retrieval: trackedRetrieval, provider: { async generate(messages, options) {
+  const chat = createQueuedChat({ store, personas, retrieval: trackedRetrieval, redisUrl: env.PTR_REDIS_URL ?? '', provider: { async generate(messages, options) {
     if (++textCalls > limits.textCalls){portStop='PILOT_TEXT_LIMIT';throw new ProviderError(portStop);}
     if (current) { current.textCalls++; current.promptHashes.push(testsetHash(messages)); } kind = 'text'; return client.generate(messages, options);
   } } });
   return { chat, pool, store, personas, sources, model: env.GOAL1_TEXT_MODEL ?? env.PTR_MODEL!,
     setTrace(trace?: TurnTrace) { current = trace as MemoryTrace | undefined; if (current) { current.sourceLookupCalls = 0; current.searchQueries = []; current.resolvedIds = []; } },
-    haltedReason:()=>ledger.stoppedReason()??portStop,close: () => pool.end() };
+    haltedReason:()=>ledger.stoppedReason()??portStop,close: async () => { await chat.close(); await pool.end(); } };
 }
 export async function budgetSnapshot(pool: Pool): Promise<Record<string, number | string>> {
   const result = await pool.query(`SELECT b.cap_microusd,b.call_cap,count(r.key)::int AS calls,

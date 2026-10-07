@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
-import { CoreError, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnQueue } from './ports';
+import { CoreError, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
@@ -9,26 +9,33 @@ import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
-  /** Goal2 queued execution: startTurn only reserves; TurnWorker processes call executeQueued. */
-  queue?:{store:TurnQueue;maxDepth:number};
+  /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
+  leases:TurnLeaseStore;delivery:TurnDelivery;
+  /** Backlog bound for admission control (default 256). */
+  maxQueueDepth?:number;
+  /** State-change notices for push delivery (SSE); never carries model output. */
+  events?:TurnEvents;
   /** Observability hook: failed turns with a sanitized error class/code only (never messages or bodies). */
   onTurnFailure?:(failure:{turnId:string;code:string})=>void}
 /** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
 const DEPTH_READING_TTL_MS=200;
 const activeStates=['pending','retrieving','generating','validating'] as const;
-/** Store view whose writes are fenced by the worker's lease; reads pass through. */
-function fencedStore(store:ConversationStore,fence?:LeaseFence):ConversationStore {
-  if(!fence) return store;
+/** Store view whose writes are fenced by the worker's lease and announced as events once they apply; reads pass through. */
+function fencedStore(store:ConversationStore,fence:LeaseFence,events?:TurnEvents):ConversationStore {
+  // Event delivery is best effort: SSE readers re-check the store, so a lost notice only delays the update.
+  const announce=(applied:boolean,turnId:string,state:Parameters<ConversationStore['transitionTurn']>[2],errorCode?:string)=>{
+    if(applied) void events?.publish({turnId,state,...(errorCode?{errorCode}:{})}).catch(()=>undefined);
+    return applied;
+  };
   return {
     create:(session,greeting)=>store.create(session,greeting),getOwnedSession:(id,owner)=>store.getOwnedSession(id,owner),
     listOwnedSessions:owner=>store.listOwnedSessions(owner),history:(id,owner)=>store.history(id,owner),
     reserveTurn:(...args)=>store.reserveTurn(...args),getTurn:(id,owner)=>store.getTurn(id,owner),cancelTurn:(id,owner)=>store.cancelTurn(id,owner),
-    transitionTurn:(id,expected,next,errorCode)=>store.transitionTurn(id,expected,next,errorCode,fence),
-    completeTurn:(id,reply)=>store.completeTurn(id,reply,fence),
+    transitionTurn:async(id,expected,next,errorCode)=>announce(await store.transitionTurn(id,expected,next,errorCode,fence),id,next,errorCode),
+    completeTurn:async(id,reply)=>announce(await store.completeTurn(id,reply,fence),id,'completed'),
   };
 }
 export class ChatService {
-  private readonly controllers=new Map<string,AbortController>();
   private depthReading?:{value:number;at:number};
   private depthRefresh?:Promise<void>;
   constructor(private readonly options:ChatServiceOptions) {}
@@ -59,40 +66,43 @@ export class ChatService {
   async cancelTurn(ownerId:string,turnId:string):Promise<boolean> {
     await this.getTurn(ownerId,turnId);
     const cancelled=await this.options.store.cancelTurn(turnId,ownerId);
-    if(cancelled) this.controllers.get(turnId)?.abort();return cancelled;
+    // The worker notices through its lease heartbeat and aborts the provider call.
+    if(cancelled) await this.options.events?.publish({turnId,state:'cancelled'}).catch(()=>undefined);
+    return cancelled;
   }
   /** Returns the reserved/current turn immediately; final output remains private until validation. */
-  startTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> {
-    if(this.options.queue) return this.enqueueTurn(ownerId,input,this.options.queue);
-    return new Promise((resolve,reject)=>{void this.runTurn(ownerId,input,resolve).catch(reject);});
-  }
-  private async enqueueTurn(ownerId:string,input:SendTurnInput,queue:NonNullable<ChatServiceOptions['queue']>):Promise<ChatTurn> {
-    // Admission control first: a rejection costs at most one shared count, no session lookup or write.
+  async startTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> { return (await this.submitTurn(ownerId,input)).turn; }
+  /**
+   * Admission → reservation (turn + outbox entry in one transaction) → publish. A failed publish is not an error:
+   * the outbox entry stays until a worker claims the turn and the dispatcher publishes it again.
+   */
+  async submitTurn(ownerId:string,input:SendTurnInput):Promise<{turn:ChatTurn;created:boolean;dispatch?:TurnDispatch}> {
+    // Admission control first: a rejection costs at most one shared backlog reading, no session lookup or write.
     if(!this.depthReading||Date.now()-this.depthReading.at>=DEPTH_READING_TTL_MS) {
-      this.depthRefresh??=queue.store.queueDepth().then(value=>{this.depthReading={value,at:Date.now()};}).finally(()=>{this.depthRefresh=undefined;});
+      this.depthRefresh??=this.options.delivery.backlog().then(value=>{this.depthReading={value,at:Date.now()};}).finally(()=>{this.depthRefresh=undefined;});
       await this.depthRefresh;
     }
     // Check and take a slot with no await in between, so a concurrent burst cannot overshoot the bound.
     const reading=this.depthReading!;
-    if(reading.value>=queue.maxDepth) throw new CoreError('QUEUE_FULL');
+    if(reading.value>=(this.options.maxQueueDepth??256)) throw new CoreError('QUEUE_FULL');
     reading.value++;
     let created=false;
     try {
       const {session,value}=await this.prepare(ownerId,input);
       const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition),value);
       created=reserved.created;
-      return reserved.turn;
+      if(reserved.dispatch) await this.options.delivery.publish(reserved.dispatch).catch(()=>undefined);
+      return reserved;
     } finally {if(!created) reading.value=Math.max(0,reading.value-1);}
   }
   /** Worker entry point: runs a claimed turn with every state write fenced by its lease. */
   async executeQueued(queued:QueuedTurn,controller:AbortController):Promise<void> {
-    const store=fencedStore(this.options.store,queued.fence);
+    const store=fencedStore(this.options.store,queued.fence,this.options.events);
     let prepared:Awaited<ReturnType<ChatService['prepare']>>;
     try {prepared=await this.prepare(queued.turn.ownerId,queued.input);}
     catch {await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');return;}
     await this.runReserved(prepared.session,queued.turn,prepared.value,prepared.query,controller,store);
   }
-  sendTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> { return this.runTurn(ownerId,input); }
   private async prepare(ownerId:string,input:SendTurnInput) {
     const checked=SendTurnSchema.safeParse(input);
     if(!checked.success) throw new CoreError('INVALID_INPUT');
@@ -103,17 +113,6 @@ export class ChatService {
     const queryResult=TimelineQuerySchema.safeParse({personId:session.personId,query:value.timeline?.query ?? value.text.slice(0,500),start:value.timeline?.start,end:value.timeline?.end,dateBasis:value.timeline?.dateBasis ?? 'posted',timezone:session.timezone,limit:value.timeline?.limit ?? 5});
     if(!queryResult.success || containsCredentialPattern(queryResult.data.query??'')) throw new CoreError('INVALID_INPUT');
     return {session,value,query:queryResult.data};
-  }
-  private async runTurn(ownerId:string,input:SendTurnInput,onReserved?:(turn:ChatTurn)=>void):Promise<ChatTurn> {
-    const {session,value,query}=await this.prepare(ownerId,input);
-    const reserved=await this.options.store.reserveTurn(session.id,ownerId,value.clientRequestId,value.text,requestFingerprint(value,session.ragCondition));
-    onReserved?.(structuredClone(reserved.turn));
-    if(!reserved.created) return reserved.turn;
-    const turn=reserved.turn;
-    const controller=new AbortController();this.controllers.set(turn.id,controller);
-    try {await this.runReserved(session,turn,value,query,controller,this.options.store);}
-    finally {this.controllers.delete(turn.id);}
-    return this.getTurn(ownerId,turn.id);
   }
   private async runReserved(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {
     let timer:ReturnType<typeof setTimeout>|undefined;

@@ -1,15 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type { Persona } from '@ptr/contracts';
-import { ChatService, requestFingerprint } from '@ptr/core';
+import { type LocalChat, requestFingerprint, createLocalChat } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository } from '../src';
 const enabled=process.env.RUN_STORAGE_DB_TESTS==='1'&&Boolean(process.env.DATABASE_URL);
 (enabled?describe:describe.skip)('dedicated local SQL structured request fingerprint (synthetic only)',()=>{
-  const scope=`synthetic-request-hash-${randomUUID()}`;let pool:Pool;let store:PostgresConversationStore;let service:ChatService;
+  const scope=`synthetic-request-hash-${randomUUID()}`;let pool:Pool;let store:PostgresConversationStore;let service:LocalChat;
   const persona:Persona={id:`persona-${scope}`,personId:scope,revision:'synthetic-v1',label:'Synthetic fingerprint fixture',language:'ko',reviewStatus:'synthetic',identity:'Fictional fixture',concept:'test',style:[],boundaries:[],sourceRefs:[],greeting:'합성 인사'};
   const provider={generate:jest.fn(async()=>JSON.stringify({status:'insufficient_evidence',answer:'',evidenceRefs:[]}))};
   const retrieval={search:jest.fn(async()=>[])};
-  beforeAll(async()=>{pool=createLocalPool(process.env.DATABASE_URL!);store=new PostgresConversationStore(pool);const personas=new PostgresPersonaRepository(pool);await personas.importPersona(persona);service=new ChatService({store,personas,provider,retrieval});});
+  beforeAll(async()=>{pool=createLocalPool(process.env.DATABASE_URL!);store=new PostgresConversationStore(pool);const personas=new PostgresPersonaRepository(pool);await personas.importPersona(persona);service=createLocalChat({store,personas,provider,retrieval});});
   afterAll(async()=>{await pool?.end();});
   async function create(){return service.createSession(scope,{personId:scope,personaId:persona.id,personaRevision:persona.revision,retrievalMode:'lexical',timezone:'UTC'});}
   test('canonical retry does not call provider/retrieval again; changed structured fields conflict',async()=>{

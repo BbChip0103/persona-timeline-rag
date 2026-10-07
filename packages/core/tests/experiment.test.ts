@@ -1,5 +1,5 @@
 import { CreateSessionSchema, type Persona, type SourcePost, type RagCondition, type ProviderMessage } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, buildExperimentPrompt, buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT, requestFingerprint, validateExperimentReply, validateSourceBoundReply } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, buildExperimentPrompt, buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT, requestFingerprint, validateExperimentReply, validateSourceBoundReply, createLocalChat } from '../src';
 const persona:Persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['declarative'],boundaries:['AI research'],sourceRefs:[],greeting:'안녕하세요.'};
 const annotation={id:'synthetic-annotation',imageHash:'synthetic-image-hash',annotationHash:'synthetic-annotation-hash',revision:'v1',text:'파란 화면에 노란 형태가 보입니다. 😀',model:'synthetic-model',humanReviewed:false as const};
 const source:SourcePost={id:'synthetic-post',personId:persona.personId,caption:'합성 전시를 소개합니다.',postedAt:'2020-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post',hash:'synthetic-source-hash',snapshot:'v1',unsafe:false,imageAnnotations:[annotation]};
@@ -7,7 +7,7 @@ const reply=(evidenceRefs:unknown[]=[],answer='모델이 생성한 자연스러�
 const query={personId:persona.personId,personaId:persona.id,personaRevision:persona.revision};
 function setup(answer=reply()) {
   const provider={generate:jest.fn(async()=>answer)};const retrieval={search:jest.fn(async()=>[source])};
-  const service=new ChatService({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
+  const service=createLocalChat({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
   return {provider,retrieval,service};
 }
 
@@ -82,7 +82,7 @@ test('experimental condition participates in fingerprints without changing legac
 test('experimental off cancellation discards late answer and keeps history isolated',async()=>{
   let resolve!:(value:string)=>void;let signal!:AbortSignal;
   const provider={generate:(_messages:ProviderMessage[],options:{signal:AbortSignal})=>{signal=options.signal;return new Promise<string>(done=>{resolve=done;});}};
-  const service=new ChatService({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([persona]),provider});
+  const service=createLocalChat({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([persona]),provider});
   const session=await service.createSession('synthetic-owner',{...query,ragCondition:'off'});
   const input={sessionId:session.id,clientRequestId:'cancel',text:'그날 어디에 갔어?'};
   const pending=service.sendTurn('synthetic-owner',input);await new Promise(done=>setTimeout(done,5));

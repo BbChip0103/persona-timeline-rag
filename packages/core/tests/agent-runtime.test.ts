@@ -1,5 +1,5 @@
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat } from '../src';
 const persona:Persona={id:'agent-synthetic',personId:'agent-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
 const source:SourcePost={id:'agent-post',personId:persona.personId,caption:'합성 숲을 그렸어요.',postedAt:'2024-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/synthetic',hash:'synthetic-hash',snapshot:'v1',unsafe:false,imageAnnotations:[{id:'agent-photo',imageHash:'ih',annotationHash:'ah',revision:'v1',text:'짙은 초록의 숲.',model:'synthetic',humanReviewed:false}]};
 const final=(patch:object={})=>JSON.stringify({status:'answered',message:'편하게 이야기해요.',evidenceRefs:[],variableUpdates:{},...patch});
@@ -8,7 +8,7 @@ const create={personId:persona.personId,personaId:persona.id,personaRevision:per
 function setup(outputs:string[]=[]) {
   const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>outputs.shift()??final())};
   const retrieval={search:jest.fn(async()=>[source])};const store=new InMemoryConversationStore();
-  const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
+  const chat=createLocalChat({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
   return {provider,retrieval,store,chat};
 }
 async function send(h:ReturnType<typeof setup>,sessionId:string,text='안녕',clientRequestId='req') {return h.chat.sendTurn('owner',{sessionId,text,clientRequestId});}
@@ -118,7 +118,7 @@ test('safety bypass preserves last finalized state, private requests call no mod
 });
 test.each(['reject','error'] as const)('optional validator %s fails closed without rewrite or state updates',async result=>{
   const h=setup([final({variableUpdates:{tone:'playful'}})]);const validate=jest.fn(async()=>{if(result==='error')throw new Error('private provider error');return 'reject' as const;});
-  const chat=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,agentValidator:{validate}});
+  const chat=createLocalChat({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,agentValidator:{validate}});
   const session=await chat.createSession('owner',{...create,ragCondition:'off'});const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'v',text:'안녕'});
   expect(turn.reply?.status).toBe('insufficient_evidence');expect(turn.reply?.agent?.validator).toBe(result==='error'?'error':'rejected');
   expect(turn.reply?.agent?.variables.tone).toBe('neutral');expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(validate).toHaveBeenCalledTimes(1);
@@ -126,7 +126,7 @@ test.each(['reject','error'] as const)('optional validator %s fails closed witho
 });
 test('validator disabled normally; configured post-tool skips exactly as declared',async()=>{
   const h=setup([tool(),final()]);const validate=jest.fn(async()=> 'accept' as const);
-  const chat=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,retrieval:h.retrieval,agentValidator:{validate}});
+  const chat=createLocalChat({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,retrieval:h.retrieval,agentValidator:{validate}});
   const session=await chat.createSession('owner',{...create,ragCondition:'caption'});const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'tool',text:'안녕'});
   expect(turn.reply?.agent?.validator).toBe('skipped_tool_followup');expect(validate).not.toHaveBeenCalled();
 });
@@ -173,7 +173,7 @@ test('cancel while tool is pending prevents the next model call and persists no 
 });
 test('configured validator accept permits only final state patch, with no model rewrite',async()=>{
   const h=setup([final({variableUpdates:{tone:'warm'}})]);const validate=jest.fn(async()=> 'accept' as const);
-  const chat=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,agentValidator:{validate}});
+  const chat=createLocalChat({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,agentValidator:{validate}});
   const session=await chat.createSession('owner',{...create,ragCondition:'off'});const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'accept',text:'안녕'});
   expect(turn.reply?.agent?.validator).toBe('accepted');expect(turn.reply?.agent?.variables.tone).toBe('warm');expect(h.provider.generate).toHaveBeenCalledTimes(1);
 });

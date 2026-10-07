@@ -1,10 +1,10 @@
 import { CalendarDateSchema, TimelineQuerySchema, type Persona, type ProviderMessage, type SourcePost } from '@ptr/contracts';
-import { ChatService, CoreError, InMemoryConversationStore, InMemoryPersonaRepository, buildPrompt, quoteCandidate, SMALL_TALK_PROMPT_REVISION, TIMELINE_PROMPT_REVISION, filterEvidence, validateSourceBoundReply, type TextProvider } from '../src';
+import { CoreError, InMemoryConversationStore, InMemoryPersonaRepository, buildPrompt, quoteCandidate, SMALL_TALK_PROMPT_REVISION, TIMELINE_PROMPT_REVISION, filterEvidence, validateSourceBoundReply, type TextProvider, createLocalChat } from '../src';
 const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',label:'Synthetic A',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional painter',concept:'Research simulation',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
 const post:SourcePost={id:'post_synthetic_a',personId:persona.personId,caption:'합성 작업실에서 그림을 그렸어요.',postedAt:'2020-05-04T01:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post/a',hash:'synthetic_hash',snapshot:'synthetic_v1',unsafe:false};
 function harness(provider:TextProvider={generate:jest.fn(async()=> '반가워요.')},retrieval={search:jest.fn(async()=>[post])}) {
   const store=new InMemoryConversationStore();
-  const service=new ChatService({store,personas:new InMemoryPersonaRepository([persona,{...persona,id:'persona_synthetic_b',personId:'person_synthetic_b'}]),provider,retrieval,timeoutMs:1000});
+  const service=createLocalChat({store,personas:new InMemoryPersonaRepository([persona,{...persona,id:'persona_synthetic_b',personId:'person_synthetic_b'}]),provider,retrieval,timeoutMs:1000});
   const create=(owner='owner_synthetic_a',mode:'off'|'lexical'|'semantic'='off')=>service.createSession(owner,{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:mode,timezone:'UTC'});
   return {store,service,provider,retrieval,create};
 }
@@ -105,7 +105,7 @@ describe('session and turn lifecycle',()=>{
   });
   test('provider timeout discards late results',async()=>{
     let resolve!:(value:string)=>void;const h=harness({generate:()=>new Promise<string>(r=>{resolve=r;})});
-    const service=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,timeoutMs:10});const s=await h.create();
+    const service=createLocalChat({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,timeoutMs:10});const s=await h.create();
     const t=await service.sendTurn('owner_synthetic_a',{sessionId:s.id,clientRequestId:'r1',text:'안녕'});expect(t.state).toBe('failed');resolve('late');await tick();expect(await service.history('owner_synthetic_a',s.id)).toHaveLength(1);
   });
   test('credentials-like provider text is not exposed',async()=>{
@@ -113,7 +113,7 @@ describe('session and turn lifecycle',()=>{
     const t=await h.service.sendTurn('owner_synthetic_a',{sessionId:s.id,clientRequestId:'r1',text:'안녕'});expect(t.state).toBe('failed');expect(t.reply).toBeUndefined();
   });
   test('history context limit fails explicitly instead of truncating',async()=>{
-    const h=harness();const s=await h.create();const service=new ChatService({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,maxHistoryMessages:0});
+    const h=harness();const s=await h.create();const service=createLocalChat({store:h.store,personas:new InMemoryPersonaRepository([persona]),provider:h.provider,maxHistoryMessages:0});
     const t=await service.sendTurn('owner_synthetic_a',{sessionId:s.id,clientRequestId:'r1',text:'안녕'});expect(t.errorCode).toBe('CONTEXT_LIMIT');expect(h.provider.generate).not.toHaveBeenCalled();
   });
 });
