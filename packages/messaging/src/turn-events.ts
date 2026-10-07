@@ -62,7 +62,12 @@ export class RedisTurnEventSource implements TurnEventSource {
     }
     set.add(listener);
     const own = set;
-    try { await this.ready.get(turnId); } catch (error) { own.delete(listener); throw error; }
+    try { await this.ready.get(turnId); } catch (error) {
+      own.delete(listener);
+      // Forget the failed channel so the next subscribe tries again instead of reusing the rejection.
+      if (!own.size && this.listeners.get(turnId) === own) { this.listeners.delete(turnId); this.ready.delete(turnId); }
+      throw error;
+    }
     return () => {
       own.delete(listener);
       if (!own.size && this.listeners.get(turnId) === own) {

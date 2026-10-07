@@ -42,7 +42,12 @@ async function main() {
   await new Promise<void>(resolve=>server.listen(port,'127.0.0.1',resolve));
   // No tokens, URLs or upstream details in startup output.
   process.stdout.write(`LLM gateway listening on 127.0.0.1:${port}\n`);
-  const shutdown=()=>{server.close();void close?.().finally(()=>process.exit(0));};
+  // Stop accepting, let in-flight calls finish (bounded), then release the ledger pool: paid calls are not cut off.
+  const shutdown=()=>{
+    const drained=new Promise<void>(resolve=>server.close(()=>resolve()));
+    const deadline=new Promise<void>(resolve=>setTimeout(resolve,integer(env,'PTR_GATEWAY_SHUTDOWN_MS',30000,0,600000)).unref());
+    void Promise.race([drained,deadline]).then(()=>close?.()).finally(()=>process.exit(0));
+  };
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
 }
 if(require.main===module) void main().catch(()=>{process.stderr.write('GATEWAY_STARTUP_FAILED\n');process.exitCode=1;});

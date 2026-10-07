@@ -17,6 +17,8 @@ export class OpenAICompatibleUpstream implements Upstream {
   }
   async complete(request:ChatCompletionRequest,signal:AbortSignal):Promise<UpstreamResult> {
     const response=await fetch(this.endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...request,model:this.model}),signal,redirect:'error'});
+    // Error bodies are never relayed; release the connection now instead of at garbage collection.
+    if(!response.ok){await response.body?.cancel().catch(()=>undefined);return {status:response.status,contentType:'application/json',body:''};}
     return {status:response.status,contentType:response.headers.get('content-type')??'application/json',
       body:response.body?(response.body as unknown as AsyncIterable<Uint8Array>):''};
   }

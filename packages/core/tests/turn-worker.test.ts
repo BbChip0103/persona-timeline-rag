@@ -75,6 +75,42 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');
     await d.stop();await stop();
   });
+  test('a claim that throws once (e.g. DB pool timeout) does not strand the turn: the dispatcher delivers it again',async()=>{
+    const {chat,session,worker,consume,store,dispatcher}=setup();
+    const s=await session();
+    const claim=jest.spyOn(store,'claimTurn').mockRejectedValueOnce(new Error('pool timeout'));
+    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'claim-error',text:'안녕'});
+    const stop=consume(worker());const d=dispatcher();d.start();
+    try {await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');}
+    finally {await d.stop();await stop();}
+    expect(claim.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+  test('Redis trouble does not hang the API: a failing backlog read admits the turn, a hanging cancel notice does not block cancel',async()=>{
+    const {chat,session,delivery,events}=setup();
+    const s=await session();
+    jest.spyOn(delivery,'backlog').mockRejectedValue(new Error('redis down'));
+    jest.spyOn(delivery,'publish').mockRejectedValue(new Error('redis down'));
+    const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'redis-down',text:'안녕'});
+    expect(turn.state).toBe('pending'); // the outbox entry carries it once Redis is back
+    jest.spyOn(events,'publish').mockReturnValue(new Promise(()=>{}));
+    await expect(chat.cancelTurn('owner_q',turn.id)).resolves.toBe(true);
+  });
+  test('a worker whose cancellation subscribe hangs still heartbeats its lease, and one renew error does not abort the turn',async()=>{
+    let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});
+    const provider:TextProvider={generate:async()=>{await gate;return '반가워요.';}};
+    const {chat,session,store,delivery}=setup(provider);
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'slow-redis',text:'안녕'});
+    const renew=jest.spyOn(store,'renewLease');renew.mockRejectedValueOnce(new Error('pool timeout'));
+    const w=new TurnWorker({chat,leases:store,workerId:'w-hang',leaseMs:90,cancellations:{subscribe:()=>new Promise(()=>{})}});
+    const running=w.handle(dispatch!);
+    await new Promise(r=>setTimeout(r,250)); // well past the 90 ms lease
+    expect(renew.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(await store.claimTurn(turn.id,'thief',90)).toBeUndefined(); // lease still held
+    release();await running;
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('completed');
+    expect(await delivery.backlog()).toBe(1); // untouched: handle() was called directly
+  });
   test('backpressure: a full delivery backlog rejects new turns with QUEUE_FULL before reserving',async()=>{
     const {chat,session,delivery}=setup(undefined,2);
     for(let i=0;i<2;i++){const s=await session(`owner_${i}`);await chat.startTurn(`owner_${i}`,{sessionId:s.id,clientRequestId:`x${i}`,text:'안녕'});}
@@ -85,18 +121,20 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
   test('a turn held by a dead worker is requeued with a new dispatch after its lease expires and completes elsewhere',async()=>{
     let calls=0;
     const provider:TextProvider={generate:async()=>{calls++;if(calls===1)return new Promise<string>(()=>{});return '반가워요.';}};
-    const {chat,session,worker,consume,dispatcher}=setup(provider);
+    const {chat,session,worker,consume,dispatcher,delivery}=setup(provider);
     const s=await session();
     const turn=await chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'crash',text:'안녕'});
     const dead=worker('worker-dead');const stopDead=consume(dead);
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
     dead.kill(); // simulates SIGKILL: no heartbeat, no further writes
     void stopDead();
+    const published=jest.spyOn(delivery,'publish');
     const d=dispatcher();d.start();
     const stopHealthy=consume(worker('worker-b'));
     await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed',3000);
     await d.stop();await stopHealthy();
     expect(calls).toBe(2);
+    expect(published).toHaveBeenCalledWith({turnId:turn.id,seq:1});
   });
   test('turns that keep losing their worker fail with WORKER_LOST after maxAttempts, publish it, and unblock the session',async()=>{
     const provider:TextProvider={generate:()=>new Promise<string>(()=>{})};

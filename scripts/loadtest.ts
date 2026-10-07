@@ -289,9 +289,10 @@ async function main():Promise<void> {
   const fleet=new Fleet(Number(options.port??56451),seeded.file,latency,directory,topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
     note:'Fake model with injected latency on synthetic data, one host: serving-architecture limits, not LLM throughput.'};
-  await fleet.startAll();
-  const sampler=startResourceSampler(fleet);
+  let sampler:ReturnType<typeof startResourceSampler>|undefined;
   try {
+    await fleet.startAll(); // inside try: a failed start still stops whatever was spawned
+    sampler=startResourceSampler(fleet);
     if(mode==='ramp') {
       const levels=(options.levels??'1,4,16,64,128,256').split(',').map(Number);const seconds=Number(options['stage-seconds']??45);
       const stages=[];
@@ -328,9 +329,9 @@ async function main():Promise<void> {
       report.sameSession={trials,statusPairs:outcomes};console.log(JSON.stringify(report.sameSession));
     } else throw new Error(`unknown mode ${mode}`);
   } finally {
-    await sampler.stop();await fleet.stopAll();
+    await sampler?.stop();await fleet.stopAll();
     const queue=new BullMqTurnDelivery(redisUrl(),{queueName:QUEUE});await queue.close(true).catch(()=>undefined);
-    report.resources=sampler.rows;report.finishedAt=new Date().toISOString();
+    report.resources=sampler?.rows??[];report.finishedAt=new Date().toISOString();
     await writeFile(join(directory,'report.json'),JSON.stringify(report,null,1),{mode:0o600});
     console.log(`report: ${join(directory,'report.json')}`);
   }

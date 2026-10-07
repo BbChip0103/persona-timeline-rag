@@ -27,16 +27,20 @@ export class TurnWorker {
     catch(error) {this.options.onError?.('claim',error);throw error;}
     if(!queued||this.dead) return 'skipped';
     const controller=new AbortController();
-    const unsubscribe=await this.options.cancellations?.subscribe(queued.turn.id,event=>{if(event.state==='cancelled') controller.abort();})
-      .catch(()=>undefined);
-    // Lost or cancelled leases abort the provider call; renewal failures are treated as lost.
+    // Heartbeat first, so nothing else (e.g. a slow Redis subscribe) can let the lease lapse. A single failed renewal
+    // is tolerated (transient DB trouble); a lost lease or two failures in a row abort the provider call.
+    let renewFailures=0;
     const heartbeat=setInterval(()=>{
       void this.options.leases.renewLease(queued.turn.id,queued.fence,this.options.leaseMs)
-        .then(held=>{if(!held) controller.abort();},()=>controller.abort());
+        .then(held=>{renewFailures=0;if(!held) controller.abort();},()=>{if(++renewFailures>=2) controller.abort();});
     },Math.max(5,Math.floor(this.options.leaseMs/3)));
+    // Cancellation notices are an accelerator, not a dependency: never awaited.
+    let unsubscribe:(()=>void)|undefined;let finished=false;
+    void this.options.cancellations?.subscribe(queued.turn.id,event=>{if(event.state==='cancelled') controller.abort();})
+      .then(off=>{if(finished) off();else unsubscribe=off;},()=>undefined);
     const done=this.options.chat.executeQueued(queued,controller)
       .catch(error=>this.options.onError?.('execute',error))
-      .finally(()=>{clearInterval(heartbeat);unsubscribe?.();this.inFlight.delete(queued.turn.id);});
+      .finally(()=>{finished=true;clearInterval(heartbeat);unsubscribe?.();this.inFlight.delete(queued.turn.id);});
     this.inFlight.set(queued.turn.id,{controller,heartbeat,done});
     await done;
     return 'executed';

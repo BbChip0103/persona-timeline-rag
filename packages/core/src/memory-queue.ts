@@ -4,7 +4,8 @@ const key=(dispatch:TurnDispatch)=>`${dispatch.turnId}:${dispatch.seq}`;
 
 /**
  * Single-process stand-in for the BullMQ delivery queue (tests and offline tooling).
- * Mirrors the properties the system relies on: a dispatch is accepted once (jobId dedupe), consumers take
+ * Mirrors the properties the system relies on: a dispatch is accepted once while it is waiting or running (jobId
+ * dedupe), a finished one can be published again (the BullMQ adapter replaces finished jobs), consumers take
  * waiting dispatches up to their concurrency, and backlog counts dispatches no consumer has taken yet.
  */
 export class InMemoryTurnDelivery implements TurnDelivery {
@@ -26,7 +27,8 @@ export class InMemoryTurnDelivery implements TurnDelivery {
     const pump=()=>{
       while(running&&inFlight.size<options.concurrency&&this.waiting.length) {
         const dispatch=this.waiting.shift()!;
-        const done:Promise<void>=handler(dispatch).catch(()=>undefined).finally(()=>{inFlight.delete(done);this.settledEntry(dispatch).resolve();pump();});
+        const done:Promise<void>=handler(dispatch).catch(()=>undefined).finally(()=>{
+          inFlight.delete(done);this.seen.delete(key(dispatch));this.settledEntry(dispatch).resolve();pump();});
         inFlight.add(done);
       }
     };

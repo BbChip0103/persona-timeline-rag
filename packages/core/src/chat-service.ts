@@ -67,7 +67,8 @@ export class ChatService {
     await this.getTurn(ownerId,turnId);
     const cancelled=await this.options.store.cancelTurn(turnId,ownerId);
     // The worker notices through its lease heartbeat and aborts the provider call.
-    if(cancelled) await this.options.events?.publish({turnId,state:'cancelled'}).catch(()=>undefined);
+    // Not awaited: the cancel is committed; a slow or failing Redis must not hold the request.
+    if(cancelled) void this.options.events?.publish({turnId,state:'cancelled'}).catch(()=>undefined);
     return cancelled;
   }
   /** Returns the reserved/current turn immediately; final output remains private until validation. */
@@ -79,7 +80,10 @@ export class ChatService {
   async submitTurn(ownerId:string,input:SendTurnInput):Promise<{turn:ChatTurn;created:boolean;dispatch?:TurnDispatch}> {
     // Admission control first: a rejection costs at most one shared backlog reading, no session lookup or write.
     if(!this.depthReading||Date.now()-this.depthReading.at>=DEPTH_READING_TTL_MS) {
-      this.depthRefresh??=this.options.delivery.backlog().then(value=>{this.depthReading={value,at:Date.now()};}).finally(()=>{this.depthRefresh=undefined;});
+      // If the backlog cannot be read (Redis trouble), keep the last reading rather than refuse every turn:
+      // reservations still land in the outbox and are delivered once Redis is back.
+      this.depthRefresh??=this.options.delivery.backlog().catch(()=>this.depthReading?.value??0)
+        .then(value=>{this.depthReading={value,at:Date.now()};}).finally(()=>{this.depthRefresh=undefined;});
       await this.depthRefresh;
     }
     // Check and take a slot with no await in between, so a concurrent burst cannot overshoot the bound.

@@ -1,5 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
 import type { ChatCompletionRequest, Upstream } from './upstreams';
 
@@ -77,7 +79,9 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       }
       res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store'});
       if(typeof result.body==='string') res.end(result.body);
-      else {for await (const chunk of result.body) {if(!res.write(chunk))await new Promise(r=>res.once('drain',r));}res.end();}
+      // pipeline handles backpressure and settles when either side closes, so a client that stops reading and
+      // disconnects cannot pin this slot on a 'drain' that never comes.
+      else await pipeline(Readable.from(result.body),res,{signal});
       counters.completed++;
     } catch {
       if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,signal.aborted?504:502,{error:{code:signal.aborted?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}});else res.destroy();}

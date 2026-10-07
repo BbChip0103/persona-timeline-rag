@@ -27,6 +27,8 @@ const safeTurn=publicTurn;
 class SafeErrorFilter implements ExceptionFilter {
   catch(error:unknown,host:ArgumentsHost) {
     const response=host.switchToHttp().getResponse<Response>();
+    // A stream (SSE) that already sent headers can only be closed; writing a JSON error would throw here.
+    if(response.headersSent){if(!response.writableEnded)response.end();return;}
     let status=500;let code='INTERNAL_ERROR';
     if(error instanceof CoreError) {
       code=error.code;status=({NOT_FOUND:404,FORBIDDEN:403,TURN_ACTIVE:409,IDEMPOTENCY_CONFLICT:409,INVALID_INPUT:400,TURN_FAILED:502,CONTEXT_LIMIT:409,PERSONA_UNAVAILABLE:404,QUEUE_FULL:503} as const)[error.code];

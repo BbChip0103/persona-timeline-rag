@@ -1,6 +1,7 @@
 import type { INestApplication } from '@nestjs/common';
 import type { Persona, ChatSession, ChatTurn, ChatMessage } from '@ptr/contracts';
-import { InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat } from '@ptr/core';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat, type TurnEvent } from '@ptr/core';
+const ChatServiceGetTurn=ChatService.prototype.getTurn;
 import { FakeTextProvider } from '@ptr/providers';
 import { createApiApplication } from '../src/app';
 import type { ApiRuntime, CreativeArtifact } from '../src/runtime';
@@ -161,7 +162,8 @@ test('SSE: a turn streams its state changes and the final public turn, then the 
   expect(status).toBe(200);expect(type).toMatch(/^text\/event-stream/);expect(closed).toBe(true);
   expect(events[0]!.event).toBe('turn');
   const last=events.at(-1)!;expect(last.event).toBe('turn');expect(last.data.state).toBe('completed');expect(last.data.reply?.content).toBe('반가워요.');
-  for(const e of events.filter(e=>e.event==='state')) expect(Object.keys(e.data).sort()).toEqual(['state']);
+  const states=events.filter(e=>e.event==='state');expect(states.length).toBeGreaterThan(0);
+  for(const e of states) expect(Object.keys(e.data).sort()).toEqual(['state']);
   expect(JSON.stringify(events)).not.toContain('"agent"');expect(JSON.stringify(events)).not.toContain('ownerId');
 });
 test('SSE: an already ended turn yields one snapshot and closes; another owner gets a plain 404',async()=>{
@@ -185,4 +187,29 @@ test('SSE: if pub/sub notices are lost, the periodic store re-check still delive
     const {events,closed}=await reading;
     expect(closed).toBe(true);expect(events.at(-1)!.data.state).toBe('completed');
   } finally {await quiet.close();}
+});
+
+test('SSE: a client gone during the ownership check leaves no subscription behind; a failing subscribe still streams via store re-checks',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  const chat=createLocalChat({store,personas:runtime.personas,provider});
+  let active=0,subscribes=0;let failSubscribe=false;
+  const counting={subscribe:async(turnId:string,listener:(e:TurnEvent)=>void)=>{
+    subscribes++;if(failSubscribe)throw new Error('redis down');active++;const off=await chat.events.subscribe(turnId,listener);return ()=>{active--;off();};}};
+  const app2=await createApiApplication({...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:counting},token,{sse:{recheckMs:40}});
+  await app2.listen(0,'127.0.0.1');const base2=await app2.getUrl();
+  try {
+    const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
+    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_gone',text:'안녕'});
+    const slow=jest.spyOn(chat,'getTurn');slow.mockImplementationOnce(async(owner,id)=>{await new Promise(r=>setTimeout(r,150));return ChatServiceGetTurn.call(chat,owner,id);});
+    const controller=new AbortController();
+    const gone=fetch(`${base2}/api/turns/${turn.id}/events`,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':'owner_synthetic_a'},signal:controller.signal}).catch(()=>undefined);
+    await new Promise(r=>setTimeout(r,30));controller.abort();await gone;
+    await new Promise(r=>setTimeout(r,250));
+    expect(active).toBe(0);expect(subscribes).toBe(0); // it left before subscribing, so nothing was opened
+    failSubscribe=true;
+    const reading=readSse(`${base2}/api/turns/${turn.id}/events`);
+    await new Promise(r=>setTimeout(r,60));release();
+    const {events,closed}=await reading;
+    expect(subscribes).toBe(1);expect(closed).toBe(true);expect(events.at(-1)!.data.state).toBe('completed');
+  } finally {await app2.close();}
 });

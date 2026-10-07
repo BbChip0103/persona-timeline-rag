@@ -48,7 +48,7 @@ describe('LLM gateway',()=>{
     const held=heldProvider();const {base,g}=await gateway(new TextProviderUpstream(held.provider,'fake'),{maxConcurrent:2,maxQueue:5});
     const requests=Array.from({length:5},()=>post(base,{messages,stream:false}));
     await until(()=>held.stats().calls===2);
-    expect(g.metrics().queued).toBe(3);
+    await until(()=>g.metrics().queued===3); // the last requests may still be arriving
     for(let i=0;i<5;i++){await until(()=>held.held()>0);held.releaseOne();}
     const responses=await Promise.all(requests);
     expect(responses.map(r=>r.status)).toEqual([200,200,200,200,200]);
@@ -102,6 +102,24 @@ describe('LLM gateway',()=>{
     fail=true;
     const failed=await post(base,{messages,stream:true});
     expect(failed.status).toBe(502);expect(failed.headers.get('x-ptr-gateway')).toBeNull();
+  });
+});
+
+describe('gateway streaming under backpressure',()=>{
+  test('a client that stops reading a large stream and disconnects frees its slot (no wait on a drain that never comes)',async()=>{
+    const chunk=`data: ${JSON.stringify({choices:[{delta:{content:'x'.repeat(16000)}}]})}\n\n`;
+    const engine=createServer((req,res)=>{req.resume();req.on('end',()=>{res.writeHead(200,{'Content-Type':'text/event-stream'});
+      let sent=0;const pump=()=>{while(sent<2000){sent++;if(!res.write(chunk)){res.once('drain',pump);return;}}res.end('data: [DONE]\n\n');};pump();
+      res.on('close',()=>undefined);});});
+    const engineBase=await listen(engine);
+    const {base,g}=await gateway(new OpenAICompatibleUpstream({baseUrl:`${engineBase}/v1`,model:'m'}),{maxConcurrent:1,maxQueue:1});
+    const controller=new AbortController();
+    const response=await post(base,{messages,stream:true},{},controller.signal);
+    const reader=response.body!.getReader();await reader.read(); // read one chunk, then stall
+    await new Promise(r=>setTimeout(r,200));controller.abort();
+    await until(()=>g.metrics().inFlight===0,3000);
+    const next=await post(base,{messages,stream:false});
+    expect(next.status).not.toBe(503);await next.body?.cancel();
   });
 });
 

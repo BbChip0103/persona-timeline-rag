@@ -22,8 +22,25 @@ run('BullMQ delivery and Redis turn events (opt-in RUN_REDIS_TESTS=1)', () => {
       expect(handled.map(d => d.seq).sort()).toEqual([0, 1]);
       expect(handled.every(d => d.turnId === dispatch.turnId)).toBe(true);
       expect(await delivery.backlog()).toBe(0);
-      await delivery.publish(dispatch); // completed jobs are retained for dedupe
-      expect(await delivery.backlog()).toBe(0);
+      await delivery.publish(dispatch); // a finished job is replaced (the outbox only re-publishes unclaimed turns)
+      expect(await delivery.backlog()).toBe(1);
+    } finally { await delivery.close(true); }
+  });
+  it('a dispatch whose job finished (failed or done) can be published again; a waiting one stays deduplicated', async () => {
+    const queueName = `test-turns-${randomUUID()}`;
+    const delivery = new BullMqTurnDelivery(url, { queueName });
+    let calls = 0;
+    try {
+      const dispatch = { turnId: randomUUID(), seq: 0 };
+      await delivery.publish(dispatch);
+      const consumer = startTurnConsumer(url, async () => { calls++; if (calls === 1) throw new Error('claim failed'); }, { queueName, concurrency: 1 });
+      await until(() => calls === 1);
+      await new Promise(r => setTimeout(r, 100)); // job is now failed (attempts: 1)
+      await delivery.publish(dispatch);
+      await until(() => calls === 2);
+      await consumer.close();
+      await delivery.publish(dispatch); await delivery.publish(dispatch);
+      expect(await delivery.backlog()).toBe(1);
     } finally { await delivery.close(true); }
   });
   it('consumer concurrency bounds jobs in flight; close waits for them', async () => {
