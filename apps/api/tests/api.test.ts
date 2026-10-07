@@ -124,3 +124,65 @@ test('new API sessions default agent_loop; explicit legacy remains pinned; inter
   expect(legacy.body.session.executionProfile).toBe('legacy');
   expect((await call(`sessions/${sessionId}/turns`,{method:'POST',body:{clientRequestId:'bad-profile',text:'안녕',executionProfile:'legacy'}})).status).toBe(400);
 });
+
+type SseEvent={event:string;data:{state?:string;id?:string;reply?:{content?:string};[key:string]:unknown}};
+/** Reads an SSE response to its end (or until limitMs) and parses `event:`/`data:` frames; comments are skipped. */
+async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promise<{status:number;type:string|null;events:SseEvent[];closed:boolean}> {
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),limitMs);
+  const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':owner},signal:controller.signal});
+  const events:SseEvent[]=[];let closed=false;let text='';
+  if(response.headers.get('content-type')?.startsWith('text/event-stream')) {
+    const reader=response.body!.getReader();const decoder=new TextDecoder();
+    try {for(;;){const {done,value}=await reader.read();if(done){closed=true;break;}text+=decoder.decode(value,{stream:true});}} catch {/* aborted at limit */}
+    for(const frame of text.split('\n\n')) {
+      const lines=frame.split('\n').filter(line=>line&&!line.startsWith(':'));
+      const event=lines.find(line=>line.startsWith('event: '))?.slice(7);const data=lines.find(line=>line.startsWith('data: '))?.slice(6);
+      if(event&&data) events.push({event,data:JSON.parse(data)});
+    }
+  } else await response.text();
+  clearTimeout(timer);
+  return {status:response.status,type:response.headers.get('content-type'),events,closed};
+}
+function blockedProvider() {
+  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});
+  return {provider:{generate:async()=>{await gate;return '반가워요.';}},release};
+}
+function useChat(chat:ReturnType<typeof createLocalChat>,store:InMemoryConversationStore) {
+  Object.assign(runtime,{chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events});
+}
+test('SSE: a turn streams its state changes and the final public turn, then the server closes the stream',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  useChat(createLocalChat({store,personas:runtime.personas,provider}),store);
+  const created=await call('sessions',{method:'POST',body:{personId:persona.personId,executionProfile:'legacy'}});const id=created.body.session.id;
+  const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'sse_1',text:'안녕'}});
+  const reading=readSse(`${base}/api/turns/${sent.body.turn.id}/events`);
+  await new Promise(r=>setTimeout(r,50));release();
+  const {status,type,events,closed}=await reading;
+  expect(status).toBe(200);expect(type).toMatch(/^text\/event-stream/);expect(closed).toBe(true);
+  expect(events[0]!.event).toBe('turn');
+  const last=events.at(-1)!;expect(last.event).toBe('turn');expect(last.data.state).toBe('completed');expect(last.data.reply?.content).toBe('반가워요.');
+  for(const e of events.filter(e=>e.event==='state')) expect(Object.keys(e.data).sort()).toEqual(['state']);
+  expect(JSON.stringify(events)).not.toContain('"agent"');expect(JSON.stringify(events)).not.toContain('ownerId');
+});
+test('SSE: an already ended turn yields one snapshot and closes; another owner gets a plain 404',async()=>{
+  const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
+  const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'sse_2',text:'안녕'}});const final=await waitTurn(sent.body.turn.id);
+  const done=await readSse(`${base}/api/turns/${final.id}/events`);
+  expect(done.closed).toBe(true);expect(done.events).toHaveLength(1);expect(done.events[0]!.data.state).toBe('completed');
+  const other=await readSse(`${base}/api/turns/${final.id}/events`,'owner_synthetic_b');
+  expect(other.status).toBe(404);expect(other.type).toMatch(/^application\/json/);
+});
+test('SSE: if pub/sub notices are lost, the periodic store re-check still delivers the end of the turn',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  const chat=createLocalChat({store,personas:runtime.personas,provider});
+  const silent:ApiRuntime={...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:{subscribe:async()=>()=>undefined}};
+  const quiet=await createApiApplication(silent,token,{sse:{recheckMs:50}});await quiet.listen(0,'127.0.0.1');const quietBase=await quiet.getUrl();
+  try {
+    const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
+    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_3',text:'안녕'});
+    const reading=readSse(`${quietBase}/api/turns/${turn.id}/events`);
+    await new Promise(r=>setTimeout(r,30));release();
+    const {events,closed}=await reading;
+    expect(closed).toBe(true);expect(events.at(-1)!.data.state).toBe('completed');
+  } finally {await quiet.close();}
+});

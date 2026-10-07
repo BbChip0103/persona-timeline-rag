@@ -4,7 +4,7 @@ type Session={id:string;personId:string;personaRevision:string;retrievalMode:str
 type Message={id:string;turnId:string|null;role:string;content:string};
 type Turn={id:string;sessionId:string;clientRequestId:string;userText:string;state:string;errorCode?:string;reply?:Record<string,unknown>};
 async function fixtures(page:Page) {
-  const sessions:Session[]=[];const histories=new Map<string,Message[]>();const turns=new Map<string,Turn>();const polls=new Map<string,number>();const requestIds=new Map<string,Turn>();let counter=0;let abortNext=false;let failNext:string|undefined;const sentBodies:Record<string,unknown>[]=[];
+  const sessions:Session[]=[];const histories=new Map<string,Message[]>();const turns=new Map<string,Turn>();const polls=new Map<string,number>();const transport={streams:0,progressPolls:0};const requestIds=new Map<string,Turn>();let counter=0;let abortNext=false;let failNext:string|undefined;const sentBodies:Record<string,unknown>[]=[];
   await page.route('**/api/proxy/**',async route=>{
     const path=new URL(route.request().url()).pathname.slice('/api/proxy/'.length);const body=route.request().method()==='POST'?route.request().postDataJSON() as Record<string,unknown>:undefined;
     let value:unknown;
@@ -18,24 +18,28 @@ async function fixtures(page:Page) {
       value={turn};if(abortNext){abortNext=false;await route.abort('failed');return;}
     }
     else if(/^turns\/[^/]+\/cancel$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;turn.state='cancelled';value={cancelled:true};}
-    else if(/^turns\/[^/]+$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;const count=(polls.get(turn.id)??0)+1;polls.set(turn.id,count);
+    // Poll and SSE share the fixture: each poll or stream connection advances the turn once (completes on the second),
+    // and a stream carries one snapshot then ends, like the API's max-duration close, so the client reconnects.
+    else if(/^turns\/[^/]+(\/events)?$/.test(path)){const turn=turns.get(path.split('/')[1]!)!;if(path.endsWith('/events'))transport.streams++;else if(turn.state==='generating')transport.progressPolls++;/* reply reads after completion are not polling */const count=(polls.get(turn.id)??0)+1;polls.set(turn.id,count);
       if(turn.state==='generating'&&count>=2){turn.state='completed';const timeline=sentBodies.find(body=>body.clientRequestId===turn.clientRequestId)?.intent==='timeline';const image=sessions.find(item=>item.id===turn.sessionId)?.ragCondition==='caption_image';turn.reply={content:timeline?'캡션 원문: 합성 기록입니다.':'합성 응답입니다. 대화를 이어 가요.',status:'answered',evidence:timeline?[{...(image?{origin:'ai_image_annotation',annotationId:'synthetic-image-description',annotationRevision:'synthetic-v5',annotationHash:'a'.repeat(64),imageHash:'b'.repeat(64)}:{origin:'source_caption'}),sourceId:'synthetic-source',sourceUrl:'https://example.com/synthetic',postedAt:'2026-01-02T00:00:00Z',eventDate:null,quote:'합성 기록입니다.'},{sourceId:'synthetic-unsafe-url',sourceUrl:'javascript:alert(1)',postedAt:'2026-01-02T00:00:00Z',eventDate:'2026-01-01',quote:'안전한 텍스트만 표시합니다.'}]:[],limitations:timeline?['합성 테스트 캡션이며 실제 활동 근거가 아닙니다.']:[]};histories.get(turn.sessionId)!.push({id:'synthetic-assistant-'+turn.id,turnId:turn.id,role:'assistant',content:String(turn.reply.content)});}
+      if(path.endsWith('/events')){await route.fulfill({status:200,headers:{'content-type':'text/event-stream; charset=utf-8'},body:`event: turn\ndata: ${JSON.stringify(turn)}\n\n`});return;}
       value={turn};
     }
     else if(/^sessions\/[^/]+\/drafts$/.test(path))value={artifact:{content:'[가상 포스트 초안 · AI 생성]\n합성 창작 초안입니다.'},image:{code:'IMAGE_RUNNER_ONLY'}};
     else {await route.fulfill({status:404,json:{error:{code:'NOT_FOUND'}}});return;}
     await route.fulfill({json:value});
   });
-  return {sentBodies,turns,abortOnce:()=>{abortNext=true;},failOnce:(code:string)=>{failNext=code;}};
+  return {transport,sentBodies,turns,abortOnce:()=>{abortNext=true;},failOnce:(code:string)=>{failNext=code;}};
 }
 async function login(page:Page) {await page.goto('/login');await page.getByLabel('연구 공간 비밀번호').fill(password);const responsePromise=page.waitForResponse('**/api/auth');await page.getByRole('button',{name:'로그인',exact:true}).click();const response=await responsePromise;expect(response.status()).toBe(200);await expect(page.getByRole('heading',{name:'대화 공간'})).toBeVisible();await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');}
 async function newSession(page:Page) {await expect(page.getByLabel('연구 페르소나')).toContainText('합성 페르소나 1');await page.getByRole('button',{name:'새 대화 시작'}).click();await expect(page.getByText('합성 연구 페르소나입니다. 편하게 이야기해 주세요.').last()).toBeVisible();}
 
 test('SYNTHETIC ONLY: five turns persist on reload and session mode stays pinned',async({page})=>{
-  await fixtures(page);await login(page);await newSession(page);
+  const {transport}=await fixtures(page);await login(page);await newSession(page);
   await expect(page.getByText('연구용 AI 시뮬레이션 · 비공식',{exact:true})).toBeVisible();
   for(let index=1;index<=5;index++){await page.getByLabel('메시지',{exact:true}).fill(`합성 메시지 ${index}`);await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.locator('.message.assistant').filter({hasText:'합성 응답입니다.'})).toHaveCount(index);}
   await page.getByLabel('새 세션의 RAG 조건').selectOption('caption');await page.getByLabel('검색 알고리즘').selectOption('lexical');await expect(page.getByTestId('session-mode')).toHaveText('RAG 없음');
+  expect(transport.streams).toBeGreaterThan(0);expect(transport.progressPolls).toBe(0); // progress arrives by SSE, not polling
   await page.reload();await expect(page.getByText('합성 메시지 5',{exact:true})).toBeVisible();await expect(page.locator('.message.assistant').filter({hasText:'합성 응답입니다.'})).toHaveCount(5);
   await expect(page.getByTestId('session-mode')).toHaveText('RAG 없음');
 });

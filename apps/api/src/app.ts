@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { Body, Catch, Controller, Get, HttpException, Inject, Module, Param, Post, Req, type ArgumentsHost, type ExceptionFilter, type INestApplication } from '@nestjs/common';
+import { Body, Catch, Controller, Get, HttpException, Inject, Module, Param, Post, Req, Res, type ArgumentsHost, type ExceptionFilter, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import type { Request, Response, NextFunction } from 'express';
@@ -8,8 +8,10 @@ import { z } from 'zod';
 import { ExecutionProfileSchema, RagConditionSchema, RetrievalModeSchema, SendTurnSchema, TimezoneSchema, type ChatSession } from '@ptr/contracts';
 import { CoreError } from '@ptr/core';
 import { publicTurn } from './public-turn';
+import { DEFAULT_SSE, streamTurn, type SseOptions } from './turn-sse';
 import type { ApiRuntime, CreativeArtifact } from './runtime';
 const RUNTIME=Symbol('API_RUNTIME');
+const SSE=Symbol('SSE_OPTIONS');
 const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
 const draftSchema=z.object({brief:z.string().trim().min(1).max(2000)}).strict();
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
@@ -39,7 +41,7 @@ class SafeErrorFilter implements ExceptionFilter {
 @Controller('api')
 class ApiController {
   private readonly drafts=new Set<string>();
-  constructor(@Inject(RUNTIME) private readonly runtime:ApiRuntime) {}
+  constructor(@Inject(RUNTIME) private readonly runtime:ApiRuntime,@Inject(SSE) private readonly sse:SseOptions) {}
   @Get('health') health() {return {ok:true,service:'persona-timeline-rag',liveEnabled:this.runtime.providerName==='openrouter'};}
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
@@ -66,6 +68,10 @@ class ApiController {
     return {turn:safeTurn(turn)};
   }
   @Get('turns/:id') async turn(@Req() request:Request,@Param('id') id:string) {return {turn:safeTurn(await this.runtime.chat.getTurn(owner(request),id))};}
+  /** Server-sent events instead of client polling: state notices plus the final public turn. */
+  @Get('turns/:id/events') async turnEvents(@Req() request:Request,@Res() response:Response,@Param('id') id:string) {
+    await streamTurn(this.runtime.chat,this.runtime.eventSource,owner(request),id,request,response,this.sse);
+  }
   @Post('turns/:id/cancel') async cancel(@Req() request:Request,@Param('id') id:string,@Body() body:unknown) {
     if(body && (typeof body!=='object' || Object.keys(body).length)) throw new CoreError('INVALID_INPUT');
     return {cancelled:await this.runtime.chat.cancelTurn(owner(request),id)};
@@ -96,9 +102,9 @@ class ApiController {
     finally {clearTimeout(timeout);this.drafts.delete(id);}
   }
 }
-export async function createApiApplication(runtime:ApiRuntime,token:string):Promise<INestApplication> {
+export async function createApiApplication(runtime:ApiRuntime,token:string,options:{sse?:Partial<SseOptions>}={}):Promise<INestApplication> {
   if(!token || token.length<24 || token.length>512) throw new CoreError('INVALID_INPUT');
-  @Module({controllers:[ApiController],providers:[{provide:RUNTIME,useValue:runtime}]})
+  @Module({controllers:[ApiController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}}]})
   class ApiModule {}
   const app=await NestFactory.create<NestExpressApplication>(ApiModule,{logger:false,bodyParser:false});
   // Token middleware runs before body parsing so unauthenticated input has no effect.

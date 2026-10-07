@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { turnNotice } from '../lib/turn-notice';
+import { readTurnStream } from '../lib/turn-stream';
 
 type Mode='off'|'lexical'|'semantic';
 type RagCondition='off'|'caption'|'caption_image';
@@ -54,18 +55,31 @@ export default function Chat() {
   useEffect(()=>{bottom.current?.scrollIntoView({behavior:'auto',block:'nearest'});},[history.length,active?.state]);
   useEffect(()=>{
     if(!active||terminal(active.state))return;
+    // Server push (SSE) instead of polling. A broken stream falls back to one status read and reconnects;
+    // a stream the server ended on purpose (max duration) reconnects for a fresh snapshot. Never resubmits.
     const controller=new AbortController();let timer:ReturnType<typeof setTimeout>;let failures=0;
-    const tick=async()=>{try{
-      const value=await api<{turn:Turn}>(`turns/${active.id}`,undefined,controller.signal);if(controller.signal.aborted)return;
-      failures=0;
-      if(terminal(value.turn.state)) {
-        if(value.turn.reply)setReplies(previous=>({...previous,[value.turn.id]:value.turn.reply!}));
-        setNotice(turnNotice(value.turn));
-        await refreshHistory(value.turn.sessionId);if(controller.signal.aborted)return;localStorage.removeItem(`ptr-active-turn-${value.turn.sessionId}`);setActive(undefined);setAttempt(undefined);return;
+    const settle=async(turn:Turn)=>{
+      if(turn.reply)setReplies(previous=>({...previous,[turn.id]:turn.reply!}));
+      setNotice(turnNotice(turn));
+      await refreshHistory(turn.sessionId);if(controller.signal.aborted)return;localStorage.removeItem(`ptr-active-turn-${turn.sessionId}`);setActive(undefined);setAttempt(undefined);
+    };
+    const connect=async()=>{try{
+      const response=await fetch(`/api/proxy/turns/${active.id}/events`,{cache:'no-store',signal:controller.signal});
+      if(response.status===403){window.location.assign('/login');return;}
+      if(!response.ok||!response.body||!response.headers.get('content-type')?.startsWith('text/event-stream')) {
+        const value=await api<{turn:Turn}>(`turns/${active.id}`,undefined,controller.signal);if(controller.signal.aborted)return;
+        if(terminal(value.turn.state)){await settle(value.turn);return;}
+        throw new Error('STREAM_UNAVAILABLE');
       }
-      setActive(value.turn);timer=setTimeout(tick,600);
-    }catch{if(controller.signal.aborted)return;failures++;setNotice('상태 확인 연결이 지연되고 있어요. 생성 요청은 재전송하지 않습니다.');timer=setTimeout(tick,Math.min(1000*failures,10000));}};
-    timer=setTimeout(tick,300);return()=>{controller.abort();clearTimeout(timer);};
+      failures=0;
+      const done=await readTurnStream(response.body,frame=>{
+        if(frame.event==='turn'){const turn=frame.data as Turn;if(terminal(turn.state)){void settle(turn);return true;}setActive(turn);}
+        else if(frame.event==='state'){const state=(frame.data as {state?:string}).state;if(state)setActive(previous=>previous?{...previous,state}:previous);}
+        return false;
+      });
+      if(!done&&!controller.signal.aborted)timer=setTimeout(connect,300);
+    }catch{if(controller.signal.aborted)return;failures++;setNotice('상태 확인 연결이 지연되고 있어요. 생성 요청은 재전송하지 않습니다.');timer=setTimeout(connect,Math.min(1000*failures,10000));}};
+    void connect();return()=>{controller.abort();clearTimeout(timer);};
   },[active?.id]);
   async function submit(value:Attempt) {
     if(!session)return;setBusy(true);setError('');setNotice('');setAttempt(value);
