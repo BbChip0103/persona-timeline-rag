@@ -185,10 +185,10 @@ async function virtualUser(o:UserOptions):Promise<void> {
     if(o.thinkMs) await sleep(o.thinkMs);
   }
 }
-let turnsPerSession=0;
+let turnsPerSession=0, thinkMs=0, pollMs=100;
 async function runStage(api:Api,users:number,seconds:number,extra:Partial<UserOptions>={}) {
   const samples:TurnSample[]=[];const started=Date.now();const deadline=started+seconds*1000;
-  await Promise.all(Array.from({length:users},(_,i)=>virtualUser({api,deadline,turnTimeoutMs:45_000,pollMs:100,thinkMs:0,samples,personaIndex:i,turnsPerSession,...extra})));
+  await Promise.all(Array.from({length:users},(_,i)=>virtualUser({api,deadline,turnTimeoutMs:45_000,pollMs,thinkMs,samples,personaIndex:i,turnsPerSession,...extra})));
   return {users,seconds,...summarizeStage(samples,Date.now()-started),wallSeconds:(Date.now()-started)/1000};
 }
 async function activeTurns(since:Date):Promise<{state:string;n:number}[]> {
@@ -202,7 +202,7 @@ async function main():Promise<void> {
   const runId=`${new Date().toISOString().replace(/[:.]/g,'-')}-${mode}`;
   const directory=join('reports','loadtest',runId);await mkdir(directory,{recursive:true,mode:0o700});
   const runStarted=new Date();
-  turnsPerSession=Number(options['turns-per-session']??0);
+  turnsPerSession=Number(options['turns-per-session']??0);thinkMs=Number(options['think-ms']??0);pollMs=Number(options['poll-ms']??100);
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
   const latency=options.latency==='none'||options.provider==='selfhosted'?null:options.latency??DEFAULT_LATENCY;
