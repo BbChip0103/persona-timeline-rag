@@ -11,4 +11,6 @@ async function main() {
   const shutdown=()=>{void app.close().then(()=>runtime.close?.()).finally(()=>process.exit(0));};
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
 }
-void main().catch(()=>{process.stderr.write('API_STARTUP_FAILED\n');process.exitCode=1;});
+// Only a bare error code (e.g. EADDRINUSE) is printed: messages can carry connection strings.
+const safeCode=(error:unknown)=>{const code=(error as {code?:unknown})?.code;return typeof code==='string'&&/^[A-Z_]{1,40}$/.test(code)?` ${code}`:'';};
+void main().catch(error=>{process.stderr.write(`API_STARTUP_FAILED${safeCode(error)}\n`);process.exitCode=1;});
