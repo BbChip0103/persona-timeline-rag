@@ -33,8 +33,8 @@ export class BullMqTurnDelivery implements TurnDelivery {
   async publish(dispatch: TurnDispatch): Promise<void> {
     // A finished job with this id means the turn was not claimed under it (claim failed or was skipped) while its
     // outbox entry is still pending: replace it, or the re-publish would be a silent no-op until retention expires.
-    const existing = await this.queue.getJob(turnJobId(dispatch));
-    if (existing && (await existing.isCompleted() || await existing.isFailed())) await existing.remove().catch(() => undefined);
+    const state = await this.queue.getJobState(turnJobId(dispatch));
+    if (state === 'completed' || state === 'failed') await this.queue.remove(turnJobId(dispatch)).catch(() => undefined);
     await this.queue.add('turn', { turnId: dispatch.turnId, seq: dispatch.seq }, {
       jobId: turnJobId(dispatch), attempts: 1,
       removeOnComplete: { age: 3600 }, removeOnFail: { age: 24 * 3600 },

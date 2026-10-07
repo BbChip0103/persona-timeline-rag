@@ -39,13 +39,14 @@ async function main() {
     maxConcurrent:integer(env,'PTR_GATEWAY_MAX_CONCURRENCY',32,1,4096),maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),
     queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),upstreamTimeoutMs:integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)}});
   const port=integer(env,'PTR_GATEWAY_PORT',56460,1024,65535);
+  const shutdownMs=integer(env,'PTR_GATEWAY_SHUTDOWN_MS',30000,0,600000); // validated at startup, not in the signal handler
   await new Promise<void>(resolve=>server.listen(port,'127.0.0.1',resolve));
   // No tokens, URLs or upstream details in startup output.
   process.stdout.write(`LLM gateway listening on 127.0.0.1:${port}\n`);
   // Stop accepting, let in-flight calls finish (bounded), then release the ledger pool: paid calls are not cut off.
   const shutdown=()=>{
     const drained=new Promise<void>(resolve=>server.close(()=>resolve()));
-    const deadline=new Promise<void>(resolve=>setTimeout(resolve,integer(env,'PTR_GATEWAY_SHUTDOWN_MS',30000,0,600000)).unref());
+    const deadline=new Promise<void>(resolve=>setTimeout(resolve,shutdownMs).unref());
     void Promise.race([drained,deadline]).then(()=>close?.()).finally(()=>process.exit(0));
   };
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);

@@ -118,9 +118,13 @@ class Fleet {
   startWorkers():void {for(let i=this.live('worker').length;i<this.topology.workers;i++) this.launch('worker','apps/api/src/worker.ts',{PTR_WORKER_ID:`lt-worker-${randomUUID().slice(0,6)}`});}
   startDispatchers():void {for(let i=this.live('dispatcher').length;i<this.topology.dispatchers;i++) this.launch('dispatcher','apps/api/src/dispatcher.ts',{});}
   async startAll():Promise<void> {await this.startGateway();await this.startApis();this.startWorkers();this.startDispatchers();await sleep(1500);}
-  kill(role:Role,signal:NodeJS.Signals,count=Infinity):Promise<void> {
+  /** Signals and waits for exit; a process still alive after `graceMs` is SIGKILLed so a run never hangs on shutdown. */
+  kill(role:Role,signal:NodeJS.Signals,count=Infinity,graceMs=150_000):Promise<void> {
     const targets=this.live(role).slice(0,count);
-    return Promise.all(targets.map(p=>new Promise<void>(resolve=>{p.child.once('exit',()=>resolve());p.child.kill(signal);}))).then(()=>undefined);
+    return Promise.all(targets.map(p=>new Promise<void>(resolve=>{
+      const timer=setTimeout(()=>p.child.kill('SIGKILL'),graceMs);
+      p.child.once('exit',()=>{clearTimeout(timer);resolve();});p.child.kill(signal);
+    }))).then(()=>undefined);
   }
   async stopAll():Promise<void> {
     // Graceful order: stop intake, let workers drain, then recovery and the model gateway.
