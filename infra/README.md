@@ -55,3 +55,17 @@ export PGPASSWORD="$PTR_DB_PASSWORD"
 docker exec -i -e PGPASSWORD -e PTR_LOADTEST_DB_PASSWORD ptr_goal1_db bash -s < infra/init-loadtest-db.sh
 DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm db:migrate
 ```
+
+## Goal2 scale rework: local Redis
+
+`compose.redis.yml` runs `ptr_goal2_redis` (Redis 8.10.2, pinned by digest) on
+`127.0.0.1:56479` only, with a password, `maxmemory-policy noeviction` (required by
+BullMQ) and AOF. It carries the BullMQ turn queue and turn-event pub/sub; it is not a
+source of truth (turns and the outbox in Postgres are). The URL guard
+(`@ptr/messaging` `assertLocalRedisUrl`) accepts only this loopback target.
+
+```sh
+# Private .env.local holds PTR_REDIS_PASSWORD and PTR_REDIS_URL (redis://:<pw>@127.0.0.1:56479/0).
+docker compose --env-file .env.local -f infra/compose.redis.yml up -d redis
+RUN_REDIS_TESTS=1 pnpm exec jest packages/messaging --runInBand
+```
