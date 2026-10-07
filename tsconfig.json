@@ -36,6 +36,7 @@
   "include": [
     "packages/**/*.ts",
     "apps/api/**/*.ts",
+    "apps/gateway/**/*.ts",
     "scripts/**/*.ts",
     "e2e/**/*.ts"
   ],

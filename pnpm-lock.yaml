@@ -106,6 +106,21 @@ importers:
         specifier: 3.24.2
         version: 3.24.2
 
+  apps/gateway:
+    dependencies:
+      '@ptr/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@ptr/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@ptr/providers':
+        specifier: workspace:*
+        version: link:../../packages/providers
+      '@ptr/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
+
   apps/web:
     dependencies:
       next:

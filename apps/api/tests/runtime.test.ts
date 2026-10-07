@@ -39,3 +39,10 @@ test('PTR_CHAT_PROVIDER=selfhosted uses the loopback OpenAI-compatible engine an
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'https://api.example.com/v1',PTR_SELFHOSTED_MODEL:'m'})).toThrow();
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'selfhosted'})).toThrow();
 });
+test('PTR_CHAT_PROVIDER=gateway sends every model call to the loopback LLM gateway with its token',async()=>{
+  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'});
+  expect(runtime.provider).toBeInstanceOf(OpenAICompatibleTextProvider);expect(runtime.model).toBe('gateway');
+  await runtime.close?.();
+  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway'})).toThrow();
+  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',PTR_GATEWAY_URL:'https://example.com/v1'})).toThrow();
+});

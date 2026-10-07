@@ -14,12 +14,21 @@ export interface OpenAICompatibleOptions {
   onMetrics?:(metrics:CallMetrics)=>void;
   /** Guided decoding: send the agent reply JSON Schema so the engine enforces the shape the app validates. */
   structuredAgentReplies?:boolean;
+  /** Bearer token, e.g. for the LLM gateway. */
+  apiKey?:string;
 }
+/** The gateway marks requests it refused before contacting any upstream; only those are safe to resend. */
+const GATEWAY_REJECTED='rejected';
+const sleep=(ms:number,signal:AbortSignal)=>new Promise<void>((resolve,reject)=>{
+  const timer=setTimeout(resolve,ms);signal.addEventListener('abort',()=>{clearTimeout(timer);reject(new ProviderError('CANCELLED'));},{once:true});
+});
 type Json=Record<string,unknown>;
 
 /**
- * OpenAI-compatible chat adapter for self-hosted serving engines. No billing ledger: GPU time is not
- * charged per request, so cost is accounted per run (GPU hours), not per call.
+ * OpenAI-compatible chat adapter for self-hosted serving engines or the LLM gateway in front of them. No billing
+ * ledger here: GPU time is accounted per run, and a billable upstream behind the gateway keeps its own ledger.
+ * Gateway admission rejections (429/503 marked `X-PTR-Gateway: rejected`) are retried after Retry-After until the
+ * caller's signal or the timeout ends the call; every other error surfaces at once.
  */
 export class OpenAICompatibleTextProvider implements TextProvider {
   private readonly fetcher:typeof fetch;
@@ -49,7 +58,18 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     const timeout=AbortSignal.timeout(this.options.timeoutMs??30000);
     const signal=AbortSignal.any([options.signal,timeout]);
     try {
-      const response=await this.fetcher(this.endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal,redirect:'error'});
+      const headers={'Content-Type':'application/json',...(this.options.apiKey?{Authorization:`Bearer ${this.options.apiKey}`}:{})};
+      let response:Response;
+      for(;;) {
+        response=await this.fetcher(this.endpoint,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});
+        if((response.status===429||response.status===503)&&response.headers.get('x-ptr-gateway')===GATEWAY_REJECTED) {
+          await response.body?.cancel().catch(()=>undefined);
+          const after=Number(response.headers.get('retry-after'));
+          await sleep(Number.isFinite(after)&&after>=0?Math.min(after*1000,5000):250,signal);
+          continue;
+        }
+        break;
+      }
       if(!response.ok||!response.body) throw new ProviderError(`PROVIDER_HTTP_${response.status}`);
       let text='', buffer='';
       const decoder=new TextDecoder();

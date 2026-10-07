@@ -58,6 +58,11 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     const baseUrl=env.PTR_SELFHOSTED_BASE_URL, selfModel=env.PTR_SELFHOSTED_MODEL;
     if(!baseUrl||!selfModel) throw new CoreError('INVALID_INPUT');
     provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_SELFHOSTED_STRUCTURED==='1'});model=`selfhosted/${selfModel}`;
+  } else if(providerName==='gateway') {
+    // Scale rework: workers reach every model through the LLM gateway (admission, metrics); the gateway owns the upstream.
+    const baseUrl=env.PTR_GATEWAY_URL??'http://127.0.0.1:56460/v1', token=env.PTR_GATEWAY_TOKEN??'';
+    if(token.length<24) throw new CoreError('INVALID_INPUT');
+    provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1'});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
   const delivery=new BullMqTurnDelivery(redisUrl);

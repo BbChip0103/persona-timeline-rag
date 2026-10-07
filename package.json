@@ -6,7 +6,7 @@
   "scripts": {
     "test": "jest --runInBand",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint packages apps/api scripts e2e --no-error-on-unmatched-pattern",
+    "lint": "eslint packages apps/api apps/gateway scripts e2e --no-error-on-unmatched-pattern",
     "check": "pnpm test && pnpm typecheck && pnpm lint",
     "build:web": "pnpm --filter @ptr/web build",
     "dev:api": "tsx apps/api/src/main.ts",
