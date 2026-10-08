@@ -2,9 +2,10 @@
  * FakeEngineUpstream (routing ): an OpenAI-compatible streaming engine for zero-cost routing comparisons.
  *
  * - `slots` sequences run at once; more wait inside the engine (vLLM `num_requests_waiting`).
- * - KV (like vLLM V1): a running request holds (prompt − the prefix it shares with other RUNNING requests + output)
- *   tokens; a prefix that is only cached (e.g. a finished turn's history) saves prefill but its blocks are allocated
- *   again. One that would exceed `kvCapacityTokens` waits.
+ * - KV (like vLLM V1): a running request needs (prompt − the prefix it shares with other RUNNING requests + output)
+ *   new tokens; shared blocks are counted once and stay in use until their last running holder ends (whichever request
+ *   allocated them). A prefix that is only cached (e.g. a finished turn's history) saves prefill but its blocks are
+ *   allocated again. One that would exceed `kvCapacityTokens` waits.
  * - Prefill: one lane at `prefillTokensPerSec` (chunked prefill shares compute), so concurrent long prompts queue.
  * - Prefix cache: an LRU of message-boundary chain hashes H_k = sha256(H_{k−1} ‖ role ‖ content_k) with cumulative
  *   tokens; a hit skips that many prompt tokens. The engine counts tokens as bytes / `bytesPerToken` (4.45, the measured
@@ -33,15 +34,19 @@ export interface FakeEngineConfig {
   kvCapacityTokens:number; prefixCacheEntries?:number; prefixCacheTokens?:number; bytesPerToken?:number;
 }
 interface Job { promptTokens:number; cachedTokens:number; outputTokens:number; hashes:{hash:string;tokens:number}[]; res:ServerResponse; state:'waiting'|'prefill'|'decode'|'done';
-  /** KV held while running (set at admission). */ kv:number }
+  /** KV of its own while running (last message + output); its chain's blocks are counted once in `held`. */ kv:number }
 
 export class FakeEngine {
   private server:Server|undefined;private readonly sockets=new Set<Socket>();
   private readonly running=new Set<Job>();private waiting:Job[]=[];
   /** H_k → the tokens of message k (its share of the cache); Map order = least recently used first. */
   private readonly prefix=new Map<string,number>();
-  /** H_k of the running requests' chains → how many hold it (shared blocks, never evicted). */
-  private readonly held=new Map<string,number>();
+  /**
+   * H_k of the running requests' chains → how many hold it and the tokens of message k (shared blocks, never evicted).
+   * KV in use = Σ running requests' own parts + Σ own tokens of the held entries (each block once, whoever holds it),
+   * so shared blocks stay counted until the LAST holder ends, whichever request first allocated them.
+   */
+  private readonly held=new Map<string,{count:number;own:number}>();
   private prefillBusyUntil=0;private kvUsed=0;private startTime=0;
   private forced:{kvUsage?:number;waiting?:number}={};private metricsHang=false;
   readonly stats={requests:0,completed:0,prefixQueries:0,prefixHits:0,cancelled:0,promptTokens:0,cachedTokens:0};
@@ -105,19 +110,23 @@ export class FakeEngine {
       this.waiting.push(job);this.admit();
     });
   }
-  /** Prompt minus the prefix shared with a running request, plus the output. */
+  /** The request's own part (last message + output): its chain's blocks are counted in `held`. */
+  private ownKv(job:Job):number {return job.promptTokens-(job.hashes.at(-1)?.tokens??0)+job.outputTokens;}
+  /** New KV this request needs: prompt minus the prefix shared with a running request, plus the output. */
   private kvNeed(job:Job):number {
-    let shared=0;
-    for(let k=job.hashes.length-1;k>=0;k--) if(this.held.has(job.hashes[k]!.hash)) {shared=job.hashes[k]!.tokens;break;}
-    return job.promptTokens-shared+job.outputTokens;
+    let fresh=0;
+    for(let k=0;k<job.hashes.length;k++) if(!this.held.has(job.hashes[k]!.hash)) fresh+=job.hashes[k]!.tokens-(k?job.hashes[k-1]!.tokens:0);
+    return this.ownKv(job)+fresh;
   }
   private admit():void {
     while(this.waiting.length&&this.running.size<this.config.slots) {
       const job=this.waiting[0]!, need=this.kvNeed(job);
       // A request larger than the whole cache still runs alone (vLLM would chunk/preempt; here it just runs).
       if(this.running.size&&this.kvUsed+need>this.config.kvCapacityTokens) break;
-      this.waiting.shift();this.running.add(job);job.kv=need;this.kvUsed+=need;
-      for(const {hash} of job.hashes) this.held.set(hash,(this.held.get(hash)??0)+1);
+      this.waiting.shift();this.running.add(job);job.kv=this.ownKv(job);this.kvUsed+=need;
+      job.hashes.forEach(({hash,tokens},k)=>{
+        const entry=this.held.get(hash)??{count:0,own:tokens-(k?job.hashes[k-1]!.tokens:0)};entry.count++;this.held.set(hash,entry);
+      });
       this.evict();this.run(job);
     }
   }
@@ -167,7 +176,10 @@ export class FakeEngine {
     const wasRunning=this.running.delete(job);
     if(wasRunning) {
       this.kvUsed-=job.kv;
-      for(const {hash} of job.hashes) {const count=(this.held.get(hash)??1)-1;if(count>0) this.held.set(hash,count);else this.held.delete(hash);}
+      for(const {hash} of job.hashes) {
+        const entry=this.held.get(hash);if(!entry) continue;
+        if(--entry.count<=0) {this.held.delete(hash);this.kvUsed-=entry.own;} // the last holder frees the shared block
+      }
     } else this.waiting=this.waiting.filter(other=>other!==job);
     job.state='done';
     if(cancelled) this.stats.cancelled++;else this.stats.completed++;

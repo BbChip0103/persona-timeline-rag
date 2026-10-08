@@ -21,7 +21,11 @@ describe('capacity controller settings (dispatcher)',()=>{
 describe('worker startup line',()=>{
   const line=(mode:'on'|'off'|'keep',explicit:boolean,globalConcurrency:number|null,controllerRunning=false)=>workerCapacityLine({mode,explicit,globalConcurrency,controllerRunning});
   test('controller on: only the current G is logged (the S1 Σ-concurrency warning is for off)',()=>{
-    expect(line('on',false,30)).toBe('capacity controller on: global concurrency G=30 (PTR_WORKER_CONCURRENCY is a local cap only)');
+    // Only an explicit PTR_CAPACITY_CONTROLLER counts on a worker: a mode derived from PTR_GATEWAY_DISCOVERY=redis (which
+    // workers now set to read the gateway registry) says nothing about a controller, so the line follows the leader lock.
+    expect(line('on',false,30)).toBe('capacity: global concurrency G=30 is set on the turn queue and no controller leader is alive (PTR_CAPACITY_CONTROLLER unset here): at most 30 turns run');
+    expect(line('on',false,30,true)).toBe('capacity controller running elsewhere: global concurrency G=30 (PTR_WORKER_CONCURRENCY is a local cap only)');
+    expect(line('on',false,null)).toBeNull();
     expect(line('on',true,null)).toBe('capacity controller on: global concurrency G=unset (PTR_WORKER_CONCURRENCY is a local cap only)');
     expect(line('off',true,null)).toBeNull();
     expect(line('off',true,12)).toBe('WARNING capacity controller off but global concurrency G=12 is set on the turn queue: a dispatcher in off mode clears it at startup; until then at most 12 turns run');

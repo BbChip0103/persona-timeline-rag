@@ -83,7 +83,9 @@ most `PTR_GATEWAY_MAX_CONCURRENCY` (32) upstream calls, queues up to `PTR_GATEWA
 `clamp(ceil(ceil(queued / PTR_GATEWAY_MAX_CONCURRENCY) × mean upstream call time), 1, 5)` seconds (mean = EWMA of
 successful calls only, 1 before the first); a queue timeout answers 1. `/metrics` also reports
 `capacity: {maxConcurrent, maxQueue, total}` (total = upstream cap + queue). A caller's disconnect leaves the queue or
-aborts the upstream call. Upstream errors become 502 without that marker.
+aborts the upstream call. Upstream errors become 502 without that marker. SIGTERM/SIGINT start a graceful drain
+(503 `draining`, see "Gateway HA" below); several gateways can publish themselves in a Redis gateway registry that
+workers read (same section).
 Workers use `PTR_CHAT_PROVIDER=gateway` (`PTR_GATEWAY_TOKEN`, `PTR_GATEWAY_STRUCTURED=1` for guided decoding) and the
 client below.
 
@@ -106,7 +108,7 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
 | --- | --- | --- | --- |
 | connection refused (`ECONNREFUSED`): nothing was sent | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_TRANSPORT` at once | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
 | 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_HTTP_429` / `PROVIDER_HTTP_503` at once | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
-| the same, reason `draining` (sent by drain, a later stage) | yes (same time rule) | yes | none before an untried URL, else as above |
+| the same, reason `draining` (a gateway draining on SIGTERM, S6) | yes (same time rule) | yes | none before an untried URL, else as above |
 | reset or close before the response headers, or a failed connect: a fetch `TypeError` whose cause code is `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET` ("other side closed"), `UND_ERR_CLOSED`, `UND_ERR_CONNECT_TIMEOUT`, `EHOSTUNREACH` or `ENETUNREACH` | only with a request key, at most `PTR_GATEWAY_RESET_RETRIES` in total, only with ≥ `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` left | yes | full jitter `U(0, min(2000, 200·2^k))` ms |
 | reset while reading the SSE body after a 200 (same codes), or a stream that ends cleanly without `[DONE]` or a `finish_reason` | as above; the partial text and its usage are discarded (only a complete answer is returned) | yes | as above |
 | any other HTTP status (502/504/500/4xx, an unmarked 503), our own abort or timeout, `INVALID_PROVIDER_RESPONSE` (empty or > 65536 chars), malformed SSE JSON, any other transport error (bad port, unexpected redirect, a `TypeError` without a known code) | never | — | — |
@@ -125,14 +127,16 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
   direct engines (`PTR_CHAT_PROVIDER=selfhosted`) and the benchmarks keep failing fast.
 - Gateway URLs: every call starts at the first URL and moves on as in the table; there is no sticky failover state.
   All URLs must be loopback, so a standby gateway is another port on the same host (it covers a process crash or a
-  deploy, not a host failure). These URL lists and the startup warning are transitional: the design is moving to a
-  stable gateway address with a Redis registry of GPU servers (38 §13).
+  deploy, not a host failure). With `PTR_GATEWAY_DISCOVERY=redis` the list comes from the gateway registry and these
+  URLs become its seed and fallback (see "Gateway HA" below); with Kubernetes a single Service address in
+  `PTR_GATEWAY_URLS` and `static` discovery replace both (in the cluster profile).
 - Every gateway in `PTR_GATEWAY_URLS` must use the **same Postgres ledger database** (`GOAL1_DATABASE_URL`) when a
   billable secondary (`PTR_GATEWAY_FAILOVER=openrouter`) is on. A reset retry that lands on another gateway is safe
   only because both see the same ledger entry for the turn key; with separate ledgers the second gateway could pay for
   the same turn again.
-- `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` is counted per gateway process, so during an active–standby switchover up to
-  twice the cap can reach the secondary.
+- `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` is counted per gateway process. Without the gateway registry, up to twice the
+  cap can reach the secondary during an active–standby switchover. With it, each gateway uses cap / k, where k is the
+  number of active gateways registered (see "Gateway HA" below).
 
 Capacity rule: **Σ worker concurrency ≤ Σ upstream caps + gateway max queue**
 (`PTR_WORKER_CONCURRENCY × replicas ≤ PTR_GATEWAY_MAX_CONCURRENCY + PTR_GATEWAY_MAX_QUEUE` today, one upstream).
@@ -163,7 +167,8 @@ The dispatcher keeps BullMQ's **global concurrency G** of the turn queue (`ptr:<
 ```text
 S_live = Σ maxSeqs of the pool's active, unexpired registry records that pass the gateway's record policy
          (allowlist, loopback, one id per origin; draining excluded; slow start ignored: the gateway absorbs the ramp)
-Q      = PTR_GATEWAY_MAX_QUEUE (256)
+Q      = Σ maxQueue of the active gateways in the gateway registry that pass PTR_GATEWAY_ALLOW (S6),
+         else PTR_GATEWAY_MAX_QUEUE (256) when none is registered or the registry cannot be read
 G*     = max(PTR_CAPACITY_FLOOR (1), min(ceil(S_live × (1 + PTR_CAPACITY_HEADROOM (0.25))), S_live + Q))
 ```
 
@@ -194,9 +199,10 @@ value); in-flight turns = min(Σ local caps, G).
   cannot throttle every worker to one turn; it stays unset for as long as the configuration looks wrong. A set G is
   held for at most 5 minutes; after that the planner follows the registry again (an empty pool then goes to FLOOR). Rejected records next to live ones are counted
   (`rejected` in the status) and logged once (`capacity: N registry record(s) rejected (…)`).
-- **Status:** `ptr:llm:cap` HASH {target, sLive, q, g, active, wait, computedAt, reason, writes, leader, registryStale,
-  workerShortage} (expires 60 s after the last tick), and one dispatcher stderr line whenever G or registry staleness
-  changes: `capacity G=30 target=30 S_live=24 Q=256 active=… wait=… reason=increase`. `reason` is one of init, increase,
+- **Status:** `ptr:llm:cap` HASH {target, sLive, q, qSource (registry | env), g, active, wait, computedAt, reason, writes,
+  leader, registryStale, workerShortage} (expires 60 s after the last tick), and one dispatcher stderr line whenever G,
+  Q or registry staleness changes: `capacity G=30 target=30 S_live=24 Q=256 active=… wait=… reason=increase` (`Q=512(gateways)`
+  when Q comes from the gateway registry). `reason` is one of init, increase,
   hold, decrease_pending, decrease, draining, registry_stale, hold_suspect.
 - **worker_shortage:** `wait > 0` while `active < G` for 15 s logs `WARNING worker_shortage …` once per episode (add
   workers or raise `PTR_WORKER_CONCURRENCY`).
@@ -222,18 +228,21 @@ value); in-flight turns = min(Σ local caps, G).
 | `PTR_CAPACITY_HEADROOM` | 0.25 (0–4) | see above |
 | `PTR_CAPACITY_FLOOR` | 1 (1–4096) | lowest G (user decision; the design draft had 4) |
 | `PTR_CAPACITY_INTERVAL_MS` | 5000 (500–60000) | tick |
-| `PTR_GATEWAY_MAX_QUEUE` | 256 | Q (the same value the gateway uses) |
+| `PTR_GATEWAY_MAX_QUEUE` | 256 | Q when no gateway is registered (the same value the gateway uses) |
+| `PTR_GATEWAY_ALLOW` | `127.0.0.1:56460-56469` | gateway records that count toward Q (the workers' rule) |
 | `PTR_TURN_QUEUE`, `PTR_REGISTRY_PREFIX`, `PTR_GATEWAY_UPSTREAM_ALLOW` | as elsewhere | queue to control, registry namespace, record allowlist |
 
 Static discovery (env or file) keeps the controller off by default: G would only mirror a fixed file, and the startup
 warning stays the guard.
 
-**Workers** read G and whether a controller leader is alive (`ptr:llm:cap:leader`) once at startup. Workers usually
-set neither `PTR_CAPACITY_CONTROLLER` nor `PTR_GATEWAY_DISCOVERY`, so a worker whose mode is only the derived default
-never warns: a running leader is reported as `capacity controller running elsewhere: G=…`, a set G without a leader as
-an info line. Warnings come only from an explicit setting that disagrees: `PTR_CAPACITY_CONTROLLER=off|keep` while a
-leader runs (mixed modes), or `off` while a G is still set. The S1 Σ-concurrency check against the gateways' `/metrics`
-runs only when no controller is on here or running elsewhere.
+**Workers** read G and whether a controller leader is alive (`ptr:llm:cap:leader`) once at startup. On a worker only an
+explicit `PTR_CAPACITY_CONTROLLER` counts. Workers now often set `PTR_GATEWAY_DISCOVERY=redis` to read the gateway
+registry (S6), which derives `on`, but that says nothing about a controller. So without an explicit setting the line
+follows the leader lock and never warns: a running leader is reported as `capacity controller running elsewhere: G=…`,
+a set G without a leader as an info line. Warnings come only from an explicit setting that disagrees:
+`PTR_CAPACITY_CONTROLLER=off|keep` while a leader runs (mixed modes), or `off` while a G is still set. The S1
+Σ-concurrency check against the gateways' `/metrics` runs unless `PTR_CAPACITY_CONTROLLER=on` is set here or a leader
+is running.
 
 **Mode changes and rolling restarts:** every dispatcher sharing a queue should use the same mode. During a rolling
 restart they briefly differ, which is safe:
@@ -691,8 +700,18 @@ restart detection off …` line, the prefix table cleared once), because alterna
 as restarts back and forth (S4 re-review). In the worst order (A, B, B, A with B later) the B, B pair still counts one
 restart before the earlier A turns detection off. While off, only the breaker reacts to real restarts; 30 polls in a
 row with one start time (one process again) re-arm it with that value as the new baseline (`restart detection back
-on` line). In-flight calls of the old process end on their own (cut streams are
+on` line); when that baseline differs from the one before detection went off, the prefix table is emptied once more
+(the process left on the port may not be the one whose cache the table describes). In-flight calls of the old process end on their own (cut streams are
 retried by the worker's reset rule). Without the metric nothing is detected (only the breaker reacts).
+
+**Keep-alive pinning (limit of the "several processes" check):** the gateway reads `/metrics` and sends calls through
+Node's default fetch agent, which keeps connections alive (undici closes an idle one after about 4 s unless the server
+says otherwise). With several processes behind one port (e.g. `SO_REUSEPORT` API servers) the kernel picks the
+process per **connection**, not per request, so a 1 s poll that keeps reusing one connection keeps reading one
+process. The second process's start time then shows only when that connection is replaced (idle timeout, a reset, an
+engine restart), so detection may turn off late, or not at all, and a restart of the process the poller does not see
+is caught by the breaker only. Calls are pinned the same way (by connection, not by the gateway's choice of upstream
+id), which is harmless for routing because the API server processes share one engine and one prefix cache.
 
 **Primary-to-primary retry and failover (§5, verified):** retried on another member only for connection-phase errors
 (`UpstreamConnectError.certain`) and, with `PTR_GATEWAY_FAILOVER_ON_CLOSE=true`, a close before any response byte; at
@@ -752,8 +771,9 @@ and the §4.3 cost (and so `scored`'s choice) use (1 − h_u)·T̂. The **KV res
 saves prefill compute, but KV only for blocks that a *running* request holds, and a session's history is held by none
 (one turn per session at a time), so vLLM allocates those blocks again (its free cached blocks move into use). The
 policy block is the one prefix that running requests always share. With affinity off the table is not consulted at all
-(matched = 0), so credit, `scored` cost and selection are exactly as in S4; the table is still kept so its metrics show
-what affinity would see.
+(matched = 0), so credit, `scored` cost and selection are exactly as in S4; the table is still kept, but only its
+size metrics fill in (`prefix.entries`, `prefix.tokens`, `prefix.cleared`): `extraHits` and the `affinity` outcome
+counters need a lookup and stay 0, so with affinity off the metrics do not show what affinity would have picked.
 
 **Cache affinity (`PTR_GATEWAY_AFFINITY=off|on`, default `off`).** Among the candidates whose credit fits:
 g_u = matched_u − G (cached tokens beyond the policy block, which every warm server holds). The member with the largest
@@ -785,7 +805,7 @@ end of the answer; the worker asks for usage with `stream_options.include_usage`
 extraHits (affinity on: dispatches whose table match exceeded G)}; per pool `latency` {ttftMs, e2eMs} (from arrival at the pool,
 queue wait included), `affinity` {mode, minTokens, slack, picked, brokenBySlack, none} (counted only when on),
 `prefixTtlMs`. Already present and named differently from §8: `retriedOnOtherPrimary` (= primaryRetries),
-`failover.failovers` by reason, `queue.queued` by band, `queue.rejected` by reason (`draining` comes with S6),
+`failover.failovers` by reason, `queue.queued` by band, `queue.rejected` by reason (`draining` since S6),
 `seqUtil`, `kvUtil`, `telemetry`.
 
 | Variable | Default | Meaning |
@@ -808,7 +828,13 @@ its history; with the current layout (state before the history) the shared prefi
 has nothing to act on. The fake engine now models vLLM's KV: a request holds prompt − (prefix shared with running
 requests) + output, so a cached history saves prefill but not KV, and cached prefixes live in the free KV (capacity −
 KV in use, so load evicts them; the old model was 2000 entries and subtracted every cached token from KV). It counts
-hit tokens. The fake cache has the gateway table's message-boundary granularity and sees exactly the gateway's
+hit tokens. **Fixed after the runs below (S6, Part A):** the shared blocks were charged to the request that allocated
+them only, so when that request ended first its sharer's history dropped out of the KV in use (under-counted KV:
+the fake engine admitted somewhat more than vLLM would under sharing). Shared blocks are now counted once and freed by
+their last running holder. Every run below was affected (all requests share at least the policy block), both arms
+alike: the fake engine's own KV limit was looser than intended, which matters only where that limit binds (KV-bound
+configs near the knee). The runs were not repeated: the bar failed by a wide margin, and the fix tightens the engine
+for both arms, not one. The fake cache has the gateway table's message-boundary granularity and sees exactly the gateway's
 requests, so these runs do not exercise table staleness (other clients, engine eviction policy, real tokenization). Expectation from the design (§0, §1.2): small, because the
 policy block (~60% of a prompt) is cached on every server whatever the routing.
 
@@ -850,6 +876,150 @@ default.** Supporting numbers (run 2, at the knee unless noted; not part of the 
 Revisit only with a reason to expect more: the approved S7 prompt reordering in the app (this run assumed it), longer
 histories (more prefill saved per sticky turn), or real-engine calibration (S8). Reusing history never saves KV.
 
+### Gateway HA: drain, gateway registry, per-replica limits (stage S6)
+
+**Graceful drain (§6.3).** SIGTERM or SIGINT on a gateway:
+1. `draining = true`: `/healthz` answers 503 `{ok:false,draining:true}`, `/metrics` reports `draining: true`.
+2. Every request waiting in the gateway (the limiter's queue, or a pool's band queue) and every request arriving
+   later get **503 `GATEWAY_DRAINING`** with `X-PTR-Gateway: rejected`, `X-PTR-Gateway-Reason: draining`,
+   `Retry-After: 1` and `Connection: close`. None of them was sent upstream, so the worker client resends at once to
+   its next gateway URL, with no wait (S1 rule). A retry inside a pool (a second primary after a connect failure, whose
+   first attempt may have reached an engine) is neither refused nor counted: queued or arriving during the drain, it
+   waits for credit and is served like an in-flight call (or ends as before: secondary, or the connect error).
+3. The registry record (below) is set to `draining`, and the leader hint is given up.
+4. Calls already sent upstream finish, for up to `PTR_GATEWAY_SHUTDOWN_MS` (30000). Idle keep-alive connections are
+   closed at once, and every response written while draining closes its connection.
+5. Then the listener and every remaining connection close, the record is deleted, the registry Redis connection and
+   the ledger pool are closed. The process exits 0 only after a clean drain; it exits 1 (with `gateway stopped
+   uncleanly …`) when the deadline cut calls still in flight or a cleanup step failed (record delete, ledger pool).
+
+The gateway logs two lines: `gateway draining: N in flight, M queued (refused now)` and `gateway drained (idle|deadline):
+K request(s) refused while draining, J still in flight`. `rejected.draining` counts the refusals (`pool.queue.rejected.draining`
+counts those refused in a pool queue). A call cut at the deadline behaves like a SIGKILL for that call: a self-hosted
+generation is regenerated by the worker's reset retry, and a paid secondary call keeps its ledger row `submitted`, so it
+is never resent.
+
+**Gateway registry (§13.6, G2).** `PTR_GATEWAY_REGISTRY=on|off` (default `on` with `PTR_GATEWAY_DISCOVERY=redis`,
+else `off`) publishes, under the registry prefix (`PTR_REGISTRY_PREFIX`, default `ptr:llm`):
+
+```text
+ptr:llm:gw:<id>      HASH {id,url,maxQueue,state(active|draining),startedAt,seq,beatAt}  PEXPIRE 10000 (heartbeat 2000)
+ptr:llm:gws          ZSET member=<id> score=expiresAtMs (trimmed by every heartbeat; Redis server clock)
+ptr:llm:gw:leader    STRING <id>  SET … PX 5000, renewed by its holder's heartbeat
+```
+
+- `PTR_GATEWAY_ID`: default `gw-<port>-<random8>`. `leader` is reserved.
+- `PTR_GATEWAY_ADVERTISE_URL`: default `http://127.0.0.1:<port>/v1`. It must pass the workers' own rule (startup
+  error otherwise).
+- `maxQueue` is `PTR_GATEWAY_MAX_QUEUE`. `startedAt` is the process start; `beatAt` is the registry clock of the last
+  heartbeat.
+- The record is published once the gateway listens. It is deleted at the end of a drain, and a crashed gateway's
+  record expires 10 s after its last heartbeat.
+
+**Leader hint (agent decision, refines the design):** a free hint goes to the **oldest** active gateway whose
+`beatAt` is within the hint's 5 s lease, not to whichever gateway heartbeats first. In the first T6 run, a gateway
+that had just started took the free hint ahead of the running standby, and every worker moved to the cold newcomer.
+A gateway also takes a free hint only after one lease (5 s) of successful heartbeats in a row (a failed heartbeat
+restarts the wait), so a gateway that just started or just got Redis back cannot take it on its first beat; it renews a
+hint it already holds on every beat. Index members that are not gateway ids (the hint's own name, a stray key) or whose
+key is not a hash are skipped by the heartbeat script and the list read. The hint is only an optimisation: a request
+sent to a standby is served there just the same.
+
+**Same ledger:** every gateway a worker can reach through the registry (like every URL in `PTR_GATEWAY_URLS`) must use
+the same Postgres ledger database (`GOAL1_DATABASE_URL`) when a billable secondary is on. A reset retry or a drain
+rejection moves a turn to another gateway with the same request key; only a shared ledger turns that into a replay or
+an unresolved refusal instead of a second paid call.
+
+**Upgrade note:** with `PTR_GATEWAY_DISCOVERY=redis` the gateway registry is on by default, and the advertised URL must
+be on a port in `PTR_GATEWAY_ALLOW` (default 56460–56469). A gateway on another port then fails at startup with
+`INVALID_PTR_GATEWAY_ADVERTISE_URL`, and workers and the capacity controller ignore records outside the allowlist: set
+`PTR_GATEWAY_ALLOW` to the same value on gateways, workers and dispatchers (or `PTR_GATEWAY_REGISTRY=off`).
+
+**Workers (`PTR_CHAT_PROVIDER=gateway` with `PTR_GATEWAY_DISCOVERY=redis`):**
+- A `GatewayDirectory` reads the registry every 2 s.
+- Each call walks a list read at its start: active gateways first, the leader at the head, then by oldest `startedAt`,
+  then by id. After them come any `PTR_GATEWAY_URLS` seed URLs that the registry does not list as active or draining
+  (for example a gateway running without the registry).
+- Before the first read, and whenever the registry has no usable active gateway, the seed is the whole list.
+- A failed read keeps the last list (Redis outage fallback), so the list is never empty.
+- Registry URLs must be `http://127.0.0.1:<port>/v1` with no credentials, query or fragment, on a port in
+  `PTR_GATEWAY_ALLOW` (default `127.0.0.1:56460-56469`; same syntax as `PTR_GATEWAY_UPSTREAM_ALLOW`). This is the same
+  §13.4 guard as for engines: anyone with the Redis password can register, and a prompt must never go to an
+  unlisted port.
+- If two ids share a URL, the later start wins.
+- Ignored records are logged once per record version, with the reason only and no URLs: `WARNING gateway registry: N
+  record(s) ignored (not_allowed) …`.
+- The client checks each listed URL again (loopback and duplicates) at every call.
+
+**Capacity controller Q:** Σ `maxQueue` of the active registered gateways that pass `PTR_GATEWAY_ALLOW`, read every tick;
+`PTR_GATEWAY_MAX_QUEUE` when none is active or the read fails (status `qSource`). With H1 (one active gateway) the
+standby's queue is counted although only the active one queues in steady state. Q only binds when S_live × headroom
+exceeds it (S_live 24 at headroom 0.25 adds 6, far below 256), so this over-count does not matter in practice.
+
+**Per-replica limits (§6.2 amendment):**
+- **Failover per-minute ceiling:** each gateway uses floor(`PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` / k), at least 1.
+  k = the active gateways in the registry that pass `PTR_GATEWAY_ALLOW` at its last successful read, itself always
+  included (also while draining). In H1 this halves the active gateway's own share while a standby is registered
+  (60/min each at the default 120). `failover.perMinuteCap` shows the value in force.
+  - **The k-fold bound holds only while k is steady.** Each gateway counts its own rolling minute, so around a change
+    of k the sum can exceed one ceiling. Example: a gateway that ran at cap / 2 sees its peer die and moves to cap / 1
+    within the minute; a newcomer starts its own empty minute. Expect up to about 1.5–2× one ceiling over the minute
+    around a membership change. A dead gateway counts until its record expires (≤ 10 s), and a Redis outage keeps the
+    last k.
+  - **k is unknown until the first successful registry read**, for example on a cold start during a Redis outage.
+    Until then the ceiling is 1 per minute, the most conservative value. BullMQ shares that Redis, so no new turns
+    run then anyway (§13.2).
+  - A global per-minute check in the Postgres ledger (design S9) would remove both limits.
+- **Telemetry fallback** (one call on a blocked engine with nothing of this gateway in flight) is still per gateway:
+  up to k such calls.
+- **H2 per-replica credit split S_u / k (`PTR_GATEWAY_SPLIT_CREDIT`): deferred, not implemented (agent decision).**
+  Splitting credits on the gateways is a few lines, but on its own it is harmful. Workers send everything to the
+  leader (H1 order), so the leader would run at S_u / k and throughput would drop by (k − 1)/k. It needs worker-side
+  spreading (hash of the turn id over the active gateways), a credit rule for while k changes (a dead gateway counts
+  until its TTL, so the survivors would run at S_u / 2 for up to 10 s), and its own acceptance tests. The design adopts
+  it only when gateway CPU is the bottleneck, and nothing has measured that. Active–standby H1 stays the only topology.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_REGISTRY` | `on` with `PTR_GATEWAY_DISCOVERY=redis`, else `off` | gateway publishes itself (needs `PTR_REDIS_URL`) |
+| `PTR_GATEWAY_ID` | `gw-<port>-<random8>` | registry id |
+| `PTR_GATEWAY_ADVERTISE_URL` | `http://127.0.0.1:<port>/v1` | URL workers use; checked against `PTR_GATEWAY_ALLOW` |
+| `PTR_GATEWAY_ALLOW` | `127.0.0.1:56460-56469` | ports a registry gateway URL may use (gateways, workers, capacity controller) |
+| `PTR_GATEWAY_DISCOVERY` (worker) | `static` | `redis`: worker reads the gateway registry; `PTR_GATEWAY_URLS` becomes seed + fallback |
+| `PTR_GATEWAY_SHUTDOWN_MS` | 30000 | drain bound for calls already sent upstream |
+
+**Acceptance (zero cost).** Two harnesses were used.
+
+`scripts/gateway-ha-acceptance.ts` runs real gateway processes (pool mode, registry on) in front of in-process fake
+engines (2 × 12 slots, about 1.5 s per call). It runs closed-loop worker clients, one client per user, with request
+keys and the S1 retry settings, and two `GatewayDirectory`s over the real Redis registry in a `ptrtest:s6<run>:llm`
+namespace, deleted afterwards. Each scenario runs for 30 s, and the leader is killed at 10 s.
+
+For D, the gateways run `PTR_GATEWAY_FAILOVER=openrouter` with the real `OpenRouterClient` and Postgres ledger
+(tables created in `ptr_loadtest` for the run and dropped afterwards). A preload (`scripts/ha-openrouter-redirect.ts`)
+sends openrouter.ai fetches to a fake on loopback and refuses any other external fetch, and the API key is synthetic.
+The primary engine is down, so every call goes to the secondary (1.5 s).
+
+`scripts/loadtest.ts crash` runs the full stack (2 APIs, workers, dispatcher, Postgres turns, static
+`PTR_GATEWAY_URLS`, 16 users).
+
+Report: `reports/gateway-ha-acceptance-be804406.json` and `reports/loadtest/…-crash/report.json` (private).
+
+| Test | Setup | Result | Bar |
+| --- | --- | --- | --- |
+| C (HA harness) | 2 gateways, leader SIGKILL, no restart, 16 users | 320 calls, **0 failed**. The 16 in flight were retried on gw-2 (16 engine generations regenerated, no billing). Kill window e2e p95 1518 ms. Leader hint moved after 6.0 s; gw-1's record left the lists after 10.0 s (TTL), until then a refused connect took ~0 ms per call. Q 512 → 256 | 0 failed: **PASS** |
+| C (loadtest, full stack) | `--target=gateway --standby-gateway=1 --restart=0` | 231 turns, **0 failed**, 0 orphaned, 16 generating at the kill | **PASS** |
+| D (HA harness) | primary engines down, fake billable secondary + ledger, leader SIGKILL during secondary calls | 336 secondary POSTs for 336 distinct bodies: **0 posted twice (no double billing)**. **16 unresolved refusals** (`REQUEST_UNRESOLVED_NO_RESUBMIT` → 502 → the turn fails), exactly the calls in flight on gw-1; their ledger rows stay `submitted`, the other 320 are `settled`. 0 other failures | double billing 0: **PASS**; refusals counted (16) |
+| E (HA harness) | SIGTERM drain of the leader with 12 in flight + 12 queued (credit 12/gateway, 24 users) | 282 calls, **0 failed**, 0 regenerated. The 12 queued and 11 later arrivals got `draining` and were served by gw-2 at once. gw-1 exited 0 after 1.55 s (its in-flight calls done). Lists dropped gw-1 and the hint moved after 2.0 s. Q 512 → 256 | 0 failed: **PASS** |
+| E (loadtest, full stack) | `--signal=SIGTERM --gateway-concurrency=8`, static URLs | 132 turns, **0 failed**, 0 orphaned. Drain: 8 in flight, 8 queued refused at once, 25 refused while draining in total (static lists keep trying the draining gateway first until it exits) | **PASS** |
+| T6 (HA harness) | leader SIGKILL at 10 s, gw-3 registers at 15 s | 320 calls, **0 failed**. Hint moved to gw-2 (the oldest beating) after 6.0 s, and gw-3 stayed standby (0 calls). gw-3 was in the workers' lists 0.8 s after it started. gw-1 left them after 10.0 s. Q 512 → 768 → 512 | workers switch, lists update, 0 failed: **PASS** |
+
+Notes:
+- Before the registry record expires, the killed gateway stays at the head of the list. Each call pays one refused
+  connect (S1: no wait before an untried URL; 48 of 96 calls in the C kill window show 2 attempts).
+- After a drain the deleted record's URL can reappear at the end of the list as a seed URL, which is harmless.
+- One run per scenario on one host. These results describe the failover mechanics, not multi-host fault tolerance.
+
 ## Providers (direct, without the gateway)
 
 - `fake` (default): deterministic, no network. `PTR_FAKE_LATENCY='{"medianMs":1900,"p95Ms":3600,"seed":7}'`
@@ -889,7 +1059,14 @@ pnpm exec tsx scripts/loadtest.ts ramp --levels=4,16,64 --turns-per-session=10 \
 `crash` kills the target 10 s into a 30 s stage and restarts it 2 s later (`--restart=0` leaves workers, an API or the
 gateway down; `--target=redis` is a `docker restart` in place and ignores it). With
 `--standby-gateway=1` a second gateway runs on port +51, workers get both URLs in `PTR_GATEWAY_URLS`, and a gateway
-crash kills only the primary.
+crash kills only the primary. `--signal=SIGTERM` (gateway only) drains it instead of SIGKILL; the report then
+carries the gateway's two drain log lines (`drainLog`).
+
+Gateway HA acceptance (`scripts/gateway-ha-acceptance.ts` C/D/E, T6; see "Gateway HA" above):
+
+```sh
+pnpm exec tsx scripts/gateway-ha-acceptance.ts [--scenarios=C,E,T6,D] [--users=16] [--seconds=30] [--base-port=56531]
+```
 
 `failover` serves the self-hosted primary from an in-process fake engine (port +60, same latency profile) with
 `PTR_GATEWAY_FAILOVER=fake`. It runs 15 s healthy; then the engine is killed 3 s into a 20 s stage and stays down

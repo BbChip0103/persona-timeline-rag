@@ -35,6 +35,8 @@ export interface FailoverMetrics {
   closedNotFailedOver:number;
   /** Requests refused because the secondary's per-minute ceiling was reached. */
   rateLimited:number; secondaryErrors:number;
+  /** The ceiling in force: PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE / k with k active gateways in the gateway registry (1 without it). */
+  perMinuteCap:number;
 }
 /** A primary: an upstream with an engine `/health` check and, optionally, its Prometheus `/metrics` text (OpenAICompatibleUpstream). */
 export type Primary=Upstream&{health(signal:AbortSignal):Promise<boolean>;metrics?(signal:AbortSignal):Promise<string|null>};
@@ -64,7 +66,7 @@ export interface PoolQueueMetrics {
   routing:RoutingPolicy; fairness:'fifo'|'drr';
   queued:Record<'1'|'0'|'-1',number>; queuedTokens:number;
   waitMs:{p50:number|null;p95:number|null};
-  rejected:{queue_full:number;saturated:number;queue_timeout:number};
+  rejected:{queue_full:number;saturated:number;queue_timeout:number;draining:number};
   /** G: the global prefix (policy block) learned from the first request's msg0, in tokens. */
   globalPrefixTokens:number;
   /** Recent uncached prompt tokens per second reaching a first chunk (Retry-After estimate); null before any. */
@@ -138,6 +140,12 @@ export interface PoolOptions {
   routeLogSample?:number;
   /** Random source of the log sampling (tests). */
   random?:()=>number;
+  /**
+   * k = active gateways (gateway registry, S6): each gateway counts its own failover calls, so the per-minute ceiling
+   * becomes floor(maxPerMinute / k) (at least 1) and the gateways together stay within it while k is steady. Infinity =
+   * k unknown (registry not read yet): 1 per minute. Default 1.
+   */
+  replicas?:()=>number;
   /** Clock for slow start (tests). */
   now?:()=>number;
   /** Operator warnings (default stderr); never contains URLs or request content. */
@@ -242,7 +250,8 @@ export class UpstreamPool implements Upstream {
   private readonly waits:number[]=[];
   private readonly processed:{at:number;tokens:number}[]=[];
   private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
-  private readonly rejected={queue_full:0,saturated:0,queue_timeout:0};
+  private readonly rejected={queue_full:0,saturated:0,queue_timeout:0,draining:0};
+  private draining=false;
   private readonly affinityCounts:Record<AffinityOutcome,number>={picked:0,brokenBySlack:0,none:0};
   private readonly ttfts:number[]=[];private readonly e2es:number[]=[];
   private readonly failovers:Record<string,number>={};
@@ -307,7 +316,7 @@ export class UpstreamPool implements Upstream {
     if(signal.aborted) throw signal.reason;
     const now=Date.now();
     while(this.started.length&&now-this.started[0]!>=60000) this.started.shift();
-    if(this.started.length>=this.options.maxPerMinute) {this.counts.rateLimited++;throw new Error('FAILOVER_RATE_LIMITED');}
+    if(this.started.length>=this.perMinuteCap()) {this.counts.rateLimited++;throw new Error('FAILOVER_RATE_LIMITED');}
     this.started.push(now);
     this.failovers[reason]=(this.failovers[reason]??0)+1;
     this.routeLog(context?.requestKey,context?.priority??0,estimate.tokens,[],'secondary','failover',null,now-arrivedAt);
@@ -361,12 +370,35 @@ export class UpstreamPool implements Upstream {
       return result;
     }
   }
+  /** The secondary's per-minute ceiling for this gateway: maxPerMinute / k active gateways (at least 1). */
+  private perMinuteCap():number {
+    const k=this.pool.replicas?.()??1;
+    if(!Number.isFinite(k)) return 1;
+    return Math.max(1,Math.floor(this.options.maxPerMinute/(k>1?k:1)));
+  }
+  /**
+   * Graceful drain (§6.3): every queued first attempt is refused at once with GATEWAY_DRAINING (nothing was sent: the
+   * server answers the marked 503, and the worker moves to its next gateway), and so is every later request. A queued
+   * retry on another primary (its first attempt failed to connect, possibly after reaching an engine) is not: like an
+   * in-flight call it stays and is served (or ends as before: secondary, or the connect error). Dispatched calls finish.
+   */
+  drain():void {
+    this.draining=true;
+    for(const pending of this.queue.items()) {
+      if(pending.retry) continue;
+      this.queue.remove(pending);this.rejected.draining++;
+      pending.reject(new GatewayRejection('GATEWAY_DRAINING'));
+    }
+    this.kick();
+  }
   private candidates(exclude:Set<Member>):Member[] {
     return [...this.members.values()].filter(member=>member.record.state==='active'&&!exclude.has(member));
   }
   private enqueue(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,exclude:Set<Member>,deadlineAt:number,retry:boolean,arrivedAt:number):
     Promise<{member:Member;reservation:Reservation}|{none:string|undefined}> {
     const band:Band=context?.priority??0, cost=uncachedTokens(estimate,this.globalPrefix);
+    // Retries continue during a drain (see drain()); only first attempts are refused, and only those are counted.
+    if(this.draining&&!retry) {this.rejected.draining++;return Promise.reject(new GatewayRejection('GATEWAY_DRAINING'));}
     if(!retry&&this.pool.rejectSaturated&&this.queue.size) {
       const rate=this.prefillRate(MIN_RATE_SAMPLES);
       if(rate&&(this.queue.tokensAhead(band)+cost)/rate*1000>deadlineAt-Date.now()) {
@@ -600,7 +632,8 @@ export class UpstreamPool implements Upstream {
           warn:line=>this.log(`WARNING gateway upstream ${added.record.id}: ${line}`)},event=>{
           if(event.restarted) this.restarted(added,breaker);
           // Several processes answer on the port: one of them may be a restarted (empty) engine the table knows nothing about.
-          if(event.detectionOff) added.prefix.clear();
+          // Re-armed on another process than before: what the table recorded may have been served by a process now gone.
+          if(event.detectionOff||event.baselineChanged) added.prefix.clear();
           this.kick();});
         added.telemetry.start();
       }
@@ -652,6 +685,6 @@ export class UpstreamPool implements Upstream {
     return {secondary:this.pool.secondary!.model,
       breaker:{state,consecutiveFailures:max('consecutiveFailures'),consecutiveTimeouts:max('consecutiveTimeouts'),opened:sum('opened'),probesOk:sum('probesOk'),probesFailed:sum('probesFailed')},
       answered:{primary:this.counts.primary,secondary:this.counts.secondary},failovers:{...this.failovers},
-      closedNotFailedOver:this.counts.closedNotFailedOver,rateLimited:this.counts.rateLimited,secondaryErrors:this.counts.secondaryErrors};
+      closedNotFailedOver:this.counts.closedNotFailedOver,rateLimited:this.counts.rateLimited,secondaryErrors:this.counts.secondaryErrors,perMinuteCap:this.perMinuteCap()};
   }
 }

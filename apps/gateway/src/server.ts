@@ -14,7 +14,9 @@ export interface GatewayOptions {
 }
 export interface GatewayMetrics {
   upstream:string; inFlight:number; queued:number; accepted:number; completed:number; upstreamErrors:number;
-  rejected:{queueFull:number;queueTimeout:number};
+  rejected:{queueFull:number;queueTimeout:number;draining:number};
+  /** Graceful drain started (SIGTERM, §6.3): queued and new requests get the marked 503 `draining`. */
+  draining:boolean;
   /** Milliseconds over the most recent requests (bounded sample). */
   queueWaitMs:{p50:number|null;p95:number|null}; upstreamMs:{p50:number|null;p95:number|null};
   /** Only when failover is configured. */
@@ -41,16 +43,33 @@ const json=(res:ServerResponse,status:number,body:unknown,headers:Record<string,
   res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(body));
 };
 
+/** The marked drain rejection: nothing was sent upstream, so the client may resend it to its next gateway at once. */
+const DRAINING_HEADERS={'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'draining','Connection':'close'};
+export interface Gateway {
+  server:Server; metrics:()=>GatewayMetrics;
+  /**
+   * Graceful drain : /healthz answers 503, queued and new requests get the marked 503 `draining` at once
+   * (never sent upstream), idle keep-alive connections are closed and every later response closes its connection.
+   * Calls already sent upstream finish. Idempotent.
+   */
+  drain:()=>void;
+  /** Resolves once no request is being handled (the in-flight calls of a drain have finished). */
+  idle:()=>Promise<void>;
+}
 /**
  * LLM gateway: one OpenAI-compatible entry point in front of one configured upstream (optionally a FailoverUpstream).
  * It bounds concurrent upstream calls, queues a bounded number of requests, rejects the rest before they reach the
  * upstream (marked `X-PTR-Gateway: rejected`, so clients may safely retry), and reports latency/rejection metrics.
  */
-export function createGateway(options:GatewayOptions):{server:Server;metrics:()=>GatewayMetrics} {
+export function createGateway(options:GatewayOptions):Gateway {
   if(options.token.length<24||options.token.length>512) throw new Error('INVALID_GATEWAY_TOKEN');
   const expected=createHash('sha256').update(options.token).digest();
   const limiter=new AdmissionLimiter(options.limits);
-  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0};
+  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0,draining:0};
+  let draining=false, active=0;const idleWaiters:(()=>void)[]=[];
+  /** Keep-alive: while draining every response closes its connection. */
+  const closing=():Record<string,string>=>draining?{'Connection':'close'}:{};
+  const refuseDraining=(res:ServerResponse)=>{counters.draining++;json(res,503,{error:{code:'GATEWAY_DRAINING'}},DRAINING_HEADERS);};
   const queueWaits:number[]=[],upstreamTimes:number[]=[];
   const record=(list:number[],value:number)=>{list.push(value);if(list.length>SAMPLE)list.shift();};
   let meanUpstreamMs:number|null=null; // EWMA of successful calls, for Retry-After
@@ -60,7 +79,7 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
   const capacity=()=>{if(!owned) return {maxConcurrent,maxQueue,total:maxConcurrent+maxQueue};const a=owned();return {maxConcurrent:a.maxConcurrent,maxQueue:a.maxQueue,total:a.maxConcurrent+a.maxQueue};};
   const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:owned?owned().inFlight:limiter.inFlight,queued:owned?owned().queued:limiter.queued,
     accepted:counters.accepted,completed:counters.completed,upstreamErrors:counters.upstreamErrors,
-    rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout},
+    rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout,draining:counters.draining},draining,
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
     ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
     ...(options.upstream.poolMetrics?{pool:options.upstream.poolMetrics()}:{}),
@@ -75,7 +94,18 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     return Buffer.concat(chunks).toString('utf8');
   }
   async function complete(req:IncomingMessage,res:ServerResponse) {
+    if(draining) {req.resume();return refuseDraining(res);}
+    active++;
+    try {await handle(req,res);}
+    finally {
+      if(--active===0) for(const resolve of idleWaiters.splice(0)) resolve();
+      // A response that ended while draining leaves an idle keep-alive connection behind: close it.
+      if(draining) setImmediate(()=>server.closeIdleConnections());
+    }
+  }
+  async function handle(req:IncomingMessage,res:ServerResponse) {
     const raw=await readBody(req);
+    if(draining) return refuseDraining(res);
     if(raw===undefined) return json(res,413,{error:{code:'BODY_TOO_LARGE'}});
     let request:ChatCompletionRequest;
     try {request=JSON.parse(raw);} catch {return json(res,400,{error:{code:'INVALID_INPUT'}});}
@@ -100,6 +130,7 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       if(code==='GATEWAY_QUEUE_FULL'){counters.queueFull++;return json(res,429,{error:{code}},
         {'Retry-After':String(queueFullRetryAfterSeconds(limiter.queued,maxConcurrent,meanUpstreamMs)),'X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_full'});}
       if(code==='GATEWAY_QUEUE_TIMEOUT'){counters.queueTimeout++;return json(res,503,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
+      if(code==='GATEWAY_DRAINING') return refuseDraining(res);
       return; // caller already gone
     }
     // With a pool that owns admission the wait happens inside complete(): see pool.queue.waitMs instead.
@@ -113,9 +144,9 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       if(result.status<200||result.status>=300) {
         counters.upstreamErrors++;
         // Upstream bodies are never forwarded; this is not a gateway rejection, so clients do not auto-retry.
-        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}},served);
+        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}},{...served,...closing()});
       }
-      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store',...served});
+      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store',...served,...closing()});
       if(typeof result.body==='string') res.end(result.body);
       // pipeline handles backpressure and settles when either side closes, so a client that stops reading and
       // disconnects cannot pin this slot on a 'drain' that never comes.
@@ -126,6 +157,7 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     } catch(error) {
       // A pool refused or timed out the request in its own queue: nothing was sent, so it is a marked (retryable) rejection.
       if(error instanceof GatewayRejection&&error.code!=='CANCELLED'&&!caller.signal.aborted&&!res.headersSent) {
+        if(error.code==='GATEWAY_DRAINING') return refuseDraining(res);
         if(error.code==='GATEWAY_QUEUE_TIMEOUT') {counters.queueTimeout++;
           return json(res,503,{error:{code:error.code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
         counters.queueFull++;
@@ -134,16 +166,22 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       }
       // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';
-      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}});else res.destroy();}
+      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}},closing());else res.destroy();}
     } finally {record(upstreamTimes,performance.now()-started);release();}
   }
   const server=createServer((req,res)=>{
     const path=(req.url??'').split('?')[0];
-    if(req.method==='GET'&&path==='/healthz') return json(res,200,{ok:true});
+    if(req.method==='GET'&&path==='/healthz') return draining?json(res,503,{ok:false,draining:true},{'Connection':'close'}):json(res,200,{ok:true});
     if(!authorized(req)) return json(res,403,{error:{code:'UNAUTHORIZED'}});
     if(req.method==='GET'&&path==='/metrics') return json(res,200,metrics());
     if(req.method==='POST'&&path==='/v1/chat/completions') return void complete(req,res).catch(()=>{if(!res.headersSent)json(res,500,{error:{code:'INTERNAL_ERROR'}});});
     return json(res,404,{error:{code:'NOT_FOUND'}});
   });
-  return {server,metrics};
+  const drain=()=>{
+    if(draining) return;draining=true;
+    limiter.drain();options.upstream.drain?.();
+    server.closeIdleConnections();
+  };
+  const idle=()=>active===0?Promise.resolve():new Promise<void>(resolve=>idleWaiters.push(resolve));
+  return {server,metrics,drain,idle};
 }

@@ -49,6 +49,18 @@ describe('FakeEngineUpstream (§9.1)',()=>{
     expect(usage()*100000).toBeLessThan(2*(2000+200)-1500);
     await Promise.all([alone,shared]);
   });
+  test('shared blocks stay counted while any running request holds them, also when the request that first held them finishes first',async()=>{
+    const e=await engine({slots:4,tpotMs:10,kvCapacityTokens:100000,prefillTokensPerSec:100000});
+    const usage=()=>Number(/vllm:kv_cache_usage_perc\{[^}]*\} (\S+)/.exec(e.metricsText())![1])*100000;
+    const history=[{role:'system',content:'P'.repeat(8900)},{role:'user',content:'u1'},{role:'assistant',content:'a1'}];
+    const first=call(e,[...history,{role:'user',content:'u3'}],30); // ~300 ms of decode
+    await new Promise(r=>setTimeout(r,50));
+    const second=call(e,[...history,{role:'user',content:'u4'}],300); // shares the 2000-token history with the first
+    await first;await new Promise(r=>setTimeout(r,50));
+    expect(usage()).toBeGreaterThan(2000+300-1); // the second still holds the whole history + its output
+    await second;
+    expect(usage()).toBe(0);
+  });
   test('the cache holds at most K − KV in use: a long running request evicts idle cached prefixes',async()=>{
     const e=await engine({slots:4,tpotMs:1,kvCapacityTokens:4000,prefillTokensPerSec:100000});
     await call(e,msgs('a',8900)); // P (2000 tokens) cached; P + Q = 4000 would fit an idle cache

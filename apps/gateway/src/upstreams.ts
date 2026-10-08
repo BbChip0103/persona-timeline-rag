@@ -23,6 +23,8 @@ export interface Upstream {
   admission?():{inFlight:number;queued:number;maxConcurrent:number;maxQueue:number};
   /** Stops background work (registry polling) at shutdown. */
   close?():Promise<void>;
+  /** Graceful drain (S6): refuse queued and new requests with GatewayRejection('GATEWAY_DRAINING'); dispatched calls finish. */
+  drain?():void;
 }
 
 /**

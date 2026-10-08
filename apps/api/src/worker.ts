@@ -21,15 +21,16 @@ async function main() {
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
     {concurrency,queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
   process.stdout.write(`Turn worker ${workerId} started\n`);
-  // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once. Workers rarely
-  // set PTR_CAPACITY_CONTROLLER, so the derived mode alone never produces a warning (mixed fleets, see workerCapacityLine).
+  // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once. Only an explicit
+  // PTR_CAPACITY_CONTROLLER counts here: the mode derived from PTR_GATEWAY_DISCOVERY=redis (set on workers to read the
+  // gateway registry) says nothing about a controller, so the line follows the leader lock (see workerCapacityLine).
   const capacityMode=capacityControllerMode(process.env), explicit=process.env.PTR_CAPACITY_CONTROLLER!==undefined;
   void readCapacityState(process.env).then(state=>{
     const line=workerCapacityLine({mode:capacityMode,explicit,...state});if(line) process.stderr.write(`${line}\n`);
     return state.controllerRunning;
   },()=>{process.stderr.write('capacity check skipped: Redis unavailable\n');return false;}).then(controllerRunning=>{
     // No controller here or elsewhere: advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
-    if(capacityMode==='on'||controllerRunning||runtime.providerName!=='gateway') return;
+    if((explicit&&capacityMode==='on')||controllerRunning||runtime.providerName!=='gateway') return;
     void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
       const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
       if(warning) process.stderr.write(`${warning}\n`);

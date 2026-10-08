@@ -1,5 +1,6 @@
 import { CapacityController, CapacityPlanner, MemoryCapacityStore, capacityControllerMode, capacityTarget, type CapacityQueue } from '../src/capacity-controller';
 import { MemoryUpstreamRegistry, parseUpstreamAllow, type UpstreamRecord } from '../src/upstream-registry';
+import { MemoryGatewayRegistry, parseGatewayAllow } from '../src/gateway-registry';
 
 describe('capacity target ',()=>{
   test('G* = max(FLOOR, min(ceil(S_live × (1 + headroom)), S_live + Q))',()=>{
@@ -88,6 +89,26 @@ describe('capacity controller',()=>{
     expect(s.writes).toEqual([30,15]);
     expect(s.store.status).toMatchObject({target:'15',sLive:'12',q:'256',g:'15',reason:'draining',writes:'2',leader:'dispatcher-1'});
     expect(s.lines.some(line=>/^capacity G=15 target=15 S_live=12 Q=256 .*reason=draining/.test(line))).toBe(true);
+  });
+  test('Q = Σ maxQueue of the active gateways in the gateway registry (S6); the env value when none is active or it cannot be read',async()=>{
+    let now=1_000_000;const registry=new MemoryUpstreamRegistry(()=>now);const gateways=new MemoryGatewayRegistry();
+    let concurrency:number|null=null;
+    const queue:CapacityQueue={getGlobalConcurrency:async()=>concurrency,setGlobalConcurrency:async(n:number)=>{concurrency=n;},getJobCounts:async()=>({active:0,wait:0})};
+    const store=new MemoryCapacityStore();
+    // headroom 4: ceil(S × 5) is above S + Q, so G = S + Q shows the Q in use.
+    const controller=new CapacityController({registry,gateways,gatewayAllow:parseGatewayAllow(undefined),queue,store,pool:'m',allow:parseUpstreamAllow(undefined),
+      id:'dispatcher-1',q:256,headroom:4,floor:1,log:()=>undefined,now:()=>now});
+    await registry.heartbeat(rec('a',18000),1e9);
+    expect(await controller.tick()).toMatchObject({sLive:12,q:256,qSource:'env',g:60}); // no gateway registered: min(60, 12 + 256)
+    const gw=(id:string,port:number,maxQueue:number,state:'active'|'draining'='active')=>({id,url:`http://127.0.0.1:${port}/v1`,maxQueue,state,startedAt:1,seq:0});
+    await gateways.heartbeat(gw('gw-a',56460,8),10000,5000);await gateways.heartbeat(gw('gw-b',56461,4),10000,5000);
+    await gateways.heartbeat(gw('gw-c',56462,100,'draining'),10000,5000);await gateways.heartbeat(gw('gw-x',18000,100),10000,5000); // draining, off the allowlist
+    now+=60000; // past the hysteresis
+    for(let i=0;i<8;i++) {await controller.tick();now+=5000;}
+    expect(await controller.tick()).toMatchObject({q:12,qSource:'registry',g:24});
+    expect(store.status).toMatchObject({q:'12',qSource:'registry'});
+    gateways.down=true;
+    expect(await controller.tick()).toMatchObject({q:256,qSource:'env'});
   });
   test('only the leader acts',async()=>{
     const s=setup({leader:false});

@@ -129,6 +129,11 @@ describe('prefix table and cache affinity in the pool (S5, §4.2–4.3)',()=>{
     expect(member(restarting,'a').prefix).toMatchObject({entries:0,cleared:2});
     engineA.setStart(200);await new Promise(r=>setTimeout(r,100));
     expect(member(restarting,'a').prefix.cleared).toBe(2);
+    // Re-armed on a start time other than the baseline before it went off (200): the process left may be another engine.
+    await readAll(await restarting.complete(turn(2),signal()));
+    engineA.setStart(150);
+    await until(()=>member(restarting,'a').telemetry?.restartDetectionDisabled===false);
+    expect(member(restarting,'a').prefix).toMatchObject({entries:0,cleared:3});
   });
   test('§8 metrics: per upstream TTFT / e2e quantiles and est/actual prompt tokens from the stream\'s usage; pool latency; affinity counters',async()=>{
     const {pool}=setup({affinity:{minTokens:256,slack:0.5}});

@@ -176,6 +176,8 @@ export class CentralQueue<T extends QueuedRequest> {
   constructor(private readonly options:QueueOptions) {}
   get size():number {return BANDS.reduce<number>((sum,band)=>sum+this.bands.get(band)!.length,0);}
   get queuedTokens():number {return this.tokens;}
+  /** Every queued item, highest band first (drain). */
+  items():T[] {return BANDS.flatMap(band=>[...this.bands.get(band)!]);}
   counts():Record<'1'|'0'|'-1',number> {return {'1':this.bands.get(1)!.length,'0':this.bands.get(0)!.length,'-1':this.bands.get(-1)!.length};}
   /** Waiting requests ahead of and including the newest of `band` (for Retry-After). */
   tokensAhead(band:Band):number {return BANDS.filter(b=>b>=band).reduce<number>((sum,b)=>sum+this.bands.get(b)!.reduce<number>((s,x)=>s+x.cost,0),0);}

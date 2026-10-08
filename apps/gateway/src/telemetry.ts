@@ -99,7 +99,7 @@ export class EngineTelemetry {
   private timer:NodeJS.Timeout|undefined;private polling:Promise<void>|undefined;private stopped=false;
   private readonly counts={staleEpisodes:0,failedPolls:0,blockedPolls:0,creditModelMiss:0,waitingStreak:0,restarts:0,implausible:0,suspectBlocked:0};
   constructor(private readonly fetchMetrics:(signal:AbortSignal)=>Promise<string|null>,private readonly options:TelemetryOptions,
-    private readonly onChange:(event:{restarted:boolean;detectionOff:boolean})=>void) {}
+    private readonly onChange:(event:{restarted:boolean;detectionOff:boolean;baselineChanged:boolean})=>void) {}
   start():void {
     if(this.timer||this.stopped) return;
     void this.poll();
@@ -138,13 +138,15 @@ export class EngineTelemetry {
     // A restart is a LATER start time seen on two polls in a row. A start time earlier than the latest one seen (current
     // or candidate) cannot come from a restart: several processes answer on this port (API servers each with its own
     // start), so detection is turned off for this member (one warning) instead of flapping between them. It re-arms once
-    // `rearmPolls` polls in a row report one start time (one process again), with that value as the new baseline.
-    let restarted=false, detectionOff=false;
+    // `rearmPolls` polls in a row report one start time (one process again), with that value as the new baseline. A new
+    // baseline other than the one before detection went off (`baselineChanged`) means the process left on the port may
+    // not be the engine the gateway's prefix table describes: the pool empties that table (S5 re-check).
+    let restarted=false, detectionOff=false, baselineChanged=false;
     const start=parsed.startTimeSeconds;
     if(start!==null&&this.restartDetectionOff) {
       this.sameStart=start===this.lastStart?this.sameStart+1:1;this.lastStart=start;
       if(this.sameStart>=(this.options.rearmPolls??30)) {
-        this.restartDetectionOff=false;this.startTime=start;this.startCandidate=null;
+        this.restartDetectionOff=false;baselineChanged=start!==this.startTime;this.startTime=start;this.startCandidate=null;
         this.options.warn?.(`restart detection back on: ${this.sameStart} polls in a row with one process_start_time_seconds`);
       }
     } else if(start!==null) {
@@ -174,7 +176,7 @@ export class EngineTelemetry {
           +`(kv_cache_usage_perc ${parsed.kvUsage}, waiting ${parsed.waiting}): check that the engine's metrics mean what the filter assumes`);
       }
     } else this.suspectStreak=0;
-    if(restarted||detectionOff||after!==before) this.onChange({restarted,detectionOff});
+    if(restarted||detectionOff||baselineChanged||after!==before) this.onChange({restarted,detectionOff,baselineChanged});
   }
   metrics():TelemetryMetrics {
     const stale=this.stale(), now=this.options.now();

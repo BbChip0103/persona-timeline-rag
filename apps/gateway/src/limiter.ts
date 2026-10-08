@@ -1,6 +1,6 @@
 export class GatewayRejection extends Error {
   /** `retryAfterSeconds`: the pool's estimate from its queued tokens (S3); the server's own estimate otherwise. */
-  constructor(readonly code:'GATEWAY_QUEUE_FULL'|'GATEWAY_QUEUE_TIMEOUT'|'GATEWAY_SATURATED'|'CANCELLED',readonly retryAfterSeconds?:number) { super(code); this.name='GatewayRejection'; }
+  constructor(readonly code:'GATEWAY_QUEUE_FULL'|'GATEWAY_QUEUE_TIMEOUT'|'GATEWAY_SATURATED'|'GATEWAY_DRAINING'|'CANCELLED',readonly retryAfterSeconds?:number) { super(code); this.name='GatewayRejection'; }
 }
 interface Waiter { grant:()=>void; reject:(error:GatewayRejection)=>void }
 
@@ -9,7 +9,7 @@ interface Waiter { grant:()=>void; reject:(error:GatewayRejection)=>void }
  * waiter gives up after `queueTimeoutMs`. Rejections happen before anything is sent upstream.
  */
 export class AdmissionLimiter {
-  private running=0;
+  private running=0;private draining=false;
   private readonly waiting:Waiter[]=[];
   constructor(private readonly limits:{maxConcurrent:number;maxQueue:number;queueTimeoutMs:number}) {}
   get inFlight():number { return this.running; }
@@ -17,6 +17,7 @@ export class AdmissionLimiter {
   /** Resolves with a release function once a slot is held; the caller must release exactly once. */
   async acquire(signal:AbortSignal):Promise<()=>void> {
     if(signal.aborted) throw new GatewayRejection('CANCELLED');
+    if(this.draining) throw new GatewayRejection('GATEWAY_DRAINING');
     if(this.running<this.limits.maxConcurrent&&!this.waiting.length) {this.running++;return this.releaser();}
     if(this.waiting.length>=this.limits.maxQueue) throw new GatewayRejection('GATEWAY_QUEUE_FULL');
     await new Promise<void>((resolve,reject)=>{
@@ -29,6 +30,11 @@ export class AdmissionLimiter {
       this.waiting.push(waiter);
     });
     return this.releaser();
+  }
+  /** Graceful drain: every waiting request and every later one is refused (GATEWAY_DRAINING); running calls keep their slots. */
+  drain():void {
+    this.draining=true;
+    for(const waiter of this.waiting.slice()) waiter.reject(new GatewayRejection('GATEWAY_DRAINING'));
   }
   private releaser():()=>void {
     let released=false;

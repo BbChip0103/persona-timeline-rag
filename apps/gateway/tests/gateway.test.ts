@@ -87,7 +87,7 @@ describe('LLM gateway',()=>{
     expect(held.stats().calls).toBe(1);
     held.releaseOne();await until(()=>held.stats().calls===2);held.releaseOne();
     expect((await first).status).toBe(200);expect((await second).status).toBe(200);
-    expect(g.metrics().rejected).toEqual({queueFull:1,queueTimeout:0});
+    expect(g.metrics().rejected).toEqual({queueFull:1,queueTimeout:0,draining:0});
   });
   test('waiting longer than the queue timeout is rejected with 503 and the marker',async()=>{
     const held=heldProvider();const {base}=await gateway(new TextProviderUpstream(held.provider,'fake'),{maxConcurrent:1,maxQueue:1,queueTimeoutMs:50});

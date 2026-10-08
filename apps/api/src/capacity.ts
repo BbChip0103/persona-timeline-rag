@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { CapacityController, POOL_NAME, RedisCapacityStore, RedisUpstreamRegistry, registryPrefixFromEnv, capacityControllerMode,
-  createRedisConnection, openTurnQueue, parseUpstreamAllow } from '@ptr/messaging';
+import { CapacityController, POOL_NAME, RedisCapacityStore, RedisGatewayRegistry, RedisUpstreamRegistry, registryPrefixFromEnv, capacityControllerMode,
+  createRedisConnection, openTurnQueue, parseGatewayAllow, parseUpstreamAllow } from '@ptr/messaging';
 
 /**
  * Capacity controller wiring . Runs in the dispatcher; one leader per Redis acts. Mode:
@@ -22,7 +22,7 @@ export function capacitySettings(env:NodeJS.ProcessEnv) {
   return {mode,pool,queueName,prefix:registryPrefixFromEnv(env),
     headroom:number('PTR_CAPACITY_HEADROOM',0.25,0,4,false),floor:number('PTR_CAPACITY_FLOOR',1,1,4096),
     intervalMs:number('PTR_CAPACITY_INTERVAL_MS',5000,500,60000),q:number('PTR_GATEWAY_MAX_QUEUE',256,0,100000),
-    allow:parseUpstreamAllow(env.PTR_GATEWAY_UPSTREAM_ALLOW)};
+    allow:parseUpstreamAllow(env.PTR_GATEWAY_UPSTREAM_ALLOW),gatewayAllow:parseGatewayAllow(env.PTR_GATEWAY_ALLOW)};
 }
 
 async function leaderAlive(url:string,prefix:string):Promise<boolean> {
@@ -76,6 +76,8 @@ export async function startCapacityController(env:NodeJS.ProcessEnv,log:(line:st
   const redis=createRedisConnection(url);redis.on('error',()=>undefined);
   const controller=new CapacityController({registry:new RedisUpstreamRegistry(redis,settings.prefix),queue,store:new RedisCapacityStore(redis,settings.prefix),
     pool:settings.pool,allow:settings.allow,id:`dispatcher-${randomUUID().slice(0,8)}`,q:settings.q,headroom:settings.headroom,floor:settings.floor,
+    // Q from the gateway registry (S6): Σ maxQueue of the active gateways; PTR_GATEWAY_MAX_QUEUE when none is registered.
+    gateways:new RedisGatewayRegistry(redis,settings.prefix),gatewayAllow:settings.gatewayAllow,
     intervalMs:settings.intervalMs,log});
   controller.start();
   return {stop:async()=>{await controller.stop();await close();redis.disconnect();}};
@@ -95,14 +97,15 @@ export async function startCapacityControllerSafely(env:NodeJS.ProcessEnv,log:(l
 }
 
 /**
- * Worker startup line. Workers do not need PTR_CAPACITY_CONTROLLER or PTR_GATEWAY_DISCOVERY, so a worker whose mode is
- * only the derived default (`explicit` false) never warns: a running controller leader or a set G is reported as
- * information. A warning means this process explicitly says off/keep while a leader runs (mixed modes), or explicitly
- * says off while a G is still set.
+ * Worker startup line. Only an explicit PTR_CAPACITY_CONTROLLER counts on a worker. The derived default says nothing
+ * about a controller there: workers set PTR_GATEWAY_DISCOVERY=redis to read the gateway registry (S6), which derives
+ * `on`, and usually leave PTR_CAPACITY_CONTROLLER unset. So without `explicit` the line follows the controller leader lock
+ * (running elsewhere, or a G without a leader) as information and never warns. A warning means this process explicitly
+ * says off/keep while a leader runs (mixed modes), or explicitly says off while a G is still set.
  */
 export function workerCapacityLine(input:{mode:'on'|'off'|'keep';explicit:boolean;globalConcurrency:number|null;controllerRunning:boolean}):string|null {
   const g=input.globalConcurrency;
-  if(input.mode==='on') return `capacity controller on: global concurrency G=${g??'unset'} (PTR_WORKER_CONCURRENCY is a local cap only)`;
+  if(input.mode==='on'&&input.explicit) return `capacity controller on: global concurrency G=${g??'unset'} (PTR_WORKER_CONCURRENCY is a local cap only)`;
   if(input.controllerRunning) return input.explicit
     ?`WARNING PTR_CAPACITY_CONTROLLER=${input.mode} here, but a capacity controller leader is running (G=${g??'unset'}): use the same mode in every process`
     :`capacity controller running elsewhere: global concurrency G=${g??'unset'} (PTR_WORKER_CONCURRENCY is a local cap only)`;

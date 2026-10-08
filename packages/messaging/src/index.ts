@@ -5,3 +5,4 @@ export * from './turn-events.js';
 export * from './queued-chat.js';
 export * from './upstream-registry.js';
 export * from './capacity-controller.js';
+export * from './gateway-registry.js';

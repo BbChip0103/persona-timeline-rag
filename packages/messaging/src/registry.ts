@@ -5,3 +5,4 @@
 export * from './local-guard.js';
 export * from './redis.js';
 export * from './upstream-registry.js';
+export * from './gateway-registry.js';

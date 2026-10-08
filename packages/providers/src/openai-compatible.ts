@@ -13,8 +13,10 @@ export interface OpenAICompatibleOptions {
   /**
    * Self-hosted engine (vLLM/SGLang) reached through an SSH tunnel, or the LLM gateway: loopback only. A list is in
    * priority order: calls start at the first and move to the next on a refused/reset connection or a `draining` rejection.
+   * A function (the gateway registry's GatewayDirectory, S6) is read at the start of every call; its entries that are not
+   * loopback or repeat an earlier one are skipped, and a call with none left fails with ENDPOINT_NOT_LOOPBACK.
    */
-  baseUrl:string|readonly string[]; model:string;
+  baseUrl:string|readonly string[]|(()=>readonly string[]); model:string;
   maxOutputTokens?:number; timeoutMs?:number; fetch?:typeof fetch;
   onMetrics?:(metrics:CallMetrics)=>void;
   /** Guided decoding: send the agent reply JSON Schema so the engine enforces the shape the app validates. */
@@ -59,6 +61,12 @@ export function gatewayRejectedBackoffMs(retryAfter:string|null,random:()=>numbe
   const after=retryAfter===null||retryAfter.trim()===''?NaN:Number(retryAfter);
   return Math.min(Number.isFinite(after)&&after>=0?after*1000:250,5000)*(0.5+random());
 }
+/** The client's own rule for an endpoint: plain http on 127.0.0.1, no credentials, query or fragment. */
+function loopback(baseUrl:string):boolean {
+  let url:URL;try {url=new URL(baseUrl);} catch {return false;}
+  return url.protocol==='http:'&&url.hostname==='127.0.0.1'&&!url.username&&!url.password&&!url.search&&!url.hash;
+}
+const endpointOf=(baseUrl:string)=>`${baseUrl.replace(/\/$/,'')}/chat/completions`;
 const sleep=(ms:number,signal:AbortSignal)=>new Promise<void>((resolve,reject)=>{
   const onAbort=()=>{clearTimeout(timer);reject(new ProviderError('CANCELLED'));};
   const timer=setTimeout(()=>{signal.removeEventListener('abort',onAbort);resolve();},ms);
@@ -77,18 +85,26 @@ type Json=Record<string,unknown>;
  */
 export class OpenAICompatibleTextProvider implements TextProvider {
   private readonly fetcher:typeof fetch;
-  private readonly endpoints:string[];
+  private readonly endpoints:()=>string[];
   constructor(private readonly options:OpenAICompatibleOptions) {
-    const baseUrls=typeof options.baseUrl==='string'?[options.baseUrl]:[...options.baseUrl];
-    if(!baseUrls.length) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
-    if(new Set(baseUrls.map(baseUrl=>baseUrl.replace(/\/$/,''))).size!==baseUrls.length) throw new ProviderError('ENDPOINT_DUPLICATE');
-    for(const baseUrl of baseUrls) {
-      const url=new URL(baseUrl);
-      if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password||url.search||url.hash)
-        throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+    const source=options.baseUrl;
+    if(typeof source==='function') {
+      // Dynamic (gateway registry): checked per call, since the list changes while the process runs.
+      this.endpoints=()=>{
+        const seen=new Set<string>();
+        for(const baseUrl of source()) if(loopback(baseUrl)) seen.add(endpointOf(baseUrl));
+        if(!seen.size) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+        return [...seen];
+      };
+    } else {
+      const baseUrls=typeof source==='string'?[source]:[...source];
+      if(!baseUrls.length) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+      if(new Set(baseUrls.map(baseUrl=>baseUrl.replace(/\/$/,''))).size!==baseUrls.length) throw new ProviderError('ENDPOINT_DUPLICATE');
+      for(const baseUrl of baseUrls) if(!loopback(baseUrl)) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+      const fixed=baseUrls.map(endpointOf);
+      this.endpoints=()=>fixed;
     }
     if(!options.model.trim()) throw new ProviderError('MODEL_NOT_ALLOWED');
-    this.endpoints=baseUrls.map(baseUrl=>`${baseUrl.replace(/\/$/,'')}/chat/completions`);
     this.fetcher=options.fetch??fetch;
   }
   async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> {
@@ -117,8 +133,9 @@ export class OpenAICompatibleTextProvider implements TextProvider {
         // The gateway's queue band: follow-up calls of a running turn (1) go before first calls (0).
         ...(options.priority!==undefined?{'X-PTR-Priority':String(options.priority)}:{})};
       // Calls start at the first URL; `next()` moves on and reports whether it wrapped around to the first again.
+      const endpoints=this.endpoints();
       let index=0, refusedAttempt=0, resets=0;
-      const next=()=>{index=(index+1)%this.endpoints.length;return index===0;};
+      const next=()=>{index=(index+1)%endpoints.length;return index===0;};
       // Time left: the earlier of this call's deadline and the turn's (the turn usually ends first: 30 s vs 60 s).
       const remainingMs=()=>Math.min(deadline-performance.now(),options.deadlineAt===undefined?Infinity:options.deadlineAt-Date.now());
       // A reset may have reached a model, but the request key makes the resend idempotent at the gateway (§ reset retries).
@@ -133,7 +150,7 @@ export class OpenAICompatibleTextProvider implements TextProvider {
       for(;;) {
         let response:Response;
         attempts++;
-        try {response=await this.fetcher(this.endpoints[index]!,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});}
+        try {response=await this.fetcher(endpoints[index]!,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});}
         catch(error) {
           if(refused(error)&&!signal.aborted) {
             const wrapped=next(), waitMs=wrapped?Math.min(100*2**refusedAttempt,1000):0;

@@ -224,6 +224,19 @@ describe('gateway connection resets, retries and URL rotation',()=>{
     await gatewayClient(full,{baseUrl:urls}).generate(messages,{signal:signal(),...key});
     expect(urlOf(full,1)).toContain(':18000/');
   });
+  test('dynamic URL list (gateway registry, S6): read at the start of every call; non-loopback and duplicate entries are skipped, none usable fails',async()=>{
+    let list=['http://127.0.0.1:18001/v1','http://10.0.0.5:18000/v1','http://127.0.0.1:18001/v1/','http://127.0.0.1:18002/v1'];
+    const fetcher=jest.fn(async(url:string)=>{if(url.startsWith('http://127.0.0.1:18001'))throw refused();return sse([delta('ok'),'[DONE]']);});
+    const client=gatewayClient(fetcher,{baseUrl:()=>list});
+    expect(await client.generate(messages,{signal:signal(),...key})).toBe('ok');
+    expect([urlOf(fetcher,0),urlOf(fetcher,1)]).toEqual(['http://127.0.0.1:18001/v1/chat/completions','http://127.0.0.1:18002/v1/chat/completions']);
+    list=['http://127.0.0.1:18003/v1'];
+    await client.generate(messages,{signal:signal(),...key});
+    expect(urlOf(fetcher,2)).toBe('http://127.0.0.1:18003/v1/chat/completions');
+    list=['http://10.0.0.5:18000/v1'];
+    await expect(client.generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('ENDPOINT_NOT_LOOPBACK'));
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
   test('every gateway URL must be loopback; a duplicate URL has its own code',()=>{
     expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://10.0.0.5:18001/v1']})).toThrow(new ProviderError('ENDPOINT_NOT_LOOPBACK'));
     expect(()=>provider(jest.fn(),{baseUrl:[]})).toThrow();

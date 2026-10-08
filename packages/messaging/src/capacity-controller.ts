@@ -1,5 +1,6 @@
 import type { Redis } from 'ioredis';
 import { REGISTRY_PREFIX, registryKeys, screenUpstreamRecords, type AllowRule, type RegistryReader } from './upstream-registry.js';
+import { screenGatewayRecords, type GatewayRegistryReader } from './gateway-registry.js';
 
 /**
  * Capacity controller (routing ): keeps BullMQ's global concurrency G of the turn queue at
@@ -7,7 +8,8 @@ import { REGISTRY_PREFIX, registryKeys, screenUpstreamRecords, type AllowRule, t
  *   G* = max(FLOOR, min(ceil(S_live × (1 + headroom)), S_live + Q))
  *
  * where S_live = Σ maxSeqs of the pool's active, unexpired, allowlisted registry records (draining excluded, slow start
- * ignored: the gateway absorbs the ramp in its own wait) and Q = the gateway queue bound. A turn makes one model call at
+ * ignored: the gateway absorbs the ramp in its own wait) and Q = Σ maxQueue of the active gateways in the gateway
+ * registry (S6), else the configured gateway queue bound (PTR_GATEWAY_MAX_QUEUE). A turn makes one model call at
  * a time, so active turns ≤ G ≤ Σ caps + queue: the operating rule holds by construction. G is checked in BullMQ's
  * Lua when a worker takes a job, and lowering it never interrupts active jobs (verified by the opt-in BullMQ test).
  */
@@ -37,9 +39,10 @@ export class CapacityPlanner {
   }
   /** A new leader's view of what was already draining: those are not a new planned shrink. */
   seedDraining(ids: string[]): void { this.draining = new Set(ids); }
-  step(input: { sLive: number | null; draining: string[]; current: number | null }): CapacityDecision {
+  /** `q`: this tick's Q (the gateway registry's Σ maxQueue); the constructor's value when absent. */
+  step(input: { sLive: number | null; draining: string[]; current: number | null; q?: number }): CapacityDecision {
     if (input.sLive === null) return { target: null, next: input.current, reason: 'registry_stale' };
-    const target = capacityTarget({ sLive: input.sLive, q: this.options.q, headroom: this.options.headroom, floor: this.options.floor });
+    const target = capacityTarget({ sLive: input.sLive, q: input.q ?? this.options.q, headroom: this.options.headroom, floor: this.options.floor });
     const newlyDraining = input.draining.some((id) => !this.draining.has(id));
     this.draining = new Set(input.draining);
     const { current } = input;
@@ -102,6 +105,8 @@ export interface CapacityStatus {
   writes: number; registryStale: boolean; workerShortage: boolean; computedAt: number;
   /** Registry records ignored by the shared record policy (same rule as the gateways). */
   rejected: number;
+  /** Where Q came from this tick: the gateway registry (Σ maxQueue of active gateways) or the env value. */
+  qSource: 'registry' | 'env';
 }
 export interface CapacityControllerOptions {
   /** `pools()` (both stores have it) lets a pool or prefix mismatch be told apart from an empty registry. */
@@ -109,6 +114,11 @@ export interface CapacityControllerOptions {
   pool: string; allow: AllowRule[]; id: string;
   /** Leader lease (default max(15 s, 3 × interval), so a slow tick never loses it). */
   q: number; headroom?: number; floor?: number; intervalMs?: number; leaderTtlMs?: number;
+  /**
+   * Gateway registry (S6): Q = Σ maxQueue of its active gateways that pass `gatewayAllow` (the workers' PTR_GATEWAY_ALLOW
+   * rule), read every tick; `q` when none is active or the read fails.
+   */
+  gateways?: GatewayRegistryReader; gatewayAllow?: AllowRule[];
   /** Longest hold_suspect (default 5 min): after it the planner runs again, so a real outage still shrinks G. */
   suspectHoldMs?: number;
   /** `wait > 0` while `active < G` this long raises worker_shortage (default 15 s): add workers. */
@@ -145,7 +155,7 @@ export class CapacityController {
   private log(line: string): void { (this.options.log ?? ((text: string) => process.stderr.write(`${text}\n`)))(line); }
   async tick(): Promise<CapacityStatus> {
     const o = this.options, now = this.now(), floor = o.floor ?? 1;
-    const base = { q: o.q, writes: this.writes, computedAt: now, workerShortage: false, rejected: 0 };
+    const base = { q: o.q, qSource: 'env' as 'registry' | 'env', writes: this.writes, computedAt: now, workerShortage: false, rejected: 0 };
     const nobody = { sLive: null, target: null, g: null, active: null, wait: null };
     let leader: boolean;
     try { leader = await o.store.acquireLeader(o.id, o.leaderTtlMs ?? Math.max(15000, 3 * (o.intervalMs ?? 5000))); }
@@ -163,6 +173,13 @@ export class CapacityController {
       if (sLive === 0 && !draining.length) otherPools = ((await o.registry.pools?.()) ?? []).filter((pool) => pool !== o.pool).sort();
     } catch { sLive = null; }
     if (firstTick) this.planner.seedDraining(draining);
+    let q = o.q, qSource: 'registry' | 'env' = 'env';
+    if (o.gateways) {
+      try {
+        const active = screenGatewayRecords((await o.gateways.list()).records, o.gatewayAllow ?? []).records.filter((record) => record.state === 'active');
+        if (active.length) { q = active.reduce((sum, record) => sum + record.maxQueue, 0); qSource = 'registry'; }
+      } catch { /* the env value */ }
+    }
     const current = await o.queue.getGlobalConcurrency();
     const counts = await o.queue.getJobCounts('active', 'wait');
     const byReason = Object.entries(rejections.reduce<Record<string, number>>((all, r) => ({ ...all, [r.reason]: (all[r.reason] ?? 0) + 1 }), {}))
@@ -179,7 +196,7 @@ export class CapacityController {
       this.lastSuspectLog = 'expired';
       this.log(`WARNING capacity: holding G for ${Math.round(holdMs / 1000)} s without a usable record; following the registry again (S_live=0)`);
     }
-    const decision: CapacityDecision = suspect ? { target: null, next: current, reason: 'hold_suspect' } : this.planner.step({ sLive, draining, current });
+    const decision: CapacityDecision = suspect ? { target: null, next: current, reason: 'hold_suspect' } : this.planner.step({ sLive, draining, current, q });
     if (suspect) {
       const held = current === null ? 'leaving G unset' : `holding G=${current}`;
       const line = rejections.length
@@ -206,12 +223,12 @@ export class CapacityController {
       this.floorLogged = true;
       this.log(`WARNING capacity_floor: G is at FLOOR=${floor} while ${wait} turns wait (15 s+): no upstream capacity is registered for pool ${o.pool}`);
     }
-    const status: CapacityStatus = { ...base, writes: this.writes, leader: true, sLive, target: decision.target, g, active, wait,
+    const status: CapacityStatus = { ...base, q, qSource, writes: this.writes, leader: true, sLive, target: decision.target, g, active, wait,
       reason: decision.reason, registryStale: sLive === null, workerShortage, rejected: rejections.length };
-    const summary = `capacity G=${g ?? 'unset'} target=${decision.target ?? '-'} S_live=${sLive ?? '-'} Q=${o.q} active=${active} wait=${wait} reason=${decision.reason}`;
-    const key = `${g}|${sLive === null}`;
+    const summary = `capacity G=${g ?? 'unset'} target=${decision.target ?? '-'} S_live=${sLive ?? '-'} Q=${q}${qSource === 'registry' ? '(gateways)' : ''} active=${active} wait=${wait} reason=${decision.reason}`;
+    const key = `${g}|${sLive === null}|${q}`;
     if (key !== this.lastLogged) { this.lastLogged = key; this.log(summary); }
-    await o.store.writeStatus({ target: String(decision.target ?? ''), sLive: String(sLive ?? ''), q: String(o.q), g: String(g ?? ''),
+    await o.store.writeStatus({ target: String(decision.target ?? ''), sLive: String(sLive ?? ''), q: String(q), qSource, g: String(g ?? ''),
       active: String(active), wait: String(wait), computedAt: String(now), reason: decision.reason, writes: String(this.writes),
       leader: o.id, registryStale: String(sLive === null), workerShortage: String(workerShortage), rejected: String(rejections.length) }).catch(() => undefined);
     return status;

@@ -13,9 +13,9 @@ import type { ChatCompletionRequest, RequestContext, Upstream, UpstreamResult } 
 export class FailoverUpstream implements Upstream {
   readonly model:string;
   private readonly pool:UpstreamPool;
-  constructor(primary:Primary,private readonly secondary:Upstream,options:Partial<FailoverOptions>={}) {
+  constructor(primary:Primary,private readonly secondary:Upstream,options:Partial<FailoverOptions>={},replicas?:()=>number) {
     this.model=primary.model;
-    this.pool=new UpstreamPool({model:primary.model,create:()=>primary,secondary,failover:options,
+    this.pool=new UpstreamPool({model:primary.model,create:()=>primary,secondary,failover:options,...(replicas?{replicas}:{}),
       source:new StaticUpstreamSource([{pool:primary.model,id:'primary',baseUrl:'static:primary',maxSeqs:Infinity,kvCapacityTokens:null,weight:1,state:'active',epoch:'static',seq:0}])});
   }
   async ready(signal:AbortSignal):Promise<void> {await this.secondary.ready?.(signal);}

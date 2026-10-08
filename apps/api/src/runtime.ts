@@ -2,7 +2,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { ChatService, CoreError, DEFAULT_SAFETY_THRESHOLDS, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
-import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents } from '@ptr/messaging';
+import { BullMqTurnDelivery, GatewayDirectory, RedisGatewayRegistry, RedisTurnEventSource, RedisTurnEvents, createRedisConnection, parseGatewayAllow,
+  registryPrefixFromEnv, type GatewayRegistryReader } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
@@ -17,6 +18,8 @@ export interface ApiRuntime {
   listPersonas():Promise<Persona[]>;
   saveArtifact(artifact:CreativeArtifact):Promise<void>;
   providerName:string;model:string;close?():Promise<void>;
+  /** PTR_CHAT_PROVIDER=gateway with PTR_GATEWAY_DISCOVERY=redis: the gateway list read from the gateway registry (S6). */
+  gateways?:GatewayDirectory;
 }
 /** Fail-open stays visible: one sanitized stderr line per safety fallback (scope, reason class, running count), never text. */
 function logSafetyFallback():(event:{scope:'turn'|'draft';reason:string})=>void {
@@ -33,7 +36,9 @@ export function gatewayBaseUrls(env:NodeJS.ProcessEnv):string[] {
   return urls;
 }
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
-export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void}={}):ApiRuntime {
+export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
+  /** Tests: read the gateway registry from this store instead of Redis. */
+  gatewayRegistry?:GatewayRegistryReader}={}):ApiRuntime {
   const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
   const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
   const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
@@ -54,6 +59,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   let provider:TextProvider=fakeText;
   let embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
   let model='synthetic/fake-text-v1';let embeddingModel=fakeEmbedding.model;
+  let gateways:GatewayDirectory|undefined;let stopGateways:(()=>Promise<void>)|undefined;
   const providerName=env.PTR_CHAT_PROVIDER??'fake';
   // One billable client per runtime: chat, embeddings and decisions share its budget ledger and live gates.
   let liveClient:OpenRouterClient|undefined;
@@ -76,8 +82,27 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   } else if(providerName==='gateway') {
     // Scale rework: workers reach every model through the LLM gateway (admission, metrics); the gateway owns the upstream.
     // Several URLs = active–standby gateways: calls use the first and move on when it refuses, resets or drains.
-    const baseUrl=gatewayBaseUrls(env), token=env.PTR_GATEWAY_TOKEN??'';
+    const seed=gatewayBaseUrls(env), token=env.PTR_GATEWAY_TOKEN??'';
     if(token.length<24) throw new CoreError('INVALID_INPUT');
+    let baseUrl:string[]|(()=>string[])=seed;
+    const discovery=env.PTR_GATEWAY_DISCOVERY??'static';
+    if(discovery!=='static'&&discovery!=='redis') throw new CoreError('INVALID_INPUT');
+    if(discovery==='redis') {
+      // Gateway registry : every call walks the registry's list (leader → oldest start), the static
+      // URLs come last and are the whole list until the first read and during a Redis outage before it (seed/fallback).
+      let allow;try {allow=parseGatewayAllow(env.PTR_GATEWAY_ALLOW);} catch {throw new CoreError('INVALID_INPUT','INVALID_PTR_GATEWAY_ALLOW');}
+      let reader=hooks.gatewayRegistry;
+      if(!reader) {
+        const redis=createRedisConnection(redisUrl);redis.on('error',()=>undefined); // reconnects on its own; the list stays as it was
+        reader=new RedisGatewayRegistry(redis,registryPrefixFromEnv(env));
+        stopGateways=async()=>{redis.disconnect();};
+      }
+      const directory=new GatewayDirectory(reader,{seed,allow});
+      void directory.start();
+      const stopRedis=stopGateways;
+      stopGateways=async()=>{await directory.close();await stopRedis?.();};
+      gateways=directory;baseUrl=()=>directory.urls();
+    }
     // Connection resets are retried for keyed turn calls (the turn id makes the resend idempotent at the gateway).
     // Number('') is 0: an empty or blank value is a configuration error, not "off".
     if([env.PTR_GATEWAY_RESET_RETRIES,env.PTR_GATEWAY_RETRY_MIN_REMAINING_MS].some(value=>value!==undefined&&!value.trim())) throw new CoreError('INVALID_INPUT');
@@ -125,7 +150,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
     ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
-  return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,
+  return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,...(gateways?{gateways}:{}),
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');
       const registry=await approvedPersonas();
@@ -135,6 +160,6 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
       const directory=join(process.cwd(),'data','generated');await mkdir(directory,{recursive:true,mode:0o700});
       await writeFile(join(directory,`${artifact.id}.json`),JSON.stringify(artifact,null,2),{flag:'wx',mode:0o600});
     },
-    async close() {await Promise.allSettled([delivery.close(),events.close(),eventSource.close()]);await pool.end();},
+    async close() {await Promise.allSettled([delivery.close(),events.close(),eventSource.close(),stopGateways?.()]);await pool.end();},
   };
 }

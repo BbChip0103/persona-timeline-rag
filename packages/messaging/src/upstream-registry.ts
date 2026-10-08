@@ -137,8 +137,11 @@ export function parseUpstreamRecord(hash: Record<string, string>): UpstreamRecor
 export interface AllowRule { host: string; from: number; to: number }
 /** PTR_GATEWAY_UPSTREAM_ALLOW: comma list of `127.0.0.1:<port>` or `127.0.0.1:<from>-<to>` (default 127.0.0.1:18000-18999). */
 export function parseUpstreamAllow(value:string|undefined):AllowRule[] {
-  const invalid=()=>new Error('INVALID_PTR_GATEWAY_UPSTREAM_ALLOW');
-  const raw=value??'127.0.0.1:18000-18999';
+  return parseAllowRules(value??'127.0.0.1:18000-18999','INVALID_PTR_GATEWAY_UPSTREAM_ALLOW');
+}
+/** `127.0.0.1:<port>` / `127.0.0.1:<from>-<to>` comma list (also PTR_GATEWAY_ALLOW for gateway records); `error` names the variable. */
+export function parseAllowRules(raw:string,error:string):AllowRule[] {
+  const invalid=()=>new Error(error);
   const rules=raw.split(',').map(part=>part.trim()).filter(Boolean).map(part=>{
     const match=/^127\.0\.0\.1:(\d{1,5})(?:-(\d{1,5}))?$/.exec(part);if(!match) throw invalid();
     const from=Number(match[1]),to=Number(match[2]??match[1]);

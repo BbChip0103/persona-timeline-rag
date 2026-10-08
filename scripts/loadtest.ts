@@ -8,6 +8,7 @@
  *   pnpm exec tsx scripts/loadtest.ts ramp --levels=64,256,1024 --stage-seconds=45 --apis=2 --workers=4
  *   pnpm exec tsx scripts/loadtest.ts crash --target=workers|api|redis|gateway --users=32
  *       [--standby-gateway=1 --restart=0]   # gateway: workers get two gateway URLs; only the primary is killed
+ *       [--signal=SIGTERM]                  # gateway: graceful drain  instead of SIGKILL
  *   pnpm exec tsx scripts/loadtest.ts same-session --trials=30
  *   pnpm exec tsx scripts/loadtest.ts failover --users=32 [--primary-failure=refuse|close]   # fake primary killed mid-run, fake secondary
  *
@@ -405,12 +406,15 @@ async function main():Promise<void> {
     } else if(mode==='crash') {
       // Kill one part mid-flight, bring it back, and check what happens to in-flight turns.
       const target=(options.target??'workers') as 'workers'|'api'|'redis'|'gateway';const users=Number(options.users??32);
+      // SIGTERM (gateway only): the graceful drain; kill() then waits for the drained process to exit.
+      const signal=(options.signal??'SIGKILL') as NodeJS.Signals;
+      if(signal!=='SIGKILL'&&!(signal==='SIGTERM'&&target==='gateway')) throw new Error('--signal=SIGTERM is for --target=gateway only');
       const stage=runStage(fleet,users,30);
       await sleep(10_000);
       const before=await activeTurns(runStarted);
       if(target==='workers') await fleet.kill('worker','SIGKILL');
       else if(target==='api') await fleet.kill('api','SIGKILL',1); // one of N: clients move to the others
-      else if(target==='gateway') await fleet.kill('gateway','SIGKILL',topology.standbyGateway?1:Infinity); // the primary only, with a standby
+      else if(target==='gateway') await fleet.kill('gateway',signal,topology.standbyGateway?1:Infinity); // the primary only, with a standby
       else await execFileAsync('docker',['restart','-t','0','ptr_goal2_redis']); // AOF keeps queued jobs; pub/sub notices in flight are lost
       const restart=options.restart!=='0';
       await sleep(2000);
@@ -418,7 +422,10 @@ async function main():Promise<void> {
       else if(target==='workers') fleet.startWorkers(); else if(target==='api') await fleet.startApis(); else if(target==='gateway') await fleet.startGateway();
       const result=await stage;
       await sleep(Math.max(20_000,topology.leaseMs*3)); // past turn timeout + lease + dispatcher: anything still active now is orphaned
-      report.crash={target,users,standbyGateway:!!topology.standbyGateway,restart,activeAtKill:before,downtimeMs:restart?2000:null,stage:result,orphanedActiveTurns:await activeTurns(runStarted)};
+      // The drained gateway's own summary lines (refused while draining, still in flight) from its log.
+      const drainLog=signal==='SIGTERM'?(await readFile(join(directory,'gateway.log'),'utf8').catch(()=>'')).split('\n').filter(line=>/gateway drain/.test(line)):undefined;
+      report.crash={target,signal,users,standbyGateway:!!topology.standbyGateway,restart,activeAtKill:before,downtimeMs:restart?2000:null,stage:result,
+        ...(drainLog?{drainLog}:{}),orphanedActiveTurns:await activeTurns(runStarted)};
       console.log(JSON.stringify(report.crash));
     } else if(mode==='failover' && engine) {
       // Healthy → primary killed mid-flight (stays down) → primary back. Per phase: turns, latency and the gateway's

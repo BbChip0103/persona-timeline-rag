@@ -1,6 +1,8 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 import { createLocalPool } from '@ptr/storage';
-import { POOL_NAME, RedisUpstreamRegistry, registryPrefixFromEnv, createRedisConnection, type UpstreamRecord } from '@ptr/messaging/registry';
+import { randomUUID } from 'node:crypto';
+import { GATEWAY_ID, GatewayPublisher, POOL_NAME, RedisGatewayRegistry, RedisUpstreamRegistry, checkGatewayUrl, createRedisConnection, parseGatewayAllow,
+  registryPrefixFromEnv, type AllowRule, type UpstreamRecord } from '@ptr/messaging/registry';
 import { createGateway } from './server';
 import { FailoverUpstream } from './failover';
 import { DEFAULT_FAILOVER, UpstreamPool, type FailoverOptions } from './pool';
@@ -84,7 +86,7 @@ function engineTelemetry(env:NodeJS.ProcessEnv):{telemetry?:{intervalMs:number;k
  * Pool of self-hosted engines : static discovery reads PTR_GATEWAY_UPSTREAMS_FILE (mtime + SIGHUP);
  * redis discovery polls the registry and uses the file (or PTR_SELFHOSTED_BASE_URL as one entry) as its seed.
  */
-function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:string):Configured {
+function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:string,replicas?:()=>number):Configured {
   const model=env.PTR_GATEWAY_POOL??env.PTR_SELFHOSTED_MODEL;
   if(!model) throw new Error('POOL_NOT_CONFIGURED');
   if(!POOL_NAME.test(model)) throw new Error('INVALID_PTR_GATEWAY_POOL');
@@ -130,12 +132,16 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
     if(failover==='fake') secondary={upstream:fakeUpstream(env)};
     else if(failover==='openrouter') secondary=openRouterUpstream(env,FAILOVER_MODEL,true);
   } catch(error) {redis?.disconnect();throw error;}
-  const pool=new UpstreamPool({model,source,...options,...(secondary?{secondary:secondary.upstream}:{})});
+  const pool=new UpstreamPool({model,source,...options,...(secondary?{secondary:secondary.upstream}:{}),...(replicas?{replicas}:{})});
   return {upstream:pool,
     close:async()=>{await pool.close();redis?.disconnect();await secondary?.close?.();},
     ...(file?{reload:()=>file.reload()}:{})};
 }
-export function upstreamFromEnvironment(env:NodeJS.ProcessEnv):Configured {
+/**
+ * `replicas`: k = active gateways in the gateway registry (S6). A failover secondary's per-minute ceiling is split by
+ * it (PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE / k), so k gateways together stay within one ceiling.
+ */
+export function upstreamFromEnvironment(env:NodeJS.ProcessEnv,replicas?:()=>number):Configured {
   const kind=env.PTR_GATEWAY_UPSTREAM??'fake', failover=env.PTR_GATEWAY_FAILOVER??'off', discovery=env.PTR_GATEWAY_DISCOVERY??'static';
   if(!['off','openrouter','fake'].includes(failover)) throw new Error('INVALID_PTR_GATEWAY_FAILOVER');
   if(!['static','redis'].includes(discovery)) throw new Error('INVALID_PTR_GATEWAY_DISCOVERY');
@@ -146,36 +152,84 @@ export function upstreamFromEnvironment(env:NodeJS.ProcessEnv):Configured {
   // Latency injection only ever wraps the fake model (here: the load-test fake failover secondary).
   if(env.PTR_FAKE_LATENCY!==undefined&&failover!=='fake') throw new Error('LATENCY_INJECTION_ONLY_FOR_FAKE');
   if(kind==='selfhosted') {
-    if(pooled) return poolFromEnvironment(env,discovery,failover);
+    if(pooled) return poolFromEnvironment(env,discovery,failover,replicas);
     if(!env.PTR_SELFHOSTED_BASE_URL||!env.PTR_SELFHOSTED_MODEL) throw new Error('SELFHOSTED_NOT_CONFIGURED');
     const primary=new OpenAICompatibleUpstream({baseUrl:env.PTR_SELFHOSTED_BASE_URL,model:env.PTR_SELFHOSTED_MODEL});
     if(failover==='off') return {upstream:primary};
     const options=failoverOptions(env);
-    if(failover==='fake') return {upstream:new FailoverUpstream(primary,fakeUpstream(env),options)};
+    if(failover==='fake') return {upstream:new FailoverUpstream(primary,fakeUpstream(env),options,replicas)};
     const secondary=openRouterUpstream(env,FAILOVER_MODEL,true);
-    return {upstream:new FailoverUpstream(primary,secondary.upstream,options),close:secondary.close};
+    return {upstream:new FailoverUpstream(primary,secondary.upstream,options,replicas),close:secondary.close};
   }
   if(kind==='openrouter') return openRouterUpstream(env,env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL);
   throw new Error('INVALID_PTR_GATEWAY_UPSTREAM');
 }
+/**
+ * Gateway registry (S6): PTR_GATEWAY_REGISTRY=on|off, default on with PTR_GATEWAY_DISCOVERY=redis
+ * (Redis is there already), else off. The record: PTR_GATEWAY_ID (default gw-<port>-<random>), the URL workers use
+ * (PTR_GATEWAY_ADVERTISE_URL, default http://127.0.0.1:<port>/v1, which must pass the workers' rule: loopback, /v1 and
+ * PTR_GATEWAY_ALLOW), PTR_GATEWAY_MAX_QUEUE and the process start time.
+ */
+export function gatewayRegistrySettings(env:NodeJS.ProcessEnv,port:number,startedAt=Date.now()):
+  {id:string;url:string;maxQueue:number;startedAt:number;prefix:string;allow:AllowRule[]}|null {
+  const mode=env.PTR_GATEWAY_REGISTRY??(env.PTR_GATEWAY_DISCOVERY==='redis'?'on':'off');
+  if(mode!=='on'&&mode!=='off') throw new Error('INVALID_PTR_GATEWAY_REGISTRY');
+  if(mode==='off') return null;
+  const id=env.PTR_GATEWAY_ID??`gw-${port}-${randomUUID().slice(0,8)}`;
+  if(!GATEWAY_ID.test(id)) throw new Error('INVALID_PTR_GATEWAY_ID');
+  const url=env.PTR_GATEWAY_ADVERTISE_URL??`http://127.0.0.1:${port}/v1`, allow=parseGatewayAllow(env.PTR_GATEWAY_ALLOW);
+  if(checkGatewayUrl(url,allow)) throw new Error('INVALID_PTR_GATEWAY_ADVERTISE_URL');
+  return {id,url,maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),startedAt,prefix:registryPrefixFromEnv(env),allow};
+}
 async function main() {
   const env=process.env;
-  const {upstream,close,reload}=upstreamFromEnvironment(env);
-  // Failover: the secondary must be usable (ledger readable, price verified) before any traffic is accepted.
-  try {await upstream.ready?.(AbortSignal.timeout(30000));} catch(error) {await close?.();throw error;}
-  const {server}=createGateway({token:env.PTR_GATEWAY_TOKEN??'',upstream,limits:{
-    maxConcurrent:integer(env,'PTR_GATEWAY_MAX_CONCURRENCY',32,1,4096),maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),
-    queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),upstreamTimeoutMs:integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)}});
   const port=integer(env,'PTR_GATEWAY_PORT',56460,1024,65535);
   const shutdownMs=integer(env,'PTR_GATEWAY_SHUTDOWN_MS',30000,0,600000); // validated at startup, not in the signal handler
+  const registered=gatewayRegistrySettings(env,port);
+  let publisher:GatewayPublisher|undefined, registryRedis:ReturnType<typeof createRedisConnection>|undefined;
+  if(registered) {
+    registryRedis=createRedisConnection(env.PTR_REDIS_URL??'');registryRedis.on('error',()=>undefined); // heartbeats retry; the record expires after 10 s
+    publisher=new GatewayPublisher(new RedisGatewayRegistry(registryRedis,registered.prefix),registered);
+  }
+  // k unknown until the first registry read (Infinity): the failover ceiling is then 1 per minute, the most conservative.
+  const {upstream,close,reload}=upstreamFromEnvironment(env,publisher?()=>publisher!.activeGateways()??Infinity:undefined);
+  // Failover: the secondary must be usable (ledger readable, price verified) before any traffic is accepted.
+  try {await upstream.ready?.(AbortSignal.timeout(30000));} catch(error) {await close?.();registryRedis?.disconnect();throw error;}
+  const gateway=createGateway({token:env.PTR_GATEWAY_TOKEN??'',upstream,limits:{
+    maxConcurrent:integer(env,'PTR_GATEWAY_MAX_CONCURRENCY',32,1,4096),maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),
+    queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),upstreamTimeoutMs:integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)}});
+  const {server}=gateway;
   await new Promise<void>(resolve=>server.listen(port,'127.0.0.1',resolve));
+  // Registered only once it listens: a worker that reads the record can connect at once.
+  await publisher?.start();
   // No tokens, URLs or upstream details in startup output.
-  process.stdout.write(`LLM gateway listening on 127.0.0.1:${port}\n`);
-  // Stop accepting, let in-flight calls finish (bounded), then release the ledger pool: paid calls are not cut off.
+  process.stdout.write(`LLM gateway listening on 127.0.0.1:${port}${publisher?` (registry id ${registered!.id})`:''}\n`);
+  // Graceful drain : queued and new requests are refused at once with the marked 503 `draining` (never
+  // sent upstream: workers resend them to their next gateway), /healthz 503, the registry record says draining; calls
+  // already sent finish for up to PTR_GATEWAY_SHUTDOWN_MS (paid calls are not cut off), then the listener and every
+  // connection close, the record is deleted and the ledger pool released.
+  let stopping=false;
   const shutdown=()=>{
-    const drained=new Promise<void>(resolve=>server.close(()=>resolve()));
-    const deadline=new Promise<void>(resolve=>setTimeout(resolve,shutdownMs).unref());
-    void Promise.race([drained,deadline]).then(()=>close?.()).finally(()=>process.exit(0));
+    if(stopping) return;stopping=true;
+    const before=gateway.metrics();
+    gateway.drain();
+    process.stderr.write(`gateway draining: ${before.inFlight} in flight, ${before.queued} queued (refused now)\n`);
+    const deadline=new Promise<'deadline'>(resolve=>setTimeout(()=>resolve('deadline'),shutdownMs).unref());
+    // Exit 0 only for a clean drain: no call cut by the deadline and every cleanup step done (a supervisor can tell).
+    void (async():Promise<number>=>{
+      const marking=publisher?.setDraining().catch(()=>undefined);
+      const ended=await Promise.race([gateway.idle().then(()=>'idle' as const),deadline]);
+      await marking;
+      const after=gateway.metrics();
+      process.stderr.write(`gateway drained (${ended}): ${after.rejected.draining} request(s) refused while draining, ${after.inFlight} still in flight\n`);
+      server.close();server.closeAllConnections();
+      let clean=ended==='idle'||after.inFlight===0;
+      if(publisher&&!await publisher.stop()) clean=false;
+      registryRedis?.disconnect();
+      try {await close?.();} catch {clean=false;}
+      if(!clean) process.stderr.write('gateway stopped uncleanly: calls cut at PTR_GATEWAY_SHUTDOWN_MS or a cleanup step failed\n');
+      return clean?0:1;
+    })().then(code=>process.exit(code),()=>process.exit(1));
   };
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
   // PTR_GATEWAY_UPSTREAMS_FILE is re-read on SIGHUP (and when its mtime changes).

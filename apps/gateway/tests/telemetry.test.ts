@@ -35,7 +35,7 @@ describe('vLLM /metrics parsing',()=>{
 
 describe('engine telemetry : a filter only, fail-open when stale',()=>{
   function setup(options:{interval?:number;kvHigh?:number;waitingMax?:number}={}) {
-    let now=1_000_000;let body:string|null=text({running:1,waiting:0,kv:0.3,start:100});let fail=false;const events:{restarted:boolean;detectionOff?:boolean}[]=[];const warnings:string[]=[];
+    let now=1_000_000;let body:string|null=text({running:1,waiting:0,kv:0.3,start:100});let fail=false;const events:{restarted:boolean;detectionOff?:boolean;baselineChanged?:boolean}[]=[];const warnings:string[]=[];
     const t=new EngineTelemetry(async()=>{if(fail) throw new Error('down');return body;},
       {intervalMs:options.interval??1000,kvHigh:options.kvHigh??0.95,waitingMax:options.waitingMax??2,now:()=>now,maxSeqs:()=>12,warn:line=>warnings.push(line)},event=>events.push(event));
     return {t,events,warnings,advance:(ms:number)=>{now+=ms;},set:(next:string|null)=>{body=next;},fail:(value:boolean)=>{fail=value;}};
@@ -123,6 +123,20 @@ describe('engine telemetry : a filter only, fail-open when stale',()=>{
     expect(s.warnings.filter(w=>/restart detection back on/.test(w))).toHaveLength(1);
     for(const start of [300,300]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
     expect(s.t.metrics().restarts).toBe(1);
+  });
+  test('re-arming with a baseline other than the one before detection went off reports it (the pool clears its prefix table); the same baseline does not',async()=>{
+    const s=setup();
+    for(const start of [200,100]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    s.set(text({running:0,waiting:0,kv:0,start:100}));
+    for(let i=0;i<29;i++) await s.t.poll();
+    expect(s.t.metrics().restartDetectionDisabled).toBe(false);
+    expect(s.events.filter(e=>e.baselineChanged)).toHaveLength(1); // 200 before, 100 now: the process left may be another engine
+    const same=setup();
+    for(const start of [200,100]) {same.set(text({running:0,waiting:0,kv:0,start}));await same.t.poll();}
+    same.set(text({running:0,waiting:0,kv:0,start:200}));
+    for(let i=0;i<30;i++) await same.t.poll();
+    expect(same.t.metrics().restartDetectionDisabled).toBe(false);
+    expect(same.events.filter(e=>e.baselineChanged)).toHaveLength(0);
   });
   test('alternating start times never re-arm detection',async()=>{
     const s=setup();

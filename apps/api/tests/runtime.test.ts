@@ -1,5 +1,7 @@
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
-import { BullMqTurnDelivery } from '@ptr/messaging';
+import { BullMqTurnDelivery, MemoryGatewayRegistry } from '@ptr/messaging';
 import { createRuntime } from '../src/runtime';
 
 // Pools are lazy: no connection is opened by composition alone.
@@ -59,6 +61,28 @@ test('gateway URLs: PTR_GATEWAY_URLS is a priority list (PTR_GATEWAY_URL a list 
   await pair.close?.();
   for(const extra of [{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,https://example.com/v1'},{PTR_GATEWAY_URLS:' , '},{PTR_GATEWAY_RESET_RETRIES:'-1'},{PTR_GATEWAY_RESET_RETRIES:''},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:' '},{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,http://127.0.0.1:56460/v1'},{PTR_GATEWAY_RESET_RETRIES:'11'},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'x'}])
     expect(()=>createRuntime({...base,...extra})).toThrow();
+});
+test('PTR_GATEWAY_DISCOVERY=redis: calls follow the gateway registry (leader first), with PTR_GATEWAY_URLS as the seed; PTR_GATEWAY_ALLOW is validated',async()=>{
+  const served:string[]=[];
+  const server=createServer((req,res)=>{req.resume();req.on('end',()=>{served.push(String(req.url));res.writeHead(200,{'Content-Type':'text/event-stream'});
+    res.end(`data: ${JSON.stringify({choices:[{delta:{content:'registry gateway'},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);});});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  const port=(server.address() as AddressInfo).port;
+  const registry=new MemoryGatewayRegistry();
+  await registry.heartbeat({id:'gw-a',url:`http://127.0.0.1:${port}/v1`,maxQueue:256,state:'active',startedAt:1,seq:0},10000,5000);
+  const base={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',
+    PTR_GATEWAY_DISCOVERY:'redis',PTR_GATEWAY_ALLOW:`127.0.0.1:${port}`};
+  const runtime=createRuntime(base,{gatewayRegistry:registry});
+  try {
+    expect(runtime.gateways?.urls()).toEqual(['http://127.0.0.1:56460/v1']); // the seed until the first read
+    await runtime.gateways?.poll();
+    expect(runtime.gateways?.urls()).toEqual([`http://127.0.0.1:${port}/v1`,'http://127.0.0.1:56460/v1']);
+    expect(await runtime.provider.generate([{role:'user',content:'x'}],{signal:new AbortController().signal})).toBe('registry gateway');
+    expect(served).toEqual(['/v1/chat/completions']);
+  } finally {await runtime.close?.();await new Promise(resolve=>server.close(resolve));}
+  expect(()=>createRuntime({...base,PTR_GATEWAY_ALLOW:'localhost:1'},{gatewayRegistry:registry})).toThrow();
+  const statics=createRuntime({...base,PTR_GATEWAY_DISCOVERY:'static'});
+  expect(statics.gateways).toBeUndefined();await statics.close?.();
 });
 test('PTR_INTENT_CLASSIFIER=jev is off by default, needs the live gates, and validates its knobs',async()=>{
   const classifierOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.chat as unknown as {options:{intentClassifier?:{classifier:{name:string};minConfidence:number;timeoutMs:number}}}).options.intentClassifier;
