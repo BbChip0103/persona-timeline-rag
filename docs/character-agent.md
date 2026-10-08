@@ -69,7 +69,8 @@ newly billed and cannot be compared naively to uncached latency/cost.
 
 ## Current conversational/service contract
 
-The prompt is `character-agent-context-v3-bounded-roleplay`: light roleplay
+The prompt is `character-agent-context-v4-prefix-stable` (the v3 bounded-roleplay wording in the S7 layout: agent
+state/tools after the history, a safety note right before the user utterance; see docs/goal2-serving.md): light roleplay
 embellishment is allowed without promoting it to source facts or contradicting
 established core events/actors. This is not a semantic guarantee or measured
 quality improvement. Existing completed turn reports keep their recorded prompt

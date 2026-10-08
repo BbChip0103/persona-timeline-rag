@@ -226,7 +226,7 @@ test('timeline deterministic candidates preserve bounded UTF16 selectors and rem
   expect(data.role).toBe('user');expect(JSON.parse(data.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length))[0].quoteCandidate).toBe(candidate.quote);
   expect(messages[0].content).toContain('not semantic entailment');
   const raw=JSON.stringify({status:'answered',answer:'',evidenceRefs:[candidate]});expect(validateSourceBoundReply(raw,[source],persona.personId).status).toBe('answered');
-  expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v1-source-quotes');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v3-offsetless-quotes');
+  expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   expect(buildPrompt(persona,[],'hello',[],false)[0].content).not.toContain('quoteCandidate');
 });
 

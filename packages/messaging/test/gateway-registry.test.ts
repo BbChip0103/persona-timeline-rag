@@ -1,5 +1,5 @@
 import { GatewayDirectory, GatewayPublisher, MemoryGatewayRegistry, checkGatewayUrl, orderGateways, parseGatewayAllow, parseGatewayRecord,
-  screenGatewayRecords, serializeGatewayRecord } from '../src/gateway-registry';
+  screenGatewayRecords, serializeGatewayRecord, type GatewayRegistryStore } from '../src/gateway-registry';
 import { gateway, gatewayRegistryContract } from './gateway-registry.contract';
 
 gatewayRegistryContract('memory',async()=>{
@@ -153,5 +153,48 @@ describe('GatewayPublisher (gateway side): heartbeat, leader hint, draining, k a
     expect(a.activeGateways()).toBe(2);expect(a.metrics()).toMatchObject({failedBeats:1});
     expect(await a.stop()).toBe(false); // the delete failed: reported, not thrown
     store.down=false;
+  });
+  test('failed heartbeats: one WARNING at the first, then at most one a minute while they go on; no URL or message in the line',async()=>{
+    const store=new MemoryGatewayRegistry();let now=0;const lines:string[]=[];
+    const a=new GatewayPublisher(store,{id:'gw-a',url:url(56460),maxQueue:256,startedAt:1000,heartbeatMs:1e9,allow,claimAfterMs:0,now:()=>now,onWarning:line=>lines.push(line)});
+    // A cold start against an unreachable registry: k unknown, so the failover cap is 1 a minute.
+    store.down=true;await a.start();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^WARNING gateway registry heartbeat failed \(Error\): 1 in a row, 1 in total; k unknown, so the failover per-minute cap is 1$/);
+    for(now=2000;now<60000;now+=2000)await a.beat();
+    expect(lines).toHaveLength(1); // 29 more failures within the minute: silent
+    expect(a.metrics()).toMatchObject({failedBeats:30,consecutiveFailedBeats:30,active:null,leader:false});
+    now=60000;await a.beat();
+    expect(lines).toHaveLength(2);expect(lines[1]).toContain('31 in a row, 31 in total');
+    // Recovery resets the run; a flapping registry still logs at most once a minute.
+    store.down=false;now=62000;await a.beat();
+    expect(a.metrics()).toMatchObject({consecutiveFailedBeats:0,failedBeats:31,active:1});
+    store.down=true;now=64000;await a.beat();
+    expect(lines).toHaveLength(2);
+    store.down=false;now=66000;await a.beat();store.down=true;now=121000;await a.beat();
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toBe('WARNING gateway registry heartbeat failed (Error): 1 in a row, 33 in total; k 1 (last read), so the failover per-minute cap stays at cap/1');
+    for(const line of lines)expect(line).not.toMatch(/http|127\.0\.0\.1|REGISTRY_UNAVAILABLE/);
+    store.down=false;await a.stop();
+  });
+  test('a failed heartbeat clears the leader flag in the metrics; the next good beat renews the hint',async()=>{
+    const store=new MemoryGatewayRegistry();
+    const a=new GatewayPublisher(store,{id:'gw-a',url:url(56460),maxQueue:256,startedAt:1000,heartbeatMs:1e9,allow,claimAfterMs:0});
+    await a.start();expect(a.metrics().leader).toBe(true);
+    store.down=true;await a.beat();
+    expect(a.metrics()).toMatchObject({leader:false,consecutiveFailedBeats:1});
+    store.down=false;await a.beat();expect(a.metrics().leader).toBe(true); // it still held the hint (within its lease)
+    await a.stop();
+  });
+  test('the warning names an error code (never the message) and stays silent without onWarning',async()=>{
+    const lines:string[]=[];
+    const failing:GatewayRegistryStore={heartbeat:async()=>{throw Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:56479 secret'),{code:'ECONNREFUSED'});},
+      list:async()=>({records:[],leader:null}),remove:async()=>undefined};
+    const a=new GatewayPublisher(failing,{id:'gw-a',url:url(56460),maxQueue:256,startedAt:1000,heartbeatMs:1e9,allow,onWarning:line=>lines.push(line)});
+    await a.start();
+    expect(lines).toEqual(['WARNING gateway registry heartbeat failed (ECONNREFUSED): 1 in a row, 1 in total; k unknown, so the failover per-minute cap is 1']);
+    const quiet=new GatewayPublisher(failing,{id:'gw-b',url:url(56461),maxQueue:256,startedAt:1000,heartbeatMs:1e9,allow});
+    await quiet.start();expect(quiet.metrics().failedBeats).toBe(1);
+    await a.stop();await quiet.stop();
   });
 });

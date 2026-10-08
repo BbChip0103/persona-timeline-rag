@@ -1,6 +1,7 @@
 # Chat core quote-selection contract
 
-The timeline model contract in `persona-chat-v3-offsetless-quotes` requests strict
+The timeline model contract introduced in `persona-chat-v3-offsetless-quotes` (current revision
+`persona-chat-v4-turn-note-last`: same bytes without a safety note, see the S7 layout below) requests strict
 JSON with `status`, `answer`, and `evidenceRefs`. Model prose in `answer` is never
 used to render factual claims. New model selections contain only:
 
@@ -28,14 +29,23 @@ cards retain posted/event date separation, and rendering labels quotations as
 caption statements rather than assertions of actual activities.
 
 Timeline prompt evidence includes a bounded candidate **string**, not candidate
-offsets. The model selects exact text without arithmetic. The small-talk message
-bytes and `persona-chat-v1-source-quotes` revision are unchanged. The v3 timeline
+offsets. The model selects exact text without arithmetic. Historical (v3): the small-talk message
+bytes and `persona-chat-v1-source-quotes` revision were unchanged by it. The v3 timeline
 prompt is an explicit variant; earlier study results must not be relabeled as if
-they used it. `PROMPT_REVISION` currently denotes the v3 timeline revision.
+they used it. `PROMPT_REVISION` currently denotes the timeline revision.
+
+**Prompt layout (S7).** Every builder renders
+`policy · persona · history · [agent state/tools] · [evidence] · [safety note] · user · [tool transcript]`,
+so policy → persona → history is a prefix that only grows from turn to turn. The input-safety deflection note is
+its own system message right before the user utterance (it was appended to the policy message). Revisions:
+`persona-chat-v2-turn-note-last` (small talk), `persona-chat-v4-turn-note-last` (timeline),
+`persona-chat-v7-turn-note-last` (experiment) and `character-agent-context-v4-prefix-stable` (agent). Without a
+safety note the first three render the same bytes as v1 / v3 / v6; the agent prompt changes on every turn (state and
+tools moved after the history). `tests/prompt-layout.test.ts` pins the byte stability.
 
 ## agent-loop conversational voice and service boundaries
 
-`character-agent-context-v3-bounded-roleplay` uses first-person author-role
+`character-agent-context-v4-prefix-stable` (v3 wording, S7 layout) uses first-person author-role
 narration in the disclosed research simulation. Light reactions, humour,
 atmosphere and minor scene embellishment are allowed, but are not verified
 source facts. Established core events/actors, exact quotations and important

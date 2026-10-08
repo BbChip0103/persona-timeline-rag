@@ -824,8 +824,8 @@ W3 on both configs — TTFT p95 at the knee ≥ 10% better and max throughput wi
 configs — both ≤ 5% worse. Reported next to it, not part of the bar: TTFT p50, engine prefix hit rate (requests and
 tokens), dispatch imbalance (max / mean per upstream), affinity outcomes. Workload change for this run: W3 requests put
 the agent state after the history (the approved S7 P2 layout), so a session's turns share a prefix that grows with
-its history; with the current layout (state before the history) the shared prefix stops at the persona and affinity
-has nothing to act on. The fake engine now models vLLM's KV: a request holds prompt − (prefix shared with running
+its history; with the layout of that time (state before the history) the shared prefix stopped at the persona and
+affinity had nothing to act on. S7 (below) made the app use that layout. The fake engine now models vLLM's KV: a request holds prompt − (prefix shared with running
 requests) + output, so a cached history saves prefill but not KV, and cached prefixes live in the free KV (capacity −
 KV in use, so load evicts them; the old model was 2000 entries and subtracted every cached token from KV). It counts
 hit tokens. **Fixed after the runs below (S6, Part A):** the shared blocks were charged to the request that allocated
@@ -970,6 +970,14 @@ exceeds it (S_live 24 at headroom 0.25 adds 6, far below 256), so this over-coun
     Until then the ceiling is 1 per minute, the most conservative value. BullMQ shares that Redis, so no new turns
     run then anyway (§13.2).
   - A global per-minute check in the Postgres ledger (design S9) would remove both limits.
+  - **Registry heartbeat failures are visible (S7 Part A).** A wrong `PTR_REDIS_URL` or password on a gateway used
+    to leave k unknown, so the ceiling stayed at 1 per minute without any sign. The gateway now writes one line to
+    stderr on the first failed heartbeat and then at most one a minute while failures go on (a flapping Redis is
+    limited the same way): `WARNING gateway registry heartbeat failed (<code or error class>): N in a row, M in total; k
+    unknown, so the failover per-minute cap is 1` (or `k <n> (last read), so … stays at cap/<n>`). The line carries no
+    URL and no error message. `/metrics` has a `registry` object when the gateway is registered: `{id, state, leader,
+    active (k, null before the first read), failedBeats, consecutiveFailedBeats}`; `leader` is whether this gateway
+    holds the leader hint after its last heartbeat.
 - **Telemetry fallback** (one call on a blocked engine with nothing of this gateway in flight) is still per gateway:
   up to k such calls.
 - **H2 per-replica credit split S_u / k (`PTR_GATEWAY_SPLIT_CREDIT`): deferred, not implemented (agent decision).**
@@ -1019,6 +1027,100 @@ Notes:
   connect (S1: no wait before an untried URL; 48 of 96 calls in the C kill window show 2 attempts).
 - After a drain the deleted record's URL can reappear at the end of the list as a seed URL, which is harmless.
 - One run per scenario on one host. These results describe the failover mechanics, not multi-host fault tolerance.
+
+### Prompt layout for prefix reuse ( P1–P3, §9.2, stage S7)
+
+All chat prompt builders (`packages/core/src/prompts.ts`; the agent runtime uses `buildExperimentContext`) render:
+
+```text
+policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENCE] · [safety note] · user · [tool transcript]
+```
+
+- **P1:** the input-safety deflection note (`SAFETY_DEFLECTION_NOTE`) is its own system message right before the user
+  utterance. It used to be appended to the policy message.
+- **P2:** the agent's per-turn state and tool list come after the history (they used to come before it).
+- **P3:** `packages/core/tests/prompt-layout.test.ts` pins the byte stability on real multi-turn chat-service runs
+  (agent with every RAG condition, experiment, legacy): the policy message is identical across personas and turns; the
+  persona message is identical across a persona's turns; the first model call of turn N up to the end of its history
+  is a byte prefix of turn N+1's first call (and of the next agent iteration's); state, tools, evidence, the note and
+  tool results appear only after the history. Mutating either change back makes the suite fail.
+- **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
+  placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
+  `persona-chat-v2-turn-note-last` (small talk). Without a safety note these three render the same bytes as v6 / v3 / v1,
+  so runs without the input-safety filter stay comparable. The timeline bump is nominal: a deflected turn is always
+  routed to small talk, so a timeline prompt never carries the note. Turns record the agent revision in
+  `reply.agent.promptRevision`; the evaluation scripts record the constants in their reports. Pre-existing gaps, not
+  changed here: only agent turns store a prompt revision (experiment and legacy turns store none), and
+  `scripts/live-research.ts` labels its small-talk outputs with the timeline revision (`PROMPT_REVISION`).
+- **HARD GATES before v4 is served or used as an eval baseline** (S8, items 1 and 2 below):
+  (a) the chat-template check. It applies to **every agent turn from turn 2 on**, not only to deflected turns: the
+  state and tool system messages now follow assistant turns. (b) The reply-level `prompt_injection` comparison of v3
+  and v4. The S7 safety condition is so far met only structurally (deterministic placement checks), not on model replies.
+- **Not changed:** the legacy goal1 `buildPrompt` keeps its reply-format instruction inside the policy message, so it
+  has two policy variants (small talk / timeline), each byte-stable; the serving path (agent) has one. The fictional
+  draft prompt (`fictional-post-draft-v1`, one call without history) still appends a deflection note to its policy.
+- **Gateway side effects:** the policy block G that admission learns from the first message (§3.1) is no longer
+  polluted by deflected turns, and the S5 prefix table (message-boundary hashes) now matches a deflected turn up to
+  its history.
+- **The Jev input-safety filter is unaffected:** it receives only the user text, at most two earlier user turns, a
+  seed and the question set (`SafetyAssessInput`), runs before any prompt is built, and does not import the prompt
+  builders. Its synthetic-set accuracy (152/154 at the defaults) measures the classifier, not the chat model, so it
+  needs no re-run.
+
+**Offline prefix gain (§9.2; zero cost).** `scripts/prompt-prefix-gain.ts --workload=<workload.private.json>` takes
+the captured Jev/Gemma workload (`reports/jev-gemma-bench/2026-10-08T11-39-16-577Z`, private: 91 agent calls, 32
+conversations of 2–3 turns, no tool rounds, no deflections), rebuilds each call in the S7 order from its own
+messages (byte-identical to the new builder, tested), and takes for each call, in capture order, the longest common
+byte prefix with any earlier call. This is an unbounded prefix cache that never evicts, so the numbers are upper
+bounds. **Global** is the prefix shared with other conversations (policy, persona, greeting). **Session** adds the
+prefix shared with the same conversation; that part hits only on the engine that served the conversation before.
+There is no Gemma tokenizer offline: bytes become tokens at 4.45 B/token (the median of UTF-8 bytes / vLLM
+`prompt_tokens` measured on these captures; range 3.74–4.96) and are floored to whole 16-token KV
+blocks. Messages are serialized with a generic chat-template wrapper.
+
+| Calls | Prompt tokens (mean) | Global: previous → S7 | Session: previous → S7 |
+| --- | --- | --- | --- |
+| turn 1 (32) | 3360 | 40.5% → 40.6% | 40.5% → 40.6% |
+| turn 2 (28) | 2591 | 49.1% → 49.9% | 51.8% → 52.7% |
+| turn 3 (31) | 2582 | 49.5% → 50.4% | 54.1% → 55.1% |
+| all (91) | 2858 | 45.7% → 46.2% | 47.8% → 48.4% |
+| per session, p10 / p50 / p90 | | 26.9 / 46.0 / 92.4% (prev. 26.5 / 45.3 / 91.0%) | 29.3 / 51.7 / 93.8% (prev. 29.1 / 51.4 / 93.4%) |
+| a deflected turn (each call as one) | | 36.7% → 44.7% | 37.5% → 46.8% |
+
+- On this workload the gain is small. Global column: +0.5 pp of prompt tokens overall (about 14 tokens per call),
+  +0.8–0.9 pp (about 22 tokens) on turns 2–3. Session column: +0.6 pp overall (about 17 tokens per call), +0.9–1.0 pp
+  (about 25 tokens) on turns 2–3. The history is only 3.5% of the prompt bytes (2–3 turns, replies ≤ 180 characters),
+  while evidence is 49% and the policy 40%. The agent state changed between consecutive turns in 43 of 59 pairs, so
+  P2 did matter where history existed; there was just little history.
+- A deflected turn gains +8.0 pp in the global column (about 230 tokens) and +9.3 pp in the session column (about 270
+  tokens). The previous layout still kept the policy tokens (the note was appended at the end of the policy text, so the
+  policy stayed a byte prefix), but it lost the persona and the history.
+  The design's "even the global prefix breaks" holds for message-level hashes (gateway prefix table, G), not for the
+  engine's token blocks.
+- Longer sessions gain more. A model with the capture's mean block sizes (policy 5029 B, persona 858, greeting 159,
+  user 59, reply 159, state + tools 116, evidence 6111) and the state unchanged in 27% of turn pairs gives a
+  same-engine cacheable share at turn n of 47.5 → 48.2% (n = 2, +19 tokens), 47.2 → 49.1% (3, +55), 46.5 → 50.7%
+  (5, +126), 45.0 → 54.5% (10, +305) and 42.6 → 60.5% (20, +662). This is a model, not a measurement.
+- The session part needs the same engine: with affinity off (the default) and N engines it hits about 1/N of the time.
+  The global part is reused on every engine.
+
+**To re-measure in S8 (needs the GPU host or paid calls, not run here):**
+1. **Chat template (hard gate a).** Render v4 prompts through the engine's chat template (vLLM `/tokenize` with `messages`, then
+   `/detokenize`; no generation) and check that system messages after assistant turns are accepted and stay in place.
+   If the template hoists or merges system messages, both the prefix gain and the note's position change. Do the same
+   for the OpenRouter failover model, whose provider applies its own template.
+2. **Reply-level injection handling (hard gate b).** No existing eval measures the chat model's answer to a deflected turn: the Jev
+   safety eval scores the classifier only. Send the 14 synthetic `prompt_injection` items (including the multi-turn
+   `prompt_injection-ko-08`) through a `agent_loop` session with the filter on, under v3 and v4, on the self-hosted
+   model. Check that no reply reveals the policy or prompt text, that the reply stays in persona, and that it keeps
+   the JSON format. Deterministic offline checks (note right before the utterance, once; no retrieval or tool; same
+   policy bytes) pass for all 14 items in all three profiles.
+3. **Answer quality under P2.** Run the Korean paired regression (`evaluate-korean-chat.ts --recollection`) on the
+   agent prompt v3 vs v4, because the state and tool list now sit closer to the question. The state includes the
+   model-written `conversationTopic`, so model-generated text now sits right before the evidence and the question.
+4. **Engine prefix hits.** Compare vLLM prefix-cache hit rate (tokens) on the same replayed workload, v3 vs v4; the
+   expectation from the table is about +0.5 pp on 2–3-turn sessions. Re-capture the workload under v4 for later
+   routing comparisons and recalibrate bytes per token.
 
 ## Providers (direct, without the gateway)
 

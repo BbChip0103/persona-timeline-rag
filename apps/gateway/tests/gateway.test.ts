@@ -5,6 +5,7 @@ import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider } from '@ptr/providers';
 import { createGateway, OpenAICompatibleUpstream, TextProviderUpstream, queueFullRetryAfterSeconds, type GatewayOptions } from '../src';
 import { upstreamFromEnvironment } from '../src/main';
+import { GatewayPublisher, MemoryGatewayRegistry, parseGatewayAllow } from '@ptr/messaging/registry';
 
 const token='synthetic_gateway_token_abcdefghij';
 const messages=[{role:'user',content:'안녕'}];
@@ -39,6 +40,21 @@ describe('LLM gateway',()=>{
     const {base}=await gateway(new TextProviderUpstream({generate:async()=> 'ok'},'fake'),{maxConcurrent:3,maxQueue:5});
     const metrics=await (await fetch(`${base}/metrics`,{headers:{Authorization:`Bearer ${token}`}})).json() as {capacity:unknown};
     expect(metrics.capacity).toEqual({maxConcurrent:3,maxQueue:5,total:8});
+  });
+  test('/metrics reports the registry publisher (k, leader hint, failed heartbeats) only when the gateway is registered',async()=>{
+    const upstream=new TextProviderUpstream({generate:async()=> 'ok'},'fake');
+    const {base:plain}=await gateway(upstream);
+    expect(await (await fetch(`${plain}/metrics`,{headers:{Authorization:`Bearer ${token}`}})).json()).not.toHaveProperty('registry');
+    const store=new MemoryGatewayRegistry();
+    const publisher=new GatewayPublisher(store,{id:'gw-a',url:'http://127.0.0.1:56460/v1',maxQueue:2,startedAt:1,heartbeatMs:1e9,claimAfterMs:0,allow:parseGatewayAllow(undefined)});
+    const g=createGateway({token,upstream,limits:{maxConcurrent:2,maxQueue:2,queueTimeoutMs:2000,upstreamTimeoutMs:5000},registry:()=>publisher.metrics()});
+    const base=await listen(g.server);
+    const read=async()=>(await (await fetch(`${base}/metrics`,{headers:{Authorization:`Bearer ${token}`}})).json() as {registry:unknown}).registry;
+    store.down=true;await publisher.start();
+    expect(await read()).toEqual({id:'gw-a',state:'active',leader:false,active:null,failedBeats:1,consecutiveFailedBeats:1});
+    store.down=false;await publisher.beat();
+    expect(await read()).toEqual({id:'gw-a',state:'active',leader:true,active:1,failedBeats:1,consecutiveFailedBeats:0});
+    await publisher.stop();
   });
   test('the Retry-After mean counts only successful upstream calls (fast failures must not shorten it, slow ones not lengthen it)',async()=>{
     const held=heldProvider();let fail=true;

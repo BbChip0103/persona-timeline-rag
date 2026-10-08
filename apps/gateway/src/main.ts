@@ -189,7 +189,7 @@ async function main() {
   let publisher:GatewayPublisher|undefined, registryRedis:ReturnType<typeof createRedisConnection>|undefined;
   if(registered) {
     registryRedis=createRedisConnection(env.PTR_REDIS_URL??'');registryRedis.on('error',()=>undefined); // heartbeats retry; the record expires after 10 s
-    publisher=new GatewayPublisher(new RedisGatewayRegistry(registryRedis,registered.prefix),registered);
+    publisher=new GatewayPublisher(new RedisGatewayRegistry(registryRedis,registered.prefix),{...registered,onWarning:line=>process.stderr.write(`${line}\n`)});
   }
   // k unknown until the first registry read (Infinity): the failover ceiling is then 1 per minute, the most conservative.
   const {upstream,close,reload}=upstreamFromEnvironment(env,publisher?()=>publisher!.activeGateways()??Infinity:undefined);
@@ -197,7 +197,8 @@ async function main() {
   try {await upstream.ready?.(AbortSignal.timeout(30000));} catch(error) {await close?.();registryRedis?.disconnect();throw error;}
   const gateway=createGateway({token:env.PTR_GATEWAY_TOKEN??'',upstream,limits:{
     maxConcurrent:integer(env,'PTR_GATEWAY_MAX_CONCURRENCY',32,1,4096),maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),
-    queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),upstreamTimeoutMs:integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)}});
+    queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),upstreamTimeoutMs:integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)},
+    ...(publisher?{registry:()=>publisher!.metrics()}:{})});
   const {server}=gateway;
   await new Promise<void>(resolve=>server.listen(port,'127.0.0.1',resolve));
   // Registered only once it listens: a worker that reads the record can connect at once.

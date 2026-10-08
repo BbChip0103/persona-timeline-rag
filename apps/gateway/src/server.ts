@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { REQUEST_KEY } from '@ptr/providers';
+import type { GatewayPublisherMetrics } from '@ptr/messaging/registry';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
 import type { ChatCompletionRequest, RequestContext, Upstream } from './upstreams';
@@ -11,6 +12,8 @@ export interface GatewayOptions {
   token:string; upstream:Upstream;
   limits:{maxConcurrent:number;maxQueue:number;queueTimeoutMs:number;upstreamTimeoutMs:number};
   maxBodyBytes?:number;
+  /** Gateway registry publisher (S6), when registered: reported as `registry` in /metrics. */
+  registry?:()=>GatewayPublisherMetrics;
 }
 export interface GatewayMetrics {
   upstream:string; inFlight:number; queued:number; accepted:number; completed:number; upstreamErrors:number;
@@ -25,6 +28,11 @@ export interface GatewayMetrics {
   pool?:PoolMetrics;
   /** Admission capacity: upstream concurrency cap + queue bound. Workers warn when Σ worker concurrency exceeds `total`. */
   capacity:{maxConcurrent:number;maxQueue:number;total:number};
+  /**
+   * Only with the gateway registry on: k (`active`, null before the first successful read), the leader hint, and failed
+   * heartbeats (`failedBeats` in total, `consecutiveFailedBeats` now; nonzero means k and the failover cap may be stale).
+   */
+  registry?:GatewayPublisherMetrics;
 }
 const SAMPLE=2000;
 function percentile(values:number[],p:number):number|null {
@@ -83,7 +91,7 @@ export function createGateway(options:GatewayOptions):Gateway {
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
     ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
     ...(options.upstream.poolMetrics?{pool:options.upstream.poolMetrics()}:{}),
-    capacity:capacity()});
+    capacity:capacity(),...(options.registry?{registry:options.registry()}:{})});
   const authorized=(req:IncomingMessage)=>{
     const header=req.headers.authorization??'';const supplied=header.startsWith('Bearer ')?header.slice(7):'';
     return !!supplied&&supplied.length<=512&&timingSafeEqual(expected,createHash('sha256').update(supplied).digest());

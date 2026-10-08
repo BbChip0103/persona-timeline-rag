@@ -5,7 +5,8 @@ import { buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT } from './prompts'
 import { containsCredentialPattern, containsInternalPathPattern } from './safety';
 
 export const AGENT_RUNTIME_REVISION='agent-loop-json-action-v1';
-export const AGENT_PROMPT_REVISION='character-agent-context-v3-bounded-roleplay';
+/** v4 (S7): agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout). */
+export const AGENT_PROMPT_REVISION='character-agent-context-v4-prefix-stable';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
@@ -14,7 +15,7 @@ export interface AgentRunInput {
   provider:TextProvider;persona:Persona;history:ChatMessage[];text:string;sources:SourcePost[];
   variables?:AgentVariables;signal:AbortSignal;maxToolRounds?:number;
   search?:(query:string)=>Promise<SourcePost[]>;
-  /** Per-turn safety note appended to the policy (input safety deflection). */
+  /** Per-turn safety note (input safety deflection): a system message right before the user utterance. */
   policyNote?:string;
   /** Passed to every model call of the turn (see TextProvider). */
   requestKey?:string;deadlineAt?:number;
@@ -42,7 +43,8 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     const safety=buildExperimentContext(input.persona,[],input.text,[]).messages[0]!.content.split('TIMELINE_JSON_REPLY:')[0];
     const context=buildExperimentContext(input.persona,input.history,input.text,sources,{
       policy:`${safety}${recollectionVoice}${protocol}`,...(input.policyNote?{policyNote:input.policyNote}:{}),
-      beforeHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify(variables)}`},
+      // Per-turn state/tools after the history keep policy → persona → history a growing shared prefix .
+      afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify(variables)}`},
         {role:'system',content:`AGENT_TOOLS_JSON_DATA ${JSON.stringify(input.search&&iteration<max?['timeline_search']:[])}`}],
       afterUser:transcript,
     });

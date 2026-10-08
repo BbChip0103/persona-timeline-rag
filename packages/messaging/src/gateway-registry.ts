@@ -308,7 +308,22 @@ export interface GatewayPublisherOptions {
    * `leaderMs`). A gateway that just started, or just got Redis back, first proves it can keep the hint alive.
    */
   claimAfterMs?: number;
+  /**
+   * Operator warning for failed heartbeats (the gateway passes a stderr writer): one line on the first failure, then at
+   * most one per `warnIntervalMs` (default 60 s) while failures go on. The line has counts, k and an error class only.
+   */
+  onWarning?: (line: string) => void; warnIntervalMs?: number;
   now?: () => number;
+}
+/** Registry view of one gateway for its /metrics: `leader` is whether it holds the leader hint after its last heartbeat. */
+export interface GatewayPublisherMetrics {
+  id: string; state: GatewayState; leader: boolean; active: number | null; failedBeats: number; consecutiveFailedBeats: number;
+}
+/** An error's class for a log line: a code such as ECONNREFUSED or the error name, never its message (may hold a URL). */
+function errorClass(error: unknown): string {
+  const { code, name } = (error ?? {}) as { code?: unknown; name?: unknown };
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) return code;
+  return typeof name === 'string' && /^[A-Za-z]{1,40}$/.test(name) ? name : 'error';
 }
 /**
  * Gateway side: publishes this gateway every `heartbeatMs` (2 s, TTL 10 s), takes or renews the leader hint while
@@ -319,7 +334,8 @@ export interface GatewayPublisherOptions {
  */
 export class GatewayPublisher {
   private state: GatewayState = 'active';
-  private seq = 0; private k: number | null = null; private leading = false; private failedBeats = 0;
+  private seq = 0; private k: number | null = null; private leading = false; private failedBeats = 0; private consecutive = 0;
+  private warnedAt: number | undefined;
   /** Start of the current run of successful heartbeats (undefined after a failure). */
   private goodSince: number | undefined;
   private timer: NodeJS.Timeout | undefined; private beating: Promise<void> | undefined; private stopped = false;
@@ -350,7 +366,17 @@ export class GatewayPublisher {
       const active = new Set<string>([this.options.id]);
       for (const parsed of screenGatewayRecords(records, this.options.allow).records) if (parsed.state === 'active') active.add(parsed.id);
       this.k = active.size;
-    } catch { this.failedBeats++; this.goodSince = undefined; }
+      this.consecutive = 0;
+    } catch (error) {
+      // Unconfirmed while Redis is unreachable (the hint lapses after its lease anyway): never report a stale leader.
+      this.failedBeats++; this.consecutive++; this.goodSince = undefined; this.leading = false;
+      // Rate-limited over failures in general (not per run), so a flapping Redis cannot flood the log either.
+      if (this.options.onWarning && (this.warnedAt === undefined || now - this.warnedAt >= (this.options.warnIntervalMs ?? 60_000))) {
+        this.warnedAt = now;
+        this.options.onWarning(`WARNING gateway registry heartbeat failed (${errorClass(error)}): ${this.consecutive} in a row, ${this.failedBeats} in total; `
+          + `k ${this.k === null ? 'unknown, so the failover per-minute cap is 1' : `${this.k} (last read), so the failover per-minute cap stays at cap/${this.k}`}`);
+      }
+    }
   }
   /** Drain: the record says draining (workers drop it on their next read) and the leader hint is given up now. */
   async setDraining(): Promise<void> {
@@ -370,7 +396,8 @@ export class GatewayPublisher {
   }
   /** k: active gateways in the registry at the last successful read, this one always included; null before the first. */
   activeGateways(): number | null { return this.k; }
-  metrics(): { id: string; state: GatewayState; leader: boolean; active: number | null; failedBeats: number } {
-    return { id: this.options.id, state: this.state, leader: this.leading, active: this.k, failedBeats: this.failedBeats };
+  metrics(): GatewayPublisherMetrics {
+    return { id: this.options.id, state: this.state, leader: this.leading, active: this.k, failedBeats: this.failedBeats,
+      consecutiveFailedBeats: this.consecutive };
   }
 }
