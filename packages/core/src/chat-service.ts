@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
-import { CoreError, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
+import { CoreError, LEASE_LOST, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
@@ -104,7 +104,10 @@ export class ChatService {
     const store=fencedStore(this.options.store,queued.fence,this.options.events);
     let prepared:Awaited<ReturnType<ChatService['prepare']>>;
     try {prepared=await this.prepare(queued.turn.ownerId,queued.input);}
-    catch {await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');return;}
+    catch {
+      if(controller.signal.reason!==LEASE_LOST) await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');
+      return;
+    }
     await this.runReserved(prepared.session,queued.turn,prepared.value,prepared.query,controller,store);
   }
   private async prepare(ownerId:string,input:SendTurnInput) {
@@ -128,6 +131,8 @@ export class ChatService {
       });
       await Promise.race([execution,timeout]);
     } catch (error) {
+      // A worker that lost its lease writes nothing: recovery requeues the turn (or fails it with WORKER_LOST).
+      if(controller.signal.reason===LEASE_LOST) return;
       // Never persist/return provider error strings: they can contain raw keys, prompts or paths.
       const providerCode=error instanceof Error&&'code' in error?error.code:undefined;
       const errorCode=error instanceof CoreError&&error.code==='CONTEXT_LIMIT'?'CONTEXT_LIMIT'

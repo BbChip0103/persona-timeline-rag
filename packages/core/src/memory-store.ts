@@ -57,7 +57,7 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
     if (!turn || terminal(turn.state) || !expected.includes(turn.state) || !this.fenced(id,fence)) return false;
     turn.state=next;
     if (errorCode) turn.errorCode=errorCode;
-    if (terminal(next)) turn.finishedAt=new Date().toISOString();
+    if (terminal(next)) {turn.finishedAt=new Date().toISOString();this.leases.delete(id);}
     return true;
   }
   async completeTurn(id:string,reply:ChatReply,fence?:LeaseFence):Promise<boolean> {
@@ -65,7 +65,7 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
     if (!turn || turn.state !== 'validating' || reply.turnId !== id || reply.sessionId !== turn.sessionId || !this.fenced(id,fence)) return false;
     const session=this.sessions.get(turn.sessionId);
     if (!session || reply.personId !== session.personId || reply.personaRevision !== session.personaRevision) return false;
-    turn.state='completed';turn.finishedAt=new Date().toISOString();turn.reply=structuredClone(reply);
+    turn.state='completed';turn.finishedAt=new Date().toISOString();turn.reply=structuredClone(reply);this.leases.delete(id);
     this.messages.get(turn.sessionId)!.push(
       {id:randomUUID(),sessionId:turn.sessionId,turnId:id,role:'user',content:turn.userText,createdAt:turn.createdAt},
       {id:reply.messageId,sessionId:turn.sessionId,turnId:id,role:'assistant',content:reply.content,createdAt:turn.finishedAt},
@@ -88,7 +88,7 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
   }
   async renewLease(id:string,fence:LeaseFence,leaseMs:number):Promise<boolean> {
     const turn=this.turns.get(id);
-    if(!turn||terminal(turn.state)||!this.fenced(id,fence)) return false;
+    if(!turn||terminal(turn.state)||!this.fenced(id,fence)||this.leases.get(id)!.expiresAt<Date.now()) return false;
     this.leases.get(id)!.expiresAt=Date.now()+leaseMs;return true;
   }
   async recoverExpired(maxAttempts:number):Promise<{requeued:string[];failed:string[]}> {
@@ -96,13 +96,15 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
     for(const turn of this.turns.values()) {
       const lease=this.leases.get(turn.id);
       if(!lease?.owner||terminal(turn.state)||lease.expiresAt>=now) continue;
-      if(lease.attempts>=maxAttempts) {turn.state='failed';turn.errorCode='WORKER_LOST';turn.finishedAt=new Date().toISOString();failed.push(turn.id);continue;}
+      if(lease.attempts>=maxAttempts) {turn.state='failed';turn.errorCode='WORKER_LOST';turn.finishedAt=new Date().toISOString();this.leases.delete(turn.id);failed.push(turn.id);continue;}
       turn.state='pending';this.leases.set(turn.id,{expiresAt:0,attempts:lease.attempts});
       const seq=(this.dispatchSeq.get(turn.id)??0)+1;this.dispatchSeq.set(turn.id,seq);
       this.outbox.set(turn.id,{seq,createdAt:now});requeued.push(turn.id);
     }
     return {requeued,failed};
   }
+  /** Token and expiry share one record here, so they cannot drift apart; nothing to repair. */
+  async reconcileLeases():Promise<{requeued:string[];failed:string[];dropped:number}> {return {requeued:[],failed:[],dropped:0};}
   async pendingDispatches(graceMs:number,limit:number):Promise<TurnDispatch[]> {
     const now=Date.now();const due:TurnDispatch[]=[];
     for(const [turnId,entry] of this.outbox) {

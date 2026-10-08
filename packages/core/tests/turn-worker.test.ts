@@ -227,4 +227,57 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     expect(turn.state).toBe('failed');
     expect(failures).toEqual([{turnId:turn.id,code:'Error'}]);
   });
+  test('an expired lease cannot be renewed, so a turn it may have lost to another claim is aborted',async()=>{
+    const {chat,session,store}=setup();
+    const s=await session();
+    const {turn}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'expired',text:'안녕'});
+    const claimed=await store.claimTurn(turn.id,'w-slow',20);
+    await new Promise(r=>setTimeout(r,40));
+    expect(await store.renewLease(turn.id,claimed!.fence,200)).toBe(false);
+    expect((await store.claimTurn(turn.id,'w-next',200))?.fence.attempt).toBe(2);
+  });
+  test('a heartbeat that finds its lease already expired leaves the turn for recovery instead of failing it',async()=>{
+    let calls=0;
+    const provider:TextProvider={generate:jest.fn(async(_m,{signal})=>{
+      if(++calls===1) await new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}));
+      return '반가워요.';
+    })};
+    const {chat,session,store,worker,consume,dispatcher}=setup(provider);
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'late-heartbeat',text:'안녕'});
+    // Every renewal of the first worker lands after its 60 ms lease has run out (e.g. a stalled event loop or DB).
+    const renew=store.renewLease.bind(store);
+    const slowRenew=jest.spyOn(store,'renewLease').mockImplementation(async(...args)=>{await new Promise(r=>setTimeout(r,80));return renew(...args);});
+    expect(await worker('w-late',60).handle(dispatch!)).toBe('executed');
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('generating'); // not failed: the lease, not the turn, was lost
+    slowRenew.mockRestore();
+    const d=dispatcher(3);await d.tick();
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('pending');
+    const stop=consume(worker('w-next'));d.start();
+    try {await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='completed');}
+    finally {await d.stop();await stop();}
+    expect(provider.generate).toHaveBeenCalledTimes(2);
+  });
+  test('user cancellation and the turn timeout still end the turn (only a lost lease is left to recovery)',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:50,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate:(_m,{signal})=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}))},
+      onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'timeout',text:'안녕'});
+    await new TurnWorker({chat,leases:store,workerId:'w-t',leaseMs:5000}).handle(dispatch!);
+    expect((await chat.getTurn('owner_q',turn.id))).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
+    expect(failures).toHaveLength(1);
+  });
+  test('the dispatcher reconciles leases at most once per reconcile interval and publishes WORKER_LOST failures',async()=>{
+    const {store,delivery,events}=setup();
+    const reconcile=jest.spyOn(store,'reconcileLeases').mockResolvedValueOnce({requeued:[],failed:['t-lost'],dropped:0});
+    const d=new TurnDispatcher({leases:store,delivery,events,maxAttempts:3,graceMs:0,intervalMs:10,reconcile:{intervalMs:100,graceMs:15000}});
+    d.start();await new Promise(r=>setTimeout(r,150));await d.stop();
+    expect(reconcile.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(reconcile.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(reconcile).toHaveBeenCalledWith(3,15000);
+    expect(events.published).toContainEqual({turnId:'t-lost',state:'failed',errorCode:'WORKER_LOST'});
+  });
 });

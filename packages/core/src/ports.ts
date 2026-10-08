@@ -21,19 +21,33 @@ export interface ConversationStore {
 /** Fencing token for queued execution: a worker may only write a turn while it owns this exact lease attempt. */
 export interface LeaseFence { workerId:string; attempt:number }
 export interface QueuedTurn { turn:ChatTurn; input:SendTurnInput; fence:LeaseFence }
+/**
+ * Abort reason of a worker that no longer holds (or cannot confirm) the turn's lease. The turn is not ended: the
+ * dispatcher's recovery requeues it with the next attempt, or fails it with WORKER_LOST after the last one.
+ */
+export const LEASE_LOST='LEASE_LOST';
 /** One hand-off of a reserved turn to the delivery queue; `seq` grows with each requeue so redeliveries stay distinct. */
 export interface TurnDispatch { turnId:string; seq:number }
 /**
  * Durable side of queued execution (Postgres): the reservation outbox, per-turn leases with fencing, and recovery.
- * Delivery queues are not a source of truth; anything they lose is re-dispatched from here.
+ * Delivery queues are not a source of truth; anything they lose is re-dispatched from here. The fencing token is
+ * written only on claim and recovery; a renewal extends only the lease expiry, and a turn that ends drops its lease.
  */
 export interface TurnLeaseStore {
   /** Leases one dispatched turn to this worker only if it is pending and not held by a live lease; otherwise undefined. */
   claimTurn(turnId:string,workerId:string,leaseMs:number):Promise<QueuedTurn|undefined>;
-  /** Extends the lease while the turn is still active under this fence; false means stop (cancelled or lost). */
+  /**
+   * Extends the lease while the turn is still active under this fence and the lease has not expired yet (an expired
+   * lease may already be claimed by another worker); false means stop (cancelled, lost or expired).
+   */
   renewLease(turnId:string,fence:LeaseFence,leaseMs:number):Promise<boolean>;
   /** Active turns with expired leases go back to pending with a new dispatch, or fail with WORKER_LOST after maxAttempts. */
   recoverExpired(maxAttempts:number):Promise<{requeued:string[];failed:string[]}>;
+  /**
+   * Low-frequency repair of state the normal paths never produce: active turns (older than graceMs) whose token has
+   * no lease are requeued or failed like recoverExpired, and leases that match no active token are dropped.
+   */
+  reconcileLeases(maxAttempts:number,graceMs:number):Promise<{requeued:string[];failed:string[];dropped:number}>;
   /**
    * Outbox entries of turns still pending and never claimed, older than graceMs and not re-published within graceMs.
    * An entry lives until a worker claims the turn (or the turn ends), so a dispatch lost by the delivery queue is

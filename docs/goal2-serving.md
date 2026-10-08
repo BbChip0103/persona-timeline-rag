@@ -19,7 +19,7 @@ client ─POST /api/sessions/:id/turns──→ API ×N ── one transaction: 
 
 Every turn runs queued; there is no inline mode (`PTR_EXECUTION` is rejected at startup). Processes:
 `pnpm dev:api`, `pnpm dev:worker` (any number), `pnpm dev:dispatcher` (one or more), `pnpm dev:gateway`.
-All need `PTR_REDIS_URL` (`infra/compose.redis.yml`) and migrations through `0007_turn_outbox.sql`.
+All need `PTR_REDIS_URL` (`infra/compose.redis.yml`) and migrations through `0008_turn_leases.sql`.
 
 ## Delivery, leases and recovery
 
@@ -33,6 +33,18 @@ All need `PTR_REDIS_URL` (`infra/compose.redis.yml`) and migrations through `000
   deliveries are skipped. The claim retires the outbox entry.
 - Fencing: every state write from a worker requires `lease_owner = worker AND attempts = claimed attempt`, so a
   stale worker never overwrites a turn another worker reclaimed.
+- Lease storage (`0008_turn_leases.sql`): the fencing token (`turns.lease_owner`, `turns.attempts`) changes only on
+  claim and recovery; the expiry lives in the small `turn_leases(turn_id, owner, attempt, expires_at)` table, so
+  heartbeats never write `turns`. A lease row counts only while (owner, attempt) equals the token. The claim updates
+  the token and upserts the lease row in one statement (a concurrent loser re-checks the committed token, which
+  matches no lease row it can see); a renewal never revives an expired lease (a claim may already have taken it);
+  recovery locks expired lease rows and their turns with `SKIP LOCKED`, clears the token and deletes the row;
+  completion, failure and cancellation delete the row too. `turn_leases` holds only in-flight turns: no secondary
+  index (recovery scans it), fillfactor 70 so heartbeats are HOT updates, fixed-threshold autovacuum.
+- Lease reconciliation: every `PTR_LEASE_RECONCILE_INTERVAL_MS` (60000) the dispatcher requeues (or fails with
+  `WORKER_LOST`) active turns older than `PTR_LEASE_MS` whose token has no matching lease row, and drops lease rows
+  that match no active token. The normal paths never produce either; this covers mixed-version deploys and manual
+  fixes. It uses `SKIP LOCKED` and is safe with several dispatchers.
 - The dispatcher (`PTR_DISPATCH_INTERVAL_MS`, 1000) returns turns with an expired lease to pending with a new
   `dispatch_seq` and outbox entry, or fails them with `WORKER_LOST` after `PTR_MAX_ATTEMPTS` (3) and publishes the
   failure. It is safe to run more than one. Its outbox sweep is database-wide.
@@ -106,8 +118,9 @@ pnpm exec tsx scripts/loadtest.ts ramp --levels=4,16,64 --turns-per-session=10 \
 Virtual users stick to one API and move to the next on network errors; they POST a turn and follow it over SSE
 (`--client=poll` for comparison), honour `Retry-After`, and `--turns-per-session=N` starts a new session every N
 turns. Reports (`reports/loadtest/<run>/report.json`, private) hold per-stage throughput, e2e/accept percentiles,
-error codes, stuck/orphaned turns, database work per stage (transactions/s and per turn, WAL bytes per turn, turns
-updates vs HOT updates, dead tuples), gateway metrics, and per-second CPU/RSS per process role and DB connections.
+error codes, stuck/orphaned turns, database work per stage (transactions/s and per turn, WAL bytes per turn, updates
+vs HOT updates and dead tuples of `turns`; inserts, updates, HOT updates, deletes, writes per turn and dead tuples of
+`turn_leases`), gateway metrics, and per-second CPU/RSS per process role and DB connections.
 Single-host replicas do not demonstrate multi-host fault tolerance. Fake-model results describe the serving
 architecture, never real LLM throughput.
 
@@ -117,3 +130,10 @@ architecture, never real LLM throughput.
 - `scripts/provider-bench.ts`: same synthetic app-shaped prompt against OpenRouter (capped by `--max-usd`,
   per-request nonce so ledger caching never counts as latency) or a tunnelled self-hosted engine.
 - `scripts/summarize_engine_bench.py <run-dir>`: Markdown + `summary.json` joining results with GPU samples.
+
+## Storage integration tests
+
+`RUN_STORAGE_DB_TESTS=1 DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm exec jest packages/storage/test --runInBand`
+(add `RUN_REDIS_TESTS=1` with `PTR_REDIS_URL` for `packages/messaging`). Lease recovery, reconciliation and
+outbox sweeps are database-wide, so run them while no dispatcher or load test uses the same database. Their
+assertions only look at the tests' own synthetic turns. The migration test creates and drops its own scratch schema.

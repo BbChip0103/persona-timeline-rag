@@ -1,5 +1,5 @@
 import type { ChatService } from './chat-service';
-import type { TurnDelivery, TurnDispatch, TurnEventSource, TurnEvents, TurnLeaseStore } from './ports';
+import { LEASE_LOST, type TurnDelivery, type TurnDispatch, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from './ports';
 
 export interface TurnWorkerOptions {
   chat:ChatService; leases:TurnLeaseStore; workerId:string;
@@ -28,11 +28,12 @@ export class TurnWorker {
     if(!queued||this.dead) return 'skipped';
     const controller=new AbortController();
     // Heartbeat first, so nothing else (e.g. a slow Redis subscribe) can let the lease lapse. A single failed renewal
-    // is tolerated (transient DB trouble); a lost lease or two failures in a row abort the provider call.
+    // is tolerated (transient DB trouble); a lost lease or two failures in a row abort the provider call with
+    // LEASE_LOST, which leaves the turn to recovery (a requeue with the next attempt) instead of failing it here.
     let renewFailures=0;
     const heartbeat=setInterval(()=>{
       void this.options.leases.renewLease(queued.turn.id,queued.fence,this.options.leaseMs)
-        .then(held=>{renewFailures=0;if(!held) controller.abort();},()=>{if(++renewFailures>=2) controller.abort();});
+        .then(held=>{renewFailures=0;if(!held) controller.abort(LEASE_LOST);},()=>{if(++renewFailures>=2) controller.abort(LEASE_LOST);});
     },Math.max(5,Math.floor(this.options.leaseMs/3)));
     // Cancellation notices are an accelerator, not a dependency: never awaited.
     let unsubscribe:(()=>void)|undefined;let finished=false;
@@ -60,13 +61,16 @@ export interface TurnDispatcherOptions {
   /** Outbox entries younger than this are left to the API's own publish; also the re-publish interval per entry. */
   graceMs:number;
   intervalMs:number; batch?:number;
-  onError?:(phase:'recover'|'dispatch',error:unknown)=>void;
+  /** Lease drift repair (reconcileLeases), run at most once per intervalMs; graceMs should be at least one lease. */
+  reconcile?:{intervalMs:number;graceMs:number};
+  onError?:(phase:'recover'|'reconcile'|'dispatch',error:unknown)=>void;
 }
 
 /** Recovery loop: requeues expired leases (or fails them with WORKER_LOST) and re-publishes undelivered outbox entries. */
 export class TurnDispatcher {
   private timer?:ReturnType<typeof setInterval>;
   private running?:Promise<void>;
+  private reconciledAt=0;
   constructor(private readonly options:TurnDispatcherOptions) {}
   start():void {
     if(this.timer) return;
@@ -79,6 +83,14 @@ export class TurnDispatcher {
       const {failed}=await this.options.leases.recoverExpired(this.options.maxAttempts);
       for(const turnId of failed) await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
     } catch(error) {this.options.onError?.('recover',error);}
+    const reconcile=this.options.reconcile;
+    if(reconcile&&Date.now()-this.reconciledAt>=reconcile.intervalMs) {
+      this.reconciledAt=Date.now();
+      try {
+        const {failed}=await this.options.leases.reconcileLeases(this.options.maxAttempts,reconcile.graceMs);
+        for(const turnId of failed) await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
+      } catch(error) {this.options.onError?.('reconcile',error);}
+    }
     try {
       for(const dispatch of await this.options.leases.pendingDispatches(this.options.graceMs,this.options.batch??500))
         await this.options.delivery.publish(dispatch);

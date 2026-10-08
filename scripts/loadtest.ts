@@ -173,14 +173,26 @@ function startResourceSampler(fleet:Fleet) {
   const running=tick();
   return {rows,stop:async()=>{stopped=true;await running;await pool.end();}};
 }
-/** Database work per stage: transactions, WAL bytes, and churn on the turns table (dead tuples, HOT updates). */
+/** Database work per stage: transactions, WAL bytes, and churn on turns and turn_leases (dead tuples, HOT updates). */
 async function dbSnapshot() {
   const pool=createLocalPool(loadtestUrl());
   try {
     const db=(await pool.query("SELECT xact_commit+xact_rollback AS xacts FROM pg_stat_database WHERE datname='ptr_loadtest'")).rows[0];
-    const turns=(await pool.query("SELECT n_tup_upd AS upd, n_tup_hot_upd AS hot, n_dead_tup AS dead FROM pg_stat_user_tables WHERE relname='turns'")).rows[0];
+    const stats=(await pool.query("SELECT relname, n_tup_ins AS ins, n_tup_upd AS upd, n_tup_hot_upd AS hot, n_tup_del AS del, n_dead_tup AS dead, autovacuum_count+vacuum_count AS vacuums FROM pg_stat_user_tables WHERE relname IN ('turns','turn_leases')")).rows;
+    const turns=stats.find(row=>row.relname==='turns'), leases=stats.find(row=>row.relname==='turn_leases');
     let walLsn:string|null=null;try {walLsn=(await pool.query('SELECT pg_current_wal_lsn()::text AS lsn')).rows[0].lsn;} catch {/* not permitted */}
-    return {at:Date.now(),xacts:Number(db?.xacts??0),turnUpdates:Number(turns?.upd??0),turnHotUpdates:Number(turns?.hot??0),turnDeadTuples:Number(turns?.dead??0),walLsn};
+    // Cluster-wide, read-only: WAL composition (full-page images follow each checkpoint) and checkpoints completed.
+    let wal:{records:number;fpi:number;bytes:number}|null=null;
+    try {const row=(await pool.query('SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_wal')).rows[0];wal={records:Number(row.wal_records),fpi:Number(row.wal_fpi),bytes:Number(row.wal_bytes)};} catch {/* not available */}
+    let checkpoints:number|null=null;
+    try {
+      const view=(await pool.query("SELECT to_regclass('pg_catalog.pg_stat_checkpointer') IS NOT NULL AS pg17")).rows[0].pg17
+        ?'SELECT num_timed+num_requested AS n FROM pg_stat_checkpointer':'SELECT checkpoints_timed+checkpoints_req AS n FROM pg_stat_bgwriter';
+      checkpoints=Number((await pool.query(view)).rows[0].n);
+    } catch {/* not available */}
+    return {at:Date.now(),xacts:Number(db?.xacts??0),turnUpdates:Number(turns?.upd??0),turnHotUpdates:Number(turns?.hot??0),turnDeadTuples:Number(turns?.dead??0),turnVacuums:Number(turns?.vacuums??0),leaseVacuums:Number(leases?.vacuums??0),
+      leaseInserts:Number(leases?.ins??0),leaseUpdates:Number(leases?.upd??0),leaseHotUpdates:Number(leases?.hot??0),
+      leaseDeletes:Number(leases?.del??0),leaseDeadTuples:Number(leases?.dead??0),walLsn,wal,checkpoints};
   } finally {await pool.end();}
 }
 async function walBytes(from:string|null,to:string|null):Promise<number|null> {
@@ -265,7 +277,15 @@ async function runStage(fleet:Fleet,users:number,seconds:number) {
   return {users,seconds,...summary,wallSeconds:(Date.now()-started)/1000,
     db:{xactsPerSecond:(after.xacts-before.xacts)/((after.at-before.at)/1000),xactsPerTurn:(after.xacts-before.xacts)/completed,
       walBytesPerTurn:await walBytes(before.walLsn,after.walLsn).then(bytes=>bytes===null?null:bytes/completed),
-      turnUpdates:after.turnUpdates-before.turnUpdates,turnHotUpdates:after.turnHotUpdates-before.turnHotUpdates,turnDeadTuplesAfter:after.turnDeadTuples},
+      wal:before.wal&&after.wal?{records:after.wal.records-before.wal.records,fpi:after.wal.fpi-before.wal.fpi,bytes:after.wal.bytes-before.wal.bytes,
+        recordsPerTurn:(after.wal.records-before.wal.records)/completed,fpiPerTurn:(after.wal.fpi-before.wal.fpi)/completed}:null,
+      vacuumsDuringStage:{turns:after.turnVacuums-before.turnVacuums,turnLeases:after.leaseVacuums-before.leaseVacuums},
+      checkpointsDuringStage:before.checkpoints!==null&&after.checkpoints!==null?after.checkpoints-before.checkpoints:null,
+      turnUpdates:after.turnUpdates-before.turnUpdates,turnHotUpdates:after.turnHotUpdates-before.turnHotUpdates,turnDeadTuplesAfter:after.turnDeadTuples,
+      leaseInserts:after.leaseInserts-before.leaseInserts,leaseUpdates:after.leaseUpdates-before.leaseUpdates,
+      leaseHotUpdates:after.leaseHotUpdates-before.leaseHotUpdates,leaseDeletes:after.leaseDeletes-before.leaseDeletes,
+      leaseWritesPerTurn:(after.leaseInserts+after.leaseUpdates+after.leaseDeletes-before.leaseInserts-before.leaseUpdates-before.leaseDeletes)/completed,
+      leaseDeadTuplesAfter:after.leaseDeadTuples},
     gateway:await fleet.gatewayMetrics()};
 }
 async function activeTurns(since:Date):Promise<{state:string;n:number}[]> {

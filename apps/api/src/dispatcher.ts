@@ -14,7 +14,9 @@ async function main() {
   const runtime=createRuntime(process.env);
   const dispatcher=new TurnDispatcher({leases:runtime.leases,delivery:runtime.delivery,events:runtime.events,
     maxAttempts:integer('PTR_MAX_ATTEMPTS',3,1,10),graceMs:integer('PTR_DISPATCH_GRACE_MS',2000,0,600000),
-    intervalMs:integer('PTR_DISPATCH_INTERVAL_MS',1000,50,60000),onError:phase=>process.stderr.write(`dispatcher ${phase} error\n`)});
+    intervalMs:integer('PTR_DISPATCH_INTERVAL_MS',1000,50,60000),
+    // Lease drift repair; the grace is one worker lease (same PTR_LEASE_MS default as the worker).
+    reconcile:{intervalMs:integer('PTR_LEASE_RECONCILE_INTERVAL_MS',60000,1000,3600000),graceMs:integer('PTR_LEASE_MS',15000,300,600000)},onError:phase=>process.stderr.write(`dispatcher ${phase} error\n`)});
   dispatcher.start();
   process.stdout.write('Turn dispatcher started\n');
   const shutdown=()=>{void dispatcher.stop().then(()=>runtime.close?.()).finally(()=>process.exit(0));};
