@@ -303,3 +303,9 @@ test('the single model call of a legacy turn carries the turn id as its request 
   const turn=await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'rk',text:'안녕'});
   expect((h.provider.generate as jest.Mock).mock.calls[0][1]).toEqual(expect.objectContaining({requestKey:turn.id}));
 });
+test('model calls get the turn deadline (epoch ms), so provider retries stop with the turn',async()=>{
+  const h=harness();const session=await h.create();const before=Date.now();
+  await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'dl',text:'안녕'});
+  const {deadlineAt}=(h.provider.generate as jest.Mock).mock.calls[0][1] as {deadlineAt:number};
+  expect(deadlineAt).toBeGreaterThanOrEqual(before+1000);expect(deadlineAt).toBeLessThanOrEqual(Date.now()+1000); // harness turn timeout 1 s
+});

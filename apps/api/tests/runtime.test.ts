@@ -46,6 +46,20 @@ test('PTR_CHAT_PROVIDER=gateway sends every model call to the loopback LLM gatew
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway'})).toThrow();
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',PTR_GATEWAY_URL:'https://example.com/v1'})).toThrow();
 });
+test('gateway URLs: PTR_GATEWAY_URLS is a priority list (PTR_GATEWAY_URL a list of one); reset retries are configurable',async()=>{
+  const base={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'};
+  const optionsOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.provider as unknown as {options:{baseUrl:string[];resetRetries:number;retryMinRemainingMs:number}}).options;
+  const defaults=createRuntime(base);
+  expect(optionsOf(defaults)).toMatchObject({baseUrl:['http://127.0.0.1:56460/v1'],resetRetries:2,retryMinRemainingMs:5000});
+  await defaults.close?.();
+  const single=createRuntime({...base,PTR_GATEWAY_URL:'http://127.0.0.1:56461/v1'});
+  expect(optionsOf(single).baseUrl).toEqual(['http://127.0.0.1:56461/v1']);await single.close?.();
+  const pair=createRuntime({...base,PTR_GATEWAY_URLS:' http://127.0.0.1:56460/v1 , http://127.0.0.1:56461/v1',PTR_GATEWAY_RESET_RETRIES:'0',PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'8000'});
+  expect(optionsOf(pair)).toMatchObject({baseUrl:['http://127.0.0.1:56460/v1','http://127.0.0.1:56461/v1'],resetRetries:0,retryMinRemainingMs:8000});
+  await pair.close?.();
+  for(const extra of [{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,https://example.com/v1'},{PTR_GATEWAY_URLS:' , '},{PTR_GATEWAY_RESET_RETRIES:'-1'},{PTR_GATEWAY_RESET_RETRIES:''},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:' '},{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,http://127.0.0.1:56460/v1'},{PTR_GATEWAY_RESET_RETRIES:'11'},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'x'}])
+    expect(()=>createRuntime({...base,...extra})).toThrow();
+});
 test('PTR_INTENT_CLASSIFIER=jev is off by default, needs the live gates, and validates its knobs',async()=>{
   const classifierOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.chat as unknown as {options:{intentClassifier?:{classifier:{name:string};minConfidence:number;timeoutMs:number}}}).options.intentClassifier;
   const off=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl});

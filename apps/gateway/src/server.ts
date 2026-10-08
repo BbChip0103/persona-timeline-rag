@@ -19,11 +19,21 @@ export interface GatewayMetrics {
   queueWaitMs:{p50:number|null;p95:number|null}; upstreamMs:{p50:number|null;p95:number|null};
   /** Only when failover is configured. */
   failover?:FailoverMetrics;
+  /** Admission capacity: upstream concurrency cap + queue bound. Workers warn when Σ worker concurrency exceeds `total`. */
+  capacity:{maxConcurrent:number;maxQueue:number;total:number};
 }
 const SAMPLE=2000;
 function percentile(values:number[],p:number):number|null {
   if(!values.length) return null;const sorted=[...values].sort((a,b)=>a-b);
   return sorted[Math.min(sorted.length-1,Math.ceil(p*sorted.length)-1)]!;
+}
+/**
+ * Retry-After for a full queue: the queue drains in ceil(queued/maxConcurrent) rounds of about one mean upstream call
+ * each, clamped to 1–5 s (1 before any call has completed). Request counts only; token-aware estimates come with credits.
+ */
+export function queueFullRetryAfterSeconds(queued:number,maxConcurrent:number,meanUpstreamMs:number|null):number {
+  if(meanUpstreamMs===null) return 1;
+  return Math.min(5,Math.max(1,Math.ceil(Math.ceil(queued/maxConcurrent)*meanUpstreamMs/1000)));
 }
 const json=(res:ServerResponse,status:number,body:unknown,headers:Record<string,string>={})=>{
   res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store',...headers});res.end(JSON.stringify(body));
@@ -41,11 +51,14 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
   const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0};
   const queueWaits:number[]=[],upstreamTimes:number[]=[];
   const record=(list:number[],value:number)=>{list.push(value);if(list.length>SAMPLE)list.shift();};
+  let meanUpstreamMs:number|null=null; // EWMA of successful calls, for Retry-After
+  const {maxConcurrent,maxQueue}=options.limits;
   const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:limiter.inFlight,queued:limiter.queued,
     accepted:counters.accepted,completed:counters.completed,upstreamErrors:counters.upstreamErrors,
     rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout},
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
-    ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{})});
+    ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
+    capacity:{maxConcurrent,maxQueue,total:maxConcurrent+maxQueue}});
   const authorized=(req:IncomingMessage)=>{
     const header=req.headers.authorization??'';const supplied=header.startsWith('Bearer ')?header.slice(7):'';
     return !!supplied&&supplied.length<=512&&timingSafeEqual(expected,createHash('sha256').update(supplied).digest());
@@ -71,8 +84,10 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     try {release=await limiter.acquire(caller.signal);}
     catch(error) {
       const code=error instanceof GatewayRejection?error.code:'CANCELLED';
-      if(code==='GATEWAY_QUEUE_FULL'){counters.queueFull++;return json(res,429,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected'});}
-      if(code==='GATEWAY_QUEUE_TIMEOUT'){counters.queueTimeout++;return json(res,503,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected'});}
+      // X-PTR-Gateway-Reason tells clients why (queue_full / queue_timeout; draining later sends them to the next URL).
+      if(code==='GATEWAY_QUEUE_FULL'){counters.queueFull++;return json(res,429,{error:{code}},
+        {'Retry-After':String(queueFullRetryAfterSeconds(limiter.queued,maxConcurrent,meanUpstreamMs)),'X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_full'});}
+      if(code==='GATEWAY_QUEUE_TIMEOUT'){counters.queueTimeout++;return json(res,503,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
       return; // caller already gone
     }
     counters.accepted++;record(queueWaits,performance.now()-queuedAt);
@@ -93,6 +108,8 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       // disconnects cannot pin this slot on a 'drain' that never comes.
       else await pipeline(Readable.from(result.body),res,{signal});
       counters.completed++;
+      // Successful calls only: fast failures would shorten the estimate and hung ones lengthen it.
+      const elapsed=performance.now()-started;meanUpstreamMs=meanUpstreamMs===null?elapsed:meanUpstreamMs+0.1*(elapsed-meanUpstreamMs);
     } catch(error) {
       // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';

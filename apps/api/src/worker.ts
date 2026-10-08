@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { TurnWorker } from '@ptr/core';
 import { startTurnConsumer } from '@ptr/messaging';
-import { createRuntime } from './runtime';
+import { fetchGatewayCapacity, gatewayCapacityWarning } from '@ptr/providers';
+import { createRuntime, gatewayBaseUrls } from './runtime';
 
 /** Turn worker: consumes dispatches from Redis (BullMQ) and runs them under a Postgres lease. Run any number. */
 function integer(name:string,fallback:number,min:number,max:number):number {
@@ -15,9 +16,15 @@ async function main() {
   // Lease must outlive several heartbeats (lease/3); the dispatcher requeues turns whose lease expired.
   const worker=new TurnWorker({chat:runtime.chat,leases:runtime.leases,workerId,leaseMs:integer('PTR_LEASE_MS',15000,300,600000),
     cancellations:runtime.eventSource,onError:phase=>process.stderr.write(`worker ${phase} error\n`)});
+  const concurrency=integer('PTR_WORKER_CONCURRENCY',32,1,1024), replicas=integer('PTR_WORKER_REPLICAS_HINT',1,1,1024);
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
-    {concurrency:integer('PTR_WORKER_CONCURRENCY',32,1,1024),queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
+    {concurrency,queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
   process.stdout.write(`Turn worker ${workerId} started\n`);
+  // Advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
+  if(runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
+    const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
+    if(warning) process.stderr.write(`${warning}\n`);
+  });
   // Graceful: stop taking jobs and let in-flight turns finish; a crash instead leaves them to lease recovery.
   const shutdown=()=>{void consumer.close().then(()=>worker.stop()).then(()=>runtime.close?.()).finally(()=>process.exit(0));};
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);

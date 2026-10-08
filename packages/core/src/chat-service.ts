@@ -151,9 +151,10 @@ export class ChatService {
   private async runReserved(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {
     let timer:ReturnType<typeof setTimeout>|undefined;
     try {
-      const execution=this.execute(session,turn,value,query,controller,store);
+      const timeoutMs=this.options.timeoutMs ?? 30000, deadlineAt=Date.now()+timeoutMs;
+      const execution=this.execute(session,turn,value,query,controller,store,deadlineAt);
       const timeout=new Promise<void>((_,reject)=>{
-        timer=setTimeout(()=>{controller.abort();reject(new CoreError('TURN_FAILED'));},this.options.timeoutMs ?? 30000);
+        timer=setTimeout(()=>{controller.abort();reject(new CoreError('TURN_FAILED'));},timeoutMs);
         controller.signal.addEventListener('abort',()=>reject(new CoreError('TURN_FAILED')),{once:true});
       });
       await Promise.race([execution,timeout]);
@@ -170,7 +171,7 @@ export class ChatService {
         :error instanceof Error?error.constructor.name:'UNKNOWN'});
     } finally { if(timer) clearTimeout(timer); }
   }
-  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore):Promise<void> {
+  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {
     const history=await store.history(session.id,session.ownerId);
     if(history.length>(this.options.maxHistoryMessages ?? 100)) {
       await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT');return;
@@ -270,7 +271,7 @@ export class ChatService {
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
-        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,
+        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
         variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
@@ -281,7 +282,7 @@ export class ChatService {
           return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
         }}:{}),
       }):undefined;
-      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id});
+      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
       if(controller.signal.aborted) return;
       if(agentRun) {
         agent=agentRun.agent;memorySources=agentRun.context.sources;

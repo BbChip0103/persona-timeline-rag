@@ -26,6 +26,12 @@ function logSafetyFallback():(event:{scope:'turn'|'draft';reason:string})=>void 
     process.stderr.write(`input_safety_fallback scope=${scope} reason=${reason} count=${count}\n`);
   };
 }
+/** Gateway base URLs in priority order: `PTR_GATEWAY_URLS` (comma list), else `PTR_GATEWAY_URL` as a list of one. */
+export function gatewayBaseUrls(env:NodeJS.ProcessEnv):string[] {
+  const urls=(env.PTR_GATEWAY_URLS??env.PTR_GATEWAY_URL??'http://127.0.0.1:56460/v1').split(',').map(url=>url.trim()).filter(Boolean);
+  if(!urls.length||urls.length>8) throw new CoreError('INVALID_INPUT');
+  return urls;
+}
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
 export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void}={}):ApiRuntime {
   const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
@@ -69,9 +75,16 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_SELFHOSTED_STRUCTURED==='1'});model=`selfhosted/${selfModel}`;
   } else if(providerName==='gateway') {
     // Scale rework: workers reach every model through the LLM gateway (admission, metrics); the gateway owns the upstream.
-    const baseUrl=env.PTR_GATEWAY_URL??'http://127.0.0.1:56460/v1', token=env.PTR_GATEWAY_TOKEN??'';
+    // Several URLs = active–standby gateways: calls use the first and move on when it refuses, resets or drains.
+    const baseUrl=gatewayBaseUrls(env), token=env.PTR_GATEWAY_TOKEN??'';
     if(token.length<24) throw new CoreError('INVALID_INPUT');
-    provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1'});model='gateway';
+    // Connection resets are retried for keyed turn calls (the turn id makes the resend idempotent at the gateway).
+    // Number('') is 0: an empty or blank value is a configuration error, not "off".
+    if([env.PTR_GATEWAY_RESET_RETRIES,env.PTR_GATEWAY_RETRY_MIN_REMAINING_MS].some(value=>value!==undefined&&!value.trim())) throw new CoreError('INVALID_INPUT');
+    const resetRetries=Number(env.PTR_GATEWAY_RESET_RETRIES??2), retryMinRemainingMs=Number(env.PTR_GATEWAY_RETRY_MIN_REMAINING_MS??5000);
+    if(!Number.isInteger(resetRetries)||resetRetries<0||resetRetries>10||!Number.isInteger(retryMinRemainingMs)||retryMinRemainingMs<0||retryMinRemainingMs>60000) throw new CoreError('INVALID_INPUT');
+    provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1',
+      resetRetries,retryMinRemainingMs});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   // Optional Jev helpers, both default off; any failure falls back to the deterministic rules. With both on, one
   // Jev request per turn answers the safety questions and (when the intent gate is open) the intent question.

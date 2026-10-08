@@ -7,6 +7,7 @@
  *   pnpm exec tsx scripts/loadtest.ts seed
  *   pnpm exec tsx scripts/loadtest.ts ramp --levels=64,256,1024 --stage-seconds=45 --apis=2 --workers=4
  *   pnpm exec tsx scripts/loadtest.ts crash --target=workers|api|redis|gateway --users=32
+ *       [--standby-gateway=1 --restart=0]   # gateway: workers get two gateway URLs; only the primary is killed
  *   pnpm exec tsx scripts/loadtest.ts same-session --trials=30
  *   pnpm exec tsx scripts/loadtest.ts failover --users=32 [--primary-failure=refuse|close]   # fake primary killed mid-run, fake secondary
  *
@@ -22,7 +23,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { assertLocalDatabaseUrl, createLocalPool, PostgresPersonaRepository, PostgresSourceRepository } from '@ptr/storage';
-import { FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, parseLatencyProfile } from '@ptr/providers';
+import { FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, fetchGatewayCapacity, gatewayCapacityWarning, parseLatencyProfile } from '@ptr/providers';
 import { BullMqTurnDelivery, assertLocalRedisUrl } from '@ptr/messaging';
 import { LOADTEST_QUESTIONS, sseParser, summarizeStage, syntheticCorpus, type TurnSample } from './loadtest-lib';
 
@@ -71,6 +72,8 @@ export interface Topology {
   client:'sse'|'poll';
   /** Gateway failover to a fake secondary (with the latency profile) behind the self-hosted primary; no paid calls. */
   failover?:{breakerCooldownMs:number};
+  /** A second, identical gateway listed after the primary in PTR_GATEWAY_URLS (active–standby). */
+  standbyGateway?:boolean;
 }
 type Role='api'|'worker'|'dispatcher'|'gateway';
 interface Proc {role:Role;child:ChildProcess;port?:number}
@@ -81,13 +84,16 @@ class Fleet {
   private procs:Proc[]=[];
   readonly apiToken=randomBytes(24).toString('hex');
   readonly gatewayToken=randomBytes(24).toString('hex');
-  readonly gatewayPort:number;
+  /** Primary (port +50) first, then the optional standby (+51). */
+  readonly gatewayPorts:number[];
   constructor(private readonly basePort:number,private readonly personasFile:string,private readonly latency:string|null,
-    private readonly directory:string,readonly topology:Topology) {this.gatewayPort=basePort+50;}
+    private readonly directory:string,readonly topology:Topology) {this.gatewayPorts=topology.standbyGateway?[basePort+50,basePort+51]:[basePort+50];}
+  gatewayUrls():string[] {return this.gatewayPorts.map(port=>`http://127.0.0.1:${port}/v1`);}
   private env(extra:NodeJS.ProcessEnv={}):NodeJS.ProcessEnv {
     const t=this.topology;
     const model:NodeJS.ProcessEnv=t.gateway
-      ?{PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_URL:`http://127.0.0.1:${this.gatewayPort}/v1`,PTR_GATEWAY_TOKEN:this.gatewayToken,PTR_GATEWAY_STRUCTURED:t.structured?'1':'0'}
+      ?{PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_URLS:this.gatewayUrls().join(','),PTR_GATEWAY_TOKEN:this.gatewayToken,PTR_GATEWAY_STRUCTURED:t.structured?'1':'0',
+        PTR_WORKER_REPLICAS_HINT:String(t.workers)}
       :t.provider==='selfhosted'
         ?{PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel,PTR_SELFHOSTED_STRUCTURED:t.structured?'1':'0'}
         :{PTR_CHAT_PROVIDER:'fake',...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
@@ -106,15 +112,19 @@ class Fleet {
   pids(role:Role):number[] {return this.live(role).flatMap(p=>p.child.pid?[p.child.pid]:[]);}
   apiBases():string[] {return this.live('api').map(p=>`http://127.0.0.1:${p.port}/api`);}
   async startGateway():Promise<void> {
-    const t=this.topology;if(!t.gateway||this.live('gateway').length) return;
-    this.launch('gateway','apps/gateway/src/main.ts',{PTR_GATEWAY_PORT:String(this.gatewayPort),PTR_GATEWAY_TOKEN:this.gatewayToken,
+    const t=this.topology;if(!t.gateway) return;
+    for(const port of this.gatewayPorts) if(!this.live('gateway').some(p=>p.port===port)) await this.launchGateway(port);
+  }
+  private async launchGateway(port:number):Promise<void> {
+    const t=this.topology;
+    this.launch('gateway','apps/gateway/src/main.ts',{PTR_GATEWAY_PORT:String(port),PTR_GATEWAY_TOKEN:this.gatewayToken,
       PTR_GATEWAY_UPSTREAM:t.provider,PTR_GATEWAY_MAX_CONCURRENCY:String(t.gatewayMaxConcurrency),PTR_GATEWAY_MAX_QUEUE:String(t.gatewayMaxQueue),
       // The gateway, not the workers, owns the model and its latency profile.
       ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:this.latency?{PTR_FAKE_LATENCY:this.latency}:{}),
       // The per-minute ceiling protects a paid secondary; the fake one is lifted so the outage shape is measured.
       ...(t.failover?{PTR_GATEWAY_FAILOVER:'fake',PTR_GATEWAY_BREAKER_COOLDOWN_MS:String(t.failover.breakerCooldownMs),PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE:'100000',
-        ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})}:{})});
-    await this.waitHealthy(`http://127.0.0.1:${this.gatewayPort}/healthz`);
+        ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})}:{})},port);
+    await this.waitHealthy(`http://127.0.0.1:${port}/healthz`);
   }
   async startApis():Promise<void> {
     for(let i=0;i<this.topology.apis;i++) {
@@ -148,9 +158,19 @@ class Fleet {
     const retryAfter=Number(response.headers.get('retry-after'));
     return {status:response.status,json:await response.json().catch(()=>({})) as ApiJson,retryAfterMs:Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:null};
   }
+  /** Metrics of the first gateway that answers (the standby once the primary is gone). */
   async gatewayMetrics():Promise<unknown> {
     if(!this.topology.gateway) return null;
-    try {return await (await fetch(`http://127.0.0.1:${this.gatewayPort}/metrics`,{headers:{Authorization:`Bearer ${this.gatewayToken}`}})).json();} catch {return null;}
+    for(const port of this.gatewayPorts)
+      try {return {port,...await (await fetch(`http://127.0.0.1:${port}/metrics`,{headers:{Authorization:`Bearer ${this.gatewayToken}`}})).json() as object};} catch {/* next */}
+    return null;
+  }
+  /** The operating rule Σ worker concurrency ≤ Σ upstream caps + gateway queue, as the workers check it at startup. */
+  async capacityCheck():Promise<{capacity:unknown;workerConcurrencyTotal:number;warning:string|null}|null> {
+    if(!this.topology.gateway) return null;
+    const capacity=await fetchGatewayCapacity(this.gatewayUrls(),this.gatewayToken);const t=this.topology;
+    return {capacity,workerConcurrencyTotal:t.workerConcurrency*t.workers,
+      warning:capacity?gatewayCapacityWarning({workerConcurrency:t.workerConcurrency,replicas:t.workers,capacity}):'gateway capacity check skipped: no gateway /metrics answered'};
   }
 }
 
@@ -360,7 +380,8 @@ async function main():Promise<void> {
     gatewayMaxQueue:Number(options['gateway-queue']??4096),queueMax:Number(options['queue-max']??2048),poolMax:Number(options['pool-max']??8),
     leaseMs:Number(options['lease-ms']??5000),provider,selfhostedBaseUrl:failover?`http://127.0.0.1:${enginePort}/v1`:options['base-url']??'http://127.0.0.1:18000/v1',
     selfhostedModel:options.model??'gemma-4-e4b',structured:options.structured==='1',client:options.client==='poll'?'poll':'sse',
-    ...(failover?{failover:{breakerCooldownMs:Number(options['breaker-cooldown-ms']??5000)}}:{})};
+    ...(failover?{failover:{breakerCooldownMs:Number(options['breaker-cooldown-ms']??5000)}}:{}),
+    ...(options['standby-gateway']==='1'?{standbyGateway:true}:{})};
   const engine=failover?fakeEngine(enginePort,latency,primaryFailure):undefined;
   const fleet=new Fleet(Number(options.port??56451),seeded.file,latency,directory,topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
@@ -370,6 +391,8 @@ async function main():Promise<void> {
     await engine?.start();
     await fleet.startAll(); // inside try: a failed start still stops whatever was spawned
     sampler=startResourceSampler(fleet);
+    const capacity=await fleet.capacityCheck();
+    if(capacity) {report.capacityCheck=capacity;console.log(capacity.warning??`gateway capacity ok: worker concurrency ${capacity.workerConcurrencyTotal} <= ${JSON.stringify(capacity.capacity)}`);}
     if(mode==='ramp') {
       const levels=(options.levels??'1,4,16,64,128,256').split(',').map(Number);const seconds=Number(options['stage-seconds']??45);
       const stages=[];
@@ -387,13 +410,15 @@ async function main():Promise<void> {
       const before=await activeTurns(runStarted);
       if(target==='workers') await fleet.kill('worker','SIGKILL');
       else if(target==='api') await fleet.kill('api','SIGKILL',1); // one of N: clients move to the others
-      else if(target==='gateway') await fleet.kill('gateway','SIGKILL');
+      else if(target==='gateway') await fleet.kill('gateway','SIGKILL',topology.standbyGateway?1:Infinity); // the primary only, with a standby
       else await execFileAsync('docker',['restart','-t','0','ptr_goal2_redis']); // AOF keeps queued jobs; pub/sub notices in flight are lost
+      const restart=options.restart!=='0';
       await sleep(2000);
-      if(target==='workers') fleet.startWorkers(); else if(target==='api') await fleet.startApis(); else if(target==='gateway') await fleet.startGateway();
+      if(!restart) {/* stays down: a standby gateway must take over */}
+      else if(target==='workers') fleet.startWorkers(); else if(target==='api') await fleet.startApis(); else if(target==='gateway') await fleet.startGateway();
       const result=await stage;
       await sleep(Math.max(20_000,topology.leaseMs*3)); // past turn timeout + lease + dispatcher: anything still active now is orphaned
-      report.crash={target,users,activeAtKill:before,downtimeMs:2000,stage:result,orphanedActiveTurns:await activeTurns(runStarted)};
+      report.crash={target,users,standbyGateway:!!topology.standbyGateway,restart,activeAtKill:before,downtimeMs:restart?2000:null,stage:result,orphanedActiveTurns:await activeTurns(runStarted)};
       console.log(JSON.stringify(report.crash));
     } else if(mode==='failover' && engine) {
       // Healthy → primary killed mid-flight (stays down) → primary back. Per phase: turns, latency and the gateway's

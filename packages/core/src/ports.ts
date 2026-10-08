@@ -1,6 +1,9 @@
 import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Persona, ProviderMessage, SendTurnInput, SourcePost, TimelineQuery, TurnState } from '@ptr/contracts';
-/** `requestKey`: a stable per-turn key (the turn id) a gateway may use to scope billing idempotency; providers may ignore it. */
-export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string}):Promise<string> }
+/**
+ * `requestKey`: a stable per-turn key (the turn id) a gateway may use to scope billing idempotency; providers may ignore it.
+ * `deadlineAt`: when the turn times out (epoch ms), so a provider does not start retries the turn cannot wait for.
+ */
+export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number}):Promise<string> }
 export interface Retrieval {
   search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
   resolve?(references:EvidenceCard[],trusted:{personId:string},options:{signal:AbortSignal;evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;

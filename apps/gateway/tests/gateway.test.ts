@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { ProviderMessage } from '@ptr/contracts';
 import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider } from '@ptr/providers';
-import { createGateway, OpenAICompatibleUpstream, TextProviderUpstream, type GatewayOptions } from '../src';
+import { createGateway, OpenAICompatibleUpstream, TextProviderUpstream, queueFullRetryAfterSeconds, type GatewayOptions } from '../src';
 import { upstreamFromEnvironment } from '../src/main';
 
 const token='synthetic_gateway_token_abcdefghij';
@@ -35,6 +35,28 @@ describe('LLM gateway',()=>{
     expect((await fetch(`${base}/metrics`)).status).toBe(403);
     expect((await fetch(`${base}/metrics`,{headers:{Authorization:`Bearer ${token}`}})).status).toBe(200);
   });
+  test('/metrics reports the admission capacity (upstream caps + queue) workers check their concurrency against',async()=>{
+    const {base}=await gateway(new TextProviderUpstream({generate:async()=> 'ok'},'fake'),{maxConcurrent:3,maxQueue:5});
+    const metrics=await (await fetch(`${base}/metrics`,{headers:{Authorization:`Bearer ${token}`}})).json() as {capacity:unknown};
+    expect(metrics.capacity).toEqual({maxConcurrent:3,maxQueue:5,total:8});
+  });
+  test('the Retry-After mean counts only successful upstream calls (fast failures must not shorten it, slow ones not lengthen it)',async()=>{
+    const held=heldProvider();let fail=true;
+    const upstream=new TextProviderUpstream({generate:async(m,o)=>{if(fail){await new Promise(r=>setTimeout(r,1200));throw new Error('upstream down');}return held.provider.generate(m,o);}},'fake');
+    const {base,g}=await gateway(upstream,{maxConcurrent:1,maxQueue:1});
+    expect((await post(base,{messages,stream:false})).status).toBe(502);fail=false;
+    const first=post(base,{messages,stream:false}),second=post(base,{messages,stream:false});
+    await until(()=>held.stats().calls===1&&g.metrics().queued===1);
+    const third=await post(base,{messages,stream:false});
+    expect(third.status).toBe(429);expect(third.headers.get('retry-after')).toBe('1'); // 2 if the failed 1.2 s call counted
+    held.releaseOne();await until(()=>held.stats().calls===2);held.releaseOne();await Promise.all([first,second]);
+  });
+  test('a full queue answers Retry-After from the estimated wait, clamp(ceil(queued/cap × mean call time), 1, 5) s',()=>{
+    expect(queueFullRetryAfterSeconds(256,32,null)).toBe(1); // no completed call yet
+    expect(queueFullRetryAfterSeconds(4,2,300)).toBe(1);
+    expect(queueFullRetryAfterSeconds(8,4,1600)).toBe(4); // 2 rounds × 1.6 s = 3.2 s
+    expect(queueFullRetryAfterSeconds(256,32,1900)).toBe(5);
+  });
   test('a text-provider upstream answers in OpenAI shape, streamed or not, and the existing client reads it',async()=>{
     const seen:ProviderMessage[][]=[];
     const {base}=await gateway(new TextProviderUpstream({generate:async m=>{seen.push(m);return '반가워요.';}},'fake-model'));
@@ -60,6 +82,7 @@ describe('LLM gateway',()=>{
     await until(()=>held.stats().calls===1&&g.metrics().queued===1);
     const third=await post(base,{messages,stream:false});
     expect(third.status).toBe(429);expect(third.headers.get('retry-after')).toBe('1');expect(third.headers.get('x-ptr-gateway')).toBe('rejected');
+    expect(third.headers.get('x-ptr-gateway-reason')).toBe('queue_full');
     expect(await third.json()).toEqual({error:{code:'GATEWAY_QUEUE_FULL'}});
     expect(held.stats().calls).toBe(1);
     held.releaseOne();await until(()=>held.stats().calls===2);held.releaseOne();
@@ -71,6 +94,7 @@ describe('LLM gateway',()=>{
     const first=post(base,{messages,stream:false});await until(()=>held.stats().calls===1);
     const late=await post(base,{messages,stream:false});
     expect(late.status).toBe(503);expect(late.headers.get('x-ptr-gateway')).toBe('rejected');
+    expect(late.headers.get('x-ptr-gateway-reason')).toBe('queue_timeout');expect(late.headers.get('retry-after')).toBe('1');
     held.releaseOne();await first;
   });
   test('a client that disconnects leaves the queue, and one that disconnects mid-call aborts the upstream call and frees its slot',async()=>{

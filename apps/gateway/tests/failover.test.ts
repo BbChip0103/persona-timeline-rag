@@ -430,7 +430,7 @@ describe('failover off (default)',()=>{
     const {base,g}=await gateway(configured.upstream);
     const response=await post(base);
     expect(response.headers.get('x-ptr-upstream')).toBeNull();expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.from(sse('주 엔진')));
-    expect(Object.keys(g.metrics()).sort()).toEqual(['accepted','completed','inFlight','queueWaitMs','queued','rejected','upstream','upstreamErrors','upstreamMs']);
+    expect(Object.keys(g.metrics()).sort()).toEqual(['accepted','capacity','completed','inFlight','queueWaitMs','queued','rejected','upstream','upstreamErrors','upstreamMs']);
     const refused=await gateway(primaryAt(await closedPort()));
     const failed=await post(refused.base);
     expect(failed.status).toBe(502);expect(failed.headers.get('x-ptr-upstream')).toBeNull();expect(await failed.text()).toBe('{"error":{"code":"UPSTREAM_UNAVAILABLE"}}');

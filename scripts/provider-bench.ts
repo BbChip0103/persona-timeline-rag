@@ -48,8 +48,8 @@ async function main():Promise<void> {
       FROM ptr_provider_requests WHERE created_at >= $1`,[started])).rows[0];return microusd(row.m)/1e6;};
     provider={generate:async(m,o)=>{
       const t0=performance.now();
-      try {const text=await client.generate(m,o);metrics.push({model:'openrouter/google/gemini-3-flash-preview',ok:true,ttftMs:null,totalMs:Math.round(performance.now()-t0),promptTokens:null,completionTokens:null,level});return text;}
-      catch(error) {metrics.push({model:'openrouter',ok:false,error:error instanceof Error?error.message:'error',ttftMs:null,totalMs:Math.round(performance.now()-t0),promptTokens:null,completionTokens:null,level});throw error;}
+      try {const text=await client.generate(m,o);metrics.push({model:'openrouter/google/gemini-3-flash-preview',ok:true,ttftMs:null,totalMs:Math.round(performance.now()-t0),promptTokens:null,completionTokens:null,attempts:1,level});return text;}
+      catch(error) {metrics.push({model:'openrouter',ok:false,error:error instanceof Error?error.message:'error',ttftMs:null,totalMs:Math.round(performance.now()-t0),promptTokens:null,completionTokens:null,attempts:1,level});throw error;}
     }};
   } else if(target==='selfhosted') {
     provider=new OpenAICompatibleTextProvider({baseUrl:options['base-url']??'http://127.0.0.1:18000/v1',model:options.model??'gemma-4-e4b',

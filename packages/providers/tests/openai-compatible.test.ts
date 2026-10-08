@@ -1,4 +1,6 @@
-import { OpenAICompatibleTextProvider, ProviderError, type CallMetrics } from '../src';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { OpenAICompatibleTextProvider, ProviderError, fetchGatewayCapacity, gatewayCapacityWarning, gatewayRejectedBackoffMs, gatewayResetBackoffMs, type CallMetrics } from '../src';
 
 const signal=()=>new AbortController().signal;
 const messages=[{role:'system' as const,content:'Synthetic system'},{role:'user' as const,content:'Synthetic hello'}];
@@ -65,4 +67,215 @@ test('a per-turn request key travels as X-PTR-Request-Key (gateway ledger scopin
   await provider(fetcher).generate(messages,{signal:signal(),requestKey:'bad key\nx'});
   expect(headers(0)['X-PTR-Request-Key']).toBe('turn_0b7c-1');
   expect(headers(1)['X-PTR-Request-Key']).toBeUndefined();expect(headers(2)['X-PTR-Request-Key']).toBeUndefined();
+});
+
+// Shapes undici's fetch produces: a failed connection/request rejects with TypeError('fetch failed', {cause}),
+// a body cut mid-stream errors the reader with TypeError('terminated', {cause}).
+const transport=(code:string,message='fetch failed')=>Object.assign(new TypeError(message),{cause:Object.assign(new Error(code),{code})});
+const reset=()=>transport('ECONNRESET'), refused=()=>transport('ECONNREFUSED');
+
+describe('gateway connection resets, retries and URL rotation',()=>{
+  /** 200 SSE that delivers `chunks` and then breaks like a gateway killed mid-stream. */
+  function brokenSse(chunks:unknown[]):Response {
+    const encoder=new TextEncoder();
+    const body=new ReadableStream<Uint8Array>({start(controller) {
+      for(const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      setTimeout(()=>controller.error(transport('UND_ERR_SOCKET','terminated')),5);
+    }});
+    return new Response(body,{status:200,headers:{'Content-Type':'text/event-stream'}});
+  }
+  const marked=(status:number,reason:string,retryAfter='0')=>new Response('{}',{status,headers:{'X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':reason,'Retry-After':retryAfter}});
+  const key={requestKey:'turn_reset-1'};
+  const gatewayClient=(fetcher:jest.Mock,extra:Record<string,unknown>={})=>provider(fetcher,{resetRetries:2,random:()=>0,...extra});
+  const urlOf=(fetcher:jest.Mock,index:number)=>String((fetcher.mock.calls[index] as unknown[])[0]);
+
+  test('a reset before response headers is retried when the call carries a request key',async()=>{
+    const fetcher=jest.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(sse([delta('다시 보냄'),'[DONE]']));
+    expect(await gatewayClient(fetcher).generate(messages,{signal:signal(),...key})).toBe('다시 보냄');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  test('a reset while reading the SSE body is retried and the partial text is discarded',async()=>{
+    const metrics:CallMetrics[]=[];
+    const fetcher=jest.fn().mockResolvedValueOnce(brokenSse([delta('잘린 '),{choices:[],usage:{prompt_tokens:9,completion_tokens:1}}]))
+      .mockResolvedValueOnce(sse([delta('완성된 답'),'[DONE]']));
+    expect(await gatewayClient(fetcher,{onMetrics:(m:CallMetrics)=>metrics.push(m)}).generate(messages,{signal:signal(),...key})).toBe('완성된 답');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(metrics).toEqual([expect.objectContaining({ok:true,promptTokens:null,completionTokens:null,attempts:2})]);
+  });
+  test('resets are retried at most resetRetries times, also across two URLs that both reset',async()=>{
+    const metrics:CallMetrics[]=[];
+    const fetcher=jest.fn(async()=>{throw reset();});
+    await expect(gatewayClient(fetcher,{onMetrics:(m:CallMetrics)=>metrics.push(m)}).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(fetcher).toHaveBeenCalledTimes(3);expect(metrics[0]).toMatchObject({ok:false,error:'PROVIDER_TRANSPORT',attempts:3});
+    const both=jest.fn(async()=>{throw reset();});
+    await expect(gatewayClient(both,{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18001/v1']}).generate(messages,{signal:signal(),...key}))
+      .rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(both).toHaveBeenCalledTimes(3);expect([0,1,2].map(i=>urlOf(both,i).split('/')[2])).toEqual(['127.0.0.1:18000','127.0.0.1:18001','127.0.0.1:18000']);
+  });
+  test('only known reset codes are retried: other transport failures (bad port, unexpected redirect, no cause) are not',async()=>{
+    for(const code of ['EPIPE','ECONNABORTED','UND_ERR_SOCKET','UND_ERR_CLOSED']) {
+      const fetcher=jest.fn().mockRejectedValueOnce(transport(code)).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+      expect(await gatewayClient(fetcher).generate(messages,{signal:signal(),...key})).toBe('ok');expect(fetcher).toHaveBeenCalledTimes(2);
+    }
+    for(const error of [Object.assign(new TypeError('fetch failed'),{cause:new Error('bad port')}),Object.assign(new TypeError('fetch failed'),{cause:new Error('unexpected redirect')}),new TypeError('fetch failed')]) {
+      const fetcher=jest.fn(async()=>{throw error;});
+      await expect(gatewayClient(fetcher).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
+  });
+  test('mid-stream failures that are not resets are never retried: malformed JSON, oversized output, a TypeError without a cause',async()=>{
+    const body=(text:string)=>new Response(text,{status:200,headers:{'Content-Type':'text/event-stream'}});
+    const cases:[Response,string][]=[[body('data: {not json\n\n'),'PROVIDER_TRANSPORT'],
+      [sse([delta('x'.repeat(65537)),'[DONE]']),'INVALID_PROVIDER_RESPONSE'],
+      [new Response(new ReadableStream<Uint8Array>({start(controller){controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(delta('부분'))}\n\n`));controller.error(new TypeError('boom'));}}),{status:200}),'PROVIDER_TRANSPORT']];
+    for(const [response,code] of cases) {
+      const fetcher=jest.fn().mockResolvedValueOnce(response).mockResolvedValue(sse([delta('ok'),'[DONE]']));
+      await expect(gatewayClient(fetcher).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError(code));
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
+  });
+  test('a stream that ends without [DONE] or a finish_reason is a cut stream: retried like a reset, else PROVIDER_TRANSPORT',async()=>{
+    const early=jest.fn().mockResolvedValueOnce(sse([delta('끊긴 답')])).mockResolvedValueOnce(sse([delta('완성'),'[DONE]']));
+    expect(await gatewayClient(early).generate(messages,{signal:signal(),...key})).toBe('완성');expect(early).toHaveBeenCalledTimes(2);
+    const unkeyed=jest.fn(async()=>sse([delta('끊긴 답')]));
+    await expect(gatewayClient(unkeyed).generate(messages,{signal:signal()})).rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    const finished=jest.fn(async()=>sse([{choices:[{delta:{content:'끝'},finish_reason:'stop'}]}]));
+    expect(await gatewayClient(finished).generate(messages,{signal:signal(),...key})).toBe('끝');expect(finished).toHaveBeenCalledTimes(1);
+  });
+  test('without a request key a reset is not retried',async()=>{
+    const fetcher=jest.fn(async()=>{throw reset();});
+    await expect(gatewayClient(fetcher).generate(messages,{signal:signal()})).rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  test('reset retries are off unless configured (direct engines, benchmarks)',async()=>{
+    const fetcher=jest.fn(async()=>{throw reset();});
+    await expect(provider(fetcher).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  test('upstream HTTP errors (502/504/500/4xx, unmarked 503) and invalid responses are never retried',async()=>{
+    for(const status of [502,504,500,400,429,503]) {
+      const fetcher=jest.fn(async()=>new Response('{}',{status}));
+      await expect(gatewayClient(fetcher).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError(`PROVIDER_HTTP_${status}`));
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
+    const empty=jest.fn(async()=>sse(['[DONE]']));
+    await expect(gatewayClient(empty).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('INVALID_PROVIDER_RESPONSE'));
+    expect(empty).toHaveBeenCalledTimes(1);
+  });
+  test('no reset retry when less than retryMinRemainingMs of the call deadline is left',async()=>{
+    const fetcher=jest.fn(async()=>{await new Promise(r=>setTimeout(r,150));throw reset();});
+    await expect(gatewayClient(fetcher,{timeoutMs:1000,retryMinRemainingMs:900}).generate(messages,{signal:signal(),...key}))
+      .rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  test('the turn deadline bounds reset retries too: a reset late in a 30 s turn is not retried',async()=>{
+    const late=jest.fn(async()=>{throw reset();});
+    await expect(gatewayClient(late,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+4000}))
+      .rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(late).toHaveBeenCalledTimes(1);
+    const early=jest.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    expect(await gatewayClient(early,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+20000})).toBe('ok');
+  });
+  test('our own timeout ends the call without a retry',async()=>{
+    const fetcher=jest.fn((_url:string,init:RequestInit)=>new Promise<Response>((_resolve,reject)=>
+      init.signal!.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'})),{once:true})));
+    await expect(gatewayClient(fetcher,{timeoutMs:100,retryMinRemainingMs:0}).generate(messages,{signal:signal(),...key}))
+      .rejects.toEqual(new ProviderError('PROVIDER_TIMEOUT'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  test('a LEASE_LOST abort during the reset backoff stops at once',async()=>{
+    const controller=new AbortController();
+    const fetcher=jest.fn(async()=>{setTimeout(()=>controller.abort('LEASE_LOST'),10);throw reset();});
+    await expect(gatewayClient(fetcher,{random:()=>0.999}).generate(messages,{signal:controller.signal,...key})).rejects.toEqual(new ProviderError('CANCELLED'));
+    expect(fetcher).toHaveBeenCalledTimes(1); // the backoff ended at the abort: no second attempt
+  });
+  test('a LEASE_LOST abort while the request is in flight is not retried',async()=>{
+    const controller=new AbortController();
+    const fetcher=jest.fn(async()=>{controller.abort('LEASE_LOST');throw reset();});
+    await expect(gatewayClient(fetcher).generate(messages,{signal:controller.signal,...key})).rejects.toEqual(new ProviderError('CANCELLED'));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  test('URL list: refused moves to the next gateway at once; later calls start again at the first',async()=>{
+    const fetcher=jest.fn(async(url:string)=>{if(url.startsWith('http://127.0.0.1:18000'))throw refused();return sse([delta('대기 gateway'),'[DONE]']);});
+    const client=gatewayClient(fetcher,{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18001/v1']});
+    expect(await client.generate(messages,{signal:signal()})).toBe('대기 gateway');
+    expect([urlOf(fetcher,0),urlOf(fetcher,1)]).toEqual(['http://127.0.0.1:18000/v1/chat/completions','http://127.0.0.1:18001/v1/chat/completions']);
+    await client.generate(messages,{signal:signal()});
+    expect(urlOf(fetcher,2)).toBe('http://127.0.0.1:18000/v1/chat/completions');
+  });
+  test('URL list: a draining rejection and a reset move to the next gateway; queue_full stays on the same one',async()=>{
+    const urls=['http://127.0.0.1:18000/v1','http://127.0.0.1:18001/v1'];
+    const draining=jest.fn().mockResolvedValueOnce(marked(503,'draining','1')).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    const started=Date.now();
+    await gatewayClient(draining,{baseUrl:urls,random:()=>0.999}).generate(messages,{signal:signal(),...key});
+    expect(urlOf(draining,1)).toContain(':18001/');expect(Date.now()-started).toBeLessThan(1000); // no Retry-After wait (≥ 1.5 s here) before the standby
+    const resetting=jest.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    await gatewayClient(resetting,{baseUrl:urls}).generate(messages,{signal:signal(),...key});
+    expect(urlOf(resetting,1)).toContain(':18001/');
+    const full=jest.fn().mockResolvedValueOnce(marked(429,'queue_full')).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    await gatewayClient(full,{baseUrl:urls}).generate(messages,{signal:signal(),...key});
+    expect(urlOf(full,1)).toContain(':18000/');
+  });
+  test('every gateway URL must be loopback',()=>{
+    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://10.0.0.5:18001/v1']})).toThrow();
+    expect(()=>provider(jest.fn(),{baseUrl:[]})).toThrow();
+    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18000/v1/']})).toThrow();
+  });
+});
+
+describe('retry backoff jitter',()=>{
+  test('reset backoff is full jitter U(0, min(2000, 200·2^k)) ms',()=>{
+    expect(gatewayResetBackoffMs(0,()=>0)).toBe(0);
+    expect(gatewayResetBackoffMs(0,()=>0.5)).toBe(100);
+    expect(gatewayResetBackoffMs(1,()=>0.999)).toBeCloseTo(399.6);
+    expect(gatewayResetBackoffMs(10,()=>0.999)).toBeCloseTo(1998);
+  });
+  test('marked rejections wait min(Retry-After, 5 s) × U(0.5, 1.5) (250 ms base without a usable header)',()=>{
+    expect(gatewayRejectedBackoffMs('1',()=>0)).toBe(500);
+    expect(gatewayRejectedBackoffMs('1',()=>0.999)).toBeCloseTo(1499);
+    expect(gatewayRejectedBackoffMs('4',()=>0.999)).toBeCloseTo(5996);
+    expect(gatewayRejectedBackoffMs('30',()=>0)).toBe(2500);expect(gatewayRejectedBackoffMs('30',()=>0.999)).toBeCloseTo(7495); // spread, not bunched at the cap
+    expect(gatewayRejectedBackoffMs('0',()=>0.7)).toBe(0);
+    expect(gatewayRejectedBackoffMs(null,()=>0)).toBe(125);expect(gatewayRejectedBackoffMs('soon',()=>0.5)).toBe(250);
+  });
+});
+
+describe('real sockets (undici error shapes)',()=>{
+  const servers:Server[]=[];
+  afterEach(async()=>{await Promise.all(servers.splice(0).map(server=>new Promise(resolve=>{server.closeAllConnections();server.close(resolve);})));});
+  async function serve(handler:(call:number,req:IncomingMessage,res:ServerResponse)=>void):Promise<string> {
+    let calls=0;const server=createServer((req,res)=>{req.resume();req.on('end',()=>handler(++calls,req,res));});servers.push(server);
+    await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));return `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  }
+  const ok=(res:ServerResponse,text:string)=>{res.writeHead(200,{'Content-Type':'text/event-stream'});res.end(`data: ${JSON.stringify(delta(text))}\n\ndata: [DONE]\n\n`);};
+  test('a socket destroyed before headers, then one destroyed mid-stream, are both retried',async()=>{
+    const base=await serve((call,_req,res)=>{
+      if(call===1) return void res.socket!.destroy();
+      if(call===2){res.writeHead(200,{'Content-Type':'text/event-stream'});res.write(`data: ${JSON.stringify(delta('버려질 앞부분'))}\n\n`);setTimeout(()=>res.socket!.destroy(),20);return;}
+      ok(res,'세 번째에 완성');
+    });
+    const client=new OpenAICompatibleTextProvider({baseUrl:base,model:'gateway',resetRetries:2,random:()=>0});
+    expect(await client.generate(messages,{signal:signal(),requestKey:'turn_real-1'})).toBe('세 번째에 완성');
+  });
+});
+
+describe('gateway capacity rule',()=>{
+  test('warns only when Σ worker concurrency exceeds Σ upstream caps + gateway queue',()=>{
+    const capacity={maxConcurrent:32,maxQueue:256,total:288};
+    expect(gatewayCapacityWarning({workerConcurrency:32,replicas:9,capacity})).toBeNull();
+    expect(gatewayCapacityWarning({workerConcurrency:32,replicas:10,capacity})).toBe(
+      'WARNING gateway capacity: worker concurrency 32 x replicas 10 = 320 > gateway capacity 288 (upstream caps 32 + queue 256); calls above it are refused with 429 and wait in client retries until the turn deadline instead of in BullMQ');
+  });
+  test('reads the capacity from the first gateway that answers /metrics, never throws',async()=>{
+    const fetcher=jest.fn(async(url:string)=>{
+      if(url.startsWith('http://127.0.0.1:18000'))throw refused();
+      return new Response(JSON.stringify({capacity:{maxConcurrent:4,maxQueue:8,total:12}}),{status:200});
+    });
+    expect(await fetchGatewayCapacity(['http://127.0.0.1:18000/v1','http://127.0.0.1:18001/v1'],'t'.repeat(24),fetcher as typeof fetch))
+      .toEqual({maxConcurrent:4,maxQueue:8,total:12});
+    expect(String((fetcher.mock.calls[1] as unknown[])[0])).toBe('http://127.0.0.1:18001/metrics');
+    expect(await fetchGatewayCapacity(['http://127.0.0.1:18000/v1'],'t'.repeat(24),fetcher as typeof fetch)).toBeNull();
+    const old=jest.fn(async()=>new Response('{"inFlight":0}',{status:200}));
+    expect(await fetchGatewayCapacity(['http://127.0.0.1:18001/v1'],'t'.repeat(24),old as unknown as typeof fetch)).toBeNull();
+  });
 });

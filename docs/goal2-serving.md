@@ -77,10 +77,78 @@ falls back to one status read before reconnecting; it never resubmits.
 (below, default off); there is no other fallback between upstreams. It runs at
 most `PTR_GATEWAY_MAX_CONCURRENCY` (32) upstream calls, queues up to `PTR_GATEWAY_MAX_QUEUE` (256) FIFO for
 `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (10000), and rejects the rest before anything reaches the upstream: 429
-`GATEWAY_QUEUE_FULL` / 503 `GATEWAY_QUEUE_TIMEOUT`, both with `Retry-After` and `X-PTR-Gateway: rejected`. A
-caller's disconnect leaves the queue or aborts the upstream call. Upstream errors become 502 without that marker.
-Workers use `PTR_CHAT_PROVIDER=gateway` (`PTR_GATEWAY_URL`, default `http://127.0.0.1:56460/v1`,
-`PTR_GATEWAY_TOKEN`, `PTR_GATEWAY_STRUCTURED=1` for guided decoding); the client retries only marked rejections.
+`GATEWAY_QUEUE_FULL` / 503 `GATEWAY_QUEUE_TIMEOUT`, both with `Retry-After`, `X-PTR-Gateway: rejected` and
+`X-PTR-Gateway-Reason: queue_full` / `queue_timeout`. A full queue's `Retry-After` is the estimated wait,
+`clamp(ceil(ceil(queued / PTR_GATEWAY_MAX_CONCURRENCY) × mean upstream call time), 1, 5)` seconds (mean = EWMA of
+successful calls only, 1 before the first); a queue timeout answers 1. `/metrics` also reports
+`capacity: {maxConcurrent, maxQueue, total}` (total = upstream cap + queue). A caller's disconnect leaves the queue or
+aborts the upstream call. Upstream errors become 502 without that marker.
+Workers use `PTR_CHAT_PROVIDER=gateway` (`PTR_GATEWAY_TOKEN`, `PTR_GATEWAY_STRUCTURED=1` for guided decoding) and the
+client below.
+
+### Worker gateway client: retries, gateway URLs, capacity rule
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_URLS` | — | comma list of loopback gateway base URLs, in priority order (active first, then standby) |
+| `PTR_GATEWAY_URL` | `http://127.0.0.1:56460/v1` | used when `PTR_GATEWAY_URLS` is unset, as a list of one |
+| `PTR_GATEWAY_RESET_RETRIES` | 2 (0–10; empty is an error) | connection resets retried per call, across all URLs (0 = the old behaviour) |
+| `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` | 5000 (0–60000; empty is an error) | a reset is retried only while this much time is left before the earlier of the provider deadline (60 s) and the turn deadline (30 s, so effectively the turn's) |
+| `PTR_WORKER_REPLICAS_HINT` | 1 (1–1024) | how many workers run with this concurrency; used only for the startup capacity warning |
+
+Retry rules (one `generate()` call, all inside the call deadline, the turn deadline and the caller's signal). The turn
+times out after 30 s (`ChatService` `timeoutMs`) and passes that deadline to every model call as `deadlineAt`; the
+provider's own 60 s timeout only matters for callers without a turn. Duplicate URLs are rejected at startup.
+
+| Failure | Retried? | Next URL? | Wait |
+| --- | --- | --- | --- |
+| connection refused (`ECONNREFUSED`): nothing was sent | yes, until the deadline | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
+| 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, until the deadline | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
+| the same, reason `draining` (sent by drain, a later stage) | yes | yes | none before an untried URL, else as above |
+| reset or close before the response headers, or a failed connect: a fetch `TypeError` whose cause code is `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET` ("other side closed"), `UND_ERR_CLOSED`, `UND_ERR_CONNECT_TIMEOUT`, `EHOSTUNREACH` or `ENETUNREACH` | only with a request key, at most `PTR_GATEWAY_RESET_RETRIES` in total, only with ≥ `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` left | yes | full jitter `U(0, min(2000, 200·2^k))` ms |
+| reset while reading the SSE body after a 200 (same codes), or a stream that ends cleanly without `[DONE]` or a `finish_reason` | as above; the partial text and its usage are discarded (only a complete answer is returned) | yes | as above |
+| any other HTTP status (502/504/500/4xx, an unmarked 503), our own abort or timeout, `INVALID_PROVIDER_RESPONSE` (empty or > 65536 chars), malformed SSE JSON, any other transport error (bad port, unexpected redirect, a `TypeError` without a known code) | never | — | — |
+
+- A lost lease aborts the turn's signal (`LEASE_LOST`): an in-flight request or a backoff stops at once. The lease
+  heartbeat keeps running during retries, and the dispatcher's turn retries are unchanged.
+- Why a reset may be resent: turn calls always carry the turn id as `X-PTR-Request-Key`. A request still queued in the
+  gateway never reached a model. A self-hosted generation cut by the reset is regenerated (no per-request bill). For the
+  OpenRouter secondary, the ledger replays a settled answer for the same body and key, and refuses an unresolved one
+  (`REQUEST_UNRESOLVED_NO_RESUBMIT`), so a turn is billed at most once.
+- `CallMetrics.attempts` counts the HTTP requests of one call (1 + retries).
+- `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` (60000) must stay above the turn timeout (30 s). A gateway timeout after the
+  response headers cuts the stream, which the client would treat as a reset; above the turn timeout the turn has
+  always ended first.
+- Reset retries are off (`resetRetries` 0) in the provider class itself; only the gateway runtime turns them on, so
+  direct engines (`PTR_CHAT_PROVIDER=selfhosted`) and the benchmarks keep failing fast.
+- Gateway URLs: every call starts at the first URL and moves on as in the table; there is no sticky failover state.
+  All URLs must be loopback, so a standby gateway is another port on the same host (it covers a process crash or a
+  deploy, not a host failure). These URL lists and the startup warning are transitional: the design is moving to a
+  stable gateway address with a Redis registry of GPU servers (38 §13).
+- Every gateway in `PTR_GATEWAY_URLS` must use the **same Postgres ledger database** (`GOAL1_DATABASE_URL`) when a
+  billable secondary (`PTR_GATEWAY_FAILOVER=openrouter`) is on. A reset retry that lands on another gateway is safe
+  only because both see the same ledger entry for the turn key; with separate ledgers the second gateway could pay for
+  the same turn again.
+- `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` is counted per gateway process, so during an active–standby switchover up to
+  twice the cap can reach the secondary.
+
+Capacity rule: **Σ worker concurrency ≤ Σ upstream caps + gateway max queue**
+(`PTR_WORKER_CONCURRENCY × replicas ≤ PTR_GATEWAY_MAX_CONCURRENCY + PTR_GATEWAY_MAX_QUEUE` today, one upstream).
+A turn makes one model call at a time, so this bounds what can reach the gateway at once. Within the rule, count
+rejections (429) do not happen in steady state, waits end only by the queue timeout (503), and further turns wait in
+BullMQ, which is durable. At startup a gateway worker reads `capacity` from the first gateway whose `/metrics` answers
+and writes one stderr line if `PTR_WORKER_CONCURRENCY × PTR_WORKER_REPLICAS_HINT` exceeds it (a warning, never a
+startup failure; `gateway capacity check skipped` when no gateway answers). Breaking the rule does not fail turns
+outright: the excess calls get 429 and wait in jittered client retries until the turn deadline, instead of waiting in
+BullMQ. Example: gateway defaults 32 + 256 = 288;
+4 workers × 32 = 128 is fine, 4 × 128 = 512 warns:
+`WARNING gateway capacity: worker concurrency 128 x replicas 4 = 512 > gateway capacity 288 (upstream caps 32 + queue 256); calls above it are refused with 429 and wait in client retries ...`.
+The load harness prints the same check (`report.capacityCheck`). Its fake-model defaults (gateway 1024 + 4096) are
+sized so the gateway is never the bottleneck. The S9 setting of 4 workers × 512 broke the rule; it measured fake
+throughput only.
+
+Upcoming upstream pools (design stage S3) replace the single cap with per-upstream caps `S_u`; the default will be
+`S_u = 12` concurrent sequences per upstream, and the rule becomes Σ worker concurrency ≤ Σ_u S_u + max queue.
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -212,12 +280,18 @@ that queue at the end.
 ```sh
 pnpm exec tsx scripts/loadtest.ts ramp --levels=64,256,1024 --stage-seconds=45 --apis=2 --workers=4 --worker-concurrency=512
 pnpm exec tsx scripts/loadtest.ts crash --target=workers|api|redis|gateway --users=32 --apis=2
+pnpm exec tsx scripts/loadtest.ts crash --target=gateway --users=16 --apis=2 --standby-gateway=1 --restart=0
 pnpm exec tsx scripts/loadtest.ts same-session --trials=30 --apis=2
 pnpm exec tsx scripts/loadtest.ts failover --users=32 --apis=2 [--primary-failure=refuse|close] [--breaker-cooldown-ms=5000]
 pnpm exec tsx scripts/loadtest.ts ramp --levels=1000 --think-ms=4000 --client=poll --poll-ms=100   # polling comparison
 pnpm exec tsx scripts/loadtest.ts ramp --levels=4,16,64 --turns-per-session=10 \
   --provider=selfhosted --base-url=http://127.0.0.1:18000/v1 --model=gemma-4-e4b-fp8 --structured=1
 ```
+
+`crash` kills the target 10 s into a 30 s stage and restarts it 2 s later (`--restart=0` leaves workers, an API or the
+gateway down; `--target=redis` is a `docker restart` in place and ignores it). With
+`--standby-gateway=1` a second gateway runs on port +51, workers get both URLs in `PTR_GATEWAY_URLS`, and a gateway
+crash kills only the primary.
 
 `failover` serves the self-hosted primary from an in-process fake engine (port +60, same latency profile) with
 `PTR_GATEWAY_FAILOVER=fake`. It runs 15 s healthy; then the engine is killed 3 s into a 20 s stage and stays down
