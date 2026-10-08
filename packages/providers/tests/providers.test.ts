@@ -111,6 +111,11 @@ describe('live adapter with fake network only',()=>{
       await expect(client(fetcher).generate(messages,{signal:signal()})).rejects.toThrow('PRICING_CHANGED_OR_UNKNOWN_FEE');expect(posts(fetcher)).toHaveLength(0);
     }
   });
+  test('a failed catalog check is not cached forever',async()=>{
+    const fetcher=fakeFetch();fetcher.mockImplementationOnce(async()=>reply({error:'synthetic outage'},503));const provider=client(fetcher);
+    await expect(provider.generate(messages,{signal:signal()})).rejects.toThrow('PROVIDER_HTTP_503');expect(posts(fetcher)).toHaveLength(0);
+    expect(await provider.generate(messages,{signal:signal()})).toBe('synthetic answer');
+  });
   test('catalog optional events are disabled and unknown message features rejected',async()=>{
     const fetcher=fakeFetch();
     fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemini-3-flash-preview',pricing:{prompt:'0.0000005',completion:'0.000003',image:'0.0000005',audio:'0.000001',input_audio_cache:'0.0000001',web_search:'0.014',internal_reasoning:'0.000003',input_cache_read:'0.00000005',input_cache_write:'0.0000000833333333333333'}}]}));
@@ -139,6 +144,36 @@ describe('live adapter with fake network only',()=>{
     // Same input reserves ~5x more under the default model's higher prices.
     const defaultLedger=new MemoryLedger();await client(fakeFetch(),defaultLedger).generate(messages,{signal:signal()});
     expect([...defaultLedger.requests.values()][0]!.reservedMicrousd).toBeGreaterThan(4*[...ledger.requests.values()][0]!.reservedMicrousd);
+  });
+  test('explicit gemma-4-26b-a4b-it uses its catalog price ceiling, structured replies and disabled reasoning',async()=>{
+    const fetcher=fakeFetch();
+    fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemma-4-26b-a4b-it',pricing:{prompt:'0.00000009',completion:'0.0000003',input_cache_read:'0.00000005'}}]}));
+    await client(fetcher,new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it'}).generate([{role:'system',content:'TIMELINE_JSON_REPLY'},...messages],{signal:signal()});
+    const body=JSON.parse(String(posts(fetcher)[0]![1]!.body));
+    expect(body.model).toBe('google/gemma-4-26b-a4b-it');expect(body.reasoning).toEqual({enabled:false});expect(body.response_format).toEqual({type:'json_object'});
+    expect(body.provider).toEqual({require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,max_price:{prompt:0.09,completion:0.3,request:0}});
+    // The free variant is never allowlisted.
+    expect(()=>client(fakeFetch(),new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it:free'})).toThrow('MODEL_NOT_ALLOWED');
+    const raised=fakeFetch();raised.mockImplementationOnce(async()=>reply({data:[{id:'google/gemma-4-26b-a4b-it',pricing:{prompt:'0.00000015',completion:'0.0000006'}}]}));
+    await expect(client(raised,new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it'}).generate(messages,{signal:signal()})).rejects.toThrow('PRICING_CHANGED_OR_UNKNOWN_FEE');
+  });
+  test('gemma agent replies are schema-constrained when the catalog advertises structured outputs; others keep json_object',async()=>{
+    const {AGENT_RESPONSE_JSON_SCHEMA}=await import('@ptr/core');
+    const gemma=(supported?:string[])=>{const fetcher=fakeFetch();
+      fetcher.mockImplementationOnce(async()=>reply({data:[{id:'google/gemma-4-26b-a4b-it',pricing:{prompt:'0.00000009',completion:'0.0000003'},...(supported?{supported_parameters:supported}:{})}]}));return fetcher;};
+    const agent=[{role:'system' as const,content:'AGENT_JSON_REPLY (TIMELINE_JSON_REPLY transport)'},...messages];
+    const sent=async(fetcher:ReturnType<typeof fakeFetch>,input=agent,textModel='google/gemma-4-26b-a4b-it')=>{
+      await client(fetcher,new MemoryLedger(),{textModel}).generate(input,{signal:signal()});return JSON.parse(String(posts(fetcher)[0]![1]!.body));};
+    const structured=await sent(gemma(['response_format','structured_outputs']));
+    expect(structured.response_format).toEqual({type:'json_schema',json_schema:{name:'agent_reply',strict:true,schema:AGENT_RESPONSE_JSON_SCHEMA}});
+    // Routes that cannot honour the schema are excluded rather than silently used.
+    expect(structured.provider.require_parameters).toBe(true);
+    expect((await sent(gemma(['response_format']))).response_format).toEqual({type:'json_object'});
+    // The legacy timeline reply has no JSON schema: json_object stays.
+    expect((await sent(gemma(['response_format','structured_outputs']),[{role:'system',content:'TIMELINE_JSON_REPLY'},...messages])).response_format).toEqual({type:'json_object'});
+    // Models not opted in keep json_object even when the catalog advertises structured outputs.
+    const flash=fakeFetch();flash.mockImplementationOnce(async()=>reply({data:[{...textCatalog[0],supported_parameters:['response_format','structured_outputs']}]}));
+    expect((await sent(flash,agent,'google/gemini-3-flash-preview')).response_format).toEqual({type:'json_object'});
   });
   test('input/output caps and unapproved models reject locally',async()=>{
     const fetcher=fakeFetch();expect(()=>client(fetcher,new MemoryLedger(),{maxOutputTokens:2048})).toThrow('INVALID_LIMIT');

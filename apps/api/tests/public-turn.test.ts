@@ -5,3 +5,9 @@ test('public turn explicit allowlist excludes unknown runtime fields, state, sou
   const raw=JSON.stringify(publicTurn({...turn,rawProvider:'private-raw'} as ChatTurn));
   expect(raw).toContain('안녕!');for(const value of ['private-owner','private-topic','private-summary','private-tool-query','private-raw','sourceContext','retrievalContext'])expect(raw).not.toContain(value);
 });
+test('intent routing trace stays internal',()=>{
+  const turn:ChatTurn={id:'turn',sessionId:'session',ownerId:'owner',clientRequestId:'req',userText:'안녕',sequence:1,state:'completed',createdAt:'2024-01-01T00:00:00Z',reply:{sessionId:'session',turnId:'turn',messageId:'message',personId:'person',personaRevision:'v1',responseKind:'timeline',status:'answered',content:'안녕!',claims:[],evidence:[],limitations:[],
+    intentRouting:{decidedBy:'classifier',classifier:'typesafe/jev-1.13',ruleIntent:'small_talk',label:'timeline',confidence:0.9}}};
+  const raw=JSON.stringify(publicTurn(turn));
+  for(const value of ['intentRouting','typesafe','classifier'])expect(raw).not.toContain(value);
+});

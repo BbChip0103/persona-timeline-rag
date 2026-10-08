@@ -3,8 +3,9 @@ import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema
 import { CoreError, LEASE_LOST, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
-import { isPostMemoryRequest, rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
-import { containsCredentialPattern, containsUngroundedBiography, isBiographicalRequest } from './safety';
+import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
+import { containsCredentialPattern, containsUngroundedBiography } from './safety';
+import { intentSignals, isSensitive, routeIntent, ruleIntent, type IntentClassifierOptions } from './intent-routing';
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
@@ -16,7 +17,9 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
   /** State-change notices for push delivery (SSE); never carries model output. */
   events?:TurnEvents;
   /** Observability hook: failed turns with a sanitized error class/code only (never messages or bodies). */
-  onTurnFailure?:(failure:{turnId:string;code:string})=>void}
+  onTurnFailure?:(failure:{turnId:string;code:string})=>void;
+  /** Optional ambiguity-only intent classifier (off by default); rules stay authoritative for safety and strong signals. */
+  intentClassifier?:IntentClassifierOptions}
 /** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
 const DEPTH_READING_TTL_MS=200;
 const activeStates=['pending','retrieving','generating','validating'] as const;
@@ -160,13 +163,16 @@ export class ChatService {
       &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
       &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
     const boundPrevious=context.followUp?ownedPrevious:undefined;
-    const sensitive=/phone number|home address|private address|real.time location|rumou?r|secret relationship|연락처|전화번호|집 주소|주거지|실시간 위치|사생활|루머|미성년/i.test(value.text);
-    const inferred=context.creative ? 'small_talk' : isBiographicalRequest(value.text) || /\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i.test(context.followUp?context.query:value.text) ? 'timeline' : 'small_talk';
-    // Conservative explicit clarification/unsupported routes never answer or retrieve.
-    // Explicit small_talk still cannot downgrade an obviously factual request.
-    const intent=sensitive || value.intent==='unsupported' ? 'unsupported'
-      : value.intent==='clarification' ? 'clarification'
-      : value.timeline || inferred==='timeline' || !context.creative && (isPostMemoryRequest(value.text) || context.followUp && boundPrevious?.responseKind==='timeline') || !context.creative && session.ragCondition && /image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i.test(value.text) ? 'timeline' : value.intent ?? inferred;
+    const signals=intentSignals({text:value.text,context,...(value.intent?{explicitIntent:value.intent}:{}),explicitTimeline:!!value.timeline,
+      ...(session.ragCondition?{ragCondition:session.ragCondition}:{}),previousTimeline:boundPrevious?.responseKind==='timeline'});
+    // Only the current text and the last two non-sensitive user turns may reach a classifier: no persona, posts, replies or IDs.
+    const recentUserTurns=history.filter(message=>message.role==='user'&&message.turnId!==null&&!containsCredentialPattern(message.content)&&!isSensitive(message.content)).slice(-2).map(message=>[...message.content].slice(0,300).join(''));
+    // Retrieval-off control sessions keep the pure rule routing (no classifier call) so experiment arms stay
+    // unchanged; with a classifier configured, the internal trace still records that the rule decided.
+    const control=session.retrievalMode==='off'&&!session.ragCondition;
+    const {intent,routing}=control&&this.options.intentClassifier?{intent:ruleIntent(signals),routing:{decidedBy:'rule' as const,ruleIntent:ruleIntent(signals)}}
+      :await routeIntent(signals,{text:[...value.text].slice(0,500).join(''),recentUserTurns,seed:turn.id},control?undefined:this.options.intentClassifier,controller.signal);
+    if(controller.signal.aborted) return;
     let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
     let sources:SourcePost[]=[];
     let memorySources:SourcePost[]=[];
@@ -264,7 +270,7 @@ export class ChatService {
     if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
   }
 }

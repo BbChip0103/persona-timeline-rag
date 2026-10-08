@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { TextProvider } from '@ptr/core';
+import { AGENT_RESPONSE_JSON_SCHEMA, type TextProvider } from '@ptr/core';
 import type { ProviderMessage } from '@ptr/contracts';
 import { assertLocalDatabaseUrl } from '@ptr/storage';
 import { ProviderError, type BudgetLedger } from './budget';
@@ -22,17 +22,37 @@ function reportedCostMicrousd(result:Json):number|null {
 }
 // Price ceilings in USD per million tokens (OpenRouter max_price unit) and per-model reasoning.
 // Gemini 3 Flash cannot disable reasoning, only minimize it.
-const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json}>={
+/**
+ * `agentSchema`: constrain agent replies with the shared AGENT_RESPONSE_JSON_SCHEMA (strict json_schema) when the
+ * catalog advertises structured outputs. Opt-in per model: strict modes differ by vendor (OpenAI strict rejects
+ * optional properties), so models that were not verified keep json_object.
+ */
+const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json;agentSchema?:boolean}>={
   [DEFAULT_TEXT_MODEL]:{prompt:0.5,completion:3,reasoning:{effort:'minimal'}},
   'google/gemini-2.5-flash-lite':{prompt:0.1,completion:0.4,reasoning:{enabled:false}},
   'openai/gpt-4.1-nano':{prompt:0.1,completion:0.4},
+  // Catalog price (2026-10-08); optional reasoning stays off. The `:free` variant is never allowed.
+  'google/gemma-4-26b-a4b-it':{prompt:0.09,completion:0.3,reasoning:{enabled:false},agentSchema:true},
 };
+/** Decision models (Decisions API): input-only pricing ceiling in USD per million tokens; output tokens are free. Pinned ids only. */
+const DECISION_MODELS:Record<string,{prompt:number}>={'typesafe/jev-1.13':{prompt:0.05}};
+export const DECISION_MODEL_IDS=Object.keys(DECISION_MODELS);
+const DECISIONS_URL='https://openrouter.ai/api/alpha/decisions';
 const SCHEMA_REVISION='goal1-provider-v1';
 type Fetch=typeof fetch;
 type Json=Record<string,unknown>;
 function object(value:unknown):Json { if (!value||typeof value!=='object'||Array.isArray(value)) throw new ProviderError('INVALID_PROVIDER_RESPONSE'); return value as Json; }
 function hash(value:unknown):string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 function aborted(signal:AbortSignal):void { if (signal.aborted) throw new ProviderError('CANCELLED'); }
+/** Waits for shared work (cached checks) without tying that work to one caller's signal. */
+function untilAborted<T>(work:Promise<T>,signal:AbortSignal):Promise<T> {
+  aborted(signal);
+  return new Promise<T>((resolve,reject)=>{
+    const stop=()=>reject(new ProviderError('CANCELLED'));
+    signal.addEventListener('abort',stop,{once:true});
+    work.then(resolve,reject).finally(()=>signal.removeEventListener('abort',stop));
+  });
+}
 export interface OpenRouterOptions {
   apiKey:string; liveEnabled:boolean; allowExternalData:boolean; databaseUrl:string; ledger:BudgetLedger;
   textModel?:string; maxOutputTokens?:number; maxInputBytes?:number; timeoutMs?:number; fetch?:Fetch;
@@ -49,6 +69,9 @@ export class OpenRouterClient {
   private readonly inputBytes:number;
   private readonly timeoutMs:number;
   private priceCheck:Promise<void>|undefined;
+  /** From the verified catalog entry of the chat model. */
+  private structuredOutputs=false;
+  private readonly decisionPriceChecks=new Map<string,Promise<void>>();
   constructor(private readonly options:OpenRouterOptions) {
     if (!options.liveEnabled||!options.allowExternalData||!options.apiKey.trim()) throw new ProviderError('LIVE_DISABLED');
     assertLocalDatabaseUrl(options.databaseUrl);
@@ -64,7 +87,11 @@ export class OpenRouterClient {
   // Invoke once at the start of each run. Public catalogs never receive a credential.
   async verifyPricing(signal:AbortSignal):Promise<void> {
     aborted(signal);
-    this.priceCheck??=this.checkPrices(signal);
+    if (!this.priceCheck) {
+      const check=this.checkPrices(signal);this.priceCheck=check;
+      // A failed or cancelled check is not kept: the next caller verifies again instead of failing forever.
+      check.catch(()=>{ if (this.priceCheck===check) this.priceCheck=undefined; });
+    }
     return this.priceCheck;
   }
   private async checkedFetch(url:string,init:RequestInit,signal:AbortSignal):Promise<Json> {
@@ -103,6 +130,7 @@ export class OpenRouterClient {
       const entry=catalog.data.find((value:unknown)=>object(value).id===model);
       if (!entry) throw new ProviderError('PRICING_UNVERIFIED');
       const metadata=object(entry);
+      if (model===this.model) this.structuredOutputs=Array.isArray(metadata.supported_parameters)&&metadata.supported_parameters.includes('structured_outputs');
       if (metadata.reasoning&&object(metadata.reasoning).mandatory===true) throw new ProviderError('MANDATORY_REASONING_NOT_ALLOWED');
       const pricing=object(metadata.pricing);
       if (pricing.prompt===undefined||pricing.completion===undefined) throw new ProviderError('PRICING_UNVERIFIED');
@@ -118,15 +146,36 @@ export class OpenRouterClient {
       }
     }
   }
+  // A failed check is not cached, so one slow catalog read cannot disable decisions for the process lifetime.
+  private checkDecisionPrice(model:string):Promise<void> {
+    let check=this.decisionPriceChecks.get(model);
+    if (!check) {
+      check=(async()=>{
+        const result=await this.checkedFetch(`${API}/models/${model}/endpoints`,{},AbortSignal.timeout(this.timeoutMs));
+        const endpoints=object(result.data).endpoints;
+        if (!Array.isArray(endpoints)||!endpoints.length) throw new ProviderError('PRICING_UNVERIFIED');
+        for (const endpoint of endpoints) for (const [key,value] of Object.entries(object(object(endpoint).pricing))) {
+          const amount=Number(value);
+          // Prompt within the ceiling; completion and every other fee must be zero.
+          if (!Number.isFinite(amount)||amount<0||amount>(key==='prompt'?DECISION_MODELS[model]!.prompt*1e-6:0)) throw new ProviderError('PRICING_CHANGED_OR_UNKNOWN_FEE');
+        }
+      })();
+      this.decisionPriceChecks.set(model,check);
+      check.catch(()=>this.decisionPriceChecks.delete(model));
+    }
+    return check;
+  }
   private provider(embedding:boolean):Json {
     const text=TEXT_MODELS[this.model]!;
     return {require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,
       max_price:{prompt:embedding?0.02:text.prompt,completion:embedding?0:text.completion,request:0}};
   }
-  private async request(body:Json,endpoint:string,reservation:number,signal:AbortSignal):Promise<Json> {
+  /** `idempotencyKey` (never sent) scopes the ledger key, e.g. to one turn; without it identical requests share one key. */
+  private async request(body:Json,endpoint:string,reservation:number,signal:AbortSignal,idempotencyKey?:string):Promise<Json> {
     aborted(signal);
-    await this.verifyPricing(signal);
-    const key=hash({endpoint,body,schema:SCHEMA_REVISION});
+    // Decisions verify their own model's endpoint price; text/embedding catalogs are irrelevant to them.
+    if (endpoint!=='decisions') await this.verifyPricing(signal);
+    const key=hash({endpoint,body,schema:SCHEMA_REVISION,...(idempotencyKey===undefined?{}:{idempotencyKey})});
     const saved=await this.options.ledger.reserve(key,reservation);
     if (!saved.created) {
       if (saved.request.response!==null) {
@@ -144,7 +193,7 @@ export class OpenRouterClient {
     // Mark before network I/O. Crashes/timeouts keep the reservation and cannot trigger a repeat POST.
     await this.options.ledger.submitted(key);
     try {
-      const result=await this.checkedFetch(`${API}/${endpoint}`,{method:'POST',headers:{Authorization:`Bearer ${this.options.apiKey}`,'Content-Type':'application/json'},body:JSON.stringify(body)},signal);
+      const result=await this.checkedFetch(endpoint==='decisions'?DECISIONS_URL:`${API}/${endpoint}`,{method:'POST',headers:{Authorization:`Bearer ${this.options.apiKey}`,'Content-Type':'application/json'},body:JSON.stringify(body)},signal);
       const generationId=typeof result.id==='string'?result.id:null;
       // Settle an explicitly reported valid cost for either endpoint. Missing/invalid cost stays unknown.
       const cost=reportedCostMicrousd(result);
@@ -162,9 +211,15 @@ export class OpenRouterClient {
     const bytes=Buffer.byteLength(JSON.stringify(messages),'utf8');
     if (bytes>this.inputBytes) throw new ProviderError('INPUT_LIMIT');
     const timeline=messages.some(message=>message.role==='system'&&message.content.includes('TIMELINE_JSON_REPLY'));
+    const agent=messages.some(message=>message.role==='system'&&message.content.includes('AGENT_JSON_REPLY'));
+    // The catalog decides structured-output support, so it is read before the body is built.
+    await this.verifyPricing(options.signal);
+    const responseFormat=agent&&TEXT_MODELS[this.model]!.agentSchema&&this.structuredOutputs
+      ?{type:'json_schema',json_schema:{name:'agent_reply',strict:true,schema:AGENT_RESPONSE_JSON_SCHEMA}}
+      :timeline?{type:'json_object'}:undefined;
     const body:Json={model:this.model,messages:messages.map(({role,content})=>({role,content})),max_tokens:this.outputTokens,temperature:0,stream:false,provider:this.provider(false),
       ...(TEXT_MODELS[this.model]!.reasoning?{reasoning:TEXT_MODELS[this.model]!.reasoning}:{}),
-      ...(timeline?{response_format:{type:'json_object'}}:{})};
+      ...(responseFormat?{response_format:responseFormat}:{})};
     // UTF8 bytes upper-bound content tokenization; generous per-message + fixed envelope overhead.
     const inputUpperBound=bytes+messages.length*64+1024;
     // Reserve both full prompt and maximum cache-write price, even if automatic caching occurs.
@@ -176,6 +231,22 @@ export class OpenRouterClient {
     const content=object(object(result.choices[0]).message).content;
     if (typeof content!=='string'||!content.trim()||Buffer.byteLength(content,'utf8')>65536) throw new ProviderError('INVALID_PROVIDER_RESPONSE');
     return content;
+  }
+  /** Decisions API (System One models such as Jev): same ledger, caps and no-resubmission rule as text/embeddings. */
+  async decide(request:{model:string;state:Json;questions:Json},options:{signal:AbortSignal;idempotencyKey?:string}):Promise<Json> {
+    aborted(options.signal);
+    if (!Object.hasOwn(DECISION_MODELS,request.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
+    const body:Json={model:request.model,state:request.state,questions:request.questions,provider:{data_collection:'deny',zdr:true,allow_fallbacks:false,
+      // Decisions API ProviderPreferences.max_price (string USD per million tokens); output tokens are free.
+      max_price:{prompt:String(DECISION_MODELS[request.model]!.prompt),completion:'0',request:'0'}}};
+    const bytes=Buffer.byteLength(JSON.stringify(body),'utf8');
+    if (bytes>this.inputBytes) throw new ProviderError('INPUT_LIMIT');
+    await untilAborted(this.checkDecisionPrice(request.model),options.signal);
+    // UTF8 bytes upper-bound tokens; the fixed allowance covers the provider's own decision template.
+    const result=await this.request(body,'decisions',Math.ceil((bytes+2048)*DECISION_MODELS[request.model]!.prompt),options.signal,options.idempotencyKey);
+    // Responses name the dated snapshot that served the pinned release.
+    if (typeof result.model!=='string'||result.model!==request.model&&!(result.model.startsWith(`${request.model}-`)&&/^\d{8}$/.test(result.model.slice(request.model.length+1)))) throw new ProviderError('MODEL_MISMATCH');
+    return result;
   }
   async embed(inputs:string[],options:{signal:AbortSignal}):Promise<number[][]> {
     aborted(options.signal);

@@ -46,3 +46,16 @@ test('PTR_CHAT_PROVIDER=gateway sends every model call to the loopback LLM gatew
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway'})).toThrow();
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',PTR_GATEWAY_URL:'https://example.com/v1'})).toThrow();
 });
+test('PTR_INTENT_CLASSIFIER=jev is off by default, needs the live gates, and validates its knobs',async()=>{
+  const classifierOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.chat as unknown as {options:{intentClassifier?:{classifier:{name:string};minConfidence:number;timeoutMs:number}}}).options.intentClassifier;
+  const off=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl});
+  expect(classifierOf(off)).toBeUndefined();await off.close?.();
+  const live={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_INTENT_CLASSIFIER:'jev',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true',OPENROUTER_API_KEY:'synthetic-private-key'};
+  const jev=createRuntime(live);
+  expect(classifierOf(jev)).toMatchObject({classifier:{name:'typesafe/jev-1.13'},minConfidence:0.6,timeoutMs:1500});
+  // The chat provider stays fake: only the classifier uses the billable client.
+  expect(jev.provider).toBeInstanceOf(FakeTextProvider);await jev.close?.();
+  expect(()=>createRuntime({...live,GOAL1_LIVE_ENABLED:'false'})).toThrow('LIVE_DISABLED');
+  for(const env of [{PTR_INTENT_CLASSIFIER:'llm'},{PTR_JEV_MIN_CONFIDENCE:'0'},{PTR_JEV_MIN_CONFIDENCE:'1.2'},{PTR_JEV_MIN_CONFIDENCE:'x'},{PTR_JEV_TIMEOUT_MS:'10'},{PTR_JEV_TIMEOUT_MS:'1500.5'},{PTR_JEV_MODEL:'~typesafe/jev-latest'},{PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'}])
+    expect(()=>createRuntime({...live,...env})).toThrow();
+});

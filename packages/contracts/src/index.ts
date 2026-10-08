@@ -61,6 +61,12 @@ export interface ChatReply {
   promptEvidence?:{sourceIds:string[];annotationIds:string[];omittedAnnotations:number;promptBytes:number};
   sourceContext?:{revision:string;references:EvidenceCard[]};
   retrievalContext?:{revision:string;action:'none'|'search'|'reuse'|'clarify';contextTurnIds:string[];query?:string;reusedSourceIds:string[]};
+  /** Internal: which path decided intent when an intent classifier is configured. Never carries user text. */
+  intentRouting?:IntentRouting;
+}
+export interface IntentRouting {
+  decidedBy:'rule'|'classifier'|'classifier_fallback'; ruleIntent:'small_talk'|'timeline'|'clarification'|'unsupported'; classifier?:string;
+  label?:'small_talk'|'timeline'; confidence?:number; fallbackReason?:'below_threshold'|'no_answer'|'timeout'|'aborted'|'budget'|'unresolved'|'error';
 }
 export interface ProviderMessage { role:'system'|'user'|'assistant'; content:string }
 export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'completed'|'failed'|'cancelled';

@@ -1,10 +1,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
-import { ChatService, CoreError, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
+import { ChatService, CoreError, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
 import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
+import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
   id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
   kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
@@ -41,17 +41,18 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   let embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
   let model='synthetic/fake-text-v1';let embeddingModel=fakeEmbedding.model;
   const providerName=env.PTR_CHAT_PROVIDER??'fake';
+  // One billable client per runtime: chat, embeddings and decisions share its budget ledger and live gates.
+  let liveClient:OpenRouterClient|undefined;
+  const openRouter=()=>liveClient??=new OpenRouterClient(liveOptionsFromEnvironment({...env,GOAL1_DATABASE_URL:databaseUrl,GOAL1_TEXT_MODEL:env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL},new PostgresBudgetLedger(pool,databaseUrl)));
   // Load tests only: delay/failure injection is never allowed to wrap a billable provider.
   if(env.PTR_FAKE_LATENCY!==undefined) {
     if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
     provider=new LatencyInjectedTextProvider(fakeText,parseLatencyProfile(env.PTR_FAKE_LATENCY));model=`${model}+latency`;
   }
   if(providerName==='openrouter') {
-    const ledger=new PostgresBudgetLedger(pool,databaseUrl);
-    const liveEnv={...env,GOAL1_DATABASE_URL:databaseUrl,GOAL1_TEXT_MODEL:env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL};
-    const client=new OpenRouterClient(liveOptionsFromEnvironment(liveEnv,ledger));
+    const client=openRouter();
     const embedding=new OpenRouterEmbeddingProvider(client);
-    provider=client;model=liveEnv.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL;embeddingModel=embedding.model;
+    provider=client;model=env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL??DEFAULT_TEXT_MODEL;embeddingModel=embedding.model;
     embed=(text,options)=>embedding.embed([text],options).then(vectors=>vectors[0]!);
   } else if(providerName==='selfhosted') {
     // Goal2: self-hosted vLLM/SGLang through an SSH tunnel. Chat only; embeddings stay on the fake space.
@@ -64,6 +65,16 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     if(token.length<24) throw new CoreError('INVALID_INPUT');
     provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1'});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
+  // Optional ambiguity-only intent classifier (default off). Any failure falls back to the deterministic rules.
+  let intentClassifier:IntentClassifierOptions|undefined;
+  const classifierName=env.PTR_INTENT_CLASSIFIER??'off';
+  if(classifierName==='jev') {
+    // Load-test latency injection never runs beside a billable classifier.
+    if(env.PTR_FAKE_LATENCY!==undefined) throw new CoreError('INVALID_INPUT');
+    const minConfidence=Number(env.PTR_JEV_MIN_CONFIDENCE??0.6), timeoutMs=Number(env.PTR_JEV_TIMEOUT_MS??1500), jevModel=env.PTR_JEV_MODEL??DEFAULT_JEV_MODEL;
+    if(!(minConfidence>0&&minConfidence<=1)||!Number.isInteger(timeoutMs)||timeoutMs<50||timeoutMs>10000||!DECISION_MODEL_IDS.includes(jevModel)) throw new CoreError('INVALID_INPUT');
+    intentClassifier={classifier:new JevIntentClassifier(openRouter(),jevModel),minConfidence,timeoutMs};
+  } else if(classifierName!=='off') throw new CoreError('INVALID_INPUT');
   const store=new PostgresConversationStore(pool);
   // Separate names let a load test run beside other users of the same Redis (and be wiped safely afterwards).
   const queueName=env.PTR_TURN_QUEUE??'turns', namespace=env.PTR_EVENTS_NAMESPACE??'events';
@@ -72,7 +83,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
-    ...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
+    ...(intentClassifier?{intentClassifier}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
   return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');

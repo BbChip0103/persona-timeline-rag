@@ -11,3 +11,4 @@ export * from './agent-runtime';
 export * from './turn-worker';
 export * from './memory-queue';
 export * from './local-execution';
+export * from './intent-routing';
