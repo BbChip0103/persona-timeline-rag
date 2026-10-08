@@ -9,8 +9,12 @@
  *   median; the gateway estimates with 3.9, so it over-reserves like in production).
  * - Decode: `tpotMs` per token at batch 1, × (1 + `tpotSlope` × (running − 1)).
  * - Output length: `ptr_fake_output_tokens` in the body (else 150), capped by `max_tokens`.
- * - `/health` 200; `/metrics` with vLLM names (num_requests_running/waiting, kv_cache_usage_perc, prefix cache
- *   queries/hits, process_start_time_seconds).
+ * - `/health` 200; `/metrics` with the vLLM v1 names the gateway reads (vllm:num_requests_running / _waiting,
+ *   vllm:kv_cache_usage_perc, vllm:prefix_cache_queries_total / _hits_total, vllm:cache_config_info{num_gpu_blocks,
+ *   block_size}) and process_start_time_seconds. Checked against vLLM's docs/source upstream, not against the deployed
+ *   build (). The prefix counters count requests here; vLLM counts tokens.
+ * - Telemetry controls for acceptance runs: `report()` forces the reported KV usage / waiting, `hangMetrics()` leaves
+ *   /metrics unanswered (stale telemetry), `restart()` restarts on the same port with a new start time and empty state.
  */
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -27,6 +31,7 @@ export class FakeEngine {
   private readonly running=new Set<Job>();private waiting:Job[]=[];
   private readonly prefix=new Map<string,number>();
   private prefillBusyUntil=0;private kvUsed=0;private startTime=0;
+  private forced:{kvUsage?:number;waiting?:number}={};private metricsHang=false;
   readonly stats={requests:0,completed:0,prefixQueries:0,prefixHits:0,cancelled:0};
   port=0;
   constructor(readonly config:FakeEngineConfig) {}
@@ -42,16 +47,30 @@ export class FakeEngine {
     for(const socket of this.sockets) socket.destroy();
     await new Promise(resolve=>this.server?.close(resolve)??resolve(undefined));
   }
+  /** Requests queued inside the engine (the real value, whatever `report()` forces). */
+  get waitingCount():number {return this.waiting.length;}
+  /** Force the reported KV usage and/or waiting count (`{}` = report the real values again). */
+  report(values:{kvUsage?:number;waiting?:number}):void {this.forced={...values};}
+  /** Leave /metrics requests unanswered (the gateway's telemetry goes stale). */
+  hangMetrics(hang:boolean):void {this.metricsHang=hang;}
+  /** Engine process restart: every running or waiting request is cut, caches are empty, the start time is new. */
+  async restart():Promise<void> {
+    for(const job of [...this.running,...this.waiting]) job.state='done';
+    this.running.clear();this.waiting=[];this.prefix.clear();this.kvUsed=0;this.prefillBusyUntil=0;
+    const port=this.port;await this.stop();await this.start(port);
+  }
   metricsText():string {
-    const usage=this.kvUsed/this.config.kvCapacityTokens;
-    return [`vllm:num_requests_running{model_name="fake"} ${this.running.size}`,`vllm:num_requests_waiting{model_name="fake"} ${this.waiting.length}`,
+    const usage=this.forced.kvUsage??this.kvUsed/this.config.kvCapacityTokens, waiting=this.forced.waiting??this.waiting.length;
+    return [`vllm:num_requests_running{model_name="fake"} ${this.running.size}`,`vllm:num_requests_waiting{model_name="fake"} ${waiting}`,
       `vllm:kv_cache_usage_perc{model_name="fake"} ${usage}`,`vllm:prefix_cache_queries_total{model_name="fake"} ${this.stats.prefixQueries}`,
-      `vllm:prefix_cache_hits_total{model_name="fake"} ${this.stats.prefixHits}`,`process_start_time_seconds ${this.startTime}`].join('\n')+'\n';
+      `vllm:prefix_cache_hits_total{model_name="fake"} ${this.stats.prefixHits}`,
+      `vllm:cache_config_info{block_size="16",enable_prefix_caching="True",num_gpu_blocks="${Math.floor(this.config.kvCapacityTokens/16)}"} 1.0`,
+      `process_start_time_seconds ${this.startTime}`].join('\n')+'\n';
   }
   private tokens(text:string):number {return Buffer.byteLength(text,'utf8')/(this.config.bytesPerToken??4.45);}
   private handle(req:IncomingMessage,res:ServerResponse):void {
     if(req.url==='/health') {res.writeHead(200);res.end();return;}
-    if(req.url==='/metrics') {res.writeHead(200,{'Content-Type':'text/plain'});res.end(this.metricsText());return;}
+    if(req.url==='/metrics') {if(this.metricsHang) return;res.writeHead(200,{'Content-Type':'text/plain'});res.end(this.metricsText());return;}
     let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
       let body:{messages?:{role:string;content:string}[];max_tokens?:number;ptr_fake_output_tokens?:number};
       try {body=JSON.parse(raw);} catch {res.writeHead(400);res.end();return;}

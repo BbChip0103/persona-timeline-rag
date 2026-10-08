@@ -187,7 +187,12 @@ value); in-flight turns = min(Σ local caps, G).
 - **Misconfiguration guard (`hold_suspect`):** S_live = 0 while registry records were **rejected** by the record
   policy (allowlist, loopback, duplicate origin), or while live records exist **only in other pools** (a wrong
   `PTR_CAPACITY_POOL` / `PTR_GATEWAY_POOL`), is treated as a configuration error: G is held, not decayed to FLOOR, and a
-  `WARNING capacity: S_live=0 but …` line names the reasons. Rejected records next to live ones are counted
+  `WARNING capacity: S_live=0 but …` line names the reasons and what to check for each (`not_allowed` →
+  `PTR_GATEWAY_UPSTREAM_ALLOW`, which must equal the gateways' value; `not_loopback`; `invalid_record`;
+  `pool_mismatch`). The registry prefix is never the suspect here: the records were found under it. On a **first
+  start** (G unset) the same guard leaves G unset instead of writing FLOOR (`leaving G unset` in the warning), so a typo
+  cannot throttle every worker to one turn; it stays unset for as long as the configuration looks wrong. A set G is
+  held for at most 5 minutes; after that the planner follows the registry again (an empty pool then goes to FLOOR). Rejected records next to live ones are counted
   (`rejected` in the status) and logged once (`capacity: N registry record(s) rejected (…)`).
 - **Status:** `ptr:llm:cap` HASH {target, sLive, q, g, active, wait, computedAt, reason, writes, leader, registryStale,
   workerShortage} (expires 60 s after the last tick), and one dispatcher stderr line whenever G or registry staleness
@@ -221,8 +226,24 @@ value); in-flight turns = min(Σ local caps, G).
 | `PTR_TURN_QUEUE`, `PTR_REGISTRY_PREFIX`, `PTR_GATEWAY_UPSTREAM_ALLOW` | as elsewhere | queue to control, registry namespace, record allowlist |
 
 Static discovery (env or file) keeps the controller off by default: G would only mirror a fixed file, and the startup
-warning stays the guard. Workers read G at startup in every mode: on → one info line; off with a G still set → a
-warning (only G turns run until an off-mode dispatcher clears it); keep → a note.
+warning stays the guard.
+
+**Workers** read G and whether a controller leader is alive (`ptr:llm:cap:leader`) once at startup. Workers usually
+set neither `PTR_CAPACITY_CONTROLLER` nor `PTR_GATEWAY_DISCOVERY`, so a worker whose mode is only the derived default
+never warns: a running leader is reported as `capacity controller running elsewhere: G=…`, a set G without a leader as
+an info line. Warnings come only from an explicit setting that disagrees: `PTR_CAPACITY_CONTROLLER=off|keep` while a
+leader runs (mixed modes), or `off` while a G is still set. The S1 Σ-concurrency check against the gateways' `/metrics`
+runs only when no controller is on here or running elsewhere.
+
+**Mode changes and rolling restarts:** every dispatcher sharing a queue should use the same mode. During a rolling
+restart they briefly differ, which is safe:
+- off → on: the first `on` dispatcher becomes leader and sets G on its first tick; old `off` dispatchers only act at
+  their own startup.
+- on → off: an `off` dispatcher removes G at startup only when no leader is alive. While an `on` dispatcher still holds
+  the lease it warns once and re-checks every lease interval (max(15 s, 3 × `PTR_CAPACITY_INTERVAL_MS`)), removing G as
+  soon as the last `on` dispatcher has stopped and its lease expired. Until then the old leader keeps G current. A check
+  that fails because Redis is unavailable is logged and repeated one lease interval later.
+- `keep` never touches G; use it for a G set by hand (`off` would remove it).
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -369,7 +390,9 @@ guarded Redis connection), which never loads BullMQ.
 
 Writes are Lua scripts (atomic): a heartbeat carries the publisher's state and refreshes TTL, index and `seq`; it never
 turns a `draining` record of the same epoch back to `active`, and a draining agent's heartbeat recreates an expired
-record as draining; a new id or epoch, or a changed field, bumps the version and publishes. Marking a record draining
+record as draining; a new id or epoch, or a changed field, bumps the version and publishes. The optional fields
+`drainMaxMs` and `prefillTokensPerSec` are removed when a heartbeat no longer carries them (also a change), so a
+withdrawn R_u calibration cannot linger; gateways compare both fields too, so a changed R_u applies on the next poll. Marking a record draining
 also writes a **drain tombstone** for its epoch: if the record expires before its agent deletes it (agent crash, Redis
 blip) and an agent comes back on the same engine (same epoch), its heartbeat recreates the record draining and the
 agent finishes the drain, so a drain started from the CLI cannot be undone by an expiry. A new epoch (new engine
@@ -488,8 +511,9 @@ bypassed, requests wait in the pool's queue, and an upstream gets a request only
 The env-only single upstream and the failover wrapper keep the old limiter, so N = 1 behaves exactly as before.
 
 **Estimate per request:** T̂ = ceil(content bytes / `PTR_GATEWAY_BYTES_PER_TOKEN` (3.9)), conservative for ~90% of
-requests; M = `max_tokens` (else 512). G (the policy block) is the most common msg0 seen (bounded table), so one odd
-first request cannot set it for good; a request whose msg0 is that block has G cached (uncached = T̂ − G), any other
+requests; M = `max_tokens` (else 512). G (the policy block) is the most common msg0 seen (bounded table of 16, counts
+decayed with a half-life of 256 requests), so one odd first request or a short batch with another system message
+cannot set it, while a policy-prompt deploy re-learns G after about 256 requests (fewer when the old block was rare); a request whose msg0 is that block has G cached (uncached = T̂ − G), any other
 has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. Until the
 per-server prefix table (S5), the global block is the only cached share.
 
@@ -501,8 +525,11 @@ per-server prefix table (S5), the global block is the only cached share.
 4. prefill, only when `prefillTokensPerSec` (R_u) is calibrated (record/file field; unset by default): U_u = 0 or
    U_u + (T̂ − G) ≤ R_u · T_max (`PTR_GATEWAY_TTFT_PENALTY_MS` 1000).
 
+5. engine telemetry, while fresh (S4, next section): KV usage < `PTR_GATEWAY_ENGINE_KV_HIGH` and waiting ≤
+   `PTR_GATEWAY_ENGINE_WAITING_MAX`, except that an upstream with nothing of ours in flight still takes one request.
+
 The ledger: N (in flight), Kres (reserved KV, released at the end), U (uncached prompt tokens, released at the first
-body chunk). Engine telemetry filters come in S4.
+body chunk).
 
 **Queue:** bands from `X-PTR-Priority` (1 = a follow-up model call of a running turn, 0 = a turn's first call, the
 default, −1 = batch), strictly ordered (a waiting higher band holds back lower ones). Within a band FIFO, or deficit
@@ -517,12 +544,47 @@ completion, first chunk, membership or breaker change, and every 250 ms while re
 - `scored` (§4.3, affinity off until S5): least cost (U + T̂ − G) / (R_u · T_max) + (N + 1) / S_eff, with
   R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of hash(policy ‖ persona).
 
-The default is `least_inflight`. In the §9.1 comparison (fake engines, no affinity, R_u uncalibrated, single runs)
-`scored` did not meet its acceptance bar: in the heterogeneous W2 and W3 workloads it was not ≥ 10% better than
-`least_inflight` on throughput or TTFT p95; on homogeneous W1 it was within 5%. Under load every policy is limited by the
-same credits and late binding, and without a calibrated R_u or a prefix table the cost has little to tell the servers
-apart. `scored` stays selectable; re-run `scripts/routing-compare.ts` after the prefix table (S5) and R_u / S_u
-calibration on real engines (S8) before changing the default.
+The default is `least_inflight`; `scored` stays selectable. It has not met the §9.1 acceptance bar (fixed before the
+first run: heterogeneous W2 and W3, one of {max throughput with TTFT p95 ≤ 2 s, TTFT p95 at the knee} ≥ 10% better and
+the other ≤ 5% worse; homogeneous W1 both ≤ 5% worse), so there is no evidence to change the default:
+
+- **S3 run** (single seed, fixed rate grid, partly overloaded): heterogeneous W2 had no rate meeting the 2 s TTFT p95
+  for either policy, so that half of the bar could not be evaluated and the other did not reach 10%; in heterogeneous
+  W3 `scored` was worse (TTFT p95 894 vs 667 ms at the nominal rate, throughput −2.3%). Homogeneous W1 within 5%.
+- **S4 re-run with the revised method** (below; `reports/routing-compare-muzx6c629836.json`, merged from three runs
+  made in parallel as three processes on one 12-core host, so they shared CPU; knees 7.5 / 6 / 9 req/s for homogeneous
+  W1 / heterogeneous W2 / W3, each from a single seed-0 sweep (the script now takes the median over 3 seeds); 3 seeds;
+  means with 95% t intervals, descriptive only (3 seeds, no significance test); paired = per-seed relative
+  difference, positive = `scored` better; re-evaluated with the ∞ rule below, verdict unchanged):
+
+| Combination | Max throughput with TTFT p95 ≤ 2 s (req/s): scored vs least_inflight | TTFT p95 at the knee (ms) | Verdict |
+| --- | --- | --- | --- |
+| heterogeneous W2 | 4.11 vs 4.11 (both [−4.8, 13.0]; per seed 5.87 / 0 / 6.47 for both) → +0% | 2672 vs 2801 → +4.6%; paired −5.1% [−58%, +48%] | not ≥ 10% better: FAIL |
+| heterogeneous W3 | 2.36 vs 4.91 (per seed 0 / 7.07 / 0 vs 0 / 7.07 / 7.67) → −52% | ∞ for both in seed 1 → no comparison; paired (2 seeds) −0.6% | FAIL (worse) |
+| homogeneous W1 | 8.49 vs 8.49 → +0% | 1245 vs 1444 → +13.8%; paired +15.1% [−5.3%, +35.4%] | not worse: PASS |
+
+  How to read it: in an open loop with no failures the completed throughput equals the offered rate for every policy,
+  so the throughput metric only moves when a policy's TTFT p95 crosses 2 s at some grid point; with 15 s windows the
+  seed-to-seed spread is far larger than the policy difference (heterogeneous W2 TTFT p95 at the knee: 929–5603 ms
+  across seeds; between the two policies on the same seed and rate the median gap is 124 ms, under 300 ms in 10 of 15 cells), and a single crossing moves a seed's
+  value by a whole grid step or to 0. The W3 "−52%" is one seed where `scored` crossed 2 s at 0.8 × knee (2035 vs
+  1531 ms). Every interval includes 0, so the data show no reliable difference in either direction on the
+  heterogeneous configs. The one consistent signal is homogeneous W1, where `scored` had the lower TTFT p95 in 11 of
+  15 seed × rate cells (it also counts uncached prefill tokens, which least in-flight ignores), not part of the bar.
+  Re-run after the prefix table and affinity (S5) and real-engine R_u / S_u calibration (S8), with longer windows or
+  more seeds, before revisiting the default.
+
+**Comparison method** (`scripts/routing-compare.ts`, revised in S4): per (config, workload) a knee sweep with
+`least_inflight` on `--knee-seeds` seeds (default 3; per seed the highest rate of the monotone prefix with TTFT p95
+≤ 2 s; the grid uses their median); a grid of knee ×
+0.8/0.9/1/1.1/1.2; 3 seeds per point, every random choice (arrival times, token lengths, outputs, flows) from the
+seeded RNG; open-loop arrivals by default (W3 turns scheduled up front every 2.5 s, sessions already running at t = 0),
+so every policy sees byte-identical requests; order seed → rate → policy; after the last arrival every request is
+awaited (60 s client timeout) and requests still open are counted as unfinished; TTFT p95 counts failed, rejected and
+unfinished requests as ∞. In the acceptance an infinite mean TTFT p95 (any seed over 5% failures) is a loss: only
+`scored` ∞ → gain −∞ (fails both "better" and "not worse"), only `least_inflight` ∞ → +∞, both → no comparison; gains
+are written as the strings "Infinity" / "-Infinity" in the JSON. `--merge=a.json,b.json` combines runs made in
+parallel into one verdict; the same point twice is an error (`MERGE_DUPLICATE_POINT`).
 
 Limits: `drr` needs `X-PTR-Flow` (the worker does not send one yet, so all traffic is one flow = FIFO with LOOKAHEAD);
 for non-streaming requests the first chunk is the whole reply, so U stays reserved to the end; requests waiting on a
@@ -532,7 +594,13 @@ only upstream with credit still holds back lower bands (strict bands, as designe
 **Rejections** (all marked `X-PTR-Gateway: rejected`, nothing was sent): queue over `PTR_GATEWAY_MAX_QUEUE` (256)
 after a dispatch attempt → 429 `queue_full` (a request with credit still runs at 0; when full, a higher band takes the
 place of the newest request of the lowest band below it, which gets the 429 instead); with `PTR_GATEWAY_REJECT_SATURATED=true` (default false) an estimated wait above the queue timeout → 429
-`saturated`; `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (10000) → 503 `queue_timeout`. Retry-After = clamp(ceil(queued uncached
+`saturated`; `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (10000) → 503 `queue_timeout`. The `saturated` estimate is
+load-dependent, which is why it is off by default: estimated wait = (uncached tokens queued at this band and above +
+this request's) / the uncached prompt tokens per second that reached a first chunk over the last 10 s. That rate is
+what the engines *did*, not what they *can* do: right after a load increase the 10 s window still holds the quieter
+period, so the rate is too low and the wait too high (early 429s while the pool could still catch up); with slow
+answers it lags too. It is only consulted while requests already wait, and only with ≥ 20 successful answers in the
+window. Enable it only after checking `rejected.saturated` against `queue_timeout` under the real load. Retry-After = clamp(ceil(queued uncached
 tokens at this band and above / recent prefill tokens per second), 1, 5) s (1 before any rate is known; only 2xx
 answers count toward the rate, and the early `saturated` refusal needs at least 20 of them in the last 10 s).
 
@@ -556,9 +624,97 @@ rejected {queue_full, saturated, queue_timeout}, globalPrefixTokens, prefillToke
 | `PTR_GATEWAY_MAX_QUEUE` / `PTR_GATEWAY_QUEUE_TIMEOUT_MS` | 256 / 10000 | the pool queue bound and wait |
 
 Comparison harness: `scripts/fake-engine.ts` (FakeEngineUpstream: slots, prefill rate on one lane, batch-dependent
-TPOT, KV capacity, prefix LRU over message-chain hashes, vLLM-named `/metrics`, `/health`) and
-`scripts/routing-compare.ts` (W1–W4 × homogeneous / heterogeneous × the three policies, report in
+TPOT, KV capacity, prefix LRU over message-chain hashes, vLLM-named `/metrics`, `/health`, telemetry controls) and
+`scripts/routing-compare.ts` (W1–W4 × homogeneous / heterogeneous × the three policies, method above, report in
 `reports/routing-compare-<run>.json`).
+
+### Engine telemetry, slow start after recovery, restarts (stage S4)
+
+Pools only (file or registry; the env-only single upstream and the failover wrapper are unchanged).
+
+**Telemetry polling (off by default):** `PTR_GATEWAY_METRICS_INTERVAL_MS` defaults to 0 until the metric names and
+meanings are verified on the real engines (S8); with e.g. 1000 the gateway reads each member's `GET {origin}/metrics`
+at that interval (one poll times out after min(500 ms, interval), overlapping polls collapse, a body over 1 MiB is
+dropped as a failed poll). Parsed (vLLM v1 names,
+checked against vLLM's metrics docs and `v1/metrics/loggers.py` upstream, **not against the deployed build**; design
+[확인 필요]):
+
+| Name | Use |
+| --- | --- |
+| `vllm:num_requests_waiting`, `vllm:num_requests_running` (gauges, summed over label sets) | filter, credit_model_miss, metrics |
+| `vllm:kv_cache_usage_perc` (gauge 0–1; older builds `vllm:gpu_cache_usage_perc`; highest label set) | filter |
+| `vllm:prefix_cache_queries[_total]`, `vllm:prefix_cache_hits[_total]` (counters; older `vllm:gpu_prefix_cache_*`) | `prefixHitRate` between two polls (metrics only; vLLM counts tokens) |
+| `process_start_time_seconds` (prometheus_client process collector; may be absent) | engine restart detection |
+
+Parsing skips comments, NaN and ±Inf, takes the first value token (a timestamp or an OpenMetrics exemplar after it is
+ignored) and reads label values containing `}` or escaped quotes. Impossible values (KV usage outside [0, 1], negative
+counts) are treated as unknown, never as a block, and counted (`telemetry.implausible`).
+
+**Filter only, never a score input** (§4.4: delayed telemetry in a closed loop oscillates). While the last good poll is
+at most 3 × the interval old, a member whose engine reports KV usage ≥ `PTR_GATEWAY_ENGINE_KV_HIGH` (0.95) or waiting >
+`PTR_GATEWAY_ENGINE_WAITING_MAX` (2) gets no new request: the request is treated like "no credit" and waits in the
+queue (no failover, no spillover); it is re-dispatched as soon as a poll clears the condition. **Fallback (agent
+decision, beyond the design text):** selection takes the fitting non-blocked members first; only when none fits does a
+blocked member with nothing of this gateway's in flight take one request, like the KV credit's idle rule. Without it, a
+misread or stuck metric (the names and semantics are unverified on the deployed vLLM) would remove an idle server
+completely, and with several gateways another gateway's load could starve this one; with it the worst case is one call
+at a time on that server. The rule is per gateway: with k gateways a blocked engine may get up to k such calls. Older
+than 3 × the interval (or never read, or `/metrics` not 200) the filter is ignored and only the gateway's ledger decides
+(fail-open, `telemetry.stale`). A member blocked for 10 polls in a row while its engine runs fewer than maxSeqs / 4
+sequences logs `WARNING gateway upstream <id>: blocked by engine telemetry …` once per episode
+(`telemetry.suspectBlocked`): the metric probably does not mean what the filter assumes.
+
+**credit_model_miss:** waiting > 0 on 3 fresh polls in a row counts one episode per upstream (`telemetry.creditModelMiss`):
+the gateway's credits (`maxSeqs`, KV) let more in than the engine runs at once, or other gateways (or other clients)
+also load that engine: the engine's queue does not say whose requests wait. Nothing is corrected automatically
+(feedback oscillation); lower that upstream's `maxSeqs` or check `kvCapacityTokens`.
+
+**Slow start after a breaker closes** (§5, deferred in S2): when a member's breaker closes again (probe healthy, or a
+call sent while open answered), its limit ramps from 1 over `PTR_GATEWAY_SLOW_START_MS` like a newly added member, so a
+recovered (cold-cache) engine does not receive the whole queue at once. `rampReason` in the member metrics says why a
+member is ramping: `added`, `breaker_closed` or `restarted`. Exception: a breaker closed by a call sent while it was
+open (no other member and no secondary, so the open upstream was used and answered) does not ramp: that upstream is
+already serving, and ramping the only member would throttle the whole pool.
+
+**Engine restarts:** a registry record's new epoch already makes a new member (S2). For file and env members the epoch
+never changes, and an agent started with `--epoch` keeps it too, so a changed `process_start_time_seconds` clears the
+member once two polls in a row report the same new value (several API server processes behind one port, each with its
+own start time, answering in turn are therefore never taken for restarts): a fresh breaker, slow start from 1 (`rampReason: restarted`), the
+telemetry streaks reset, `events.restarted` + 1. In-flight calls of the old process end on their own (cut streams are
+retried by the worker's reset rule). Without the metric nothing is detected (only the breaker reacts).
+
+**Primary-to-primary retry and failover (§5, verified):** retried on another member only for connection-phase errors
+(`UpstreamConnectError.certain`) and, with `PTR_GATEWAY_FAILOVER_ON_CLOSE=true`, a close before any response byte; at
+most `PTR_GATEWAY_PRIMARY_ATTEMPTS` (2) members per request; the reservation moves with it (released on the failed
+member, a new one on the next). Timeouts, HTTP errors and streams cut mid-response are not moved. The secondary is used
+only when no primary can take the request: every member's breaker open (`breaker_open`), none active (`no_upstream`,
+draining members included), or every tried member failed to connect. Busy members (no credit, or telemetry-blocked) are
+waited for, never failed over. One nuance the design text leaves open: after a failed connect, if the other members
+stay busy until the queue timeout, the request goes to the secondary (or the connect error surfaces); the marked
+"nothing was sent" 503 is not used because a close before response may have reached the engine.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_METRICS_INTERVAL_MS` | 0 = off (else 100–60000, e.g. 1000) | telemetry poll interval; stale after 3 ×; off until verified on real engines (S8) |
+| `PTR_GATEWAY_ENGINE_KV_HIGH` | 0.95 (0.1–1) | KV usage at or above it filters a member out |
+| `PTR_GATEWAY_ENGINE_WAITING_MAX` | 2 (0–100000) | engine waiting above it filters a member out |
+
+**Metrics:** per upstream `rampReason` and `telemetry` {stale, ageMs, staleEpisodes, failedPolls, running, waiting,
+kvUsage, prefixHitRate, blocked, blockedPolls, creditModelMiss, waitingStreak, restarts, implausible, suspectBlocked}
+(null when off); `members`
+adds `telemetryBlocked` and `telemetryStale`; `events.restarted`; pool `telemetry` {intervalMs, kvHigh, waitingMax} or
+null.
+
+**Acceptance (fake engines, `scripts/telemetry-acceptance.ts`, telemetry explicitly on at 1000 ms, open-loop W1 at
+8 req/s for 15 s, one run each; `reports/telemetry-acceptance-muzxeyw8c96c.json`):**
+
+| Scenario | Result |
+| --- | --- |
+| A1 b reports KV 0.97 (engine actually idle) | telemetry on: b 16 / a 105 dispatches (b only when a had no room), 0 failed, TTFT p95 8.6 s, one suspect-block warning; off: b 57 / a 64, TTFT p95 1.6 s. The filter works; a false high report concentrates load on a (without the fallback an earlier run had 15 queue timeouts) |
+| A1b b has 3 engine slots but maxSeqs 12 | on: b 35 dispatches, TTFT p95 5.7 s, credit_model_miss 2; off: b 41, TTFT p95 7.6 s. Peak engine waiting 9 in both: with a 1 s poll the gateway overfills b before the first report. Small gain, single run |
+| A2 b blocked, then its /metrics hangs at 5 s | stale 2.8 s after the hang (3 × interval minus the poll phase); b dispatches 2 before 5 s, 1 until stale, 47 after; 0 failed |
+| A3 b's engine down 2–5 s (telemetry off) | breaker open at 2.2 s, closed at 5.2 s (3 s cooldown), b's limit 1 → 2 → 5 → 8 → 12 at +0/2.5/5/7.5/10 s (10 s ramp), at most 2 in flight in the first 2 s; 5 failed = the streams on b cut when it stopped (the worker retries those) |
+| A4 b's engine restarts at 5 s (same port and epoch) | restart confirmed at 6.8 s (two polls), b's limit 1 then 5 after 5 s, breaker closed, `events.restarted` 1; 4 failed = streams cut by the restart |
 
 ## Providers (direct, without the gateway)
 

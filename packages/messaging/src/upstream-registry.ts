@@ -77,11 +77,17 @@ export const POOL_NAME = /^[A-Za-z0-9._/-]{1,128}$/;
 export const UPSTREAM_ID = /^[A-Za-z0-9._-]{1,64}$/;
 export const EPOCH = /^[A-Za-z0-9._-]{1,64}$/;
 const FIELDS = ['pool', 'id', 'baseUrl', 'maxSeqs', 'kvCapacityTokens', 'weight', 'state', 'epoch', 'seq'] as const;
+/** Fields a record may omit; a heartbeat without one removes it from the stored record. */
+const OPTIONAL_FIELDS = ['drainMaxMs', 'prefillTokensPerSec'] as const;
 
 /** `ptr:llm` or a dedicated test namespace such as `ptrtest:<run>:llm`; always ends in `:llm`, so it can never touch BullMQ keys. */
 export function assertRegistryPrefix(prefix: string): string {
   if (prefix.length > 64 || !/^(?:[A-Za-z0-9_-]+:)+llm$/.test(prefix)) throw new Error('INVALID_REGISTRY_PREFIX');
   return prefix;
+}
+/** PTR_REGISTRY_PREFIX (default `ptr:llm`), validated; the error names the variable. */
+export function registryPrefixFromEnv(env: Record<string, string | undefined>): string {
+  try { return assertRegistryPrefix(env.PTR_REGISTRY_PREFIX ?? REGISTRY_PREFIX); } catch { throw new Error('INVALID_PTR_REGISTRY_PREFIX'); }
 }
 export function registryKeys(prefix = REGISTRY_PREFIX) {
   assertRegistryPrefix(prefix);
@@ -199,8 +205,14 @@ local result = 'active'
 if not state or epoch ~= ARGV[3] then
   result = 'created'
 else
+  local sent = {}
   for i = 6, #ARGV, 2 do
+    sent[ARGV[i]] = true
     if ARGV[i] ~= 'seq' and not (drained and ARGV[i] == 'state') and redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then result = 'changed' end
+  end
+  -- An optional field the publisher no longer sends is removed (a stale R_u or drain bound must not linger).
+  for _, field in ipairs({${OPTIONAL_FIELDS.map((field) => `'${field}'`).join(', ')}}) do
+    if not sent[field] and redis.call('HDEL', KEYS[1], field) == 1 then result = 'changed' end
   end
 end
 if result == 'created' then redis.call('DEL', KEYS[1]) end
@@ -341,7 +353,8 @@ export class MemoryUpstreamRegistry implements RegistryReader, RegistryWriter {
       return 'draining';
     }
     const result: HeartbeatResult = !existing || existing.hash.epoch !== record.epoch ? 'created'
-      : Object.entries(hash).some(([field, value]) => field !== 'seq' && existing.hash[field] !== value) ? 'changed' : 'active';
+      : Object.entries(hash).some(([field, value]) => field !== 'seq' && existing.hash[field] !== value)
+        || OPTIONAL_FIELDS.some((field) => field in existing.hash && !(field in hash)) ? 'changed' : 'active';
     this.records.set(key, { hash, expiresAt });
     if (result !== 'active') this.changed();
     return drained ? 'draining' : result;

@@ -1,6 +1,6 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 import { createLocalPool } from '@ptr/storage';
-import { POOL_NAME, REGISTRY_PREFIX, RedisUpstreamRegistry, assertRegistryPrefix, createRedisConnection, type UpstreamRecord } from '@ptr/messaging/registry';
+import { POOL_NAME, RedisUpstreamRegistry, registryPrefixFromEnv, createRedisConnection, type UpstreamRecord } from '@ptr/messaging/registry';
 import { createGateway } from './server';
 import { FailoverUpstream } from './failover';
 import { DEFAULT_FAILOVER, UpstreamPool, type FailoverOptions } from './pool';
@@ -71,6 +71,16 @@ function failoverOptions(env:NodeJS.ProcessEnv):FailoverOptions {
 }
 type Configured={upstream:Upstream;close?:()=>Promise<void>;reload?:()=>void};
 /**
+ * Engine telemetry filter  for pools: off by default (PTR_GATEWAY_METRICS_INTERVAL_MS=0) until the metric
+ * names and meanings are verified on the real engines (S8); e.g. 1000 turns it on.
+ */
+function engineTelemetry(env:NodeJS.ProcessEnv):{telemetry?:{intervalMs:number;kvHigh:number;waitingMax:number}} {
+  const intervalMs=integer(env,'PTR_GATEWAY_METRICS_INTERVAL_MS',0,0,60000);
+  if(intervalMs!==0&&intervalMs<100) throw new Error('INVALID_PTR_GATEWAY_METRICS_INTERVAL_MS');
+  const kvHigh=decimal(env,'PTR_GATEWAY_ENGINE_KV_HIGH',0.95,0.1,1), waitingMax=integer(env,'PTR_GATEWAY_ENGINE_WAITING_MAX',2,0,100000);
+  return intervalMs?{telemetry:{intervalMs,kvHigh,waitingMax}}:{};
+}
+/**
  * Pool of self-hosted engines : static discovery reads PTR_GATEWAY_UPSTREAMS_FILE (mtime + SIGHUP);
  * redis discovery polls the registry and uses the file (or PTR_SELFHOSTED_BASE_URL as one entry) as its seed.
  */
@@ -90,13 +100,13 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
     kappa:decimal(env,'PTR_GATEWAY_KV_OVERCOMMIT',0.9,0.1,1),bytesPerToken:decimal(env,'PTR_GATEWAY_BYTES_PER_TOKEN',3.9,0.5,20),
     ttftPenaltyMs:integer(env,'PTR_GATEWAY_TTFT_PENALTY_MS',1000,1,60000),lookahead:integer(env,'PTR_GATEWAY_LOOKAHEAD',8,1,256),
     starvationMs:integer(env,'PTR_GATEWAY_STARVATION_MS',2000,0,600000),drrQuantum:integer(env,'PTR_GATEWAY_DRR_QUANTUM_TOKENS',4096,1,1000000),
-    rejectSaturated:saturated==='true'};
+    rejectSaturated:saturated==='true',...engineTelemetry(env)};
   // The upstream deadline starts once the request is admitted, and the wait for a free upstream (up to the queue
   // timeout) runs inside it: if it were not longer, that wait would end as an unmarked 504 instead of the retryable 503.
   if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
   const allow=parseUpstreamAllow(env.PTR_GATEWAY_UPSTREAM_ALLOW);
   const pollMs=integer(env,'PTR_GATEWAY_REGISTRY_POLL_MS',2000,100,60000), graceMs=integer(env,'PTR_GATEWAY_REGISTRY_GRACE_MS',10000,0,600000);
-  const prefix=assertRegistryPrefix(env.PTR_REGISTRY_PREFIX??REGISTRY_PREFIX);
+  const prefix=registryPrefixFromEnv(env);
   const file=env.PTR_GATEWAY_UPSTREAMS_FILE?new FileUpstreamSource(env.PTR_GATEWAY_UPSTREAMS_FILE,model):undefined;
   let seed:UpstreamSource|undefined=file;
   if(env.PTR_SELFHOSTED_BASE_URL) {

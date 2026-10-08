@@ -133,6 +133,39 @@ describe('capacity controller: review follow-ups',()=>{
     expect(s.writes).toEqual([]);
     expect(s.lines.filter(line=>line.startsWith('WARNING capacity: S_live=0 but 1 registry record(s) rejected (not_allowed:1)'))).toHaveLength(1);
   });
+  test('first start (G unset) with every record rejected: G stays unset (no write of FLOOR) and the warning says so',async()=>{
+    const s=setup(null);const c=s.make();
+    await s.registry.heartbeat(rec('rogue',19999),60000);
+    for(let i=0;i<3;i++) expect(await c.tick()).toMatchObject({g:null,target:null,reason:'hold_suspect',rejected:1});
+    expect(s.writes).toEqual([]);
+    expect(s.lines.filter(line=>line.startsWith('WARNING capacity: S_live=0 but 1 registry record(s) rejected (not_allowed:1); leaving G unset'))).toHaveLength(1);
+  });
+  test('first start (G unset) with a configuration that looks wrong: G stays unset indefinitely (the 5 min bound is for a set G)',async()=>{
+    const s=setup(null);const c=s.make();
+    await s.registry.heartbeat(rec('rogue',19999),3600000);
+    await c.tick();s.advance(600000);
+    expect(await c.tick()).toMatchObject({g:null,reason:'hold_suspect'});
+    expect(s.writes).toEqual([]);
+    expect(s.lines.some(line=>line.startsWith('WARNING capacity: holding G for'))).toBe(false);
+  });
+  test('first start (G unset) with live records only in other pools: G stays unset, with the pool warning',async()=>{
+    const s=setup(null);const c=s.make();
+    await s.registry.heartbeat(rec('a',18000,{pool:'other-model'}),60000);
+    expect(await c.tick()).toMatchObject({g:null,reason:'hold_suspect'});
+    expect(s.writes).toEqual([]);
+    expect(s.lines.some(line=>line.includes('only in other pools (other-model); leaving G unset'))).toBe(true);
+  });
+  test('the suspect warning names the setting that matches the rejection reason, never PTR_REGISTRY_PREFIX (the records were found under it)',async()=>{
+    const s=setup();const c=s.make();
+    await s.registry.heartbeat(rec('rogue',19999),60000);
+    await c.tick();
+    const line=s.lines.find(l=>l.startsWith('WARNING capacity: S_live=0'))!;
+    expect(line).toContain('PTR_GATEWAY_UPSTREAM_ALLOW');expect(line).not.toContain('PTR_REGISTRY_PREFIX');
+    const t=setup();const d=t.make();
+    await t.registry.heartbeat(rec('loop',18000,{baseUrl:'http://localhost:18000/v1'}),60000);
+    await d.tick();
+    expect(t.lines.find(l=>l.startsWith('WARNING capacity: S_live=0'))).toMatch(/not_loopback:1.*127\.0\.0\.1/);
+  });
   test('the suspect hold is bounded (5 min): a real outage of this pool still shrinks G afterwards',async()=>{
     const s=setup();const c=s.make();
     await s.registry.heartbeat(rec('rogue',19999),3600000);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { TurnWorker } from '@ptr/core';
 import { capacityControllerMode, startTurnConsumer } from '@ptr/messaging';
 import { fetchGatewayCapacity, gatewayCapacityWarning } from '@ptr/providers';
-import { readGlobalConcurrency, workerCapacityLine } from './capacity';
+import { readCapacityState, workerCapacityLine } from './capacity';
 import { createRuntime, gatewayBaseUrls } from './runtime';
 
 /** Turn worker: consumes dispatches from Redis (BullMQ) and runs them under a Postgres lease. Run any number. */
@@ -21,15 +21,19 @@ async function main() {
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
     {concurrency,queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
   process.stdout.write(`Turn worker ${workerId} started\n`);
-  // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once.
-  const capacityMode=capacityControllerMode(process.env);
-  // Every mode reads G once: off with a G still set warns (only G turns run until a dispatcher clears it).
-  void readGlobalConcurrency(process.env).then(globalConcurrency=>{const line=workerCapacityLine({mode:capacityMode,globalConcurrency});if(line) process.stderr.write(`${line}\n`);},
-    ()=>process.stderr.write('capacity check skipped: Redis unavailable\n'));
-  // Controller off: advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
-  if(capacityMode!=='on'&&runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
-    const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
-    if(warning) process.stderr.write(`${warning}\n`);
+  // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once. Workers rarely
+  // set PTR_CAPACITY_CONTROLLER, so the derived mode alone never produces a warning (mixed fleets, see workerCapacityLine).
+  const capacityMode=capacityControllerMode(process.env), explicit=process.env.PTR_CAPACITY_CONTROLLER!==undefined;
+  void readCapacityState(process.env).then(state=>{
+    const line=workerCapacityLine({mode:capacityMode,explicit,...state});if(line) process.stderr.write(`${line}\n`);
+    return state.controllerRunning;
+  },()=>{process.stderr.write('capacity check skipped: Redis unavailable\n');return false;}).then(controllerRunning=>{
+    // No controller here or elsewhere: advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
+    if(capacityMode==='on'||controllerRunning||runtime.providerName!=='gateway') return;
+    void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
+      const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
+      if(warning) process.stderr.write(`${warning}\n`);
+    });
   });
   // Graceful: stop taking jobs and let in-flight turns finish; a crash instead leaves them to lease recovery.
   const shutdown=()=>{void consumer.close().then(()=>worker.stop()).then(()=>runtime.close?.()).finally(()=>process.exit(0));};

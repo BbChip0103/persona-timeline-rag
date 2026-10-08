@@ -35,6 +35,17 @@ export function registryContract(name:string,make:()=>Promise<RegistryHarness>) 
       expect((await h.store.list('gemma-4-e4b-fp8')).version).toBe(version+1);
       expect((await live(h.store))[0]!.maxSeqs).toBe(8);
     });
+    test('an optional field the publisher stops sending (drainMaxMs, prefillTokensPerSec) is removed and counts as a change',async()=>{
+      await h.store.heartbeat(record({drainMaxMs:60000,prefillTokensPerSec:9000}),10000);
+      const version=(await h.store.list('gemma-4-e4b-fp8')).version;
+      expect((await live(h.store))[0]).toMatchObject({drainMaxMs:60000,prefillTokensPerSec:9000});
+      expect(await h.store.heartbeat(record({seq:1,drainMaxMs:60000}),10000)).toBe('changed');
+      expect((await live(h.store))[0]!.prefillTokensPerSec).toBeUndefined();
+      expect(await h.store.heartbeat(record({seq:2}),10000)).toBe('changed');
+      expect((await live(h.store))[0]).toEqual(record({seq:2}));
+      expect((await h.store.list('gemma-4-e4b-fp8')).version).toBe(version+2);
+      expect(await h.store.heartbeat(record({seq:3}),10000)).toBe('active');
+    });
     test('draining sticks: later heartbeats of the same epoch only refresh the TTL; a new epoch is a new engine',async()=>{
       expect(await h.store.setState('gemma-4-e4b-fp8','pod-a','draining')).toBe(false); // nothing to drain
       await h.store.heartbeat(record(),300);

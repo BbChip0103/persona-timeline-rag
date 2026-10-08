@@ -30,6 +30,8 @@ export class UpstreamHealth {
   /** `onChange`: called when the breaker opens or closes (a pool wakes requests waiting for a usable upstream). */
   constructor(private readonly check:(signal:AbortSignal)=>Promise<boolean>,private readonly options:BreakerOptions,private readonly onChange?:()=>void) {}
   get isOpen():boolean {return this.open;}
+  /** The last close came from a call sent while open that got an answer (not from a /health probe). */
+  closedByAnswer=false;
   /** Breaker generation: how many times it has opened. */
   get generation():number {return this.counts.opened;}
   state():BreakerState {return !this.open?'closed':Date.now()-this.openedAt<this.options.cooldownMs?'open':'half_open';}
@@ -42,7 +44,7 @@ export class UpstreamHealth {
   /** The upstream answered (any HTTP status). A call sent while the breaker was open (no alternative) also closes it. */
   answered(sentWhileOpenGeneration?:number):void {
     this.failures=0;this.timeouts=0;
-    if(this.open&&sentWhileOpenGeneration===this.counts.opened) {this.open=false;this.onChange?.();}
+    if(this.open&&sentWhileOpenGeneration===this.counts.opened) {this.open=false;this.closedByAnswer=true;this.onChange?.();}
   }
   timedOut():void {if(!this.open&&++this.timeouts>=this.options.timeoutThreshold) void this.probeHealth();}
   connectFailed():void {if(!this.open&&++this.failures>=this.options.failureThreshold) this.trip();}
@@ -59,7 +61,7 @@ export class UpstreamHealth {
       this.probe=undefined;
       if(ok) {
         this.counts.probesOk++;
-        if(!this.open||this.counts.opened===generation) {const was=this.open;this.open=false;this.failures=0;this.timeouts=0;if(was) this.onChange?.();}
+        if(!this.open||this.counts.opened===generation) {const was=this.open;this.open=false;this.failures=0;this.timeouts=0;if(was) {this.closedByAnswer=false;this.onChange?.();}}
       }
       else {this.counts.probesFailed++;if(this.open) this.openedAt=Date.now();else this.trip();this.timeouts=0;}
       return ok;

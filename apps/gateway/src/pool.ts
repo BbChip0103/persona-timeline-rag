@@ -4,6 +4,7 @@ import { CentralQueue, chooseUpstream, estimateRequest, kvReservation, queueRetr
   type RequestEstimate, type RoutingPolicy } from './admission';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
+import { EngineTelemetry, type TelemetryMetrics, type TelemetryOptions } from './telemetry';
 import { OpenAICompatibleUpstream, UpstreamConnectError, type ChatCompletionRequest, type RequestContext, type Upstream, type UpstreamResult } from './upstreams';
 
 export interface FailoverOptions extends BreakerOptions {
@@ -33,18 +34,22 @@ export interface FailoverMetrics {
   /** Requests refused because the secondary's per-minute ceiling was reached. */
   rateLimited:number; secondaryErrors:number;
 }
-/** A primary: an upstream with an engine `/health` check (OpenAICompatibleUpstream). */
-export type Primary=Upstream&{health(signal:AbortSignal):Promise<boolean>};
+/** A primary: an upstream with an engine `/health` check and, optionally, its Prometheus `/metrics` text (OpenAICompatibleUpstream). */
+export type Primary=Upstream&{health(signal:AbortSignal):Promise<boolean>;metrics?(signal:AbortSignal):Promise<string|null>};
+/** Why an upstream's limit is ramping: newly added, its breaker closed again, or its engine restarted (S4). */
+export type RampReason='added'|'breaker_closed'|'restarted';
 export interface UpstreamMemberMetrics {
   id:string; epoch:string; state:'active'|'draining'|'gone';
   /** N_u, and the current limit S_u^eff: maxSeqs ramped during slow start (null = unlimited). */
   inFlight:number;
-  limit:number|null; maxSeqs:number|null; weight:number; slowStart:boolean; breaker:BreakerState;
+  limit:number|null; maxSeqs:number|null; weight:number; slowStart:boolean; rampReason:RampReason|null; breaker:BreakerState;
   /** Kres_u (reserved KV tokens) and U_u (uncached prompt tokens before the first chunk); K_u, R_u as configured. */
   reservedKvTokens:number; prefillTokens:number; kvCapacityTokens:number|null; prefillTokensPerSec:number|null;
   /** N/S_eff and Kres/(κ·K − G) (null when unknown). */
   seqUtil:number|null; kvUtil:number|null;
   dispatched:number; answered:number; connectFailures:number;
+  /** Engine telemetry (S4; null when off or the client has no /metrics). */
+  telemetry:TelemetryMetrics|null;
 }
 export interface PoolQueueMetrics {
   routing:RoutingPolicy; fairness:'fifo'|'drr';
@@ -59,14 +64,19 @@ export interface PoolQueueMetrics {
 export interface PoolMetrics {
   pool:string;
   /** Members by state; `ramping` ⊂ active (slow start), `gone` = left the source but still finishing calls. */
-  members:{active:number;ramping:number;draining:number;gone:number;breakerOpen:number};
+  members:{active:number;ramping:number;draining:number;gone:number;breakerOpen:number;
+    /** Members the engine telemetry filter currently excludes, and members whose telemetry is stale (filter ignored). */
+    telemetryBlocked:number;telemetryStale:number};
   /** Requests waiting in the pool's queue for credit on an upstream (bounded by the queue timeout). */
   waiting:number;
   /** Requests resent to another primary after a connection failure (nothing reached the first one). */
   retriedOnOtherPrimary:number;
   /** Requests that got the marked 503 GATEWAY_QUEUE_TIMEOUT from the pool queue (a subset of the gateway's rejected.queueTimeout). */
   queueTimeouts:number;
-  events:{added:number;removed:number;replaced:number;invalid:number};
+  /** `restarted`: an engine restart seen in telemetry (process_start_time_seconds) cleared a member's state. */
+  events:{added:number;removed:number;replaced:number;invalid:number;restarted:number};
+  /** The telemetry filter settings (null = off). */
+  telemetry:{intervalMs:number;kvHigh:number;waitingMax:number}|null;
   queue:PoolQueueMetrics;
   upstreams:UpstreamMemberMetrics[];
   registry?:SourceMetrics;
@@ -100,16 +110,26 @@ export interface PoolOptions {
   fairness?:'fifo'|'drr'; drrQuantum?:number;
   /** Refuse at once (429 `saturated`) when the estimated wait exceeds the queue timeout. Default off. */
   rejectSaturated?:boolean;
+  /**
+   * Engine telemetry filter (S4, §4.4): poll each member's /metrics every `intervalMs` (PTR_GATEWAY_METRICS_INTERVAL_MS);
+   * while fresh, KV usage ≥ `kvHigh` or waiting > `waitingMax` takes the member out of selection. Off when absent.
+   */
+  telemetry?:Pick<TelemetryOptions,'intervalMs'|'kvHigh'|'waitingMax'|'timeoutMs'>;
   /** Clock for slow start (tests). */
   now?:()=>number;
+  /** Operator warnings (default stderr); never contains URLs or request content. */
+  log?:(line:string)=>void;
 }
 
 const isTimeout=(reason:unknown)=>(reason as {name?:unknown})?.name==='TimeoutError';
 // The early `saturated` refusal trusts the observed prefill rate only with this many recent answers behind it.
 const TICK_MS=250, SAMPLE=2000, RATE_WINDOW_MS=10000, MIN_RATE_SAMPLES=20;
+const PREFIX_HALF_LIFE=256, PREFIX_DECAY=Math.pow(0.5,1/PREFIX_HALF_LIFE);
 class Member {
   inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;kvReserved=0;prefill=0;
-  constructor(public record:UpstreamRecord,readonly upstream:Primary,readonly health:UpstreamHealth,readonly addedAt:number) {}
+  health!:UpstreamHealth;telemetry:EngineTelemetry|undefined;
+  /** Start of the current slow-start ramp (−∞ = full capacity) and its cause. */
+  constructor(public record:UpstreamRecord,readonly upstream:Primary,public rampFrom:number,public rampReason:RampReason) {}
 }
 interface Reservation { kv:number; prefill:number; firstChunk:boolean; released:boolean }
 interface Pending extends QueuedRequest {
@@ -164,7 +184,7 @@ export class UpstreamPool implements Upstream {
   private readonly routing:RoutingPolicy;
   private readonly maxQueue:number;
   private startingUp=true;private rr=0;private nextId=0;private globalPrefix=0;private prefixKey='';
-  /** msg0 blocks seen (bounded): G is the most common one, so one odd first request cannot set it for good. */
+  /** msg0 blocks seen (bounded, decayed counts): G is the most common one, so one odd first request cannot set it for good. */
   private readonly prefixSeen=new Map<string,{tokens:number;count:number}>();
   private dispatching=false;private again=false;private ticker:NodeJS.Timeout|undefined;
   private readonly started:number[]=[];
@@ -173,7 +193,7 @@ export class UpstreamPool implements Upstream {
   private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
   private readonly rejected={queue_full:0,saturated:0,queue_timeout:0};
   private readonly failovers:Record<string,number>={};
-  private readonly events={added:0,removed:0,replaced:0,invalid:0};
+  private readonly events={added:0,removed:0,replaced:0,invalid:0,restarted:0};
   constructor(private readonly pool:PoolOptions) {
     this.model=pool.model;this.options={...DEFAULT_FAILOVER,...pool.failover};this.now=pool.now??Date.now;
     this.create=pool.create??(record=>new OpenAICompatibleUpstream({baseUrl:record.baseUrl,model:pool.model}));
@@ -195,7 +215,11 @@ export class UpstreamPool implements Upstream {
     try {await this.pool.source.start?.();} finally {this.startingUp=false;}
     await this.pool.secondary?.ready?.(signal);
   }
-  async close():Promise<void> {this.stopSource();clearInterval(this.ticker);this.ticker=undefined;await this.pool.source.close?.();}
+  async close():Promise<void> {
+    this.stopSource();clearInterval(this.ticker);this.ticker=undefined;
+    for(const member of [...this.members.values(),...this.retiring]) member.telemetry?.stop();
+    await this.pool.source.close?.();
+  }
 
   async complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult> {
     const estimate=this.learnPrefix(estimateRequest(request,this.pool.bytesPerToken??3.9));
@@ -246,9 +270,15 @@ export class UpstreamPool implements Upstream {
   /** G = the most common msg0 (the policy block); a request gets the cached share only if its msg0 is that block. */
   private learnPrefix(estimate:RequestEstimate):RequestEstimate&{cachedPrefix:number} {
     if(estimate.prefixKey) {
+      // Exponentially decayed counts (half-life PREFIX_HALF_LIFE requests): a policy-prompt deploy re-learns G after
+      // about that many requests, while a shorter run of other system messages (a batch, a probe) does not move it.
+      for(const entry of this.prefixSeen.values()) entry.count*=PREFIX_DECAY;
       const seen=this.prefixSeen.get(estimate.prefixKey)??{tokens:estimate.prefixTokens,count:0};seen.count++;
       this.prefixSeen.set(estimate.prefixKey,seen);
-      if(this.prefixSeen.size>16) {const rarest=[...this.prefixSeen.entries()].sort((a,b)=>a[1].count-b[1].count)[0]!;this.prefixSeen.delete(rarest[0]);}
+      if(this.prefixSeen.size>16) {
+        const rarest=[...this.prefixSeen.entries()].filter(([key])=>key!==estimate.prefixKey).sort((a,b)=>a[1].count-b[1].count)[0]!;
+        this.prefixSeen.delete(rarest[0]);
+      }
       const [key,top]=[...this.prefixSeen.entries()].reduce((best,entry)=>entry[1].count>best[1].count?entry:best);
       this.prefixKey=key;this.globalPrefix=top.tokens;
     }
@@ -341,8 +371,10 @@ export class UpstreamPool implements Upstream {
       if(!closed.length&&this.pool.secondary) {pending.settle({none:'breaker_open'});return true;}
       // No closed member and no secondary: the open ones are the only alternative (a single upstream has no breaker).
       const usable=closed.length?closed:live;
+      // Engine telemetry is a filter only (§4.4): a blocked member is "busy" (the request waits), never "unavailable".
       const states=usable.map(member=>({id:member.record.id,member,inFlight:member.inFlight,limit:this.limit(member,now),kvReserved:member.kvReserved,
-        prefill:member.prefill,kvCapacity:member.record.kvCapacityTokens,prefillPerSec:member.record.prefillTokensPerSec??null,weight:member.record.weight}));
+        prefill:member.prefill,kvCapacity:member.record.kvCapacityTokens,prefillPerSec:member.record.prefillTokensPerSec??null,weight:member.record.weight,
+        engineBlocked:member.telemetry?.blocked()??false}));
       const chosen=chooseUpstream(this.routing,states,pending.estimate,{kappa:this.pool.kappa??0.9,globalPrefix:this.globalPrefix,
         ttftPenaltyMs:this.pool.ttftPenaltyMs??1000},this.rr);
       if(!chosen) return false;
@@ -426,9 +458,24 @@ export class UpstreamPool implements Upstream {
   private limit(member:Member,now:number):number {
     const max=member.record.maxSeqs, ramp=this.pool.slowStartMs??30000;
     if(!Number.isFinite(max)||ramp<=0) return max;
-    return Math.max(1,Math.floor(max*Math.min(1,(now-member.addedAt)/ramp)));
+    return Math.max(1,Math.floor(max*Math.min(1,(now-member.rampFrom)/ramp)));
   }
-  private ramping(member:Member,now:number):boolean {return now-member.addedAt<(this.pool.slowStartMs??30000);}
+  private ramping(member:Member,now:number):boolean {return now-member.rampFrom<(this.pool.slowStartMs??30000);}
+  /** A fresh breaker for the member; when it closes again the member's limit ramps from 1 (slow start, §5). */
+  private newHealth(member:Member,breaker:BreakerOptions):UpstreamHealth {
+    const health:UpstreamHealth=new UpstreamHealth(probe=>member.upstream.health(probe),breaker,()=>{
+      // Called on open and on close: closed now means it just closed (a cold engine must not get the whole queue).
+      // Not when a call sent while open closed it: that upstream was the only alternative and is already serving.
+      if(!health.isOpen&&!health.closedByAnswer&&member.health===health) {member.rampFrom=this.now();member.rampReason='breaker_closed';}
+      this.kick();
+    });
+    return health;
+  }
+  /** Engine restart seen in telemetry (file/env sources keep their epoch; a registry epoch override may too): start over. */
+  private restarted(member:Member,breaker:BreakerOptions):void {
+    if(member.gone) return;
+    member.health=this.newHealth(member,breaker);member.rampFrom=this.now();member.rampReason='restarted';this.events.restarted++;
+  }
   /** Applies the source's snapshot: add (slow start unless loading at startup), update, drain, retire. */
   private sync():void {
     const now=this.now(), seen=new Set<string>();
@@ -443,14 +490,23 @@ export class UpstreamPool implements Upstream {
       if(record.state!=='active') continue;
       let upstream:Primary;
       try {upstream=this.create(record);} catch {this.events.invalid++;continue;}
-      this.members.set(record.id,new Member(record,upstream,new UpstreamHealth(probe=>upstream.health(probe),breaker,()=>this.kick()),this.startingUp?-Infinity:now));
+      const added=new Member(record,upstream,this.startingUp?-Infinity:now,'added');
+      added.health=this.newHealth(added,breaker);
+      const telemetry=this.pool.telemetry, metrics=upstream.metrics?.bind(upstream);
+      if(telemetry&&metrics) {
+        const log=this.pool.log??((line:string)=>process.stderr.write(`${line}\n`));
+        added.telemetry=new EngineTelemetry(metrics,{...telemetry,now:this.now,maxSeqs:()=>added.record.maxSeqs,
+          warn:line=>log(`WARNING gateway upstream ${added.record.id}: ${line}`)},event=>{if(event.restarted) this.restarted(added,breaker);this.kick();});
+        added.telemetry.start();
+      }
+      this.members.set(record.id,added);
       if(!this.startingUp) this.events.added++;
     }
     for(const member of [...this.members.values()]) if(!seen.has(member.record.id)) {this.retire(member);this.events.removed++;}
     if(!this.startingUp) this.kick();
   }
   private retire(member:Member):void {
-    this.members.delete(member.record.id);member.gone=true;
+    this.members.delete(member.record.id);member.gone=true;member.telemetry?.stop();
     if(member.inFlight>0) this.retiring.add(member);
   }
   poolMetrics():PoolMetrics {
@@ -460,20 +516,23 @@ export class UpstreamPool implements Upstream {
       const budget=capacity===null?null:kappa*capacity-this.globalPrefix;
       return {id:member.record.id,epoch:member.record.epoch,state:member.gone?'gone':member.record.state,inFlight:member.inFlight,
         limit:Number.isFinite(limit)?limit:null,maxSeqs:Number.isFinite(member.record.maxSeqs)?member.record.maxSeqs:null,weight:member.record.weight,
-        slowStart:!member.gone&&this.ramping(member,now),breaker:member.health.state(),
+        slowStart:!member.gone&&this.ramping(member,now),rampReason:!member.gone&&this.ramping(member,now)?member.rampReason:null,breaker:member.health.state(),
         reservedKvTokens:member.kvReserved,prefillTokens:member.prefill,kvCapacityTokens:capacity,prefillTokensPerSec:member.record.prefillTokensPerSec??null,
         seqUtil:Number.isFinite(limit)?Math.round(member.inFlight/limit*1000)/1000:null,kvUtil:budget&&budget>0?Math.round(member.kvReserved/budget*1000)/1000:null,
-        dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures};
+        dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures,
+        telemetry:member.telemetry&&!member.gone?member.telemetry.metrics():null};
     });
     const count=(check:(u:UpstreamMemberMetrics)=>boolean)=>upstreams.filter(check).length;
     const rate=this.prefillRate();
     return {pool:this.model,
       members:{active:count(u=>u.state==='active'),ramping:count(u=>u.state==='active'&&u.slowStart),draining:count(u=>u.state==='draining'),
-        gone:count(u=>u.state==='gone'),breakerOpen:count(u=>u.state!=='gone'&&u.breaker!=='closed')},
+        gone:count(u=>u.state==='gone'),breakerOpen:count(u=>u.state!=='gone'&&u.breaker!=='closed'),
+        telemetryBlocked:count(u=>!!u.telemetry?.blocked),telemetryStale:count(u=>!!u.telemetry?.stale)},
       waiting:this.queue.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,events:{...this.events},
       queue:{routing:this.routing,fairness:this.pool.fairness??'fifo',queued:this.queue.counts(),queuedTokens:this.queue.queuedTokens,
         waitMs:{p50:percentile(this.waits,0.5),p95:percentile(this.waits,0.95)},rejected:{...this.rejected},globalPrefixTokens:this.globalPrefix,
         prefillTokensPerSec:rate===null?null:Math.round(rate)},
+      telemetry:this.pool.telemetry?{intervalMs:this.pool.telemetry.intervalMs,kvHigh:this.pool.telemetry.kvHigh,waitingMax:this.pool.telemetry.waitingMax}:null,
       upstreams,...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
   }
   private secondaryMetrics():FailoverMetrics {

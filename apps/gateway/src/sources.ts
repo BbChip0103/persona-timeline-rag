@@ -32,7 +32,8 @@ const baseMetrics=(discovery:SourceMetrics['discovery']):SourceMetrics=>({discov
 const sameRecords=(a:UpstreamRecord[],b:UpstreamRecord[])=>a.length===b.length&&a.every((record,index)=>{
   const other=b[index]!;
   return record.id===other.id&&record.baseUrl===other.baseUrl&&record.maxSeqs===other.maxSeqs&&record.weight===other.weight&&record.state===other.state
-    &&record.epoch===other.epoch&&record.kvCapacityTokens===other.kvCapacityTokens;
+    &&record.epoch===other.epoch&&record.kvCapacityTokens===other.kvCapacityTokens&&record.prefillTokensPerSec===other.prefillTokensPerSec
+    &&record.drainMaxMs===other.drainMaxMs;
 });
 const byId=(records:UpstreamRecord[])=>[...records].sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0);
 

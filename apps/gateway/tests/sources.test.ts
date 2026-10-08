@@ -69,6 +69,26 @@ describe('upstreams file (PTR_GATEWAY_UPSTREAMS_FILE)',()=>{
   });
 });
 
+describe('record comparison',()=>{
+  test('a changed prefillTokensPerSec or drainMaxMs is a change of the snapshot (file reload, registry poll)',async()=>{
+    const write=(prefill?:number)=>JSON.stringify({pools:{'gemma-4-e4b-fp8':{upstreams:[{id:'a',baseUrl:'http://127.0.0.1:18000/v1',...(prefill?{prefillTokensPerSec:prefill}:{})}]}}});
+    const file=tempFile(write());
+    const source=new FileUpstreamSource(file,'gemma-4-e4b-fp8');
+    let changes=0;source.onChange(()=>{changes++;});
+    writeFileSync(file,write(9000));source.reload();
+    expect(changes).toBe(1);expect(source.snapshot()[0]!.prefillTokensPerSec).toBe(9000);
+    writeFileSync(file,write());source.reload();
+    expect(changes).toBe(2);expect(source.snapshot()[0]!.prefillTokensPerSec).toBeUndefined();
+    let now=1_000_000;const store=new MemoryUpstreamRegistry(()=>now);
+    const registry=new RedisRegistrySource(store,{pool:'gemma-4-e4b-fp8',allow:parseUpstreamAllow(undefined),pollMs:1e9,now:()=>now});
+    let nudged=0;registry.onChange(()=>{nudged++;});
+    await store.heartbeat(rec('pod-a',18000,{drainMaxMs:60000}),10000);await registry.poll();
+    await store.heartbeat(rec('pod-a',18000,{drainMaxMs:30000,seq:1}),10000);await registry.poll();
+    expect(nudged).toBe(2);expect(registry.snapshot()[0]!.drainMaxMs).toBe(30000);
+    now+=1;await registry.close();
+  });
+});
+
 describe('Redis registry source',()=>{
   function setup(options:{seed?:StaticUpstreamSource;allow?:string}={}) {
     let now=1_000_000;const store=new MemoryUpstreamRegistry(()=>now);

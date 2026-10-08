@@ -53,6 +53,8 @@ export function classifyTransportError(error:unknown):UpstreamConnectError|undef
   return new UpstreamConnectError('closed_before_response',false);
 }
 
+/** vLLM's /metrics is tens of KiB; anything far larger is not read into memory. */
+const METRICS_MAX_BYTES=1024*1024;
 /** Self-hosted OpenAI-compatible engine (vLLM/SGLang through an SSH tunnel); the gateway pins the model. */
 export class OpenAICompatibleUpstream implements Upstream {
   readonly model:string;
@@ -76,6 +78,18 @@ export class OpenAICompatibleUpstream implements Upstream {
     if(!response.ok){await response.body?.cancel().catch(()=>undefined);return {status:response.status,contentType:'application/json',body:''};}
     return {status:response.status,contentType:response.headers.get('content-type')??'application/json',
       body:response.body?(response.body as unknown as AsyncIterable<Uint8Array>):''};
+  }
+  /** The engine's Prometheus text (`GET {origin}/metrics`) for the telemetry filter; null on a non-200 answer or over 1 MiB. */
+  async metrics(signal:AbortSignal):Promise<string|null> {
+    const response=await fetch(`${new URL(this.healthUrl).origin}/metrics`,{signal,redirect:'error'});
+    if(!response.ok||!response.body) {await response.body?.cancel().catch(()=>undefined);return null;}
+    const chunks:Uint8Array[]=[];let size=0;
+    for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+      size+=chunk.byteLength;
+      if(size>METRICS_MAX_BYTES) {await response.body.cancel().catch(()=>undefined);return null;}
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString('utf8');
   }
   /** vLLM/SGLang `GET /health`: 200 only while the engine is alive (vLLM answers 503 once EngineCore is dead). */
   async health(signal:AbortSignal):Promise<boolean> {

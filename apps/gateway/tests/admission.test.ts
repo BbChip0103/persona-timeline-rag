@@ -19,6 +19,21 @@ describe('request estimate (§3.1, §4.1)',()=>{
 const state=(extra:Partial<CreditState>={}):CreditState=>({inFlight:0,limit:12,kvReserved:0,prefill:0,kvCapacity:null,prefillPerSec:null,weight:1,...extra});
 describe('credit admission fits_u(r) (§3.1)',()=>{
   const r={tokens:2900,maxTokens:512,prefixTokens:1100};
+  test('engine telemetry (condition 5): a blocked upstream does not fit',()=>{
+    const options={kappa:0.9,globalPrefix:1100,ttftPenaltyMs:1000};
+    expect(fitsCredit(state({engineBlocked:true}),r,options)).toBe(false);
+    expect(fitsCredit(state({engineBlocked:false,inFlight:1}),r,options)).toBe(true);
+  });
+  test('selection: non-blocked members first; an idle blocked member takes one request only when no other member fits',()=>{
+    const options={kappa:0.9,globalPrefix:1100,ttftPenaltyMs:1000}, req={...r,affinityKey:'k'};
+    for(const policy of ['round_robin','least_inflight','scored'] as const) {
+      const members=[{...state({engineBlocked:true}),id:'idle-blocked'},{...state({inFlight:5}),id:'busy-ok'}];
+      expect(chooseUpstream(policy,members,req,options,0)?.id).toBe('busy-ok');
+      const full=[{...state({engineBlocked:true}),id:'idle-blocked'},{...state({inFlight:12}),id:'full'}];
+      expect(chooseUpstream(policy,full,req,options,0)?.id).toBe('idle-blocked');
+      expect(chooseUpstream(policy,[{...state({engineBlocked:true,inFlight:1}),id:'blocked'}],req,options,0)).toBeUndefined();
+    }
+  });
   test('sequences: N + 1 ≤ S_eff',()=>{
     expect(fitsCredit(state({inFlight:11}),r,{kappa:0.9,globalPrefix:1100,ttftPenaltyMs:1000})).toBe(true);
     expect(fitsCredit(state({inFlight:12}),r,{kappa:0.9,globalPrefix:1100,ttftPenaltyMs:1000})).toBe(false);

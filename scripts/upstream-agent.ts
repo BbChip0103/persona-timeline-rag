@@ -19,7 +19,7 @@
  * (120000), then delete the record and exit. Output never contains the Redis URL.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { EPOCH, POOL_NAME, REGISTRY_PREFIX, REGISTRY_HEARTBEAT_MS, REGISTRY_TTL_MS, RedisUpstreamRegistry, UPSTREAM_ID, assertRegistryPrefix,
+import { EPOCH, POOL_NAME, REGISTRY_HEARTBEAT_MS, REGISTRY_TTL_MS, RedisUpstreamRegistry, UPSTREAM_ID, registryPrefixFromEnv,
   createRedisConnection, parseUpstreamRecord, type RegistryReader, type RegistryWriter, type UpstreamRecord } from '@ptr/messaging/registry';
 
 export interface EngineStatus { running:number|null; waiting:number|null; kvCapacityTokens:number|null; startTimeSeconds:number|null }
@@ -232,7 +232,7 @@ export function agentTimings(env:NodeJS.ProcessEnv) {
 
 async function main():Promise<number> {
   const parsed=parseAgentArgs(process.argv.slice(2));
-  const prefix=assertRegistryPrefix(process.env.PTR_REGISTRY_PREFIX??REGISTRY_PREFIX);
+  const prefix=registryPrefixFromEnv(process.env);
   const redis=createRedisConnection(process.env.PTR_REDIS_URL??'');
   redis.on('error',()=>undefined); // reconnects on its own; the agent logs registry_unreachable instead
   const store=new RedisUpstreamRegistry(redis,prefix);

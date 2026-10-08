@@ -40,6 +40,8 @@ export interface CreditState {
   /** K_u (null = unknown: no KV check); R_u prefill tok/s (null = uncalibrated: no prefill gate). */
   kvCapacity:number|null; prefillPerSec:number|null;
   weight:number;
+  /** Fresh engine telemetry over the filter limits (§3.1 item 5, S4): no new request while it lasts (see chooseUpstream). */
+  engineBlocked?:boolean;
 }
 export interface CreditOptions {
   /** κ (PTR_GATEWAY_KV_OVERCOMMIT, 0.9). */
@@ -59,8 +61,9 @@ export const uncachedTokens=(r:CreditRequest,globalPrefix:number)=>Math.max(0,r.
 /** The KV this request reserves until it ends: (1 − h)·T̂ + M. */
 export const kvReservation=(r:CreditRequest,globalPrefix:number)=>uncachedTokens(r,globalPrefix)+r.maxTokens;
 
-/** fits_u(r), §3.1 conditions 2–4 (state and telemetry are checked by the caller). */
+/** fits_u(r), §3.1 conditions 2–5 (the member state, condition 1, is checked by the caller). */
 export function fitsCredit(state:CreditState,r:CreditRequest,options:CreditOptions):boolean {
+  if(state.engineBlocked) return false;
   if(state.inFlight+1>state.limit) return false;
   // An idle server always takes one request, however large, so nothing waits forever. G (resident once per server) is
   // capped at half the budget so a wrongly learned block cannot starve a server.
@@ -79,7 +82,12 @@ const rendezvous=(key:string,id:string)=>createHash('sha256').update(`${key}\n${
  */
 export function chooseUpstream<T extends CreditState&{id:string}>(policy:RoutingPolicy,members:T[],r:CreditRequest&{affinityKey:string},
   options:CreditOptions,turn:number):T|undefined {
-  const fitting=members.filter(member=>fitsCredit(member,r,options));
+  let fitting=members.filter(member=>fitsCredit(member,r,options));
+  // Only when no member fits: a telemetry-blocked member with nothing of this gateway's in flight takes one request
+  // (like the KV rule's idle exception). A misread or stuck engine metric (names and semantics unverified on the
+  // deployed vLLM) then degrades that server to one call at a time instead of removing it, and another gateway's load
+  // cannot starve this gateway completely. One per gateway: with k gateways an engine may get k such calls.
+  if(!fitting.length) fitting=members.filter(member=>member.engineBlocked&&member.inFlight===0&&fitsCredit({...member,engineBlocked:false},r,options));
   if(!fitting.length) return undefined;
   if(policy==='round_robin') return fitting[turn%fitting.length];
   if(policy==='least_inflight') {

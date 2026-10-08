@@ -115,6 +115,18 @@ describe('central queue in the gateway (S3)',()=>{
     expect(pool.poolMetrics().queue.globalPrefixTokens).toBe(100); // 390 B / 3.9, the block three requests share
     for(let i=0;i<4;i++) e.release();await Promise.all([probe,...calls]);
   });
+  test('G counts decay (half-life 256 requests): after a policy-prompt deploy the new block becomes G; a short run of odd requests does not',async()=>{
+    const answer={model:'m',health:async()=>true,complete:async()=>({status:200,contentType:'application/json',body:'{}'})};
+    const pool=new UpstreamPool({model:'m',source:new TestSource([rec('a','http://127.0.0.1:18000',{maxSeqs:1000})]),create:()=>answer,admission:true});
+    const send=(policyBytes:number)=>pool.complete({messages:[{role:'system',content:'P'.repeat(policyBytes)},{role:'user',content:'u'}]},new AbortController().signal);
+    for(let i=0;i<1000;i++) await send(390);
+    expect(pool.poolMetrics().queue.globalPrefixTokens).toBe(100);
+    for(let i=0;i<100;i++) await send(780); // a batch with another system message: not the policy block
+    expect(pool.poolMetrics().queue.globalPrefixTokens).toBe(100);
+    let switched=0;
+    for(let i=1;i<=400&&!switched;i++) {await send(780);if(pool.poolMetrics().queue.globalPrefixTokens===200) switched=i;}
+    expect(switched).toBeGreaterThan(0);expect(switched).toBeLessThanOrEqual(300); // the old block's weight halves every 256
+  });
   test('prefill tokens (U) are released at the first body chunk, the sequence and KV at the end',async()=>{
     let finish:(()=>void)|undefined;
     const engine=createServer((req,res)=>{req.resume();req.on('end',()=>{

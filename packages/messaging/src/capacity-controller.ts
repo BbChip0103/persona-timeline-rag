@@ -115,6 +115,19 @@ export interface CapacityControllerOptions {
   shortageMs?: number;
   log?: (line: string) => void; now?: () => number;
 }
+/**
+ * What to check for the rejection reasons present. The records were found under this pool's index, so the registry
+ * prefix and the pool name are right; the record policy (shared with the gateways) refused them.
+ */
+function rejectionHint(reasons: string[]): string {
+  const hints: string[] = [];
+  if (reasons.includes('not_allowed')) hints.push('PTR_GATEWAY_UPSTREAM_ALLOW must contain the records\' ports (use the gateways\' value here)');
+  if (reasons.includes('not_loopback')) hints.push('records must use http://127.0.0.1:<port> (no credentials, query or fragment)');
+  if (reasons.includes('invalid_record')) hints.push('malformed records (agent version mismatch, or written by hand)');
+  if (reasons.includes('pool_mismatch')) hints.push('a record\'s pool field differs from the pool it is indexed under (written by hand?)');
+  if (reasons.includes('duplicate_url')) hints.push('two ids registered for one engine origin');
+  return `check: ${hints.join('; ')}`;
+}
 /** One controller per pool/queue; any number may run (one leader acts). `tick` runs every `intervalMs` (5 s). */
 export class CapacityController {
   private planner: CapacityPlanner;
@@ -155,20 +168,23 @@ export class CapacityController {
     const byReason = Object.entries(rejections.reduce<Record<string, number>>((all, r) => ({ ...all, [r.reason]: (all[r.reason] ?? 0) + 1 }), {}))
       .sort().map(([reason, n]) => `${reason}:${n}`).join(',');
     // S_live = 0 with rejected records, or with live records only in other pools, is a configuration error (allowlist,
-    // pool name, prefix): hold G instead of shrinking every worker to FLOOR, and say so loudly.
-    const suspicious = sLive === 0 && current !== null && (rejections.length > 0 || otherPools.length > 0);
+    // pool name): hold G instead of shrinking every worker to FLOOR, and say so loudly. A set G is held for at most
+    // `suspectHoldMs` (a real outage must still shrink it); an unset G (first start) stays unset for as long as the
+    // configuration looks wrong, since writing FLOOR would throttle every worker to one turn because of a typo.
+    const suspicious = sLive === 0 && (rejections.length > 0 || otherPools.length > 0);
     if (suspicious) this.suspectSince ??= now; else this.suspectSince = undefined;
     const holdMs = o.suspectHoldMs ?? 300000;
-    const suspect = suspicious && now - this.suspectSince! < holdMs;
+    const suspect = suspicious && (current === null || now - this.suspectSince! < holdMs);
     if (suspicious && !suspect && this.lastSuspectLog !== 'expired') {
       this.lastSuspectLog = 'expired';
       this.log(`WARNING capacity: holding G for ${Math.round(holdMs / 1000)} s without a usable record; following the registry again (S_live=0)`);
     }
     const decision: CapacityDecision = suspect ? { target: null, next: current, reason: 'hold_suspect' } : this.planner.step({ sLive, draining, current });
     if (suspect) {
+      const held = current === null ? 'leaving G unset' : `holding G=${current}`;
       const line = rejections.length
-        ? `WARNING capacity: S_live=0 but ${rejections.length} registry record(s) rejected (${byReason}); holding G=${current}: check PTR_GATEWAY_UPSTREAM_ALLOW, PTR_CAPACITY_POOL, PTR_REGISTRY_PREFIX`
-        : `WARNING capacity: S_live=0 for pool ${o.pool} but live records exist only in other pools (${otherPools.join(',')}); holding G=${current}: check PTR_CAPACITY_POOL / PTR_GATEWAY_POOL`;
+        ? `WARNING capacity: S_live=0 but ${rejections.length} registry record(s) rejected (${byReason}); ${held}: ${rejectionHint(rejections.map((r) => r.reason))}`
+        : `WARNING capacity: S_live=0 for pool ${o.pool} but live records exist only in other pools (${otherPools.join(',')}); ${held}: check PTR_CAPACITY_POOL / PTR_GATEWAY_POOL`;
       if (line !== this.lastSuspectLog) { this.lastSuspectLog = line; this.log(line); }
     } else if (!suspicious) {
       this.lastSuspectLog = undefined;

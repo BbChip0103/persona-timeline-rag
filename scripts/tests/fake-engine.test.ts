@@ -41,4 +41,21 @@ describe('FakeEngineUpstream (§9.1)',()=>{
     const [first,second]=await Promise.all([a,b]);
     expect(second.total).toBeGreaterThan(first.total);
   });
+  test('telemetry controls for acceptance runs: forced KV/waiting reports, an unanswered /metrics, a restart with a new start time',async()=>{
+    const e=await engine({kvCapacityTokens:1000});
+    const read=async()=>(await fetch(`http://127.0.0.1:${e.port}/metrics`,{signal:AbortSignal.timeout(300)})).text();
+    const info=/vllm:cache_config_info\{([^}]*)\}/.exec(await read())![1]!; // 1000 tokens / 16 = 62 blocks
+    expect(info).toContain('num_gpu_blocks="62"');expect(info).toContain('block_size="16"');
+    e.report({kvUsage:0.97,waiting:5});
+    expect(await read()).toMatch(/vllm:kv_cache_usage_perc\{[^}]*\} 0\.97/);expect(await read()).toMatch(/vllm:num_requests_waiting\{[^}]*\} 5/);
+    e.report({});expect(await read()).toMatch(/vllm:kv_cache_usage_perc\{[^}]*\} 0\n/);
+    const before=/process_start_time_seconds (\S+)/.exec(await read())![1];
+    e.hangMetrics(true);await expect(read()).rejects.toThrow();e.hangMetrics(false);
+    await new Promise(r=>setTimeout(r,20));
+    await e.restart();
+    // A pooled keep-alive connection may still point at the old process: one failed read is what a poller sees too.
+    const after=await read().catch(()=>read());
+    expect(/process_start_time_seconds (\S+)/.exec(after)![1]).not.toBe(before);
+    expect((await call(e,msgs('after restart',100),5)).text).toContain('[DONE]');
+  });
 });
