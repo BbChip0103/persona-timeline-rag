@@ -1,6 +1,6 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 import { createLocalPool } from '@ptr/storage';
-import { POOL_NAME, REGISTRY_PREFIX, RedisUpstreamRegistry, assertRegistryPrefix, createRedisConnection, type UpstreamRecord } from '@ptr/messaging';
+import { POOL_NAME, REGISTRY_PREFIX, RedisUpstreamRegistry, assertRegistryPrefix, createRedisConnection, type UpstreamRecord } from '@ptr/messaging/registry';
 import { createGateway } from './server';
 import { FailoverUpstream } from './failover';
 import { DEFAULT_FAILOVER, UpstreamPool, type FailoverOptions } from './pool';
@@ -73,9 +73,9 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
   if(env.PTR_GATEWAY_UPSTREAMS_FILE&&env.PTR_SELFHOSTED_BASE_URL) throw new Error('SELFHOSTED_BASE_URL_WITH_UPSTREAMS_FILE');
   const options={failover:failoverOptions(env),primaryAttempts:integer(env,'PTR_GATEWAY_PRIMARY_ATTEMPTS',2,1,8),
     slowStartMs:integer(env,'PTR_GATEWAY_SLOW_START_MS',30000,0,600000),queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000)};
-  // A request may wait the queue timeout twice (admission queue, then for a free upstream) inside the upstream deadline;
-  // past it a pool wait would end as an unmarked 504 instead of the retryable 503.
-  if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=2*options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
+  // The upstream deadline starts once the request is admitted, and the wait for a free upstream (up to the queue
+  // timeout) runs inside it: if it were not longer, that wait would end as an unmarked 504 instead of the retryable 503.
+  if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
   const allow=parseUpstreamAllow(env.PTR_GATEWAY_UPSTREAM_ALLOW);
   const pollMs=integer(env,'PTR_GATEWAY_REGISTRY_POLL_MS',2000,100,60000), graceMs=integer(env,'PTR_GATEWAY_REGISTRY_GRACE_MS',10000,0,600000);
   const prefix=assertRegistryPrefix(env.PTR_REGISTRY_PREFIX??REGISTRY_PREFIX);

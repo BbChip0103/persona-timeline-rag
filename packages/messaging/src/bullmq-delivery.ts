@@ -62,3 +62,13 @@ export function startTurnConsumer(url: string, handler: (dispatch: TurnDispatch)
   // Graceful: stop taking jobs, wait for in-flight handlers, then release the connection BullMQ will not close.
   return { close: async () => { await worker.close(); await connection.quit(); } };
 }
+
+/** The turn queue as the capacity controller and workers see it (global concurrency, counts); owns its connection. */
+export function openTurnQueue(url: string, queueName = TURN_QUEUE): {
+  queue: Pick<Queue, 'getGlobalConcurrency' | 'setGlobalConcurrency' | 'removeGlobalConcurrency' | 'getJobCounts'>; close(): Promise<void>;
+} {
+  const connection = createRedisConnection(url);
+  connection.on('error', () => undefined); // fail-fast commands surface the outage to the caller
+  const queue = new Queue(queueName, { connection, prefix: REDIS_PREFIX });
+  return { queue, close: async () => { await queue.close(); connection.disconnect(); } };
+}

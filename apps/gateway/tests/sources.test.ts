@@ -119,12 +119,17 @@ describe('Redis registry source',()=>{
   });
   test('the static seed is used only until the registry is first read; the registry is the authority after that',async()=>{
     const seed=new StaticUpstreamSource([rec('pod-a',18000,{epoch:'file',maxSeqs:4}),rec('pod-s',18005,{epoch:'file'})]);
-    const {store,source}=setup({seed});
+    const {store,source,advance}=setup({seed});
     store.down=true;await source.start();
     try {
       expect(ids(source)).toEqual(['pod-a','pod-s']);expect(source.metrics().stale).toBe(true);
       store.down=false;await store.heartbeat(rec('pod-a',18000,{maxSeqs:12}),10000);await source.poll();
-      expect(source.snapshot()).toEqual([rec('pod-a',18000,{maxSeqs:12})]);
+      // First read after a stale start: the registry takes over at once; seed entries it lacks get the TTL grace
+      // (their agents may not have re-published yet), then they are dropped.
+      expect(source.snapshot().find(r=>r.id==='pod-a')).toEqual(rec('pod-a',18000,{maxSeqs:12}));
+      expect(ids(source)).toEqual(['pod-a','pod-s']);expect(source.metrics().graceRemainingMs).toBe(10000);
+      advance(10000);await store.heartbeat(rec('pod-a',18000,{maxSeqs:12,seq:1}),10000);await source.poll();
+      expect(source.snapshot()).toEqual([rec('pod-a',18000,{maxSeqs:12,seq:1})]);
       // Drained and removed: it must not come back from the seed.
       await store.setState('gemma-4-e4b-fp8','pod-a','draining');await source.poll();
       expect(source.snapshot()[0]).toMatchObject({id:'pod-a',state:'draining'});
@@ -133,9 +138,9 @@ describe('Redis registry source',()=>{
       store.down=true;await source.poll();expect(source.snapshot()).toEqual([]); // a later outage freezes, never re-seeds
     } finally {await source.close();}
   });
-  test('two records with the same baseUrl are one engine: the second is rejected (duplicate_url)',async()=>{
+  test('two records on the same origin (host:port) are one engine: the second is rejected (duplicate_url)',async()=>{
     const {store,source}=setup();
-    await store.heartbeat(rec('pod-a',18000),10000);await store.heartbeat(rec('pod-b',18000),10000);
+    await store.heartbeat(rec('pod-a',18000),10000);await store.heartbeat(rec('pod-b',18000,{baseUrl:'http://127.0.0.1:18000/other/v1'}),10000);
     await source.poll();await source.poll();
     expect(ids(source)).toEqual(['pod-a']);expect(source.metrics()).toMatchObject({rejected:1,rejectedReasons:{duplicate_url:1}});
   });
@@ -172,7 +177,9 @@ describe('gateway discovery configuration',()=>{
     expect(()=>upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_SLOW_START_MS:'-1'})).toThrow('INVALID_PTR_GATEWAY_SLOW_START_MS');
     expect(()=>upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_PRIMARY_ATTEMPTS:'0'})).toThrow('INVALID_PTR_GATEWAY_PRIMARY_ATTEMPTS');
     expect(()=>upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_UPSTREAM_ALLOW:'10.0.0.1:1'})).toThrow('INVALID_PTR_GATEWAY_UPSTREAM_ALLOW');
-    // Admission queue + pool wait can each take the queue timeout; the upstream deadline must outlast both.
-    expect(()=>upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_QUEUE_TIMEOUT_MS:'30000',PTR_GATEWAY_UPSTREAM_TIMEOUT_MS:'60000'})).toThrow('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
+    // The wait for a free upstream runs inside the upstream deadline (which starts after admission): it must be longer.
+    expect(()=>upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_QUEUE_TIMEOUT_MS:'10000',PTR_GATEWAY_UPSTREAM_TIMEOUT_MS:'10000'})).toThrow('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
+    const ok=upstreamFromEnvironment({...base,PTR_GATEWAY_UPSTREAMS_FILE:file(),PTR_GATEWAY_QUEUE_TIMEOUT_MS:'30000',PTR_GATEWAY_UPSTREAM_TIMEOUT_MS:'31000'});
+    void ok.close?.();
   });
 });

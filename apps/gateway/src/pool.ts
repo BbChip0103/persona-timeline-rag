@@ -1,4 +1,4 @@
-import type { UpstreamRecord } from '@ptr/messaging';
+import type { UpstreamRecord } from '@ptr/messaging/registry';
 import { UpstreamHealth, type BreakerMetrics, type BreakerOptions, type BreakerState } from './health';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
@@ -48,6 +48,8 @@ export interface PoolMetrics {
   waiting:number;
   /** Requests resent to another primary after a connection failure (nothing reached the first one). */
   retriedOnOtherPrimary:number;
+  /** Requests that got the marked 503 GATEWAY_QUEUE_TIMEOUT because no upstream slot freed in time (a subset of the gateway's rejected.queueTimeout). */
+  queueTimeouts:number;
   events:{added:number;removed:number;replaced:number;invalid:number};
   upstreams:UpstreamMemberMetrics[];
   registry?:SourceMetrics;
@@ -116,7 +118,7 @@ export class UpstreamPool implements Upstream {
   private readonly stopSource:()=>void;
   private startingUp=true;private rr=0;
   private readonly started:number[]=[];
-  private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0};
+  private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
   private readonly failovers:Record<string,number>={};
   private readonly events={added:0,removed:0,replaced:0,invalid:0};
   constructor(private readonly pool:PoolOptions) {
@@ -145,6 +147,7 @@ export class UpstreamPool implements Upstream {
         // After a failed attempt the request may have reached an engine (closed before response): no other upstream
         // in time must not become a marked "nothing was sent" rejection. Fall through to the secondary or the error.
         if(attempt>0&&error instanceof GatewayRejection) break;
+        if(error instanceof GatewayRejection) this.counts.queueTimeouts++;
         throw error;
       }
       if(!picked.member) {if(picked.none) reason=picked.none;break;}
@@ -188,14 +191,11 @@ export class UpstreamPool implements Upstream {
       const halfOpen=live.filter(member=>member.health.state()==='half_open');
       // With a secondary as the alternative, a half-open primary is probed before use (FailoverUpstream behaviour).
       // Otherwise probe in the background: others serve meanwhile, or (no alternative) the request goes out at once.
-      if(!usable.length&&this.pool.secondary) {
-        let changed=false;
-        for(const member of halfOpen) if(await member.health.allowed(signal)) {
-          // The membership may have changed during the probe: never dispatch to a member that left or is draining.
-          if(this.members.get(member.record.id)===member&&member.record.state==='active') usable=[member];else changed=true;
-          break;
-        }
-        if(changed) continue;
+      if(!usable.length&&this.pool.secondary&&halfOpen.length) {
+        const healthy=await this.firstHealthy(halfOpen,signal,deadline());
+        // The membership may have changed during the probe: never dispatch to a member that left or is draining.
+        if(healthy&&!(this.members.get(healthy.record.id)===healthy&&healthy.record.state==='active')) continue;
+        if(healthy) usable=[healthy];
       }
       else for(const member of halfOpen) void member.health.probeHealth();
       if(!usable.length) {
@@ -213,6 +213,21 @@ export class UpstreamPool implements Upstream {
       }
       await this.waitForChange(signal,deadline());
     }
+  }
+  /** Probes all half-open members at once (shared probes); the first healthy one wins. Undefined if none by the deadline. */
+  private firstHealthy(members:Member[],signal:AbortSignal,deadlineAt:number):Promise<Member|undefined> {
+    if(signal.aborted) return Promise.reject(signal.reason);
+    return new Promise<Member|undefined>((resolve,reject)=>{
+      let pending=members.length, settled=false;
+      const finish=(value:Member|undefined,error?:unknown)=>{
+        if(settled) return;settled=true;clearTimeout(timer);signal.removeEventListener('abort',onAbort);
+        if(error!==undefined) reject(error);else resolve(value);
+      };
+      const onAbort=()=>finish(undefined,signal.reason);
+      const timer=setTimeout(()=>finish(undefined),Math.max(0,deadlineAt-Date.now()));
+      signal.addEventListener('abort',onAbort,{once:true});
+      for(const member of members) void member.health.probeHealth().then(ok=>{if(ok) finish(member);else if(--pending===0) finish(undefined);});
+    });
   }
   private async callPrimary(member:Member,request:ChatCompletionRequest,signal:AbortSignal,openGeneration:number|undefined):Promise<UpstreamResult> {
     let released=false;
@@ -305,7 +320,7 @@ export class UpstreamPool implements Upstream {
     return {pool:this.model,
       members:{active:count(u=>u.state==='active'),ramping:count(u=>u.state==='active'&&u.slowStart),draining:count(u=>u.state==='draining'),
         gone:count(u=>u.state==='gone'),breakerOpen:count(u=>u.state!=='gone'&&u.breaker!=='closed')},
-      waiting:this.waiters.size,retriedOnOtherPrimary:this.counts.retried,events:{...this.events},upstreams,
+      waiting:this.waiters.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,events:{...this.events},upstreams,
       ...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
   }
   private secondaryMetrics():FailoverMetrics {

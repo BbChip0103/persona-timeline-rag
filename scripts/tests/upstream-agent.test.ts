@@ -117,6 +117,32 @@ describe('ptr-upstream-agent',()=>{
     expect(await handle.done).toBe('drained');clearInterval(watch);
     expect(states).toContain('draining');expect(await live(memory)).toEqual([]);
   });
+  test('a CLI drain survives an agent crash and record expiry: the agent restarted on the same engine finishes the drain',async()=>{
+    const engine=fakeEngine();engine.state.running=1;const base=await listen(engine.server);
+    const store=new MemoryUpstreamRegistry(Date.now);const first=agent(store,base);
+    await until(async()=>(await live(store)).length===1);
+    const drained=drainUpstream(store,'m','pod-a',{timeoutMs:5000,pollMs:20,tombstoneMs:5000});
+    await until(()=>first.status().phase==='draining');
+    first.kill();await first.done; // crashed mid-drain (engine still busy)
+    await until(async()=>(await live(store)).length===0,2000); // record expired
+    const second=agent(store,base);
+    await until(async()=>(await live(store))[0]?.state==='draining'); // came back draining, not active
+    expect(second.status().phase).toBe('draining');
+    engine.state.running=0;
+    expect(await second.done).toBe('drained');expect(await drained).toBe('drained');
+  });
+  test('labels are matched whole: a label ending in block_size does not count as block_size',()=>{
+    expect(parseEngineMetrics('vllm:cache_config_info{kv_block_size="64",block_size="16",num_gpu_blocks="10"} 1\n').kvCapacityTokens).toBe(160);
+    expect(parseEngineMetrics('vllm:cache_config_info{kv_block_size="64",num_gpu_blocks="10"} 1\n').kvCapacityTokens).toBeNull();
+  });
+  test('the /health timeout is an option (default 2500 ms): a slow but healthy engine still registers',async()=>{
+    const slow=createServer((req,res)=>{if(req.url==='/health'){setTimeout(()=>{res.writeHead(200);res.end();},1200);return;}res.writeHead(404);res.end();});
+    const base=await listen(slow);const store=new MemoryUpstreamRegistry(Date.now);
+    agent(store,base);
+    await until(async()=>(await live(store)).length===1,4000);
+    const quick=new MemoryUpstreamRegistry(Date.now);agent(quick,base,{id:'pod-b',healthTimeoutMs:300});
+    await new Promise(r=>setTimeout(r,1500));expect(await live(quick)).toEqual([]);
+  });
   test('a dead engine is deregistered; when it comes back (new process) it registers with a new epoch',async()=>{
     const engine=fakeEngine();const base=await listen(engine.server);
     const store=new MemoryUpstreamRegistry(Date.now);agent(store,base);

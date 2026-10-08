@@ -5,6 +5,11 @@
  * RedisRegistrySource, and worker clients (OpenAICompatibleTextProvider with the S1 retry settings) as closed-loop users.
  *
  *   pnpm exec tsx scripts/registry-acceptance.ts [--store=redis|memory] [--scenarios=T1,T2,T3,T4,T5,T7,T7b,T9] [--users=24]
+ *   pnpm exec tsx scripts/registry-acceptance.ts --scenarios=G1,G2,G5,T8      # capacity controller (S2b), Redis only
+ *
+ * The G scenarios replace the closed-loop users with the production BullMQ path (BullMqTurnDelivery / startTurnConsumer /
+ * openTurnQueue) on a throwaway queue `ptrtest-cap-<hex>` (obliterated afterwards), workers (local concurrency 64) whose turn is 400 ms outside the gateway [assumption: Jev ~0.4 s, 36 §7] plus one
+ * gateway call, a feeder that keeps 48 turns waiting, and the real CapacityController (5 s ticks) on the registry.
  *
  * --store=redis (default) uses the isolated Redis (PTR_REDIS_URL) through a local TCP proxy (so T7 can cut it without
  * touching the shared container), in a dedicated `ptrtest:s2<run>:llm` namespace that is deleted afterwards.
@@ -15,7 +20,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { connect, createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { MemoryUpstreamRegistry, RedisUpstreamRegistry, assertLocalRedisUrl, createRedisConnection, type RegistryReader, type RegistryWriter } from '@ptr/messaging';
+import { BullMqTurnDelivery, CapacityController, MemoryUpstreamRegistry, RedisCapacityStore, RedisUpstreamRegistry, assertLocalRedisUrl,
+  createRedisConnection, openTurnQueue, startTurnConsumer, type RegistryReader, type RegistryWriter } from '@ptr/messaging';
 import { OpenAICompatibleTextProvider, type ProviderError } from '@ptr/providers';
 import { createGateway } from '../apps/gateway/src/server';
 import { UpstreamPool, type PoolMetrics } from '../apps/gateway/src/pool';
@@ -92,7 +98,7 @@ class World {
   readonly engines=new Map<string,FakeEngine>();readonly agents=new Map<string,AgentHandle>();
   private readonly closers:(()=>Promise<void>|void)[]=[];
   private stopLoad=false;private loadDone:Promise<void>|undefined;private sampler:NodeJS.Timeout|undefined;
-  pool!:UpstreamPool;gatewayBase='';private readonly token=randomBytes(24).toString('hex');
+  pool!:UpstreamPool;gatewayBase='';readonly token=randomBytes(24).toString('hex');
   constructor(readonly name:string,readonly backend:Backend) {}
   t():number {return (Date.now()-this.t0)/1000;}
   mark(event:string,extra:Record<string,unknown>={}):void {this.events.push({t:this.t(),event,...extra});}
@@ -101,9 +107,9 @@ class World {
     for(let port=18700+Math.floor(Math.random()*200);;port++) {try {await engine.start(port);break;} catch {if(port>18999) throw new Error('NO_FREE_PORT');}}
     this.engines.set(name,engine);this.closers.push(()=>engine.kill());return engine;
   }
-  agent(name:string,engine:FakeEngine):AgentHandle {
+  agent(name:string,engine:FakeEngine,extra:{maxSeqs?:number}={}):AgentHandle {
     const store=this.backend.store();
-    const handle=runAgent(store.store,{pool:POOL,id:name,baseUrl:engine.baseUrl,log:line=>{const parsed=JSON.parse(line) as {event:string};this.mark(`agent ${name}: ${parsed.event}`);}});
+    const handle=runAgent(store.store,{pool:POOL,id:name,baseUrl:engine.baseUrl,...extra,log:line=>{const parsed=JSON.parse(line) as {event:string};this.mark(`agent ${name}: ${parsed.event}`);}});
     this.agents.set(name,handle);this.closers.push(()=>{handle.kill();return store.close();});
     return handle;
   }
@@ -136,6 +142,7 @@ class World {
     };
     this.loadDone=Promise.all(Array.from({length:users},(_,index)=>user(index))).then(()=>undefined);
   }
+  addCloser(close:()=>Promise<void>|void):void {this.closers.push(close);}
   async until(seconds:number):Promise<void> {const wait=this.t0+seconds*1000-Date.now();if(wait>0) await sleep(wait);}
   async finish():Promise<void> {
     this.stopLoad=true;await this.loadDone;clearInterval(this.sampler);
@@ -157,6 +164,8 @@ class World {
 
 interface Backend {
   close?():Promise<void>;
+  /** Redis only: for BullMQ and the capacity controller (direct, not through the proxy). */
+  redis?:{url:string;prefix:string};
   store():{store:Store;close():Promise<void>};
   cut():Promise<void>|void; restore():Promise<void>|void;
   /** Live records as Redis sees them (bypassing the proxy). */
@@ -178,7 +187,7 @@ async function redisBackend(run:string):Promise<Backend> {
     return {store:new RedisUpstreamRegistry(redis,prefix),close:async()=>{redis.disconnect();}};
   };
   return {
-    store:viaProxy,cut:()=>proxy.cut(),restore:()=>proxy.restore(),direct:()=>directStore,
+    store:viaProxy,cut:()=>proxy.cut(),restore:()=>proxy.restore(),direct:()=>directStore,redis:{url,prefix},
     liveIds:async()=>(await directStore.list(POOL)).records.map(hash=>hash.id!).sort(),
     cleanup:async()=>{
       let cursor='0';
@@ -243,9 +252,12 @@ async function t3(world:World,users:number):Promise<Result> {
   world.agents.get('b')!.kill();b.kill();world.mark('SIGKILL engine b + agent b');
   await world.until(30);
   const gone=world.firstSample(sample=>!sample.pool.upstreams.some(u=>u.id==='b'),killAt);
+  const breaker=world.firstSample(sample=>sample.pool.upstreams.some(u=>u.id==='b'&&u.breaker!=='closed'),killAt);
   const f=world.failures();const last=world.samples.at(-1)!.pool;
+  // Removal bound: the record expires ≤ TTL (10 s) after the last heartbeat (≤ 2 s before the kill) and a gateway sees
+  // it within one poll (2 s): ≤ 12 s after the kill. The breaker takes the dead engine out of dispatch much earlier.
   return {scenario:'T3 engine+agent SIGKILL',...f,engineInFlightAtKill:inFlight,streamsCut:b.cut,retriedOnOtherPrimary:last.retriedOnOtherPrimary,
-    removedAfterS:round(gone?gone.t-killAt:null),pass:f.failed===0&&!!gone&&gone.t-killAt<=12};
+    breakerOpenAfterS:round(breaker?breaker.t-killAt:null),removedAfterS:round(gone?gone.t-killAt:null),pass:f.failed===0&&!!gone&&gone.t-killAt<=12};
 }
 async function t4(world:World,users:number):Promise<Result> {
   const [,b]=await bothUp(world,users);await world.until(8);
@@ -267,6 +279,7 @@ async function t5(world:World,users:number):Promise<Result> {
   await world.registered(1);await world.gateway();await world.waitForMembers(1);world.load(users);
   const reAdds:{t:number;limit:number|null;maxInFlight2s:number}[]=[];
   let handle=world.agent('b',b);
+  await world.waitForMembers(2);const flapsFrom=world.t(); // b's initial registration is not a re-add
   for(let cycle=0;cycle<4;cycle++) {
     // Agent stalls: no heartbeat → the record expires after the TTL; it comes back 12 s after the stall began.
     await sleep(2000);handle.kill();world.mark(`flap ${cycle}: agent b stalls`);
@@ -274,16 +287,15 @@ async function t5(world:World,users:number):Promise<Result> {
   }
   await sleep(4000);
   const before=world.pool.poolMetrics().events;
+  // Every add is counted by the pool (events.added), so a re-add between two samples is still seen.
   for(let i=1;i<world.samples.length;i++) {
-    const was=world.member(world.samples[i-1]!,'b'), now=world.member(world.samples[i]!,'b');
-    if(!was&&now) {
-      const window=world.samples.filter(s=>s.t>=world.samples[i]!.t&&s.t<world.samples[i]!.t+2);
-      reAdds.push({t:round(world.samples[i]!.t)!,limit:now.limit,maxInFlight2s:Math.max(...window.map(s=>world.member(s,'b')?.inFlight??0))});
-    }
+    if(world.samples[i]!.t<=flapsFrom||world.samples[i]!.pool.events.added<=world.samples[i-1]!.pool.events.added) continue;
+    const at=world.samples[i]!.t;const window=world.samples.filter(s=>s.t>=at&&s.t<at+2);
+    reAdds.push({t:round(at)!,limit:world.member(world.samples[i]!,'b')?.limit??null,maxInFlight2s:Math.max(0,...window.map(s=>world.member(s,'b')?.inFlight??0))});
   }
   const f=world.failures();
   return {scenario:'T5 flapping',...f,adds:before.added,removes:before.removed,reAdds,
-    pass:f.failed===0&&reAdds.every(add=>add.maxInFlight2s<=2)};
+    pass:f.failed===0&&reAdds.length===4&&reAdds.every(add=>add.maxInFlight2s<=2)};
 }
 async function t7(world:World,users:number,backend:Backend,outageMs:number):Promise<Result> {
   await bothUp(world,users);await world.until(8);
@@ -324,6 +336,107 @@ async function t9(world:World,users:number,backend:Backend):Promise<Result> {
     pass:f.failed===0&&metrics.registry!.rejected-before===2&&rogueConnections===0&&metrics.upstreams.every(u=>u.id==='a')};
 }
 
+
+/** S2b: a real BullMQ queue + workers + the capacity controller in front of the world's gateway. */
+interface CapacityRun {gSamples:{t:number;g:number|null;active:number;wait:number}[];llmShare:number[];controllerLines:{t:number;line:string}[]}
+async function withCapacity(world:World,nonLlmMs=400):Promise<CapacityRun> {
+  const redis=world.backend.redis;if(!redis) throw new Error('G scenarios need --store=redis');
+  const queueName=`ptrtest-cap-${randomBytes(4).toString('hex')}`;
+  const connection=createRedisConnection(redis.url);connection.on('error',()=>undefined);
+  const delivery=new BullMqTurnDelivery(redis.url,{queueName});
+  const {queue,close:closeQueue}=openTurnQueue(redis.url,queueName);
+  const run:CapacityRun={gSamples:[],llmShare:[],controllerLines:[]};
+  const controller=new CapacityController({registry:new RedisUpstreamRegistry(connection,redis.prefix),queue,store:new RedisCapacityStore(connection,redis.prefix),
+    pool:POOL,allow:parseUpstreamAllow(undefined),id:'harness-dispatcher',q:256,intervalMs:5000,log:line=>{run.controllerLines.push({t:world.t(),line});world.mark(line);}});
+  await controller.tick();controller.start(); // G is set before the first job
+  const client=new OpenAICompatibleTextProvider({baseUrl:world.gatewayBase,model:'gateway',apiKey:world.token,resetRetries:2,retryMinRemainingMs:5000,timeoutMs:60000});
+  const consumer=startTurnConsumer(redis.url,async dispatch=>{
+    const start=Date.now();
+    try {
+      await sleep(nonLlmMs);const llmStart=Date.now();
+      await client.generate([{role:'user',content:`synthetic queued turn ${dispatch.turnId}`}],{signal:AbortSignal.timeout(40000),requestKey:`s2b-${dispatch.turnId}`,deadlineAt:start+30000});
+      const end=Date.now();world.turns.push({start,end,ok:true});run.llmShare.push((end-llmStart)/(end-start));
+    } catch(error) {world.turns.push({start,end:Date.now(),ok:false,code:(error as ProviderError).code??'UNKNOWN'});}
+  },{concurrency:64,queueName});
+  let stopped=false,n=0;
+  const feeder=(async()=>{while(!stopped){try {const {wait=0}=await queue.getJobCounts('wait');
+    for(let i=wait;i<48&&!stopped;i++) await delivery.publish({turnId:`${queueName}-${n++}`,seq:0});} catch {/* next */}
+    await sleep(100);}})();
+  const sampler=(async()=>{while(!stopped){try {const g=await queue.getGlobalConcurrency();const {active=0,wait=0}=await queue.getJobCounts('active','wait');
+    run.gSamples.push({t:world.t(),g,active,wait});} catch {/* next */}await sleep(250);}})();
+  world.addCloser(async()=>{
+    stopped=true;await feeder;await sampler;await controller.stop();await consumer.close();
+    await delivery.close(true);await closeQueue();connection.disconnect();
+  });
+  return run;
+}
+const gAt=(run:CapacityRun,t:number)=>[...run.gSamples].reverse().find(s=>s.t<=t)?.g??null;
+const median=(values:number[])=>{const sorted=[...values].sort((a,b)=>a-b);return sorted.length?sorted[Math.floor(sorted.length/2)]!:null;};
+const activeIn=(run:CapacityRun,from:number,to:number)=>median(run.gSamples.filter(s=>s.t>=from&&s.t<to).map(s=>s.active));
+/** Largest number of G changes inside any 15 s window. */
+function maxChangesPer15s(run:CapacityRun,from:number,to:number):number {
+  const changes:number[]=[];
+  for(let i=1;i<run.gSamples.length;i++) {const s=run.gSamples[i]!;if(s.t>=from&&s.t<to&&s.g!==run.gSamples[i-1]!.g) changes.push(s.t);}
+  return Math.max(0,...changes.map(t=>changes.filter(u=>u>=t&&u<t+15).length));
+}
+const share=(run:CapacityRun)=>{const v=median(run.llmShare);return v===null?null:round(v);};
+
+async function g1(world:World):Promise<Result> {
+  const a=await world.engine('a');world.agent('a',a);await world.registered(1);await world.gateway();await world.waitForMembers(1);
+  const run=await withCapacity(world);await world.until(12);
+  const gBefore=gAt(run,11.9);const b=await world.engine('b');const agentB=world.agent('b',b);
+  await world.until(56);
+  const published=agentB.status().firstPublishedAt!;const publishedT=(published-world.t0)/1000;
+  const raised=run.gSamples.find(s=>s.t>=publishedT&&s.g!==null&&gBefore!==null&&s.g>gBefore);
+  const f=world.failures();
+  return {scenario:'G1 scale-up: G',...f,gBefore,gAfter:gAt(run,56),gRaisedAfterS:round(raised?raised.t-publishedT:null),
+    activeBefore:activeIn(run,6,12),activeAfter:activeIn(run,46,56),rateBefore:round(world.rate(6,12)),rateAfter:round(world.rate(46,56)),
+    llmShareOfTurn:share(run),pass:f.failed===0&&gBefore===15&&gAt(run,56)===30&&!!raised&&raised.t-publishedT<=5.5};
+}
+async function g2(world:World,users:number,backend:Backend):Promise<Result> {
+  await bothUpQueued(world);const run=await withCapacity(world);await world.until(12);
+  const gBefore=gAt(run,11.9);const drainAt=world.t();
+  const result=await drainUpstream(backend.direct(),POOL,'b',{timeoutMs:60000,pollMs:200});
+  await world.until(30);
+  const lowered=run.gSamples.find(s=>s.t>=drainAt&&s.g===15);
+  const f=world.failures();void users;
+  return {scenario:'G2 planned drain: G',...f,cli:result,gBefore,gAfter:gAt(run,30),gLoweredAfterS:round(lowered?lowered.t-drainAt:null),
+    activeAfter:activeIn(run,22,30),pass:f.failed===0&&gBefore===30&&!!lowered&&lowered.t-drainAt<=5.5};
+}
+async function g5(world:World):Promise<Result> {
+  const [,b]=await bothUpQueued(world);const run=await withCapacity(world);await world.until(8);
+  const from=world.t();let handle=world.agents.get('b')!;
+  for(let cycle=0;cycle<4;cycle++) {
+    await sleep(2000);handle.kill();world.mark(`flap ${cycle}: agent b stalls`);
+    await sleep(12000);handle=world.agent('b',b);
+  }
+  await sleep(4000);const to=world.t();
+  const values=[...new Set(run.gSamples.filter(s=>s.t>=from&&s.t<to).map(s=>s.g))];
+  const f=world.failures();const maxChanges=maxChangesPer15s(run,from,to);
+  return {scenario:'G5 flapping: G',...f,gValuesDuringFlaps:values,maxGChangesPer15s:maxChanges,pass:f.failed===0&&maxChanges<=1};
+}
+async function t8(world:World):Promise<Result> {
+  const [,b]=await bothUpQueued(world);const run=await withCapacity(world);await world.until(10);
+  const gBefore=gAt(run,9.9);const lowerAt=world.t();
+  world.agents.get('b')!.kill();world.agent('b',b,{maxSeqs:4});world.mark('agent b re-published with maxSeqs 4');
+  await world.until(55);
+  const firstDrop=run.gSamples.find(s=>s.t>=lowerAt&&s.g!==null&&gBefore!==null&&s.g<gBefore);
+  const final=run.gSamples.find(s=>s.t>=lowerAt&&s.g===20);
+  const after=run.gSamples.filter(s=>s.t>=(final?.t??55));
+  const converged=after.find((s,i)=>after.slice(i).every(x=>x.g===null||x.active<=x.g));
+  const overshoot=Math.max(0,...run.gSamples.filter(s=>s.t>=lowerAt&&s.g!==null).map(s=>s.active-s.g!));
+  const f=world.failures();
+  return {scenario:'T8 maxSeqs lowered',...f,gBefore,gSteps:[...new Set(run.gSamples.filter(s=>s.t>=lowerAt).map(s=>s.g))],
+    firstDecreaseAfterS:round(firstDrop?firstDrop.t-lowerAt:null),reachedTargetAfterS:round(final?final.t-lowerAt:null),
+    activeConvergedAfterTargetS:round(converged&&final?converged.t-final.t:null),maxActiveOverG:overshoot,llmShareOfTurn:share(run),
+    pass:f.failed===0&&gBefore===30&&!!firstDrop&&firstDrop.t-lowerAt>=10&&!!final&&!!converged};
+}
+async function bothUpQueued(world:World):Promise<[FakeEngine,FakeEngine]> {
+  const a=await world.engine('a'),b=await world.engine('b');world.agent('a',a);world.agent('b',b);
+  await world.registered(2);await world.gateway();await world.waitForMembers(2);
+  return [a,b];
+}
+
 async function main():Promise<void> {
   const run=`${Date.now().toString(36)}${randomBytes(2).toString('hex')}`;
   const storeKind=args.store??'redis', users=Number(args.users??24);
@@ -336,7 +449,8 @@ async function main():Promise<void> {
     try {
       const result=scenario==='T1'?await t1(world,users):scenario==='T2'?await t2(world,users,backend):scenario==='T3'?await t3(world,users)
         :scenario==='T4'?await t4(world,users):scenario==='T5'?await t5(world,users):scenario==='T7'?await t7(world,users,backend,10000)
-        :scenario==='T7b'?await t7(world,users,backend,12000):scenario==='T9'?await t9(world,8,backend):undefined;
+        :scenario==='T7b'?await t7(world,users,backend,12000):scenario==='T9'?await t9(world,8,backend)
+        :scenario==='G1'?await g1(world):scenario==='G2'?await g2(world,users,backend):scenario==='G5'?await g5(world):scenario==='T8'?await t8(world):undefined;
       if(!result) throw new Error(`unknown scenario ${scenario}`);
       results.push({...result,events:world.events});
       process.stderr.write(`${scenario}: ${result.pass?'PASS':'FAIL'} failed=${String(result.failed)}\n`);

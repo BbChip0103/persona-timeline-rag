@@ -30,6 +30,9 @@
       ],
       "@ptr/messaging": [
         "packages/messaging/src/index.ts"
+      ],
+      "@ptr/messaging/registry": [
+        "packages/messaging/src/registry.ts"
       ]
     }
   }

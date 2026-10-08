@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from 'node:fs';
-import { parseUpstreamRecord, POOL_NAME, REGISTRY_TTL_MS, REGISTRY_HEARTBEAT_MS, UPSTREAM_ID, type RegistryReader, type UpstreamRecord } from '@ptr/messaging';
+import { REGISTRY_TTL_MS, REGISTRY_HEARTBEAT_MS, UPSTREAM_ID, checkUpstreamUrl, screenUpstreamRecords, type AllowRule, type RegistryReader, type UpstreamRecord } from '@ptr/messaging/registry';
 
 export interface SourceMetrics {
   discovery:'static'|'file'|'redis';
@@ -45,32 +45,9 @@ export class StaticUpstreamSource implements UpstreamSource {
   metrics():SourceMetrics {return baseMetrics('static');}
 }
 
-export interface AllowRule {host:string;from:number;to:number}
-/** PTR_GATEWAY_UPSTREAM_ALLOW: comma list of `127.0.0.1:<port>` or `127.0.0.1:<from>-<to>` (default 127.0.0.1:18000-18999). */
-export function parseUpstreamAllow(value:string|undefined):AllowRule[] {
-  const invalid=()=>new Error('INVALID_PTR_GATEWAY_UPSTREAM_ALLOW');
-  const raw=value??'127.0.0.1:18000-18999';
-  const rules=raw.split(',').map(part=>part.trim()).filter(Boolean).map(part=>{
-    const match=/^127\.0\.0\.1:(\d{1,5})(?:-(\d{1,5}))?$/.exec(part);if(!match) throw invalid();
-    const from=Number(match[1]),to=Number(match[2]??match[1]);
-    if(from<1||to>65535||from>to) throw invalid();
-    return {host:'127.0.0.1',from,to};
-  });
-  if(!rules.length) throw invalid();
-  return rules;
-}
-/**
- * The gateway's own rule for any upstream URL (same as OpenAICompatibleUpstream): plain http on 127.0.0.1, no
- * credentials, query or fragment. With `allow` (registry records) the explicit port must also be allowlisted.
- * Returns the rejection reason, or null when it may be used.
- */
-export function checkUpstreamUrl(baseUrl:string,allow?:AllowRule[]):'not_loopback'|'not_allowed'|null {
-  let url:URL;try {url=new URL(baseUrl);} catch {return 'not_loopback';}
-  if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password||url.search||url.hash) return 'not_loopback';
-  if(!allow) return null;
-  const port=Number(url.port);
-  return url.port&&allow.some(rule=>rule.host===url.hostname&&port>=rule.from&&port<=rule.to)?null:'not_allowed';
-}
+// The registry record policy (loopback + allowlist + one id per engine) lives with the registry, so the capacity
+// controller counts exactly the upstreams a gateway would use.
+export { checkUpstreamUrl, parseUpstreamAllow, screenUpstreamRecords, type AllowRule } from '@ptr/messaging/registry';
 
 const FILE_KEYS=new Set(['id','baseUrl','maxSeqs','kvCapacityTokens','weight','prefillTokensPerSec']);
 /**
@@ -203,26 +180,21 @@ export class RedisRegistrySource implements UpstreamSource {
       return; // frozen: keep the last membership
     }
     const now=this.now();
-    if(this.staleSince!==null&&this.everRead) this.graceUntil=now+(this.options.graceMs??REGISTRY_TTL_MS);
+    // Readable again after an outage, or for the first time after a stale start (then the seed is what we had).
+    if(this.staleSince!==null) this.graceUntil=now+(this.options.graceMs??REGISTRY_TTL_MS);
     this.staleSince=null;this.everRead=true;this.version=listed.version;
-    const next=new Map<string,UpstreamRecord>(), urls=new Set<string>();
-    // By id, so which of two records sharing a baseUrl wins does not depend on Redis ordering.
-    for(const hash of [...listed.records].sort((a,b)=>String(a.id)<String(b.id)?-1:String(a.id)>String(b.id)?1:0)) {
-      const key=`${hash.id}\u0000${hash.epoch}\u0000${hash.baseUrl}`;
-      let record:UpstreamRecord|undefined, reason:string|null;
-      try {
-        record=parseUpstreamRecord(hash);
-        reason=record.pool!==this.options.pool||!POOL_NAME.test(record.pool)?'pool_mismatch':checkUpstreamUrl(record.baseUrl,this.options.allow);
-        // One engine under two ids would get twice its maxSeqs.
-        if(!reason&&urls.has(new URL(record.baseUrl).href.replace(/\/$/,''))) reason='duplicate_url';
-      } catch {reason='invalid_record';}
-      if(reason||!record) {
-        if(!this.rejectedKeys.has(key)) {if(this.rejectedKeys.size>=10000) this.rejectedKeys.clear();this.rejectedKeys.add(key);this.rejected++;this.rejectedReasons[reason!]=(this.rejectedReasons[reason!]??0)+1;}
-        continue;
-      }
-      next.set(record.id,record);urls.add(new URL(record.baseUrl).href.replace(/\/$/,''));
+    const screened=screenUpstreamRecords(listed.records,this.options.pool,this.options.allow);
+    for(const {key,reason} of screened.rejections) if(!this.rejectedKeys.has(key)) {
+      if(this.rejectedKeys.size>=10000) this.rejectedKeys.clear();
+      this.rejectedKeys.add(key);this.rejected++;this.rejectedReasons[reason]=(this.rejectedReasons[reason]??0)+1;
     }
-    if(now<this.graceUntil) for(const record of this.registry) if(!next.has(record.id)) next.set(record.id,record);
+    const next=new Map(screened.records.map(record=>[record.id,record]));
+    const urls=new Set(screened.records.map(record=>new URL(record.baseUrl).origin));
+    // Grace: keep what we were using (registry records, or the seed after a stale start) unless the registry now has it.
+    if(now<this.graceUntil) for(const record of this.merged) {
+      const origin=new URL(record.baseUrl).origin;
+      if(!next.has(record.id)&&!urls.has(origin)) {next.set(record.id,record);urls.add(origin);}
+    }
     this.registry=byId([...next.values()]);
     this.publish();
     if(!this.unsubscribe&&this.timer) void this.subscribe();

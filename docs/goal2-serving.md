@@ -138,7 +138,9 @@ Capacity rule: **Σ worker concurrency ≤ Σ upstream caps + gateway max queue*
 (`PTR_WORKER_CONCURRENCY × replicas ≤ PTR_GATEWAY_MAX_CONCURRENCY + PTR_GATEWAY_MAX_QUEUE` today, one upstream).
 A turn makes one model call at a time, so this bounds what can reach the gateway at once. Within the rule, count
 rejections (429) do not happen in steady state, waits end only by the queue timeout (503), and further turns wait in
-BullMQ, which is durable. At startup a gateway worker reads `capacity` from the first gateway whose `/metrics` answers
+BullMQ, which is durable. **With the capacity controller on** (below; default with `PTR_GATEWAY_DISCOVERY=redis`) the
+rule is enforced automatically through BullMQ's global concurrency, and a worker only logs the current G at startup.
+**With it off**, at startup a gateway worker reads `capacity` from the first gateway whose `/metrics` answers
 and writes one stderr line if `PTR_WORKER_CONCURRENCY × PTR_WORKER_REPLICAS_HINT` exceeds it (a warning, never a
 startup failure; `gateway capacity check skipped` when no gateway answers). Breaking the rule does not fail turns
 outright: the excess calls get 429 and wait in jittered client retries until the turn deadline, instead of waiting in
@@ -151,8 +153,63 @@ throughput only.
 
 With an upstream pool (below) each upstream also has its own cap `maxSeqs` (default 12), and the rule becomes
 Σ worker concurrency ≤ min(`PTR_GATEWAY_MAX_CONCURRENCY`, Σ_u maxSeqs_u) + max queue. `/metrics` `capacity` still
-reports the gateway-wide numbers only; the capacity controller (design stage S2b) will enforce the rule from the
-registry.
+reports the gateway-wide numbers only; the capacity controller (next section) enforces the rule from the registry.
+
+### Capacity controller (stage S2b)
+
+The dispatcher keeps BullMQ's **global concurrency G** of the turn queue (`ptr:<PTR_TURN_QUEUE>:meta` field
+`concurrency`) at
+
+```text
+S_live = Σ maxSeqs of the pool's active, unexpired registry records that pass the gateway's record policy
+         (allowlist, loopback, one id per origin; draining excluded; slow start ignored: the gateway absorbs the ramp)
+Q      = PTR_GATEWAY_MAX_QUEUE (256)
+G*     = max(PTR_CAPACITY_FLOOR (1), min(ceil(S_live × (1 + PTR_CAPACITY_HEADROOM (0.25))), S_live + Q))
+```
+
+BullMQ checks G in its Lua when a worker takes the next job, so active turns ≤ G ≤ Σ caps + queue: the capacity rule
+holds by construction, whatever the number of workers. `PTR_WORKER_CONCURRENCY` is only a local cap now (64 is a good
+value); in-flight turns = min(Σ local caps, G).
+
+- **Leader:** any number of dispatchers may run; one holds `ptr:llm:cap:leader` (`SET NX PX 15000`, renewed every
+  tick) and acts every `PTR_CAPACITY_INTERVAL_MS` (5000). It writes G only when it changes.
+- **Hysteresis:** increases apply at once (a new server raises G within one tick). A decrease applies only after 3
+  consecutive ticks (15 s) with a lower target, then at most 25% (at least 1) per tick, so a record flapping on its TTL
+  never moves G. A newly **draining** upstream (planned shrink) lowers G at once. Lowering G never interrupts active
+  turns: BullMQ only stops handing out new jobs (verified by the opt-in BullMQ test), so `active` may exceed G briefly
+  and converges as turns finish.
+- **Registry unreachable:** G is held and those ticks never count toward a decrease (§13.2 freeze); BullMQ is down
+  with it anyway. A readable but empty registry goes to FLOOR (1) through the hysteresis: never 0, which would stop
+  every worker silently. With failover on, OpenRouter's 120/min ceiling is the minimum path; turns beyond G wait in
+  BullMQ, durably.
+- **Status:** `ptr:llm:cap` HASH {target, sLive, q, g, active, wait, computedAt, reason, writes, leader, registryStale,
+  workerShortage} (expires 60 s after the last tick), and one dispatcher stderr line whenever G or registry staleness
+  changes: `capacity G=30 target=30 S_live=24 Q=256 active=… wait=… reason=increase`. `reason` is one of init, increase,
+  hold, decrease_pending, decrease, draining, registry_stale.
+- **worker_shortage:** `wait > 0` while `active < G` for 15 s logs `WARNING worker_shortage …` once per episode (add
+  workers or raise `PTR_WORKER_CONCURRENCY`).
+- **Known limits:** a crashed worker's job holds its active slot until BullMQ's stall check (about 30–60 s); one queue
+  = one pool (several pools need one turn queue each).
+- **Headroom:** part of a turn runs outside the gateway (Jev intent p50 0.39 s × 0.594 calls/turn, the safety filter
+  about 0.4 s when on; the measured workload), so the GPUs stay busy only if G ≥ S_live / share, i.e. headroom ≈ 1/share − 1, where
+  share = time in gateway calls / turn time. From the measured parts: share ≈ 1.0 with both Jev features off (the
+  fake-model path's turn e2e p50 1.94 s vs gateway call p50 1.99 s), ≈ 0.86 with intent only and ≈ 0.69 with intent +
+  safety at an E4B call of 1.4 s (the measured safety step), so headroom 0 – 0.45. The default 0.25 stays; set 0.5 with both Jev features
+  on, and re-measure with real engines (S8). Too much headroom only lengthens gateway waits (bounded by Q); too little
+  leaves GPU slots idle (the acceptance harness shows it: share 0.6, G = 15 keeps about 9 of 12 slots busy).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_CAPACITY_CONTROLLER` | `on` with `PTR_GATEWAY_DISCOVERY=redis`, else `off` | `on`, `off` (the dispatcher never touches G; it warns if a G is still set), `clear` (remove a G left by an earlier run, then behave as off) |
+| `PTR_CAPACITY_POOL` | `PTR_GATEWAY_POOL`, else `PTR_SELFHOSTED_MODEL` | pool whose registry records count (required when on) |
+| `PTR_CAPACITY_HEADROOM` | 0.25 (0–4) | see above |
+| `PTR_CAPACITY_FLOOR` | 1 (1–4096) | lowest G (user decision; the design draft had 4) |
+| `PTR_CAPACITY_INTERVAL_MS` | 5000 (500–60000) | tick |
+| `PTR_GATEWAY_MAX_QUEUE` | 256 | Q (the same value the gateway uses) |
+| `PTR_TURN_QUEUE`, `PTR_REGISTRY_PREFIX`, `PTR_GATEWAY_UPSTREAM_ALLOW` | as elsewhere | queue to control, registry namespace, record allowlist |
+
+Static discovery (env or file) keeps the controller off by default: G would only mirror a fixed file, and the startup
+warning stays the guard. Turning the controller off leaves the last G in Redis (`clear` removes it).
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -263,8 +320,10 @@ A self-hosted gateway can front a **pool** of engines that serve the same model 
 
 Sources (`UpstreamSource`):
 - **env only** (`PTR_SELFHOSTED_BASE_URL` + `PTR_SELFHOSTED_MODEL`, nothing below set): the single upstream as before.
-  It behaves exactly like a pool built from a file with one entry (`apps/gateway/tests/pool.test.ts` compares the
-  bytes); the failover wrapper is now that one-entry pool internally.
+  It behaves like a pool built from a file with one entry (`apps/gateway/tests/pool.test.ts` compares the bytes), with
+  one difference: env only has no per-upstream cap (only `PTR_GATEWAY_MAX_CONCURRENCY`), while a file entry defaults to
+  `maxSeqs` 12; give the entry `maxSeqs` = `PTR_GATEWAY_MAX_CONCURRENCY` for the same behaviour. The failover wrapper
+  is that uncapped one-entry pool internally.
 - **file** (`PTR_GATEWAY_UPSTREAMS_FILE`, `PTR_GATEWAY_DISCOVERY=static`): JSON as in
   `configs/gateway-upstreams.example.json`. The gateway serves one pool, `PTR_GATEWAY_POOL` (default
   `PTR_SELFHOSTED_MODEL`); the pool name is the model name sent to the engines (their `--served-model-name`).
@@ -274,9 +333,10 @@ Sources (`UpstreamSource`):
   `PTR_SELFHOSTED_BASE_URL` together with a file is a startup error.
 - **redis** (`PTR_GATEWAY_DISCOVERY=redis`, `PTR_REDIS_URL`): the registry below. The file (or else
   `PTR_SELFHOSTED_BASE_URL` as one entry `selfhosted`) is only the seed: the membership until the registry has been
-  read once (Redis unreachable at startup). From the first successful read on, the registry is the only authority,
-  so a drained or removed upstream never comes back from the seed, and the seed's id never doubles an engine that its
-  agent registers under another id.
+  read once (Redis unreachable at startup). On that first read the seed entries the registry lacks get the TTL grace
+  (their agents may not have re-published yet); after it the registry is the only authority, so a drained or removed
+  upstream never comes back from the seed, and the seed's id never doubles an engine that its agent registers under
+  another id (one id per origin).
 
 Registry layout (`packages/messaging/src/upstream-registry.ts`, prefix `PTR_REGISTRY_PREFIX`, default `ptr:llm`; it must
 end in `:llm`, so it can never touch `ptr:turns:*` or `ptr:events:*`):
@@ -286,11 +346,21 @@ ptr:llm:up:<pool>:<id>   HASH {pool,id,baseUrl,maxSeqs,kvCapacityTokens,weight,s
 ptr:llm:ups:<pool>       ZSET member=<id> score=expiresAtMs   (read with ZRANGEBYSCORE now +inf; writers trim expired entries)
 ptr:llm:reg:ver          INCR on every new record, field change, drain or removal
 ptr:llm:reg              PUB/SUB, empty message = "poll now"
+ptr:llm:drain:<pool>:<id> STRING epoch, PX drain bound + TTL (130000): the drain tombstone
+ptr:llm:cap / :cap:leader HASH status / leader lock of the capacity controller (S2b)
 ```
+
+Expiry scores and the live listing use the Redis server clock (`TIME` inside the scripts). Pool names and ids are
+validated before any key or SCAN pattern is built. The gateway and the agent import `@ptr/messaging/registry` (registry +
+guarded Redis connection), which never loads BullMQ.
 
 Writes are Lua scripts (atomic): a heartbeat carries the publisher's state and refreshes TTL, index and `seq`; it never
 turns a `draining` record of the same epoch back to `active`, and a draining agent's heartbeat recreates an expired
-record as draining; a new id or epoch, or a changed field, bumps the version and publishes.
+record as draining; a new id or epoch, or a changed field, bumps the version and publishes. Marking a record draining
+also writes a **drain tombstone** for its epoch: if the record expires before its agent deletes it (agent crash, Redis
+blip) and an agent comes back on the same engine (same epoch), its heartbeat recreates the record draining and the
+agent finishes the drain, so a drain started from the CLI cannot be undone by an expiry. A new epoch (new engine
+process) is not affected.
 
 Gateway behaviour (`RedisRegistrySource` + `UpstreamPool`):
 - **Discovery:** polls every `PTR_GATEWAY_REGISTRY_POLL_MS` (2000) and at once on a nudge; lost nudges are covered by
@@ -329,8 +399,8 @@ prompts (user data) are sent. The gateway therefore applies the existing loopbac
 (`http`, `127.0.0.1`, no credentials, query or fragment) **and** `PTR_GATEWAY_UPSTREAM_ALLOW`, a comma list of
 `127.0.0.1:<port>` or `127.0.0.1:<from>-<to>` (default `127.0.0.1:18000-18999`; anything else is a startup error).
 Records that fail are ignored and counted once per record version in `registry.rejected` / `rejectedReasons`
-(`not_loopback`, `not_allowed`, `invalid_record`, `pool_mismatch`, and `duplicate_url`: a second id for a `baseUrl`
-already listed, which would double that engine's `maxSeqs`); they are never logged with their URL. File and env
+(`not_loopback`, `not_allowed`, `invalid_record`, `pool_mismatch`, and `duplicate_url`: a second id on an origin
+(host:port) already listed, which would double that engine's `maxSeqs`; the lower id wins); they are never logged with their URL. File and env
 entries are operator config and need only the loopback rule. Records are not signed; multi-host operation (TLS, Redis
 ACL users, HMAC-signed records, a host/CIDR allowlist) is a later, separately approved stage.
 
@@ -344,14 +414,16 @@ ACL users, HMAC-signed records, a host/CIDR allowlist) is a later, separately ap
 | `PTR_GATEWAY_PRIMARY_ATTEMPTS` | 2 (1–8) | upstreams tried per request on connection failures |
 | `PTR_GATEWAY_REGISTRY_POLL_MS` | 2000 (100–60000) | registry poll interval |
 | `PTR_GATEWAY_REGISTRY_GRACE_MS` | 10000 (0–600000) | keep-missing-records grace after Redis comes back |
-| (check) | — | with a pool, `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` must exceed 2 × `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (admission queue + upstream wait), else startup fails |
+| (check) | — | with a pool, `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` must exceed `PTR_GATEWAY_QUEUE_TIMEOUT_MS`, else startup fails: the upstream deadline starts once a request is admitted and the wait for a free upstream (up to the queue timeout) runs inside it, so a shorter deadline would turn that wait into an unmarked 504 |
 | `PTR_REGISTRY_PREFIX` | `ptr:llm` | registry namespace (`…:llm`; tests use `ptrtest:<run>:llm`) |
 | `PTR_UPSTREAM_HEARTBEAT_MS` / `PTR_UPSTREAM_TTL_MS` | 2000 / 10000 | agent heartbeat and record TTL (TTL ≥ 2 × heartbeat) |
 | `PTR_UPSTREAM_DRAIN_SETTLE_MS` | 4000 | agent drain: minimum wait before checking the engine is idle (two gateway polls) |
-| `PTR_UPSTREAM_DRAIN_MAX_MS` | 120000 | agent drain: upper bound before the record is deleted anyway |
+| `PTR_UPSTREAM_DRAIN_MAX_MS` | 120000 | agent drain: upper bound before the record is deleted anyway; the CLI's drain tombstone lives this + TTL |
+| `PTR_UPSTREAM_HEALTH_TIMEOUT_MS` | 2500 (100–30000) | agent: timeout of one engine `/health` check (a busy engine may answer slowly) |
 
 `/metrics` with a pool adds `pool`: `members` {active, ramping, draining, gone, breakerOpen}, `waiting`,
-`retriedOnOtherPrimary`, `events` {added, removed, replaced, invalid}, `upstreams[]` {id, epoch, state, inFlight, limit,
+`retriedOnOtherPrimary`, `queueTimeouts` (marked 503s because no upstream slot freed in time; a subset of
+`rejected.queueTimeout`, which also counts the admission queue), `events` {added, removed, replaced, invalid}, `upstreams[]` {id, epoch, state, inFlight, limit,
 maxSeqs, weight, slowStart, breaker, dispatched, answered, connectFailures} and `registry` {discovery, stale
 (registry_stale), staleForMs, failedPolls, rejected (registry_rejected), rejectedReasons, graceRemainingMs, version,
 fileErrors}. With failover on, `failover.breaker` aggregates the members (closed if any is closed).
@@ -386,7 +458,8 @@ Runbook:
 - **Scale down:** `drain` (or `SIGTERM` the agent). New calls stop within a poll, in-flight calls finish, the record is
   deleted, then stop the engine and the tunnel.
 - **Engine crash:** in-flight streams break (workers retry them with the turn key), new calls get connection errors and
-  move to another upstream, the breaker opens, and the record expires 10 s after the agent's last heartbeat.
+  move to another upstream, the breaker opens (within a few calls), and the record expires ≤ 10 s after the agent's
+  last heartbeat, i.e. a gateway drops it ≤ 12 s (TTL + one poll) after the crash.
 - **Agent crash only:** the engine keeps serving its in-flight calls but takes no new ones once the record expires
   (capacity drops); restart the agent and it returns with the same epoch (slow start again).
 - **Redis outage:** nothing to do; check `registry.stale` and that `members` did not drop after it came back.
@@ -456,7 +529,14 @@ namespace deleted afterwards; `--store=memory` uses the in-memory registry. Repo
 
 ```sh
 pnpm exec tsx scripts/registry-acceptance.ts [--store=redis|memory] [--scenarios=T1,T2,T3,T4,T5,T7,T7b,T9] [--users=24]
+pnpm exec tsx scripts/registry-acceptance.ts --scenarios=G1,G2,G5,T8     # capacity controller, Redis only
 ```
+
+The G scenarios (S2b) drive the production BullMQ path (`BullMqTurnDelivery`, `startTurnConsumer`, `openTurnQueue`) on
+a throwaway `ptrtest-cap-<hex>` queue (obliterated afterwards) with the real `CapacityController`: workers of local
+concurrency 64 whose turn is 400 ms outside the gateway plus one gateway call, and a feeder that keeps 48 turns
+waiting. G1 = scale-up (G rises within a tick), G2 = drain (G drops at once), G5 = flapping (G changes at most once per
+15 s), T8 = `maxSeqs` lowered (G drops after the hysteresis; active converges).
 
 ## Engine benchmarks
 

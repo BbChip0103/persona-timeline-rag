@@ -10,13 +10,17 @@ import { REDIS_PREFIX } from './redis.js';
  *   <prefix>:ups:<pool>       ZSET member=<id> score=expiresAtMs (index without SCAN; expired entries are trimmed by writers)
  *   <prefix>:reg:ver          INCR on every membership or field change
  *   <prefix>:reg              PUB/SUB channel, empty message: "poll now"
+ *   <prefix>:drain:<pool>:<id> STRING epoch, PX drain bound + TTL: a drain outlives its record (see setState)
  *
+ * Expiry scores use the Redis server clock (TIME inside the scripts), so publishers' and gateways' clocks never matter.
  * Records are not signed (single host; anyone with the Redis password can register). Gateways therefore check every
  * record's `baseUrl` against their own loopback + port allowlist before sending anything to it (§13.4).
  */
 export const REGISTRY_PREFIX = `${REDIS_PREFIX}:llm`;
 export const REGISTRY_TTL_MS = 10000;
 export const REGISTRY_HEARTBEAT_MS = 2000;
+/** Drain tombstone lifetime: the agent's drain bound (PTR_UPSTREAM_DRAIN_MAX_MS default) + one record TTL. */
+export const DRAIN_TOMBSTONE_MS = 120000 + REGISTRY_TTL_MS;
 
 export type UpstreamState = 'active' | 'draining';
 export interface UpstreamRecord {
@@ -48,8 +52,12 @@ export interface RegistryWriter {
    * epoch; 'changed': a field other than seq changed (including active → draining); both bump the version and nudge.
    */
   heartbeat(record: UpstreamRecord, ttlMs: number): Promise<HeartbeatResult>;
-  /** Mark a live record draining; false when there is none. */
-  setState(pool: string, id: string, state: 'draining'): Promise<boolean>;
+  /**
+   * Mark a live record draining; false when there is none. It also writes a tombstone for the record's epoch for
+   * `tombstoneMs` (default DRAIN_TOMBSTONE_MS): if the record expires before its agent deletes it, a heartbeat of that
+   * epoch recreates it draining (result 'draining'), so a drain started from the CLI cannot be undone by an expiry.
+   */
+  setState(pool: string, id: string, state: 'draining', tombstoneMs?: number): Promise<boolean>;
   /** Delete a record, only if its epoch matches when `epoch` is given. */
   remove(pool: string, id: string, epoch?: string): Promise<boolean>;
   /** Pools with at least one live index entry. */
@@ -71,12 +79,17 @@ export function registryKeys(prefix = REGISTRY_PREFIX) {
   return {
     record: (pool: string, id: string) => `${prefix}:up:${pool}:${id}`,
     index: (pool: string) => `${prefix}:ups:${pool}`,
+    drain: (pool: string, id: string) => `${prefix}:drain:${pool}:${id}`,
     indexPattern: `${prefix}:ups:*`,
     version: `${prefix}:reg:ver`,
     channel: `${prefix}:reg`,
   };
 }
 
+/** Every key is built from a validated pool and id (no ':' or glob characters can reach a key or a SCAN pattern). */
+export function assertRegistryKey(pool: string, id?: string): void {
+  if (!POOL_NAME.test(pool) || (id !== undefined && !UPSTREAM_ID.test(id))) throw new Error('INVALID_REGISTRY_KEY');
+}
 export function serializeUpstreamRecord(record: UpstreamRecord): Record<string, string> {
   return { pool: record.pool, id: record.id, baseUrl: record.baseUrl, maxSeqs: String(record.maxSeqs),
     kvCapacityTokens: record.kvCapacityTokens === null ? '' : String(record.kvCapacityTokens), weight: String(record.weight),
@@ -100,13 +113,67 @@ export function parseUpstreamRecord(hash: Record<string, string>): UpstreamRecor
   return { pool, id, baseUrl, maxSeqs, kvCapacityTokens: kv, weight, state, epoch, seq };
 }
 
-// KEYS: record, index, version. ARGV: ttlMs, nowMs, epoch, id, channel, field/value pairs (the publisher's state included).
+export interface AllowRule { host: string; from: number; to: number }
+/** PTR_GATEWAY_UPSTREAM_ALLOW: comma list of `127.0.0.1:<port>` or `127.0.0.1:<from>-<to>` (default 127.0.0.1:18000-18999). */
+export function parseUpstreamAllow(value:string|undefined):AllowRule[] {
+  const invalid=()=>new Error('INVALID_PTR_GATEWAY_UPSTREAM_ALLOW');
+  const raw=value??'127.0.0.1:18000-18999';
+  const rules=raw.split(',').map(part=>part.trim()).filter(Boolean).map(part=>{
+    const match=/^127\.0\.0\.1:(\d{1,5})(?:-(\d{1,5}))?$/.exec(part);if(!match) throw invalid();
+    const from=Number(match[1]),to=Number(match[2]??match[1]);
+    if(from<1||to>65535||from>to) throw invalid();
+    return {host:'127.0.0.1',from,to};
+  });
+  if(!rules.length) throw invalid();
+  return rules;
+}
+/**
+ * The gateway's own rule for any upstream URL (same as OpenAICompatibleUpstream): plain http on 127.0.0.1, no
+ * credentials, query or fragment. With `allow` (registry records) the explicit port must also be allowlisted.
+ * Returns the rejection reason, or null when it may be used.
+ */
+export function checkUpstreamUrl(baseUrl:string,allow?:AllowRule[]):'not_loopback'|'not_allowed'|null {
+  let url:URL;try {url=new URL(baseUrl);} catch {return 'not_loopback';}
+  if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password||url.search||url.hash) return 'not_loopback';
+  if(!allow) return null;
+  const port=Number(url.port);
+  return url.port&&allow.some(rule=>rule.host===url.hostname&&port>=rule.from&&port<=rule.to)?null:'not_allowed';
+}
+
+
+/**
+ * The record policy shared by gateways and the capacity controller : parse, same pool, loopback +
+ * allowlist, and one id per engine origin (a second id on the same host:port would double its maxSeqs; the lower id
+ * wins, independent of Redis ordering). `key` identifies a record version for counting a rejection once.
+ */
+export function screenUpstreamRecords(hashes: Record<string, string>[], pool: string, allow: AllowRule[]):
+  { records: UpstreamRecord[]; rejections: { key: string; reason: string }[] } {
+  const records: UpstreamRecord[] = [], rejections: { key: string; reason: string }[] = [], origins = new Set<string>();
+  for (const hash of [...hashes].sort((a, b) => String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0)) {
+    const key = `${hash.id}\u0000${hash.epoch}\u0000${hash.baseUrl}`;
+    let record: UpstreamRecord | undefined, reason: string | null;
+    try {
+      record = parseUpstreamRecord(hash);
+      reason = record.pool !== pool ? 'pool_mismatch' : checkUpstreamUrl(record.baseUrl, allow);
+      if (!reason && origins.has(new URL(record.baseUrl).origin)) reason = 'duplicate_url';
+    } catch { reason = 'invalid_record'; }
+    if (reason || !record) { rejections.push({ key, reason: reason ?? 'invalid_record' }); continue; }
+    records.push(record); origins.add(new URL(record.baseUrl).origin);
+  }
+  return { records, rejections };
+}
+
+// Server clock in ms (scripts only; replicated by effects).
+const NOW = `local t = redis.call('TIME') local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)`;
+// KEYS: record, index, version, drain tombstone. ARGV: ttlMs, (unused), epoch, id, channel, field/value pairs (the publisher's state included).
 const HEARTBEAT = `
+${NOW}
 local state = redis.call('HGET', KEYS[1], 'state')
 local epoch = redis.call('HGET', KEYS[1], 'epoch')
 local ttl = tonumber(ARGV[1])
-local expires = tonumber(ARGV[2]) + ttl
-redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', '(' .. ARGV[2])
+local expires = now + ttl
+local drained = redis.call('GET', KEYS[4]) == ARGV[3]
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', '(' .. now)
 if state == 'draining' and epoch == ARGV[3] then
   for i = 6, #ARGV, 2 do if ARGV[i] == 'seq' then redis.call('HSET', KEYS[1], 'seq', ARGV[i + 1]) end end
   redis.call('PEXPIRE', KEYS[1], ttl)
@@ -118,22 +185,26 @@ if not state or epoch ~= ARGV[3] then
   result = 'created'
 else
   for i = 6, #ARGV, 2 do
-    if ARGV[i] ~= 'seq' and redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then result = 'changed' end
+    if ARGV[i] ~= 'seq' and not (drained and ARGV[i] == 'state') and redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then result = 'changed' end
   end
 end
 if result == 'created' then redis.call('DEL', KEYS[1]) end
 redis.call('HSET', KEYS[1], unpack(ARGV, 6))
+if drained then redis.call('HSET', KEYS[1], 'state', 'draining') end
 redis.call('PEXPIRE', KEYS[1], ttl)
 redis.call('ZADD', KEYS[2], expires, ARGV[4])
 if result ~= 'active' then
   redis.call('INCR', KEYS[3])
   redis.call('PUBLISH', ARGV[5], '')
 end
+if drained then return 'draining' end
 return result`;
-// KEYS: record, version. ARGV: channel.
+// KEYS: record, version, drain tombstone. ARGV: channel, tombstoneMs.
 const SET_DRAINING = `
-if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local epoch = redis.call('HGET', KEYS[1], 'epoch')
+if not epoch then return 0 end
 redis.call('HSET', KEYS[1], 'state', 'draining')
+redis.call('SET', KEYS[3], epoch, 'PX', ARGV[2])
 redis.call('INCR', KEYS[2])
 redis.call('PUBLISH', ARGV[1], '')
 return 1`;
@@ -147,6 +218,10 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('INCR', KEYS[3])
 redis.call('PUBLISH', ARGV[2], '')
 return 1`;
+// KEYS: index. Live ids by the server clock.
+const LIVE = `
+${NOW}
+return redis.call('ZRANGEBYSCORE', KEYS[1], now, '+inf')`;
 
 /**
  * Redis store. Use a non-blocking connection (`createRedisConnection`, fail fast) so a Redis outage surfaces as a
@@ -154,23 +229,28 @@ return 1`;
  */
 export class RedisUpstreamRegistry implements RegistryReader, RegistryWriter {
   private readonly keys: ReturnType<typeof registryKeys>;
-  constructor(private readonly redis: Redis, prefix = REGISTRY_PREFIX, private readonly now: () => number = Date.now) {
+  constructor(private readonly redis: Redis, prefix = REGISTRY_PREFIX) {
     this.keys = registryKeys(prefix);
   }
   async heartbeat(record: UpstreamRecord, ttlMs: number): Promise<HeartbeatResult> {
+    assertRegistryKey(record.pool, record.id);
     const fields = Object.entries(serializeUpstreamRecord(record)).flat();
-    return (await this.redis.eval(HEARTBEAT, 3, this.keys.record(record.pool, record.id), this.keys.index(record.pool), this.keys.version,
-      String(ttlMs), String(this.now()), record.epoch, record.id, this.keys.channel, ...fields)) as HeartbeatResult;
+    return (await this.redis.eval(HEARTBEAT, 4, this.keys.record(record.pool, record.id), this.keys.index(record.pool), this.keys.version,
+      this.keys.drain(record.pool, record.id), String(ttlMs), '', record.epoch, record.id, this.keys.channel, ...fields)) as HeartbeatResult;
   }
-  async setState(pool: string, id: string, _state: 'draining'): Promise<boolean> {
-    return (await this.redis.eval(SET_DRAINING, 2, this.keys.record(pool, id), this.keys.version, this.keys.channel)) === 1;
+  async setState(pool: string, id: string, _state: 'draining', tombstoneMs = DRAIN_TOMBSTONE_MS): Promise<boolean> {
+    assertRegistryKey(pool, id);
+    return (await this.redis.eval(SET_DRAINING, 3, this.keys.record(pool, id), this.keys.version, this.keys.drain(pool, id),
+      this.keys.channel, String(tombstoneMs))) === 1;
   }
   async remove(pool: string, id: string, epoch?: string): Promise<boolean> {
+    assertRegistryKey(pool, id);
     return (await this.redis.eval(REMOVE, 3, this.keys.record(pool, id), this.keys.index(pool), this.keys.version,
       id, this.keys.channel, epoch ?? '')) === 1;
   }
   async list(pool: string): Promise<{ records: Record<string, string>[]; version: number }> {
-    const ids = await this.redis.zrangebyscore(this.keys.index(pool), this.now(), '+inf');
+    assertRegistryKey(pool);
+    const ids = (await this.redis.eval(LIVE, 1, this.keys.index(pool))) as string[];
     const pipeline = this.redis.pipeline();
     for (const id of ids) pipeline.hgetall(this.keys.record(pool, id));
     pipeline.get(this.keys.version);
@@ -194,10 +274,12 @@ export class RedisUpstreamRegistry implements RegistryReader, RegistryWriter {
     const pools = new Set<string>();
     let cursor = '0';
     const at = this.keys.index('').length;
+    const [seconds, micros] = await this.redis.time();
+    const now = Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
     do {
       const [next, keys] = await this.redis.scan(cursor, 'MATCH', this.keys.indexPattern, 'COUNT', 100);
       cursor = next;
-      for (const key of keys) if (await this.redis.zcount(key, this.now(), '+inf')) pools.add(key.slice(at));
+      for (const key of keys) if (await this.redis.zcount(key, now, '+inf')) pools.add(key.slice(at));
     } while (cursor !== '0');
     return [...pools];
   }
@@ -212,6 +294,7 @@ export class MemoryUpstreamRegistry implements RegistryReader, RegistryWriter {
   private clock = 0;
   private version = 0;
   private readonly records = new Map<string, { hash: Record<string, string>; expiresAt: number }>();
+  private readonly tombstones = new Map<string, { epoch: string; expiresAt: number }>();
   private readonly listeners = new Set<() => void>();
   constructor(private readonly clockSource?: () => number) {}
   now(): number { return this.clockSource ? this.clockSource() : this.clock; }
@@ -223,10 +306,16 @@ export class MemoryUpstreamRegistry implements RegistryReader, RegistryWriter {
     return entry;
   }
   private changed(): void { this.version++; for (const listener of [...this.listeners]) queueMicrotask(listener); }
+  private drained(key: string, epoch: string): boolean {
+    const tombstone = this.tombstones.get(key);
+    if (tombstone && tombstone.expiresAt <= this.now()) { this.tombstones.delete(key); return false; }
+    return tombstone?.epoch === epoch;
+  }
   async heartbeat(record: UpstreamRecord, ttlMs: number): Promise<HeartbeatResult> {
-    this.check();
+    this.check(); assertRegistryKey(record.pool, record.id);
     const key = `${record.pool}\u0000${record.id}`, existing = this.live(key);
-    const hash = serializeUpstreamRecord(record);
+    const drained = this.drained(key, record.epoch);
+    const hash = serializeUpstreamRecord(drained ? { ...record, state: 'draining' } : record);
     const expiresAt = this.now() + ttlMs;
     if (existing?.hash.state === 'draining' && existing.hash.epoch === record.epoch) {
       existing.hash.seq = hash.seq!; existing.expiresAt = expiresAt;
@@ -236,24 +325,25 @@ export class MemoryUpstreamRegistry implements RegistryReader, RegistryWriter {
       : Object.entries(hash).some(([field, value]) => field !== 'seq' && existing.hash[field] !== value) ? 'changed' : 'active';
     this.records.set(key, { hash, expiresAt });
     if (result !== 'active') this.changed();
-    return result;
+    return drained ? 'draining' : result;
   }
-  async setState(pool: string, id: string, state: 'draining'): Promise<boolean> {
-    this.check();
+  async setState(pool: string, id: string, state: 'draining', tombstoneMs = DRAIN_TOMBSTONE_MS): Promise<boolean> {
+    this.check(); assertRegistryKey(pool, id);
     const entry = this.live(`${pool}\u0000${id}`);
     if (!entry) return false;
     entry.hash.state = state; this.changed();
+    this.tombstones.set(`${pool}\u0000${id}`, { epoch: entry.hash.epoch!, expiresAt: this.now() + tombstoneMs });
     return true;
   }
   async remove(pool: string, id: string, epoch?: string): Promise<boolean> {
-    this.check();
+    this.check(); assertRegistryKey(pool, id);
     const key = `${pool}\u0000${id}`, entry = this.live(key);
     if (!entry || (epoch !== undefined && entry.hash.epoch !== epoch)) return false;
     this.records.delete(key); this.changed();
     return true;
   }
   async list(pool: string): Promise<{ records: Record<string, string>[]; version: number }> {
-    this.check();
+    this.check(); assertRegistryKey(pool);
     const records: Record<string, string>[] = [];
     for (const key of [...this.records.keys()]) {
       const entry = this.live(key);

@@ -122,6 +122,7 @@ describe('upstream pool: dynamic membership',()=>{
     expect(late.status).toBe(503);expect(late.headers.get('x-ptr-gateway')).toBe('rejected');
     expect(late.headers.get('x-ptr-gateway-reason')).toBe('queue_timeout');expect(await late.json()).toEqual({error:{code:'GATEWAY_QUEUE_TIMEOUT'}});
     expect(a.calls.completions).toBe(1);expect(g.metrics().rejected.queueTimeout).toBe(1);
+    expect(pool.poolMetrics().queueTimeouts).toBe(1); // the share of queue timeouts spent waiting for an upstream slot
     a.release();expect((await first).status).toBe(200);
   });
   test('an empty pool waits for a member to appear (no secondary)',async()=>{
@@ -286,6 +287,21 @@ describe('upstream pool: per-upstream breaker and retry on another primary',()=>
     await until(()=>member(pool,'b')!.inFlight===1);
     await expect(pool.complete({messages},signal())).rejects.toMatchObject({reason:'closed_before_response'});
     releaseB!();await held;
+  });
+  test('half-open upstreams are probed in parallel: a hung probe does not hold the request while another one is healthy',async()=>{
+    const answer=(name:string)=>async():Promise<UpstreamResult>=>({status:200,contentType:'application/json',body:`{"from":"${name}"}`});
+    const refusedOnce=(name:string)=>{let first=true;return async():Promise<UpstreamResult>=>{if(first){first=false;throw new UpstreamConnectError('connect_refused',true);}return answer(name)();};};
+    const a={model:'m',health:()=>new Promise<boolean>(()=>{}),complete:refusedOnce('a')};
+    const b={model:'m',health:async()=>{await new Promise(r=>setTimeout(r,50));return true;},complete:refusedOnce('b')};
+    const byId:Record<string,typeof a>={a,b};
+    const secondary=new TextProviderUpstream({generate:async()=>'보조'},'secondary/model');
+    const pool=new UpstreamPool({model:'m',source:new TestSource([rec('a','http://127.0.0.1:18000'),rec('b','http://127.0.0.1:18001')]),
+      create:record=>byId[record.id]!,secondary,failover:{failureThreshold:1,cooldownMs:100,probeTimeoutMs:2000}});
+    expect((await pool.complete({messages},signal())).upstream).toBe('secondary'); // both refused → both open
+    await new Promise(r=>setTimeout(r,120)); // both half-open now
+    const started=Date.now();
+    const result=await pool.complete({messages},signal());
+    expect(String(result.body)).toContain('"b"');expect(Date.now()-started).toBeLessThan(1000);
   });
   test('a pool without a secondary has no failover metrics and never marks the answering upstream',async()=>{
     const {pool}=twoMembers();

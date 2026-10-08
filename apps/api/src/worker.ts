@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { TurnWorker } from '@ptr/core';
-import { startTurnConsumer } from '@ptr/messaging';
+import { capacityControllerMode, startTurnConsumer } from '@ptr/messaging';
 import { fetchGatewayCapacity, gatewayCapacityWarning } from '@ptr/providers';
+import { readGlobalConcurrency, workerCapacityLine } from './capacity';
 import { createRuntime, gatewayBaseUrls } from './runtime';
 
 /** Turn worker: consumes dispatches from Redis (BullMQ) and runs them under a Postgres lease. Run any number. */
@@ -20,8 +21,12 @@ async function main() {
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
     {concurrency,queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});
   process.stdout.write(`Turn worker ${workerId} started\n`);
-  // Advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
-  if(runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
+  // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once.
+  const capacityMode=capacityControllerMode(process.env);
+  if(capacityMode==='on') void readGlobalConcurrency(process.env).then(globalConcurrency=>process.stderr.write(`${workerCapacityLine({mode:capacityMode,globalConcurrency})}\n`),
+    ()=>process.stderr.write('capacity check skipped: Redis unavailable\n'));
+  // Controller off: advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
+  else if(runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
     const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
     if(warning) process.stderr.write(`${warning}\n`);
   });

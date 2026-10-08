@@ -20,7 +20,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { EPOCH, POOL_NAME, REGISTRY_PREFIX, REGISTRY_HEARTBEAT_MS, REGISTRY_TTL_MS, RedisUpstreamRegistry, UPSTREAM_ID, assertRegistryPrefix,
-  createRedisConnection, parseUpstreamRecord, type RegistryReader, type RegistryWriter, type UpstreamRecord } from '@ptr/messaging';
+  createRedisConnection, parseUpstreamRecord, type RegistryReader, type RegistryWriter, type UpstreamRecord } from '@ptr/messaging/registry';
 
 export interface EngineStatus { running:number|null; waiting:number|null; kvCapacityTokens:number|null; startTimeSeconds:number|null }
 /** vLLM Prometheus text: running/waiting summed over label sets (one per engine core / model). */
@@ -35,7 +35,8 @@ export function parseEngineMetrics(text:string):EngineStatus {
     else if(name==='vllm:num_requests_waiting') waiting=(waiting??0)+value;
     else if(name==='process_start_time_seconds') start=value;
     else if(name==='vllm:cache_config_info') {
-      const label=(key:string)=>Number(new RegExp(`${key}="(\\d+)"`).exec(labels)?.[1]);
+      // Whole label names only (`kv_block_size` is not `block_size`).
+      const label=(key:string)=>Number(new RegExp(`[{,]\\s*${key}="(\\d+)"`).exec(labels)?.[1]);
       const blocks=label('num_gpu_blocks'), size=label('block_size');
       if(Number.isInteger(blocks)&&Number.isInteger(size)&&blocks>0&&size>0) kv=blocks*size;
     }
@@ -47,8 +48,8 @@ export function engineEpoch(id:string,baseUrl:string,startTimeSeconds:number):st
   return createHash('sha256').update(`${id}\n${baseUrl}\n${startTimeSeconds}`).digest('hex').slice(0,32);
 }
 const origin=(baseUrl:string)=>new URL(baseUrl).origin;
-async function engineHealthy(baseUrl:string,fetcher:typeof fetch):Promise<boolean> {
-  try {const response=await fetcher(`${origin(baseUrl)}/health`,{signal:AbortSignal.timeout(1000),redirect:'error'});await response.body?.cancel().catch(()=>undefined);return response.ok;}
+async function engineHealthy(baseUrl:string,fetcher:typeof fetch,timeoutMs:number):Promise<boolean> {
+  try {const response=await fetcher(`${origin(baseUrl)}/health`,{signal:AbortSignal.timeout(timeoutMs),redirect:'error'});await response.body?.cancel().catch(()=>undefined);return response.ok;}
   catch {return false;}
 }
 /** null when the engine cannot be reached at all. */
@@ -66,6 +67,8 @@ export interface AgentOptions {
   heartbeatMs?:number; ttlMs?:number; drainMaxMs?:number; drainSettleMs?:number;
   /** Consecutive failed engine health checks (one per heartbeat) before the record is removed. */
   engineFailures?:number; healthPollMs?:number;
+  /** Timeout of one engine `/health` check (PTR_UPSTREAM_HEALTH_TIMEOUT_MS, default 2500: a busy engine may answer slowly). */
+  healthTimeoutMs?:number;
   fetch?:typeof fetch; log?:(line:string)=>void;
 }
 export type AgentPhase='waiting'|'active'|'draining'|'done';
@@ -82,7 +85,7 @@ export interface AgentHandle {
 export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle {
   const fetcher=options.fetch??fetch, log=options.log??((line:string)=>process.stderr.write(`${line}\n`));
   const heartbeatMs=options.heartbeatMs??REGISTRY_HEARTBEAT_MS, ttlMs=options.ttlMs??REGISTRY_TTL_MS;
-  const drainMaxMs=options.drainMaxMs??120000, settleMs=options.drainSettleMs??4000;
+  const drainMaxMs=options.drainMaxMs??120000, settleMs=options.drainSettleMs??4000, healthTimeoutMs=options.healthTimeoutMs??2500;
   let phase:AgentPhase='waiting', killed=false, drainRequested=false, epoch:string|undefined, firstPublishedAt:number|undefined;
   let wake:(()=>void)|undefined;
   const sleep=(ms:number)=>new Promise<void>(resolve=>{const timer=setTimeout(()=>{wake=undefined;resolve();},ms);wake=()=>{clearTimeout(timer);wake=undefined;resolve();};});
@@ -90,7 +93,7 @@ export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle 
 
   async function register():Promise<UpstreamRecord|undefined> {
     while(!killed&&!drainRequested) {
-      if(await engineHealthy(options.baseUrl,fetcher)) {
+      if(await engineHealthy(options.baseUrl,fetcher,healthTimeoutMs)) {
         const status=await engineStatus(options.baseUrl,fetcher);
         epoch=options.epoch??(status?.startTimeSeconds?engineEpoch(options.id,options.baseUrl,status.startTimeSeconds):randomUUID());
         if(!options.epoch&&!status?.startTimeSeconds) event('epoch_random',{note:'no process_start_time_seconds: an agent restart will look like a new engine'});
@@ -126,7 +129,7 @@ export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle 
             if(drainStarted!==undefined) drainConfirmed??=Date.now();
           } catch {if(!registryDown) {registryDown=true;event('registry_unreachable');}}
           if(drainStarted===undefined) {
-            if(await engineHealthy(record.baseUrl,fetcher)) unhealthy=0;
+            if(await engineHealthy(record.baseUrl,fetcher,healthTimeoutMs)) unhealthy=0;
             else if(++unhealthy>=(options.engineFailures??3)) {
               event('engine_down');
               try {await store.remove(record.pool,record.id,record.epoch);} catch {/* expires by TTL */}
@@ -165,9 +168,12 @@ export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle 
   };
 }
 
-/** CLI `drain`: mark the record draining and wait until it is gone (its agent deletes it, or it expires). */
-export async function drainUpstream(store:RegistryReader&RegistryWriter,pool:string,id:string,options:{timeoutMs:number;pollMs?:number}):Promise<'drained'|'not_found'|'timeout'> {
-  if(!await store.setState(pool,id,'draining')) return 'not_found';
+/**
+ * CLI `drain`: mark the record draining (with a tombstone for its epoch, `tombstoneMs` = drain bound + TTL, so an agent
+ * that crashes and comes back on the same engine resumes the drain) and wait until it is gone.
+ */
+export async function drainUpstream(store:RegistryReader&RegistryWriter,pool:string,id:string,options:{timeoutMs:number;pollMs?:number;tombstoneMs?:number}):Promise<'drained'|'not_found'|'timeout'> {
+  if(!await store.setState(pool,id,'draining',options.tombstoneMs)) return 'not_found';
   const end=Date.now()+options.timeoutMs;
   while(Date.now()<end) {
     await new Promise(resolve=>setTimeout(resolve,options.pollMs??1000));
@@ -221,7 +227,8 @@ async function main():Promise<number> {
     if(parsed.command==='register') {
       const heartbeatMs=envInt('PTR_UPSTREAM_HEARTBEAT_MS',REGISTRY_HEARTBEAT_MS,200,60000);
       if(ttlMs<2*heartbeatMs) throw new Error('INVALID_PTR_UPSTREAM_TTL_MS');
-      const handle=runAgent(store,{...parsed,heartbeatMs,ttlMs,drainMaxMs,drainSettleMs:envInt('PTR_UPSTREAM_DRAIN_SETTLE_MS',4000,0,600000)});
+      const handle=runAgent(store,{...parsed,heartbeatMs,ttlMs,drainMaxMs,drainSettleMs:envInt('PTR_UPSTREAM_DRAIN_SETTLE_MS',4000,0,600000),
+        healthTimeoutMs:envInt('PTR_UPSTREAM_HEALTH_TIMEOUT_MS',2500,100,30000)});
       let signals=0;
       const stop=()=>{if(++signals>1) process.exit(1);handle.drain();};
       process.on('SIGTERM',stop);process.on('SIGINT',stop);
@@ -229,7 +236,7 @@ async function main():Promise<number> {
       return 0;
     }
     if(parsed.command==='drain') {
-      const result=await drainUpstream(store,parsed.pool,parsed.id,{timeoutMs:drainMaxMs+ttlMs+5000});
+      const result=await drainUpstream(store,parsed.pool,parsed.id,{timeoutMs:drainMaxMs+ttlMs+5000,tombstoneMs:drainMaxMs+ttlMs});
       print({pool:parsed.pool,id:parsed.id,result});return result==='drained'?0:1;
     }
     if(parsed.command==='deregister') {
