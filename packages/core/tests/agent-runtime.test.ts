@@ -204,3 +204,8 @@ test('bounded roleplay policy allows light embellishment, preserves core events 
   expect(policy).toContain('Light roleplay embellishment');expect(policy).toContain('not a verified source claim');
   expect(policy).toContain('Do not invert established core events');expect(policy).toContain('never request unavailable tools');
 });
+test('every model call of a turn carries the turn id as its request key (gateway ledger scoping)',async()=>{
+  const h=setup([tool(),final()]);const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  const turn=await send(h,session.id,'이야기하자');
+  expect(h.provider.generate.mock.calls.map(call=>(call as unknown[])[1])).toEqual([expect.objectContaining({requestKey:turn.id}),expect.objectContaining({requestKey:turn.id})]);
+});

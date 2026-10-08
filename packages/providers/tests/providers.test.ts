@@ -175,6 +175,18 @@ describe('live adapter with fake network only',()=>{
     const flash=fakeFetch();flash.mockImplementationOnce(async()=>reply({data:[{...textCatalog[0],supported_parameters:['response_format','structured_outputs']}]}));
     expect((await sent(flash,agent,'google/gemini-3-flash-preview')).response_format).toEqual({type:'json_object'});
   });
+  test('an idempotency key scopes the chat ledger entry; a smaller max output is honoured and capped; usage is reported',async()=>{
+    const ledger=new MemoryLedger();const fetcher=fakeFetch(body=>reply({id:'gen-synthetic',model:body.model,choices:[{message:{content:'synthetic answer'}}],usage:{cost:0.000001,prompt_tokens:21,completion_tokens:4}}));
+    const provider=client(fetcher,ledger);const usage:unknown[]=[];
+    await provider.generate(messages,{signal:signal(),idempotencyKey:'turn-a',onUsage:value=>usage.push(value)});
+    await provider.generate(messages,{signal:signal(),idempotencyKey:'turn-b'});
+    await provider.generate(messages,{signal:signal(),idempotencyKey:'turn-a'}); // replay
+    expect(posts(fetcher)).toHaveLength(2);expect(ledger.requests.size).toBe(2);
+    expect(usage).toEqual([{promptTokens:21,completionTokens:4}]);
+    await provider.generate([{role:'user',content:'Synthetic short'}],{signal:signal(),maxOutputTokens:100});
+    await provider.generate([{role:'user',content:'Synthetic long'}],{signal:signal(),maxOutputTokens:4096});
+    expect(posts(fetcher).slice(2).map(([,init])=>JSON.parse(String(init?.body)).max_tokens)).toEqual([100,512]);
+  });
   test('input/output caps and unapproved models reject locally',async()=>{
     const fetcher=fakeFetch();expect(()=>client(fetcher,new MemoryLedger(),{maxOutputTokens:2048})).toThrow('INVALID_LIMIT');
     expect(()=>client(fetcher,new MemoryLedger(),{textModel:'unknown/model'})).toThrow('MODEL_NOT_ALLOWED');

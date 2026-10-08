@@ -57,3 +57,12 @@ test('structured agent replies send the agent JSON Schema for guided decoding (a
   const plain=JSON.parse(((fetcher.mock.calls[1] as unknown[])[1] as RequestInit).body as string);
   expect(plain.response_format).toBeUndefined();
 });
+test('a per-turn request key travels as X-PTR-Request-Key (gateway ledger scoping); malformed keys are not sent',async()=>{
+  const fetcher=jest.fn(async()=>sse([delta('ok'),'[DONE]']));
+  const headers=(index:number)=>((fetcher.mock.calls[index] as unknown[])[1] as RequestInit).headers as Record<string,string>;
+  await provider(fetcher).generate(messages,{signal:signal(),requestKey:'turn_0b7c-1'});
+  await provider(fetcher).generate(messages,{signal:signal()});
+  await provider(fetcher).generate(messages,{signal:signal(),requestKey:'bad key\nx'});
+  expect(headers(0)['X-PTR-Request-Key']).toBe('turn_0b7c-1');
+  expect(headers(1)['X-PTR-Request-Key']).toBeUndefined();expect(headers(2)['X-PTR-Request-Key']).toBeUndefined();
+});

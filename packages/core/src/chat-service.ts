@@ -270,7 +270,7 @@ export class ChatService {
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
-        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,
+        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,
         variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
@@ -281,7 +281,7 @@ export class ChatService {
           return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
         }}:{}),
       }):undefined;
-      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal});
+      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id});
       if(controller.signal.aborted) return;
       if(agentRun) {
         agent=agentRun.agent;memorySources=agentRun.context.sources;

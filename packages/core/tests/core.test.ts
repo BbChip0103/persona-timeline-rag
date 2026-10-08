@@ -298,3 +298,8 @@ describe('offsetless exact quote canonicalization (timeline v3)',()=>{
     expect(typeof data[0].quoteCandidate).toBe('string');expect(data[0]).not.toHaveProperty('start');expect(data[0]).not.toHaveProperty('end');
   });
 });
+test('the single model call of a legacy turn carries the turn id as its request key',async()=>{
+  const h=harness();const session=await h.create();
+  const turn=await h.service.sendTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'rk',text:'안녕'});
+  expect((h.provider.generate as jest.Mock).mock.calls[0][1]).toEqual(expect.objectContaining({requestKey:turn.id}));
+});

@@ -2,6 +2,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { REQUEST_KEY } from '@ptr/providers';
+import type { FailoverMetrics } from './failover';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
 import type { ChatCompletionRequest, Upstream } from './upstreams';
 
@@ -15,6 +17,8 @@ export interface GatewayMetrics {
   rejected:{queueFull:number;queueTimeout:number};
   /** Milliseconds over the most recent requests (bounded sample). */
   queueWaitMs:{p50:number|null;p95:number|null}; upstreamMs:{p50:number|null;p95:number|null};
+  /** Only when failover is configured. */
+  failover?:FailoverMetrics;
 }
 const SAMPLE=2000;
 function percentile(values:number[],p:number):number|null {
@@ -26,7 +30,7 @@ const json=(res:ServerResponse,status:number,body:unknown,headers:Record<string,
 };
 
 /**
- * LLM gateway: one OpenAI-compatible entry point in front of one configured upstream (no cross-provider fallback).
+ * LLM gateway: one OpenAI-compatible entry point in front of one configured upstream (optionally a FailoverUpstream).
  * It bounds concurrent upstream calls, queues a bounded number of requests, rejects the rest before they reach the
  * upstream (marked `X-PTR-Gateway: rejected`, so clients may safely retry), and reports latency/rejection metrics.
  */
@@ -40,7 +44,8 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
   const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:limiter.inFlight,queued:limiter.queued,
     accepted:counters.accepted,completed:counters.completed,upstreamErrors:counters.upstreamErrors,
     rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout},
-    queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)}});
+    queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
+    ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{})});
   const authorized=(req:IncomingMessage)=>{
     const header=req.headers.authorization??'';const supplied=header.startsWith('Bearer ')?header.slice(7):'';
     return !!supplied&&supplied.length<=512&&timingSafeEqual(expected,createHash('sha256').update(supplied).digest());
@@ -57,6 +62,9 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     try {request=JSON.parse(raw);} catch {return json(res,400,{error:{code:'INVALID_INPUT'}});}
     if(!Array.isArray(request?.messages)||!request.messages.length||!request.messages.every(m=>typeof m?.role==='string'&&typeof m?.content==='string'))
       return json(res,400,{error:{code:'INVALID_INPUT'}});
+    // Optional per-turn key (the worker's turn id): scopes a billable upstream's ledger entry; never sent upstream.
+    const requestKey=req.headers['x-ptr-request-key'];
+    if(requestKey!==undefined&&(typeof requestKey!=='string'||!REQUEST_KEY.test(requestKey))) return json(res,400,{error:{code:'INVALID_INPUT'}});
     // The caller's disconnect cancels waiting and the upstream call alike.
     const caller=new AbortController();res.on('close',()=>{if(!res.writableFinished)caller.abort();});
     const queuedAt=performance.now();let release:(()=>void)|undefined;
@@ -71,20 +79,24 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     const started=performance.now();
     const signal=AbortSignal.any([caller.signal,AbortSignal.timeout(options.limits.upstreamTimeoutMs)]);
     try {
-      const result=await options.upstream.complete(request,signal);
+      const result=await options.upstream.complete(request,signal,requestKey===undefined?undefined:{requestKey});
+      // Which upstream answered, only when failover is configured.
+      const served:Record<string,string>=result.upstream?{'X-PTR-Upstream':result.upstream}:{};
       if(result.status<200||result.status>=300) {
         counters.upstreamErrors++;
         // Upstream bodies are never forwarded; this is not a gateway rejection, so clients do not auto-retry.
-        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}});
+        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}},served);
       }
-      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store'});
+      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store',...served});
       if(typeof result.body==='string') res.end(result.body);
       // pipeline handles backpressure and settles when either side closes, so a client that stops reading and
       // disconnects cannot pin this slot on a 'drain' that never comes.
       else await pipeline(Readable.from(result.body),res,{signal});
       counters.completed++;
-    } catch {
-      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,signal.aborted?504:502,{error:{code:signal.aborted?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}});else res.destroy();}
+    } catch(error) {
+      // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
+      const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';
+      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}});else res.destroy();}
     } finally {record(upstreamTimes,performance.now()-started);release();}
   }
   const server=createServer((req,res)=>{

@@ -8,18 +8,21 @@
  *   pnpm exec tsx scripts/loadtest.ts ramp --levels=64,256,1024 --stage-seconds=45 --apis=2 --workers=4
  *   pnpm exec tsx scripts/loadtest.ts crash --target=workers|api|redis|gateway --users=32
  *   pnpm exec tsx scripts/loadtest.ts same-session --trials=30
+ *   pnpm exec tsx scripts/loadtest.ts failover --users=32 [--primary-failure=refuse|close]   # fake primary killed mid-run, fake secondary
  *
  * Requires PTR_LOADTEST_DATABASE_URL (guarded: ptr_loadtest/ptr_loadtester only) and PTR_REDIS_URL. The run uses
  * its own BullMQ queue and event namespace and wipes that queue when it ends.
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { openSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { assertLocalDatabaseUrl, createLocalPool, PostgresPersonaRepository, PostgresSourceRepository } from '@ptr/storage';
-import { FakeEmbeddingProvider } from '@ptr/providers';
+import { FakeEmbeddingProvider, FakeTextProvider, LatencyInjectedTextProvider, parseLatencyProfile } from '@ptr/providers';
 import { BullMqTurnDelivery, assertLocalRedisUrl } from '@ptr/messaging';
 import { LOADTEST_QUESTIONS, sseParser, summarizeStage, syntheticCorpus, type TurnSample } from './loadtest-lib';
 
@@ -66,6 +69,8 @@ export interface Topology {
   queueMax:number; poolMax:number; leaseMs:number;
   provider:'fake'|'selfhosted'; selfhostedBaseUrl?:string; selfhostedModel?:string; structured?:boolean;
   client:'sse'|'poll';
+  /** Gateway failover to a fake secondary (with the latency profile) behind the self-hosted primary; no paid calls. */
+  failover?:{breakerCooldownMs:number};
 }
 type Role='api'|'worker'|'dispatcher'|'gateway';
 interface Proc {role:Role;child:ChildProcess;port?:number}
@@ -105,7 +110,10 @@ class Fleet {
     this.launch('gateway','apps/gateway/src/main.ts',{PTR_GATEWAY_PORT:String(this.gatewayPort),PTR_GATEWAY_TOKEN:this.gatewayToken,
       PTR_GATEWAY_UPSTREAM:t.provider,PTR_GATEWAY_MAX_CONCURRENCY:String(t.gatewayMaxConcurrency),PTR_GATEWAY_MAX_QUEUE:String(t.gatewayMaxQueue),
       // The gateway, not the workers, owns the model and its latency profile.
-      ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:this.latency?{PTR_FAKE_LATENCY:this.latency}:{})});
+      ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:this.latency?{PTR_FAKE_LATENCY:this.latency}:{}),
+      // The per-minute ceiling protects a paid secondary; the fake one is lifted so the outage shape is measured.
+      ...(t.failover?{PTR_GATEWAY_FAILOVER:'fake',PTR_GATEWAY_BREAKER_COOLDOWN_MS:String(t.failover.breakerCooldownMs),PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE:'100000',
+        ...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})}:{})});
     await this.waitHealthy(`http://127.0.0.1:${this.gatewayPort}/healthz`);
   }
   async startApis():Promise<void> {
@@ -294,6 +302,43 @@ async function activeTurns(since:Date):Promise<{state:string;n:number}[]> {
   finally {await pool.end();}
 }
 const execFileAsync=promisify(execFile);
+/**
+ * In-process fake OpenAI-compatible engine (the failover primary): the fake model, with the same latency profile,
+ * behind `/v1/chat/completions` (SSE) and `/health`. `kill` stops listening and cuts every open connection; with
+ * `failure: 'close'` the port then stays bound by a listener that accepts and closes without answering, like an SSH
+ * tunnel whose remote engine is dead (`refuse` leaves the port closed: connections are refused).
+ */
+function fakeEngine(port:number,latency:string|null,failure:'refuse'|'close') {
+  const model=latency?new LatencyInjectedTextProvider(new FakeTextProvider(),parseLatencyProfile(latency)):new FakeTextProvider();
+  let server:Server|undefined;let tunnel:ReturnType<typeof createTcpServer>|undefined;
+  const listen=(target:Server|ReturnType<typeof createTcpServer>)=>new Promise<void>((resolve,reject)=>{
+    target.once('error',reject);target.listen(port,'127.0.0.1',()=>{target.off('error',reject);resolve();});
+  });
+  const start=async()=>{
+    await closeAll();
+    server=createServer((req,res)=>{
+      if(req.url==='/health'){res.writeHead(200);res.end();return;}
+      let raw='';req.on('data',chunk=>raw+=chunk);
+      req.on('end',()=>{
+        const controller=new AbortController();res.on('close',()=>controller.abort());
+        void Promise.resolve().then(()=>model.generate((JSON.parse(raw) as {messages:Parameters<FakeTextProvider['generate']>[0]}).messages,{signal:controller.signal})).then(
+          content=>{res.writeHead(200,{'Content-Type':'text/event-stream'});res.end(`data: ${JSON.stringify({choices:[{delta:{content}}]})}\n\ndata: [DONE]\n\n`);},
+          ()=>{if(!res.headersSent){res.writeHead(500);res.end();}});
+      });
+    });
+    await listen(server);
+  };
+  const closeAll=async()=>{
+    const s=server;server=undefined;
+    if(s) await new Promise<void>(resolve=>{s.close(()=>resolve());s.closeAllConnections();});
+    if(tunnel){const closing=tunnel;tunnel=undefined;await new Promise(resolve=>closing.close(resolve));}
+  };
+  const kill=async()=>{
+    await closeAll();
+    if(failure==='close'){tunnel=createTcpServer(socket=>{socket.on('error',()=>undefined);socket.once('data',()=>socket.destroy());});await listen(tunnel);}
+  };
+  return {start,kill,stop:closeAll};
+}
 
 async function main():Promise<void> {
   const mode=process.argv[2];const options=args();
@@ -303,18 +348,26 @@ async function main():Promise<void> {
   turnsPerSession=Number(options['turns-per-session']??0);thinkMs=Number(options['think-ms']??0);pollMs=Number(options['poll-ms']??100);
   const seeded=await seed(directory);
   if(mode==='seed') {console.log(JSON.stringify(seeded));return;}
-  const provider=options.provider==='selfhosted'?'selfhosted' as const:'fake' as const;
-  const latency=options.latency==='none'||provider==='selfhosted'?null:options.latency??DEFAULT_LATENCY;
+  const failover=mode==='failover';
+  if(failover&&(options.provider!==undefined||options.gateway==='0')) throw new Error('failover runs through the gateway against its own fake primary');
+  const primaryFailure=options['primary-failure']==='close'?'close' as const:'refuse' as const;
+  const enginePort=Number(options.port??56451)+60;
+  const provider=options.provider==='selfhosted'||failover?'selfhosted' as const:'fake' as const;
+  // Failover: the fake primary and the fake secondary both use the latency profile.
+  const latency=options.latency==='none'||provider==='selfhosted'&&!failover?null:options.latency??DEFAULT_LATENCY;
   const topology:Topology={apis:Number(options.apis??1),workers:Number(options.workers??2),workerConcurrency:Number(options['worker-concurrency']??128),
     dispatchers:Number(options.dispatchers??1),gateway:options.gateway!=='0',gatewayMaxConcurrency:Number(options['gateway-concurrency']??1024),
     gatewayMaxQueue:Number(options['gateway-queue']??4096),queueMax:Number(options['queue-max']??2048),poolMax:Number(options['pool-max']??8),
-    leaseMs:Number(options['lease-ms']??5000),provider,selfhostedBaseUrl:options['base-url']??'http://127.0.0.1:18000/v1',selfhostedModel:options.model??'gemma-4-e4b',
-    structured:options.structured==='1',client:options.client==='poll'?'poll':'sse'};
+    leaseMs:Number(options['lease-ms']??5000),provider,selfhostedBaseUrl:failover?`http://127.0.0.1:${enginePort}/v1`:options['base-url']??'http://127.0.0.1:18000/v1',
+    selfhostedModel:options.model??'gemma-4-e4b',structured:options.structured==='1',client:options.client==='poll'?'poll':'sse',
+    ...(failover?{failover:{breakerCooldownMs:Number(options['breaker-cooldown-ms']??5000)}}:{})};
+  const engine=failover?fakeEngine(enginePort,latency,primaryFailure):undefined;
   const fleet=new Fleet(Number(options.port??56451),seeded.file,latency,directory,topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
     note:'Fake model with injected latency on synthetic data, one host: serving-architecture limits, not LLM throughput.'};
   let sampler:ReturnType<typeof startResourceSampler>|undefined;
   try {
+    await engine?.start();
     await fleet.startAll(); // inside try: a failed start still stops whatever was spawned
     sampler=startResourceSampler(fleet);
     if(mode==='ramp') {
@@ -342,6 +395,26 @@ async function main():Promise<void> {
       await sleep(Math.max(20_000,topology.leaseMs*3)); // past turn timeout + lease + dispatcher: anything still active now is orphaned
       report.crash={target,users,activeAtKill:before,downtimeMs:2000,stage:result,orphanedActiveTurns:await activeTurns(runStarted)};
       console.log(JSON.stringify(report.crash));
+    } else if(mode==='failover' && engine) {
+      // Healthy → primary killed mid-flight (stays down) → primary back. Per phase: turns, latency and the gateway's
+      // failover counters (cumulative at phase end). In-flight calls cut by the kill (closed before any response) fail over by default (PTR_GATEWAY_FAILOVER_ON_CLOSE).
+      const users=Number(options.users??32);const cooldownMs=topology.failover!.breakerCooldownMs;
+      const phases:Record<string,unknown>[]=[];let activeAtKill:unknown=null;
+      const phase=async(name:string,seconds:number,during?:()=>Promise<void>)=>{
+        const stage=runStage(fleet,users,seconds);await during?.();const result=await stage;
+        const failoverMetrics=(result.gateway as {failover?:unknown}|null)?.failover??null;
+        phases.push({phase:name,...result});
+        console.log(JSON.stringify({phase:name,turns:result.turns,e2eMs:result.e2eMs,errors:result.errors,failover:failoverMetrics}));
+      };
+      await phase('healthy',15);
+      await phase('outage',20,async()=>{await sleep(3000);activeAtKill=await activeTurns(runStarted);await engine.kill();});
+      await engine.start();
+      // The breaker probes /health once its cooldown has passed, then the primary serves again.
+      await phase('recovered',Math.ceil(cooldownMs/1000)+15);
+      await sleep(Math.max(20_000,topology.leaseMs*3)); // anything still active now is orphaned
+      const orphanedActiveTurns=await activeTurns(runStarted);
+      report.failover={users,primaryFailure,breakerCooldownMs:cooldownMs,activeAtKill,phases,orphanedActiveTurns};
+      console.log(JSON.stringify({activeAtKill,orphanedActiveTurns}));
     } else if(mode==='same-session') {
       const owner=`lt-${randomUUID().slice(0,8)}`;const trials=Number(options.trials??30);const outcomes:Record<string,number>={};
       const [a,b]=[fleet.apiBases()[0]!,fleet.apiBases().at(-1)!]; // with two APIs, the pair races across processes
@@ -353,7 +426,7 @@ async function main():Promise<void> {
       report.sameSession={trials,statusPairs:outcomes};console.log(JSON.stringify(report.sameSession));
     } else throw new Error(`unknown mode ${mode}`);
   } finally {
-    await sampler?.stop();await fleet.stopAll();
+    await sampler?.stop();await fleet.stopAll();await engine?.stop();
     const queue=new BullMqTurnDelivery(redisUrl(),{queueName:QUEUE});await queue.close(true).catch(()=>undefined);
     report.resources=sampler?.rows??[];report.finishedAt=new Date().toISOString();
     await writeFile(join(directory,'report.json'),JSON.stringify(report,null,1),{mode:0o600});

@@ -97,13 +97,18 @@ describe('chat service integration (mocked Jev)',()=>{
   });
   test('below-threshold answers change nothing: prompt bytes equal the disabled path',async()=>{
     const off=await fixture();const on=await fixture({safety:safetyClassifier({safety:zero()})});
+    const turnIds:{off:string[];on:string[]}={off:[],on:[]};
     for(const text of ['안녕, 오늘 기분 어때?','작년에 어디 갔어?']) {
-      const a=await off.send(text);const b=await on.send(text);
+      const a=await off.send(text);const b=await on.send(text);turnIds.off.push(a.id);turnIds.on.push(b.id);
       expect(b.reply?.inputSafety).toMatchObject({decidedBy:'classifier',action:'none',fired:[]});
       const strip=(reply:typeof a.reply)=>{const {sessionId:_s,turnId:_t,messageId:_m,inputSafety:_i,retrievalContext:_r,...rest}=reply!;return rest;};
       expect(strip(b.reply)).toEqual(strip(a.reply));
     }
-    expect(JSON.stringify(on.provider.generate.mock.calls)).toBe(JSON.stringify(off.provider.generate.mock.calls));
+    // Prompts are identical; the options carry each run's own turn id as the request key.
+    const prompts=(calls:unknown[][])=>JSON.stringify(calls.map(call=>call[0]));
+    expect(prompts(on.provider.generate.mock.calls)).toBe(prompts(off.provider.generate.mock.calls));
+    const keys=(calls:unknown[][])=>calls.map(call=>(call[1] as {requestKey?:string}).requestKey);
+    expect(keys(off.provider.generate.mock.calls)).toEqual(turnIds.off);expect(keys(on.provider.generate.mock.calls)).toEqual(turnIds.on);
   });
   test('disabled: no classifier call, no trace, and the prompt is the plain buildPrompt output',async()=>{
     const f=await fixture();const turn=await f.send('안녕, 오늘 기분 어때?');

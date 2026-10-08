@@ -215,7 +215,12 @@ export class OpenRouterClient {
       throw error instanceof ProviderError?error:new ProviderError('PROVIDER_REQUEST_FAILED');
     }
   }
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> {
+  /**
+   * `idempotencyKey` (never sent) scopes the ledger entry, e.g. to one turn; `maxOutputTokens` may lower (never raise)
+   * the configured output cap; `onUsage` receives the reported token counts.
+   */
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;idempotencyKey?:string;maxOutputTokens?:number;
+    onUsage?:(usage:{promptTokens:number|null;completionTokens:number|null})=>void}):Promise<string> {
     aborted(options.signal);
     if (!Array.isArray(messages)||!messages.length||messages.length>64||messages.some(message=>!message||!['system','user','assistant'].includes(message.role)||typeof message.content!=='string'||Object.keys(message).some(key=>!['role','content'].includes(key)))) throw new ProviderError('INVALID_INPUT');
     const bytes=Buffer.byteLength(JSON.stringify(messages),'utf8');
@@ -227,19 +232,24 @@ export class OpenRouterClient {
     const responseFormat=agent&&TEXT_MODELS[this.model]!.agentSchema&&this.structuredOutputs
       ?{type:'json_schema',json_schema:{name:'agent_reply',strict:true,schema:AGENT_RESPONSE_JSON_SCHEMA}}
       :timeline?{type:'json_object'}:undefined;
-    const body:Json={model:this.model,messages:messages.map(({role,content})=>({role,content})),max_tokens:this.outputTokens,temperature:0,stream:false,provider:this.provider(false),
+    const outputTokens=Number.isInteger(options.maxOutputTokens)&&options.maxOutputTokens!>=1?Math.min(options.maxOutputTokens!,this.outputTokens):this.outputTokens;
+    const body:Json={model:this.model,messages:messages.map(({role,content})=>({role,content})),max_tokens:outputTokens,temperature:0,stream:false,provider:this.provider(false),
       ...(TEXT_MODELS[this.model]!.reasoning?{reasoning:TEXT_MODELS[this.model]!.reasoning}:{}),
       ...(responseFormat?{response_format:responseFormat}:{})};
     // UTF8 bytes upper-bound content tokenization; generous per-message + fixed envelope overhead.
     const inputUpperBound=bytes+messages.length*64+1024;
     // Reserve both full prompt and maximum cache-write price, even if automatic caching occurs.
     const {prompt,completion}=TEXT_MODELS[this.model]!;
-    const reserved=Math.ceil(inputUpperBound*2*prompt+this.outputTokens*completion);
-    const result=await this.request(body,'chat/completions',reserved,options.signal);
+    const reserved=Math.ceil(inputUpperBound*2*prompt+outputTokens*completion);
+    const result=await this.request(body,'chat/completions',reserved,options.signal,options.idempotencyKey);
     if (result.model!==undefined&&result.model!==this.model) throw new ProviderError('MODEL_MISMATCH');
     if (!Array.isArray(result.choices)||result.choices.length!==1) throw new ProviderError('INVALID_PROVIDER_RESPONSE');
     const content=object(object(result.choices[0]).message).content;
     if (typeof content!=='string'||!content.trim()||Buffer.byteLength(content,'utf8')>65536) throw new ProviderError('INVALID_PROVIDER_RESPONSE');
+    if (options.onUsage&&result.usage&&typeof result.usage==='object') {
+      const usage=result.usage as Json;const count=(value:unknown)=>typeof value==='number'&&Number.isInteger(value)&&value>=0?value:null;
+      options.onUsage({promptTokens:count(usage.prompt_tokens),completionTokens:count(usage.completion_tokens)});
+    }
     return content;
   }
   /** Decisions API (System One models such as Jev): same ledger, caps and no-resubmission rule as text/embeddings. */
@@ -286,6 +296,11 @@ export class OpenRouterClient {
     await this.options.ledger.finish(requestKey,Math.ceil(cost*1_000_000),null,request.generationId);
   }
 }
+/**
+ * Direct (no gateway) chat provider. The core's per-turn `requestKey` is deliberately NOT used as the ledger
+ * `idempotencyKey`: direct callers keep body-only keys so research reruns replay settled responses. Only the gateway
+ * maps X-PTR-Request-Key to `idempotencyKey`.
+ */
 export class OpenRouterTextProvider implements TextProvider {
   constructor(private readonly client:OpenRouterClient) {}
   generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> { return this.client.generate(messages,options); }

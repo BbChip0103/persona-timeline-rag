@@ -17,6 +17,8 @@ export interface OpenAICompatibleOptions {
   /** Bearer token, e.g. for the LLM gateway. */
   apiKey?:string;
 }
+/** Per-turn request key accepted by the gateway (`X-PTR-Request-Key`). */
+export const REQUEST_KEY=/^[A-Za-z0-9._:-]{1,128}$/;
 /** The gateway marks requests it refused before contacting any upstream; those are safe to resend. */
 const GATEWAY_REJECTED='rejected';
 /** A refused connection means the request never left this process (e.g. the gateway is restarting): also safe to resend. */
@@ -44,7 +46,7 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     this.endpoint=`${options.baseUrl.replace(/\/$/,'')}/chat/completions`;
     this.fetcher=options.fetch??fetch;
   }
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> {
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string}):Promise<string> {
     if(options.signal.aborted) throw new ProviderError('CANCELLED');
     const started=performance.now();let ttftMs:number|null=null;
     let promptTokens:number|null=null, completionTokens:number|null=null;
@@ -61,7 +63,9 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     const timeout=AbortSignal.timeout(this.options.timeoutMs??30000);
     const signal=AbortSignal.any([options.signal,timeout]);
     try {
-      const headers={'Content-Type':'application/json',...(this.options.apiKey?{Authorization:`Bearer ${this.options.apiKey}`}:{})};
+      const headers={'Content-Type':'application/json',...(this.options.apiKey?{Authorization:`Bearer ${this.options.apiKey}`}:{}),
+        // The gateway scopes a billable secondary's ledger entry to this key (the turn id); malformed keys are not sent.
+        ...(options.requestKey&&REQUEST_KEY.test(options.requestKey)?{'X-PTR-Request-Key':options.requestKey}:{})};
       let response:Response;
       for(let attempt=0;;attempt++) {
         try {response=await this.fetcher(this.endpoint,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});}
