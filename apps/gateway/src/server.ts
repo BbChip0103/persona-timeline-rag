@@ -5,7 +5,7 @@ import { pipeline } from 'node:stream/promises';
 import { REQUEST_KEY } from '@ptr/providers';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
-import type { ChatCompletionRequest, Upstream } from './upstreams';
+import type { ChatCompletionRequest, RequestContext, Upstream } from './upstreams';
 
 export interface GatewayOptions {
   token:string; upstream:Upstream;
@@ -55,13 +55,16 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
   const record=(list:number[],value:number)=>{list.push(value);if(list.length>SAMPLE)list.shift();};
   let meanUpstreamMs:number|null=null; // EWMA of successful calls, for Retry-After
   const {maxConcurrent,maxQueue}=options.limits;
-  const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:limiter.inFlight,queued:limiter.queued,
+  // A pool that owns admission (S3) replaces this limiter: bands, credits and its own queue bound.
+  const owned=options.upstream.admission?.bind(options.upstream);
+  const capacity=()=>{if(!owned) return {maxConcurrent,maxQueue,total:maxConcurrent+maxQueue};const a=owned();return {maxConcurrent:a.maxConcurrent,maxQueue:a.maxQueue,total:a.maxConcurrent+a.maxQueue};};
+  const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:owned?owned().inFlight:limiter.inFlight,queued:owned?owned().queued:limiter.queued,
     accepted:counters.accepted,completed:counters.completed,upstreamErrors:counters.upstreamErrors,
     rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout},
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
     ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
     ...(options.upstream.poolMetrics?{pool:options.upstream.poolMetrics()}:{}),
-    capacity:{maxConcurrent,maxQueue,total:maxConcurrent+maxQueue}});
+    capacity:capacity()});
   const authorized=(req:IncomingMessage)=>{
     const header=req.headers.authorization??'';const supplied=header.startsWith('Bearer ')?header.slice(7):'';
     return !!supplied&&supplied.length<=512&&timingSafeEqual(expected,createHash('sha256').update(supplied).digest());
@@ -81,10 +84,16 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     // Optional per-turn key (the worker's turn id): scopes a billable upstream's ledger entry; never sent upstream.
     const requestKey=req.headers['x-ptr-request-key'];
     if(requestKey!==undefined&&(typeof requestKey!=='string'||!REQUEST_KEY.test(requestKey))) return json(res,400,{error:{code:'INVALID_INPUT'}});
+    // X-PTR-Priority (band: 1 follow-up call of a running turn, 0 first call, −1 batch) and X-PTR-Flow (DRR key).
+    const priority=req.headers['x-ptr-priority'], flow=req.headers['x-ptr-flow'];
+    if(priority!==undefined&&!['1','0','-1'].includes(String(priority))) return json(res,400,{error:{code:'INVALID_INPUT'}});
+    if(flow!==undefined&&(typeof flow!=='string'||!/^[0-9a-f]{1,32}$/.test(flow))) return json(res,400,{error:{code:'INVALID_INPUT'}});
+    const context:RequestContext={...(requestKey!==undefined?{requestKey}:{}),...(priority!==undefined?{priority:Number(priority) as 1|0|-1}:{}),
+      ...(flow!==undefined?{flow:flow as string}:{})};
     // The caller's disconnect cancels waiting and the upstream call alike.
     const caller=new AbortController();res.on('close',()=>{if(!res.writableFinished)caller.abort();});
     const queuedAt=performance.now();let release:(()=>void)|undefined;
-    try {release=await limiter.acquire(caller.signal);}
+    try {release=owned?()=>undefined:await limiter.acquire(caller.signal);}
     catch(error) {
       const code=error instanceof GatewayRejection?error.code:'CANCELLED';
       // X-PTR-Gateway-Reason tells clients why (queue_full / queue_timeout; draining later sends them to the next URL).
@@ -93,11 +102,12 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       if(code==='GATEWAY_QUEUE_TIMEOUT'){counters.queueTimeout++;return json(res,503,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
       return; // caller already gone
     }
-    counters.accepted++;record(queueWaits,performance.now()-queuedAt);
+    // With a pool that owns admission the wait happens inside complete(): see pool.queue.waitMs instead.
+    counters.accepted++;if(!owned) record(queueWaits,performance.now()-queuedAt);
     const started=performance.now();
     const signal=AbortSignal.any([caller.signal,AbortSignal.timeout(options.limits.upstreamTimeoutMs)]);
     try {
-      const result=await options.upstream.complete(request,signal,requestKey===undefined?undefined:{requestKey});
+      const result=await options.upstream.complete(request,signal,Object.keys(context).length?context:undefined);
       // Which upstream answered, only when failover is configured.
       const served:Record<string,string>=result.upstream?{'X-PTR-Upstream':result.upstream}:{};
       if(result.status<200||result.status>=300) {
@@ -114,10 +124,13 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       // Successful calls only: fast failures would shorten the estimate and hung ones lengthen it.
       const elapsed=performance.now()-started;meanUpstreamMs=meanUpstreamMs===null?elapsed:meanUpstreamMs+0.1*(elapsed-meanUpstreamMs);
     } catch(error) {
-      // A pool found no free upstream within the queue timeout: nothing was sent, so it is a marked (retryable) rejection.
-      if(error instanceof GatewayRejection&&error.code==='GATEWAY_QUEUE_TIMEOUT'&&!caller.signal.aborted&&!res.headersSent) {
-        counters.queueTimeout++;
-        return json(res,503,{error:{code:error.code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});
+      // A pool refused or timed out the request in its own queue: nothing was sent, so it is a marked (retryable) rejection.
+      if(error instanceof GatewayRejection&&error.code!=='CANCELLED'&&!caller.signal.aborted&&!res.headersSent) {
+        if(error.code==='GATEWAY_QUEUE_TIMEOUT') {counters.queueTimeout++;
+          return json(res,503,{error:{code:error.code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
+        counters.queueFull++;
+        return json(res,429,{error:{code:error.code}},{'Retry-After':String(error.retryAfterSeconds??1),'X-PTR-Gateway':'rejected',
+          'X-PTR-Gateway-Reason':error.code==='GATEWAY_SATURATED'?'saturated':'queue_full'});
       }
       // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';

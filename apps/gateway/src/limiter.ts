@@ -1,5 +1,6 @@
 export class GatewayRejection extends Error {
-  constructor(readonly code:'GATEWAY_QUEUE_FULL'|'GATEWAY_QUEUE_TIMEOUT'|'CANCELLED') { super(code); this.name='GatewayRejection'; }
+  /** `retryAfterSeconds`: the pool's estimate from its queued tokens (S3); the server's own estimate otherwise. */
+  constructor(readonly code:'GATEWAY_QUEUE_FULL'|'GATEWAY_QUEUE_TIMEOUT'|'GATEWAY_SATURATED'|'CANCELLED',readonly retryAfterSeconds?:number) { super(code); this.name='GatewayRejection'; }
 }
 interface Waiter { grant:()=>void; reject:(error:GatewayRejection)=>void }
 

@@ -65,7 +65,7 @@ describe('capacity planner: hysteresis',()=>{
 describe('capacity controller',()=>{
   const rec=(id:string,port:number,extra:Partial<UpstreamRecord>={}):UpstreamRecord=>({pool:'m',id,baseUrl:`http://127.0.0.1:${port}/v1`,
     maxSeqs:12,kvCapacityTokens:null,weight:1,state:'active',epoch:'e1',seq:0,...extra});
-  function setup(options:{leader?:boolean}={}) {
+  function setup(options:{leader?:boolean;intervalMs?:number}={}) {
     let now=1_000_000;const registry=new MemoryUpstreamRegistry(()=>now);
     const writes:number[]=[];let concurrency:number|null=null;const counts={active:0,wait:0};
     const queue:CapacityQueue={getGlobalConcurrency:async()=>concurrency,setGlobalConcurrency:async(n:number)=>{concurrency=n;writes.push(n);},
@@ -73,7 +73,7 @@ describe('capacity controller',()=>{
     const store=new MemoryCapacityStore();if(options.leader===false) store.leader='someone-else';
     const lines:string[]=[];
     const controller=new CapacityController({registry,queue,store,pool:'m',allow:parseUpstreamAllow(undefined),id:'dispatcher-1',
-      q:256,headroom:0.25,floor:1,intervalMs:5000,log:line=>lines.push(line),now:()=>now});
+      q:256,headroom:0.25,floor:1,intervalMs:options.intervalMs??5000,log:line=>lines.push(line),now:()=>now});
     return {registry,controller,store,writes,counts,lines,advance:(ms:number)=>{now+=ms;},get:()=>concurrency};
   }
   test('counts active, allowlisted upstreams (draining and rejected ones excluded) and writes only on change',async()=>{
@@ -114,13 +114,85 @@ describe('capacity controller',()=>{
   });
 });
 
+describe('capacity controller: review follow-ups',()=>{
+  const rec=(id:string,port:number,extra:Partial<UpstreamRecord>={}):UpstreamRecord=>({pool:'m',id,baseUrl:`http://127.0.0.1:${port}/v1`,
+    maxSeqs:12,kvCapacityTokens:null,weight:1,state:'active',epoch:'e1',seq:0,...extra});
+  function setup(start:number|null=30) {
+    let now=1_000_000;const registry=new MemoryUpstreamRegistry(()=>now);
+    const writes:number[]=[];let concurrency:number|null=start;const counts={active:0,wait:0};
+    const queue:CapacityQueue={getGlobalConcurrency:async()=>concurrency,setGlobalConcurrency:async(n:number)=>{concurrency=n;writes.push(n);},getJobCounts:async()=>({...counts})};
+    const store=new MemoryCapacityStore();const lines:string[]=[];
+    const make=(id='d1',intervalMs=5000)=>new CapacityController({registry,queue,store,pool:'m',allow:parseUpstreamAllow(undefined),id,q:256,intervalMs,
+      log:line=>lines.push(line),now:()=>now});
+    return {registry,store,writes,counts,lines,make,advance:(ms:number)=>{now+=ms;},get:()=>concurrency};
+  }
+  test('S_live = 0 because every record was rejected: G is held (no decay to FLOOR) and a warning names the reasons',async()=>{
+    const s=setup();const c=s.make();
+    await s.registry.heartbeat(rec('rogue',19999),60000);
+    for(let i=0;i<5;i++) expect(await c.tick()).toMatchObject({g:30,reason:'hold_suspect',rejected:1});
+    expect(s.writes).toEqual([]);
+    expect(s.lines.filter(line=>line.startsWith('WARNING capacity: S_live=0 but 1 registry record(s) rejected (not_allowed:1)'))).toHaveLength(1);
+  });
+  test('the suspect hold is bounded (5 min): a real outage of this pool still shrinks G afterwards',async()=>{
+    const s=setup();const c=s.make();
+    await s.registry.heartbeat(rec('rogue',19999),3600000);
+    expect(await c.tick()).toMatchObject({reason:'hold_suspect'});
+    s.advance(300000);
+    expect((await c.tick()).reason).toBe('decrease_pending');
+    expect(s.lines.some(line=>line.startsWith('WARNING capacity: holding G for 300 s without a usable record'))).toBe(true);
+  });
+  test('S_live = 0 while other pools have live records (pool or prefix mismatch suspected): G is held, with a warning',async()=>{
+    const s=setup();const c=s.make();
+    await s.registry.heartbeat(rec('a',18000,{pool:'other-model'}),60000);
+    for(let i=0;i<4;i++) expect(await c.tick()).toMatchObject({g:30,reason:'hold_suspect'});
+    expect(s.lines.some(line=>line.includes('live records exist only in other pools (other-model)'))).toBe(true);
+    // A truly empty registry still decays to FLOOR through the hysteresis.
+    await s.registry.remove('other-model','a');
+    for(let i=0;i<3;i++) await c.tick();
+    expect(s.writes).toEqual([23]);
+  });
+  test('rejected records next to live ones are counted and logged once, not held',async()=>{
+    const s=setup(null);const c=s.make();
+    await s.registry.heartbeat(rec('a',18000),60000);await s.registry.heartbeat(rec('rogue',19999),60000);
+    expect(await c.tick()).toMatchObject({g:15,reason:'init',rejected:1});await c.tick();
+    expect(s.lines.filter(line=>line.startsWith('capacity: 1 registry record(s) rejected'))).toHaveLength(1);
+  });
+  test('G at FLOOR while turns wait for 15 s: one capacity_floor warning per episode',async()=>{
+    const s=setup(1);const c=s.make(); // empty (readable) registry: G sits at FLOOR=1
+    s.counts.wait=5;s.counts.active=1;
+    for(let i=0;i<4;i++) {await c.tick();s.advance(5000);}
+    expect(s.lines.filter(line=>line.startsWith('WARNING capacity_floor'))).toHaveLength(1);
+  });
+  test('leader lease = max(15 s, 3 × interval)',async()=>{
+    const s=setup();
+    const ttls:number[]=[];const acquire=s.store.acquireLeader.bind(s.store);
+    s.store.acquireLeader=async(id:string,ttl:number)=>{ttls.push(ttl);return acquire(id,ttl);};
+    await s.make('d1',5000).tick();await s.make('d1',10000).tick();
+    expect(ttls).toEqual([15000,30000]);
+  });
+  test('a new leader starts with fresh hysteresis and does not treat already-draining records as a new drain',async()=>{
+    const s=setup();
+    await s.registry.heartbeat(rec('a',18000),600000);await s.registry.heartbeat(rec('b',18001),600000);
+    await s.registry.setState('m','b','draining');
+    const c=s.make();
+    expect(await c.tick()).toMatchObject({target:15,g:30,reason:'decrease_pending'}); // b was draining before this leader: no immediate drop
+    expect(await c.tick()).toMatchObject({reason:'decrease_pending'});
+    s.store.leader='other';expect(await c.tick()).toMatchObject({leader:false});
+    s.store.leader=undefined;
+    expect(await c.tick()).toMatchObject({reason:'decrease_pending'}); // streak restarted on regaining leadership
+    expect(await c.tick()).toMatchObject({reason:'decrease_pending'});
+    expect(await c.tick()).toMatchObject({reason:'decrease',g:23});
+  });
+});
+
 describe('controller mode',()=>{
   test('default on with Redis discovery, off otherwise; explicit values win; anything else is an error',()=>{
     expect(capacityControllerMode({})).toBe('off');
     expect(capacityControllerMode({PTR_GATEWAY_DISCOVERY:'redis'})).toBe('on');
     expect(capacityControllerMode({PTR_GATEWAY_DISCOVERY:'redis',PTR_CAPACITY_CONTROLLER:'off'})).toBe('off');
     expect(capacityControllerMode({PTR_CAPACITY_CONTROLLER:'on'})).toBe('on');
-    expect(capacityControllerMode({PTR_CAPACITY_CONTROLLER:'clear'})).toBe('clear');
+    expect(capacityControllerMode({PTR_CAPACITY_CONTROLLER:'keep'})).toBe('keep');
+    expect(capacityControllerMode({PTR_CAPACITY_CONTROLLER:'clear'})).toBe('off'); // 7d34739 name: off now clears
     expect(()=>capacityControllerMode({PTR_CAPACITY_CONTROLLER:'yes'})).toThrow('INVALID_PTR_CAPACITY_CONTROLLER');
   });
 });

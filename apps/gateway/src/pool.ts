@@ -1,5 +1,7 @@
 import type { UpstreamRecord } from '@ptr/messaging/registry';
 import { UpstreamHealth, type BreakerMetrics, type BreakerOptions, type BreakerState } from './health';
+import { CentralQueue, chooseUpstream, estimateRequest, kvReservation, queueRetryAfterSeconds, uncachedTokens, type Band, type QueuedRequest,
+  type RequestEstimate, type RoutingPolicy } from './admission';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
 import { OpenAICompatibleUpstream, UpstreamConnectError, type ChatCompletionRequest, type RequestContext, type Upstream, type UpstreamResult } from './upstreams';
@@ -35,22 +37,37 @@ export interface FailoverMetrics {
 export type Primary=Upstream&{health(signal:AbortSignal):Promise<boolean>};
 export interface UpstreamMemberMetrics {
   id:string; epoch:string; state:'active'|'draining'|'gone';
+  /** N_u, and the current limit S_u^eff: maxSeqs ramped during slow start (null = unlimited). */
   inFlight:number;
-  /** Current per-upstream concurrency limit: maxSeqs, ramped during slow start (null = unlimited). */
   limit:number|null; maxSeqs:number|null; weight:number; slowStart:boolean; breaker:BreakerState;
+  /** Kres_u (reserved KV tokens) and U_u (uncached prompt tokens before the first chunk); K_u, R_u as configured. */
+  reservedKvTokens:number; prefillTokens:number; kvCapacityTokens:number|null; prefillTokensPerSec:number|null;
+  /** N/S_eff and Kres/(κ·K − G) (null when unknown). */
+  seqUtil:number|null; kvUtil:number|null;
   dispatched:number; answered:number; connectFailures:number;
+}
+export interface PoolQueueMetrics {
+  routing:RoutingPolicy; fairness:'fifo'|'drr';
+  queued:Record<'1'|'0'|'-1',number>; queuedTokens:number;
+  waitMs:{p50:number|null;p95:number|null};
+  rejected:{queue_full:number;saturated:number;queue_timeout:number};
+  /** G: the global prefix (policy block) learned from the first request's msg0, in tokens. */
+  globalPrefixTokens:number;
+  /** Recent uncached prompt tokens per second reaching a first chunk (Retry-After estimate); null before any. */
+  prefillTokensPerSec:number|null;
 }
 export interface PoolMetrics {
   pool:string;
   /** Members by state; `ramping` ⊂ active (slow start), `gone` = left the source but still finishing calls. */
   members:{active:number;ramping:number;draining:number;gone:number;breakerOpen:number};
-  /** Requests waiting for a free upstream slot (bounded by the gateway queue timeout). */
+  /** Requests waiting in the pool's queue for credit on an upstream (bounded by the queue timeout). */
   waiting:number;
   /** Requests resent to another primary after a connection failure (nothing reached the first one). */
   retriedOnOtherPrimary:number;
-  /** Requests that got the marked 503 GATEWAY_QUEUE_TIMEOUT because no upstream slot freed in time (a subset of the gateway's rejected.queueTimeout). */
+  /** Requests that got the marked 503 GATEWAY_QUEUE_TIMEOUT from the pool queue (a subset of the gateway's rejected.queueTimeout). */
   queueTimeouts:number;
   events:{added:number;removed:number;replaced:number;invalid:number};
+  queue:PoolQueueMetrics;
   upstreams:UpstreamMemberMetrics[];
   registry?:SourceMetrics;
 }
@@ -67,20 +84,40 @@ export interface PoolOptions {
   primaryAttempts?:number;
   /** Linear ramp of a newly added upstream's limit (PTR_GATEWAY_SLOW_START_MS). Default 30000; 0 = off. */
   slowStartMs?:number;
-  /** Longest wait for a free upstream slot before a marked 503 GATEWAY_QUEUE_TIMEOUT. Default 10000. */
+  /** Longest wait in the pool queue before a marked 503 GATEWAY_QUEUE_TIMEOUT. Default 10000. */
   queueTimeoutMs?:number;
+  /**
+   * The pool owns admission (S3): the gateway's own limiter is bypassed, requests wait in this pool's band queue, and
+   * a full queue is a marked 429. File / registry pools; the env-only failover wrapper keeps the gateway limiter.
+   */
+  admission?:boolean;
+  /** PTR_GATEWAY_MAX_QUEUE when the pool owns admission (256); unbounded otherwise (the gateway limiter bounds it). */
+  maxQueue?:number;
+  /** PTR_GATEWAY_ROUTING (class default least_inflight, the S2 rule). */
+  routing?:RoutingPolicy;
+  /** κ (0.9), bytes per token (3.9), T_max (1000 ms), LOOKAHEAD (8), starvation age (2000 ms), fifo|drr, DRR quantum (4096). */
+  kappa?:number; bytesPerToken?:number; ttftPenaltyMs?:number; lookahead?:number; starvationMs?:number;
+  fairness?:'fifo'|'drr'; drrQuantum?:number;
+  /** Refuse at once (429 `saturated`) when the estimated wait exceeds the queue timeout. Default off. */
+  rejectSaturated?:boolean;
   /** Clock for slow start (tests). */
   now?:()=>number;
 }
 
 const isTimeout=(reason:unknown)=>(reason as {name?:unknown})?.name==='TimeoutError';
-const RAMP_TICK_MS=250;
+// The early `saturated` refusal trusts the observed prefill rate only with this many recent answers behind it.
+const TICK_MS=250, SAMPLE=2000, RATE_WINDOW_MS=10000, MIN_RATE_SAMPLES=20;
 class Member {
-  inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;
+  inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;kvReserved=0;prefill=0;
   constructor(public record:UpstreamRecord,readonly upstream:Primary,readonly health:UpstreamHealth,readonly addedAt:number) {}
 }
-/** Releases the upstream slot when the relayed stream ends, fails, is closed by its consumer, or the call is aborted. */
-function releasing(body:AsyncIterable<Uint8Array>,release:()=>void,signal:AbortSignal):AsyncIterable<Uint8Array> {
+interface Reservation { kv:number; prefill:number; firstChunk:boolean; released:boolean }
+interface Pending extends QueuedRequest {
+  estimate:RequestEstimate&{cachedPrefix:number}; exclude:Set<Member>;
+  settle:(result:{member:Member;reservation:Reservation}|{none:string|undefined})=>void; reject:(error:unknown)=>void;
+}
+/** Relays the body; marks the first chunk (prefill done) and releases the slot when it ends, fails, is closed, or the call is aborted. */
+function relaying(body:AsyncIterable<Uint8Array>,first:()=>void,release:()=>void,signal:AbortSignal):AsyncIterable<Uint8Array> {
   const onAbort=()=>release();
   const done=()=>{signal.removeEventListener('abort',onAbort);release();};
   if(signal.aborted) release();else signal.addEventListener('abort',onAbort,{once:true});
@@ -88,43 +125,67 @@ function releasing(body:AsyncIterable<Uint8Array>,release:()=>void,signal:AbortS
     const iterator=body[Symbol.asyncIterator]();
     return {
       async next() {
-        try {const result=await iterator.next();if(result.done) done();return result;} catch(error) {done();throw error;}
+        try {const result=await iterator.next();if(result.done) done();else first();return result;} catch(error) {done();throw error;}
       },
       async return(value?:unknown) {done();await iterator.return?.(value);return {done:true as const,value:undefined};},
     };
   }};
 }
+const percentile=(values:number[],p:number)=>{
+  if(!values.length) return null;const sorted=[...values].sort((a,b)=>a-b);
+  return Math.round(sorted[Math.min(sorted.length-1,Math.ceil(p*sorted.length)-1)]!);
+};
 
 /**
- * One model's upstreams (routing ): the member set follows an UpstreamSource (static list, file or
- * Redis registry), each member has its own breaker (UpstreamHealth) and concurrency limit (`maxSeqs`, ramped by slow
- * start when added), and a request goes to the member with the fewest calls in flight that has room (ties rotate).
- * This is the interim selection; scored routing with token credits replaces it in S3. Without room anywhere the
- * request waits (no spillover). Draining or departed members take no new calls and finish the ones they have.
- * Connection failures (nothing reached the engine; with `failOverOnClose` also a close before any response byte) are
- * retried on another member, then on the optional secondary; timeouts, HTTP errors and streams cut mid-response are
- * surfaced as before. With one member this is exactly the single-upstream (and FailoverUpstream) behaviour: an open
- * breaker with no other member and no secondary still sends to it, as a plain upstream without a breaker would.
+ * One model's upstreams (routing –§5, §13). The member set follows an UpstreamSource (static list, file or
+ * Redis registry); each member has its own breaker (UpstreamHealth) and credit: sequences (maxSeqs, ramped by slow
+ * start), KV tokens (when its capacity is known) and prefill tokens (when its prefill rate is calibrated). A request
+ * waits in the pool's central queue (bands from X-PTR-Priority, FIFO or DRR, LOOKAHEAD, aging) and is bound to an
+ * upstream only when one has credit (late binding), by PTR_GATEWAY_ROUTING: round_robin, least_inflight or scored
+ * (§4.3 least cost, affinity comes in S5). There is no spillover. Draining or departed members take no new calls and
+ * finish the ones they have. Connection failures (nothing reached the engine; with `failOverOnClose` also a close
+ * before any response byte) are retried on another member, then on the optional secondary; timeouts, HTTP errors and
+ * streams cut mid-response are surfaced as before. With one uncapped member this is exactly the single-upstream (and
+ * FailoverUpstream) behaviour: an open breaker with no other member and no secondary still sends to it.
  */
 export class UpstreamPool implements Upstream {
   readonly model:string;
   readonly failoverMetrics?:()=>FailoverMetrics;
+  /** Present when the pool owns admission: the gateway skips its own limiter and reports this instead. */
+  readonly admission?:()=>{inFlight:number;queued:number;maxConcurrent:number;maxQueue:number};
+  readonly admits:boolean;
   private readonly options:FailoverOptions;
   private readonly members=new Map<string,Member>();
   private readonly retiring=new Set<Member>();
-  private readonly waiters=new Set<()=>void>();
+  private readonly queue:CentralQueue<Pending>;
   private readonly now:()=>number;
   private readonly create:(record:UpstreamRecord)=>Primary;
   private readonly stopSource:()=>void;
-  private startingUp=true;private rr=0;
+  private readonly routing:RoutingPolicy;
+  private readonly maxQueue:number;
+  private startingUp=true;private rr=0;private nextId=0;private globalPrefix=0;private prefixKey='';
+  /** msg0 blocks seen (bounded): G is the most common one, so one odd first request cannot set it for good. */
+  private readonly prefixSeen=new Map<string,{tokens:number;count:number}>();
+  private dispatching=false;private again=false;private ticker:NodeJS.Timeout|undefined;
   private readonly started:number[]=[];
+  private readonly waits:number[]=[];
+  private readonly processed:{at:number;tokens:number}[]=[];
   private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
+  private readonly rejected={queue_full:0,saturated:0,queue_timeout:0};
   private readonly failovers:Record<string,number>={};
   private readonly events={added:0,removed:0,replaced:0,invalid:0};
   constructor(private readonly pool:PoolOptions) {
     this.model=pool.model;this.options={...DEFAULT_FAILOVER,...pool.failover};this.now=pool.now??Date.now;
     this.create=pool.create??(record=>new OpenAICompatibleUpstream({baseUrl:record.baseUrl,model:pool.model}));
+    this.routing=pool.routing??'least_inflight';this.admits=!!pool.admission;
+    this.maxQueue=pool.maxQueue??(pool.admission?256:Infinity);
+    this.queue=new CentralQueue<Pending>({lookahead:pool.lookahead??8,starvationMs:pool.starvationMs??2000,fairness:pool.fairness??'fifo',quantum:pool.drrQuantum??4096});
     if(pool.secondary) this.failoverMetrics=()=>this.secondaryMetrics();
+    if(pool.admission) this.admission=()=>{
+      const caps=[...this.members.values()].filter(member=>member.record.state==='active').map(member=>member.record.maxSeqs);
+      return {inFlight:[...this.members.values(),...this.retiring].reduce((sum,member)=>sum+member.inFlight,0),queued:this.queue.size,
+        maxConcurrent:caps.reduce((sum,cap)=>sum+(Number.isFinite(cap)?cap:0),0),maxQueue:this.maxQueue};
+    };
     this.sync();this.startingUp=false;
     this.stopSource=pool.source.onChange(()=>this.sync());
   }
@@ -134,25 +195,27 @@ export class UpstreamPool implements Upstream {
     try {await this.pool.source.start?.();} finally {this.startingUp=false;}
     await this.pool.secondary?.ready?.(signal);
   }
-  async close():Promise<void> {this.stopSource();await this.pool.source.close?.();}
+  async close():Promise<void> {this.stopSource();clearInterval(this.ticker);this.ticker=undefined;await this.pool.source.close?.();}
 
   async complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult> {
+    const estimate=this.learnPrefix(estimateRequest(request,this.pool.bytesPerToken??3.9));
     const tried=new Set<Member>();let reason='breaker_open';let lastError:unknown;let waitUntil:number|undefined;
     const deadline=()=>waitUntil??=Date.now()+(this.pool.queueTimeoutMs??10000);
     const attempts=Math.max(1,this.pool.primaryAttempts??2);
     for(let attempt=0;attempt<attempts;attempt++) {
-      let picked:Awaited<ReturnType<UpstreamPool['pick']>>;
-      try {picked=await this.pick(signal,tried,deadline);}
+      let routed:Awaited<ReturnType<UpstreamPool['route']>>;
+      try {routed=await this.route(estimate,context,signal,tried,deadline,attempt>0);}
       catch(error) {
         // After a failed attempt the request may have reached an engine (closed before response): no other upstream
         // in time must not become a marked "nothing was sent" rejection. Fall through to the secondary or the error.
         if(attempt>0&&error instanceof GatewayRejection) break;
-        if(error instanceof GatewayRejection) this.counts.queueTimeouts++;
+        if(error instanceof GatewayRejection&&error.code==='GATEWAY_QUEUE_TIMEOUT') {this.counts.queueTimeouts++;this.rejected.queue_timeout++;}
         throw error;
       }
-      if(!picked.member) {if(picked.none) reason=picked.none;break;}
-      tried.add(picked.member);if(attempt>0) this.counts.retried++;
-      try {return await this.callPrimary(picked.member,request,signal,picked.openGeneration);}
+      if(!('member' in routed)) {if(routed.none) reason=routed.none;break;}
+      const {member,reservation,openGeneration}=routed;
+      tried.add(member);if(attempt>0) this.counts.retried++;
+      try {return await this.callPrimary(member,reservation,request,signal,openGeneration);}
       catch(error) {
         if(!(error instanceof UpstreamConnectError)) throw error;
         if(!error.certain&&!this.options.failOverOnClose) {this.counts.closedNotFailedOver++;throw error;}
@@ -177,42 +240,119 @@ export class UpstreamPool implements Upstream {
   }
 
   /**
-   * A member with room, or why there is none: 'no_upstream' / 'breaker_open' (secondary configured), or nothing left
-   * after a failed attempt. Waits while every usable member is full, or (no secondary) while none is registered.
+   * Decides what can be decided before queueing (no member left after a failed attempt, all breakers open with a
+   * secondary: answer at once), probes half-open members, then waits in the central queue for credit.
    */
-  private async pick(signal:AbortSignal,tried:Set<Member>,deadline:()=>number):Promise<{member?:Member;openGeneration?:number;none?:string}> {
-    for(;;) {
-      const live=[...this.members.values()].filter(member=>member.record.state==='active'&&!tried.has(member));
-      if(!live.length) {
-        if(this.pool.secondary||tried.size) return {none:tried.size?undefined:'no_upstream'};
-        await this.waitForChange(signal,deadline());continue;
-      }
-      let usable=live.filter(member=>member.health.state()==='closed');
-      const halfOpen=live.filter(member=>member.health.state()==='half_open');
-      // With a secondary as the alternative, a half-open primary is probed before use (FailoverUpstream behaviour).
-      // Otherwise probe in the background: others serve meanwhile, or (no alternative) the request goes out at once.
-      if(!usable.length&&this.pool.secondary&&halfOpen.length) {
-        const healthy=await this.firstHealthy(halfOpen,signal,deadline());
-        // The membership may have changed during the probe: never dispatch to a member that left or is draining.
-        if(healthy&&!(this.members.get(healthy.record.id)===healthy&&healthy.record.state==='active')) continue;
-        if(healthy) usable=[healthy];
-      }
-      else for(const member of halfOpen) void member.health.probeHealth();
-      if(!usable.length) {
-        if(this.pool.secondary) return {none:'breaker_open'};
-        usable=live; // no alternative at all: try anyway, as a plain upstream without a breaker would
-      }
-      const now=this.now();
-      const room=usable.filter(member=>member.inFlight<this.limit(member,now));
-      if(room.length) {
-        const least=Math.min(...room.map(member=>member.inFlight));
-        const tied=room.filter(member=>member.inFlight===least);
-        const member=tied.length>1?tied[this.rr++%tied.length]!:tied[0]!;
-        member.inFlight++;member.dispatched++;
-        return {member,...(member.health.isOpen?{openGeneration:member.health.generation}:{})};
-      }
-      await this.waitForChange(signal,deadline());
+  /** G = the most common msg0 (the policy block); a request gets the cached share only if its msg0 is that block. */
+  private learnPrefix(estimate:RequestEstimate):RequestEstimate&{cachedPrefix:number} {
+    if(estimate.prefixKey) {
+      const seen=this.prefixSeen.get(estimate.prefixKey)??{tokens:estimate.prefixTokens,count:0};seen.count++;
+      this.prefixSeen.set(estimate.prefixKey,seen);
+      if(this.prefixSeen.size>16) {const rarest=[...this.prefixSeen.entries()].sort((a,b)=>a[1].count-b[1].count)[0]!;this.prefixSeen.delete(rarest[0]);}
+      const [key,top]=[...this.prefixSeen.entries()].reduce((best,entry)=>entry[1].count>best[1].count?entry:best);
+      this.prefixKey=key;this.globalPrefix=top.tokens;
     }
+    return {...estimate,cachedPrefix:estimate.prefixKey&&estimate.prefixKey===this.prefixKey?this.globalPrefix:0};
+  }
+  private async route(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,tried:Set<Member>,deadline:()=>number,retry:boolean):
+    Promise<{member:Member;reservation:Reservation;openGeneration?:number}|{none:string|undefined}> {
+    for(;;) {
+      const live=this.candidates(tried);
+      if(!live.length&&(this.pool.secondary||tried.size)) return {none:tried.size?undefined:'no_upstream'};
+      if(live.length) {
+        const closed=live.filter(member=>member.health.state()==='closed');
+        const halfOpen=live.filter(member=>member.health.state()==='half_open');
+        // With a secondary as the alternative, a half-open primary is probed before use (FailoverUpstream behaviour).
+        // Otherwise probe in the background: others serve meanwhile, or (no alternative) the request goes out at once.
+        if(!closed.length&&this.pool.secondary) {
+          const healthy=halfOpen.length?await this.firstHealthy(halfOpen,signal,deadline()):undefined;
+          // The membership may have changed during the probe: never dispatch to a member that left or is draining.
+          if(healthy&&!(this.members.get(healthy.record.id)===healthy&&healthy.record.state==='active')) continue;
+          if(!healthy) return {none:'breaker_open'};
+        } else for(const member of halfOpen) void member.health.probeHealth();
+      }
+      const result=await this.enqueue(estimate,context,signal,tried,deadline(),retry);
+      if('member' in result) return {...result,...(result.member.health.isOpen?{openGeneration:result.member.health.generation}:{})};
+      return result;
+    }
+  }
+  private candidates(exclude:Set<Member>):Member[] {
+    return [...this.members.values()].filter(member=>member.record.state==='active'&&!exclude.has(member));
+  }
+  private enqueue(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,exclude:Set<Member>,deadlineAt:number,retry:boolean):
+    Promise<{member:Member;reservation:Reservation}|{none:string|undefined}> {
+    const band:Band=context?.priority??0, cost=uncachedTokens(estimate,this.globalPrefix);
+    if(!retry&&this.pool.rejectSaturated&&this.queue.size) {
+      const rate=this.prefillRate(MIN_RATE_SAMPLES);
+      if(rate&&(this.queue.tokensAhead(band)+cost)/rate*1000>deadlineAt-Date.now()) {
+        this.rejected.saturated++;
+        return Promise.reject(new GatewayRejection('GATEWAY_SATURATED',this.retryAfterSeconds(band)));
+      }
+    }
+    return new Promise((resolve,reject)=>{
+      const remaining=deadlineAt-Date.now();
+      const cleanup=()=>{clearTimeout(timer);signal.removeEventListener('abort',onAbort);};
+      let settled=false;
+      const pending:Pending={id:++this.nextId,band,flow:context?.flow??'',cost,enqueuedAt:Date.now(),estimate,exclude,
+        settle:result=>{settled=true;cleanup();this.record(this.waits,Date.now()-pending.enqueuedAt);resolve(result);},
+        reject:error=>{settled=true;cleanup();reject(error);}};
+      // Leaving frees the head of a band: run a pass so the requests behind it do not wait for the next tick.
+      const leave=(error:unknown)=>{if(this.queue.remove(pending)) {cleanup();reject(error);this.kick();}};
+      const onAbort=()=>leave(signal.reason);
+      const timer=setTimeout(()=>leave(new GatewayRejection('GATEWAY_QUEUE_TIMEOUT')),Math.max(0,remaining));
+      if(retry) this.queue.unshift(pending);else this.queue.push(pending);
+      this.kick();
+      // Bound checked after a dispatch attempt (a request with credit runs even at PTR_GATEWAY_MAX_QUEUE=0). When full, a
+      // higher band takes the place of the newest request of the lowest band below it; else this request is refused.
+      if(!settled&&!retry&&this.queue.size>this.maxQueue) {
+        const victim=this.queue.newestBelow(band);
+        const refused=victim??pending;
+        this.queue.remove(refused);this.rejected.queue_full++;
+        refused.reject(new GatewayRejection('GATEWAY_QUEUE_FULL',this.retryAfterSeconds(refused.band)));
+        if(!victim) return;
+      }
+      // Credit available now: dispatched even for a caller that already left (as before S3: the call itself sees the
+      // aborted signal). Only a request that has to wait is dropped for an aborted caller.
+      if(settled) return;
+      if(signal.aborted) leave(signal.reason);else signal.addEventListener('abort',onAbort,{once:true});
+    });
+  }
+  /**
+   * Runs the dispatch loop now (re-entrant calls from releases during a pass just request another pass). While requests
+   * wait, a 250 ms tick covers slow start, breaker cooldowns and aging.
+   */
+  private kick():void {
+    if(this.dispatching) {this.again=true;return;}
+    this.dispatching=true;
+    try {do {this.again=false;this.dispatch();} while(this.again);} finally {this.dispatching=false;}
+    if(this.queue.size&&!this.ticker) {this.ticker=setInterval(()=>this.kick(),TICK_MS);this.ticker.unref();}
+    if(!this.queue.size&&this.ticker) {clearInterval(this.ticker);this.ticker=undefined;}
+  }
+  private dispatch():void {
+    const now=this.now();
+    this.queue.plan(Date.now(),pending=>{
+      const live=this.candidates(pending.exclude);
+      if(!live.length) {
+        if(this.pool.secondary||pending.exclude.size) {pending.settle({none:pending.exclude.size?undefined:'no_upstream'});return true;}
+        return false; // wait for a member to appear
+      }
+      const closed=live.filter(member=>member.health.state()==='closed');
+      for(const member of live) if(member.health.state()==='half_open') void member.health.probeHealth();
+      if(!closed.length&&this.pool.secondary) {pending.settle({none:'breaker_open'});return true;}
+      // No closed member and no secondary: the open ones are the only alternative (a single upstream has no breaker).
+      const usable=closed.length?closed:live;
+      const states=usable.map(member=>({id:member.record.id,member,inFlight:member.inFlight,limit:this.limit(member,now),kvReserved:member.kvReserved,
+        prefill:member.prefill,kvCapacity:member.record.kvCapacityTokens,prefillPerSec:member.record.prefillTokensPerSec??null,weight:member.record.weight}));
+      const chosen=chooseUpstream(this.routing,states,pending.estimate,{kappa:this.pool.kappa??0.9,globalPrefix:this.globalPrefix,
+        ttftPenaltyMs:this.pool.ttftPenaltyMs??1000},this.rr);
+      if(!chosen) return false;
+      this.rr++;
+      const member=chosen.member;
+      const reservation:Reservation={kv:kvReservation(pending.estimate,this.globalPrefix),prefill:uncachedTokens(pending.estimate,this.globalPrefix),firstChunk:false,released:false};
+      member.inFlight++;member.dispatched++;member.kvReserved+=reservation.kv;member.prefill+=reservation.prefill;
+      pending.settle({member,reservation});
+      return true;
+    });
   }
   /** Probes all half-open members at once (shared probes); the first healthy one wins. Undefined if none by the deadline. */
   private firstHealthy(members:Member[],signal:AbortSignal,deadlineAt:number):Promise<Member|undefined> {
@@ -229,60 +369,66 @@ export class UpstreamPool implements Upstream {
       for(const member of members) void member.health.probeHealth().then(ok=>{if(ok) finish(member);else if(--pending===0) finish(undefined);});
     });
   }
-  private async callPrimary(member:Member,request:ChatCompletionRequest,signal:AbortSignal,openGeneration:number|undefined):Promise<UpstreamResult> {
-    let released=false;
-    const release=()=>{if(released) return;released=true;this.release(member);};
+  private async callPrimary(member:Member,reservation:Reservation,request:ChatCompletionRequest,signal:AbortSignal,openGeneration:number|undefined):Promise<UpstreamResult> {
+    const release=()=>this.release(member,reservation);
+    let ok=true;
+    const first=()=>this.firstChunk(member,reservation,ok);
     const headers=new AbortController();
     const timer=this.options.headersTimeoutMs?setTimeout(()=>headers.abort(new DOMException('primary headers timeout','TimeoutError')),this.options.headersTimeoutMs):undefined;
     const primarySignal=AbortSignal.any([signal,headers.signal]);
     try {
       // The request key is for billing on the secondary; it is not sent to the engine.
       const result=await member.upstream.complete(request,primarySignal);
-      member.health.answered(openGeneration);member.answered++;this.counts.primary++;
-      const body=typeof result.body==='string'?(release(),result.body):releasing(result.body,release,signal);
+      member.health.answered(openGeneration);member.answered++;this.counts.primary++;ok=result.status>=200&&result.status<300;
+      const body=typeof result.body==='string'?(first(),release(),result.body):relaying(result.body,first,release,signal);
       return {...result,body,...(this.pool.secondary?{upstream:'primary' as const}:{})};
     } catch(error) {
-      release();
+      // The breaker learns of the failure before the slot is handed to a queued request.
       if(!(error instanceof UpstreamConnectError)) {
         // Sent and unanswered in time (the gateway's deadline, the headers timeout, or the HTTP client's own
         // timeout): it may be in the model, so it is never retried elsewhere.
         const timeout=isTimeout(error)?error:primarySignal.aborted&&isTimeout(primarySignal.reason)?primarySignal.reason:undefined;
-        if(timeout) {member.health.timedOut();throw timeout;}
-        throw error;
+        if(timeout) member.health.timedOut();
+        release();
+        throw timeout??error;
       }
       member.connectFailures++;member.health.connectFailed();
+      release();
       throw error;
     } finally {clearTimeout(timer);}
   }
+  /** Prefill done: U is released; only successful answers count toward the prefill rate (fast errors would inflate it). */
+  private firstChunk(member:Member,reservation:Reservation,ok:boolean):void {
+    if(reservation.firstChunk||reservation.released) return;
+    reservation.firstChunk=true;member.prefill-=reservation.prefill;
+    if(ok) this.processed.push({at:Date.now(),tokens:reservation.prefill});
+    while(this.processed.length&&Date.now()-this.processed[0]!.at>RATE_WINDOW_MS) this.processed.shift();
+    this.kick();
+  }
+  private release(member:Member,reservation:Reservation):void {
+    if(reservation.released) return;reservation.released=true;
+    member.inFlight--;member.kvReserved-=reservation.kv;
+    if(!reservation.firstChunk) member.prefill-=reservation.prefill;
+    if(member.gone&&member.inFlight<=0) this.retiring.delete(member);
+    this.kick();
+  }
+  /** Uncached prompt tokens per second reaching a first chunk over the last 10 s (null before `minSamples`). */
+  private prefillRate(minSamples=1):number|null {
+    const now=Date.now();
+    while(this.processed.length&&now-this.processed[0]!.at>RATE_WINDOW_MS) this.processed.shift();
+    if(this.processed.length<Math.max(1,minSamples)) return null;
+    const span=Math.max(1000,now-this.processed[0]!.at);
+    return this.processed.reduce((sum,entry)=>sum+entry.tokens,0)/(span/1000);
+  }
+  /** Retry-After for a marked rejection: the tokens queued at this band and above over the recent prefill rate. */
+  retryAfterSeconds(band:Band=0):number {return queueRetryAfterSeconds(this.queue.tokensAhead(band),this.prefillRate());}
+  private record(list:number[],value:number):void {list.push(value);if(list.length>SAMPLE) list.shift();}
   private limit(member:Member,now:number):number {
     const max=member.record.maxSeqs, ramp=this.pool.slowStartMs??30000;
     if(!Number.isFinite(max)||ramp<=0) return max;
     return Math.max(1,Math.floor(max*Math.min(1,(now-member.addedAt)/ramp)));
   }
   private ramping(member:Member,now:number):boolean {return now-member.addedAt<(this.pool.slowStartMs??30000);}
-  private release(member:Member):void {
-    member.inFlight--;
-    if(member.gone&&member.inFlight<=0) this.retiring.delete(member);
-    this.wake();
-  }
-  private wake():void {for(const waiter of [...this.waiters]) waiter();}
-  /** Resolves on any change (a slot freed, membership changed, or a slow-start tick); rejects at the deadline or on abort. */
-  private waitForChange(signal:AbortSignal,deadlineAt:number):Promise<void> {
-    if(signal.aborted) return Promise.reject(signal.reason);
-    const remaining=deadlineAt-Date.now();
-    if(remaining<=0) return Promise.reject(new GatewayRejection('GATEWAY_QUEUE_TIMEOUT'));
-    const now=this.now();
-    // Re-check on a short tick while a limit is ramping or a breaker is open (its cooldown ends without any event).
-    const ramping=[...this.members.values()].some(member=>this.ramping(member,now)||member.health.isOpen);
-    return new Promise<void>((resolve,reject)=>{
-      const cleanup=()=>{clearTimeout(timer);signal.removeEventListener('abort',onAbort);this.waiters.delete(wake);};
-      const wake=()=>{cleanup();resolve();};
-      const onAbort=()=>{cleanup();reject(signal.reason);};
-      const timer=setTimeout(()=>{cleanup();if(Date.now()>=deadlineAt) reject(new GatewayRejection('GATEWAY_QUEUE_TIMEOUT'));else resolve();},
-        ramping?Math.min(remaining,RAMP_TICK_MS):remaining);
-      signal.addEventListener('abort',onAbort,{once:true});this.waiters.add(wake);
-    });
-  }
   /** Applies the source's snapshot: add (slow start unless loading at startup), update, drain, retire. */
   private sync():void {
     const now=this.now(), seen=new Set<string>();
@@ -297,31 +443,38 @@ export class UpstreamPool implements Upstream {
       if(record.state!=='active') continue;
       let upstream:Primary;
       try {upstream=this.create(record);} catch {this.events.invalid++;continue;}
-      this.members.set(record.id,new Member(record,upstream,new UpstreamHealth(probe=>upstream.health(probe),breaker,()=>this.wake()),this.startingUp?-Infinity:now));
+      this.members.set(record.id,new Member(record,upstream,new UpstreamHealth(probe=>upstream.health(probe),breaker,()=>this.kick()),this.startingUp?-Infinity:now));
       if(!this.startingUp) this.events.added++;
     }
     for(const member of [...this.members.values()]) if(!seen.has(member.record.id)) {this.retire(member);this.events.removed++;}
-    this.wake();
+    if(!this.startingUp) this.kick();
   }
   private retire(member:Member):void {
     this.members.delete(member.record.id);member.gone=true;
     if(member.inFlight>0) this.retiring.add(member);
   }
   poolMetrics():PoolMetrics {
-    const now=this.now();
+    const now=this.now(), kappa=this.pool.kappa??0.9;
     const upstreams=[...this.members.values(),...this.retiring].map((member):UpstreamMemberMetrics=>{
-      const limit=this.limit(member,now);
+      const limit=this.limit(member,now), capacity=member.record.kvCapacityTokens;
+      const budget=capacity===null?null:kappa*capacity-this.globalPrefix;
       return {id:member.record.id,epoch:member.record.epoch,state:member.gone?'gone':member.record.state,inFlight:member.inFlight,
         limit:Number.isFinite(limit)?limit:null,maxSeqs:Number.isFinite(member.record.maxSeqs)?member.record.maxSeqs:null,weight:member.record.weight,
         slowStart:!member.gone&&this.ramping(member,now),breaker:member.health.state(),
+        reservedKvTokens:member.kvReserved,prefillTokens:member.prefill,kvCapacityTokens:capacity,prefillTokensPerSec:member.record.prefillTokensPerSec??null,
+        seqUtil:Number.isFinite(limit)?Math.round(member.inFlight/limit*1000)/1000:null,kvUtil:budget&&budget>0?Math.round(member.kvReserved/budget*1000)/1000:null,
         dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures};
     });
     const count=(check:(u:UpstreamMemberMetrics)=>boolean)=>upstreams.filter(check).length;
+    const rate=this.prefillRate();
     return {pool:this.model,
       members:{active:count(u=>u.state==='active'),ramping:count(u=>u.state==='active'&&u.slowStart),draining:count(u=>u.state==='draining'),
         gone:count(u=>u.state==='gone'),breakerOpen:count(u=>u.state!=='gone'&&u.breaker!=='closed')},
-      waiting:this.waiters.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,events:{...this.events},upstreams,
-      ...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
+      waiting:this.queue.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,events:{...this.events},
+      queue:{routing:this.routing,fairness:this.pool.fairness??'fifo',queued:this.queue.counts(),queuedTokens:this.queue.queuedTokens,
+        waitMs:{p50:percentile(this.waits,0.5),p95:percentile(this.waits,0.95)},rejected:{...this.rejected},globalPrefixTokens:this.globalPrefix,
+        prefillTokensPerSec:rate===null?null:Math.round(rate)},
+      upstreams,...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
   }
   private secondaryMetrics():FailoverMetrics {
     const breakers=[...this.members.values()].map(member=>member.health.metrics());

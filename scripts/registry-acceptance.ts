@@ -116,7 +116,8 @@ class World {
   async gateway():Promise<void> {
     const reader=this.backend.store();
     const source=new RedisRegistrySource(reader.store,{pool:POOL,allow:parseUpstreamAllow(undefined),pollMs:2000,graceMs:10000});
-    this.pool=new UpstreamPool({model:POOL,source,slowStartMs:30000,queueTimeoutMs:10000});
+    // As apps/gateway/src/main.ts builds a registry pool: the pool owns admission (S3 central queue and credits).
+    this.pool=new UpstreamPool({model:POOL,source,slowStartMs:30000,queueTimeoutMs:10000,admission:true,maxQueue:256});
     await this.pool.ready(AbortSignal.timeout(5000));
     const {server}=createGateway({token:this.token,upstream:this.pool,limits:{maxConcurrent:256,maxQueue:256,queueTimeoutMs:10000,upstreamTimeoutMs:60000}});
     await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',()=>resolve()));

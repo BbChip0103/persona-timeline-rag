@@ -68,6 +68,14 @@ test('a per-turn request key travels as X-PTR-Request-Key (gateway ledger scopin
   expect(headers(0)['X-PTR-Request-Key']).toBe('turn_0b7c-1');
   expect(headers(1)['X-PTR-Request-Key']).toBeUndefined();expect(headers(2)['X-PTR-Request-Key']).toBeUndefined();
 });
+test('a call priority travels as X-PTR-Priority (gateway band); none is sent without one',async()=>{
+  const fetcher=jest.fn(async()=>sse([delta('ok'),'[DONE]']));
+  const headers=(index:number)=>((fetcher.mock.calls[index] as unknown[])[1] as RequestInit).headers as Record<string,string>;
+  await provider(fetcher).generate(messages,{signal:signal(),priority:1});
+  await provider(fetcher).generate(messages,{signal:signal(),priority:0});
+  await provider(fetcher).generate(messages,{signal:signal()});
+  expect([headers(0)['X-PTR-Priority'],headers(1)['X-PTR-Priority'],headers(2)['X-PTR-Priority']]).toEqual(['1','0',undefined]);
+});
 
 // Shapes undici's fetch produces: a failed connection/request rejects with TypeError('fetch failed', {cause}),
 // a body cut mid-stream errors the reader with TypeError('terminated', {cause}).

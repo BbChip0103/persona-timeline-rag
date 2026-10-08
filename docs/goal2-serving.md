@@ -171,8 +171,10 @@ BullMQ checks G in its Lua when a worker takes the next job, so active turns ≤
 holds by construction, whatever the number of workers. `PTR_WORKER_CONCURRENCY` is only a local cap now (64 is a good
 value); in-flight turns = min(Σ local caps, G).
 
-- **Leader:** any number of dispatchers may run; one holds `ptr:llm:cap:leader` (`SET NX PX 15000`, renewed every
-  tick) and acts every `PTR_CAPACITY_INTERVAL_MS` (5000). It writes G only when it changes.
+- **Leader:** any number of dispatchers may run; one holds `ptr:llm:cap:leader` (`SET NX PX max(15 s, 3 × interval)`,
+  renewed every tick) and acts every `PTR_CAPACITY_INTERVAL_MS` (5000). It writes G only when it changes. A dispatcher
+  that (re)gains leadership starts with fresh hysteresis, and records that are already draining are its starting point
+  (not a new drain that would lower G at once).
 - **Hysteresis:** increases apply at once (a new server raises G within one tick). A decrease applies only after 3
   consecutive ticks (15 s) with a lower target, then at most 25% (at least 1) per tick, so a record flapping on its TTL
   never moves G. A newly **draining** upstream (planned shrink) lowers G at once. Lowering G never interrupts active
@@ -182,12 +184,22 @@ value); in-flight turns = min(Σ local caps, G).
   with it anyway. A readable but empty registry goes to FLOOR (1) through the hysteresis: never 0, which would stop
   every worker silently. With failover on, OpenRouter's 120/min ceiling is the minimum path; turns beyond G wait in
   BullMQ, durably.
+- **Misconfiguration guard (`hold_suspect`):** S_live = 0 while registry records were **rejected** by the record
+  policy (allowlist, loopback, duplicate origin), or while live records exist **only in other pools** (a wrong
+  `PTR_CAPACITY_POOL` / `PTR_GATEWAY_POOL`), is treated as a configuration error: G is held, not decayed to FLOOR, and a
+  `WARNING capacity: S_live=0 but …` line names the reasons. Rejected records next to live ones are counted
+  (`rejected` in the status) and logged once (`capacity: N registry record(s) rejected (…)`).
 - **Status:** `ptr:llm:cap` HASH {target, sLive, q, g, active, wait, computedAt, reason, writes, leader, registryStale,
   workerShortage} (expires 60 s after the last tick), and one dispatcher stderr line whenever G or registry staleness
   changes: `capacity G=30 target=30 S_live=24 Q=256 active=… wait=… reason=increase`. `reason` is one of init, increase,
-  hold, decrease_pending, decrease, draining, registry_stale.
+  hold, decrease_pending, decrease, draining, registry_stale, hold_suspect.
 - **worker_shortage:** `wait > 0` while `active < G` for 15 s logs `WARNING worker_shortage …` once per episode (add
   workers or raise `PTR_WORKER_CONCURRENCY`).
+- **capacity_floor:** G at FLOOR while turns wait for 15 s logs `WARNING capacity_floor …` once per episode: no upstream
+  capacity is registered for the pool.
+- **Startup errors:** a controller configuration error (bad env, unknown mode) is logged as `WARNING capacity
+  controller disabled (CODE) …` and the dispatcher runs without it: turn dispatch, lease recovery and the outbox never
+  depend on the controller.
 - **Known limits:** a crashed worker's job holds its active slot until BullMQ's stall check (about 30–60 s); one queue
   = one pool (several pools need one turn queue each).
 - **Headroom:** part of a turn runs outside the gateway (Jev intent p50 0.39 s × 0.594 calls/turn, the safety filter
@@ -200,7 +212,7 @@ value); in-flight turns = min(Σ local caps, G).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PTR_CAPACITY_CONTROLLER` | `on` with `PTR_GATEWAY_DISCOVERY=redis`, else `off` | `on`, `off` (the dispatcher never touches G; it warns if a G is still set), `clear` (remove a G left by an earlier run, then behave as off) |
+| `PTR_CAPACITY_CONTROLLER` | `on` with `PTR_GATEWAY_DISCOVERY=redis`, else `off` | `on`; `off` (the dispatcher removes any G at startup, so switching the controller off never leaves a stale cap; `clear`, the earlier name, means the same); `keep` (never touch G, e.g. a G set by hand). All dispatchers on one queue must use the same mode. |
 | `PTR_CAPACITY_POOL` | `PTR_GATEWAY_POOL`, else `PTR_SELFHOSTED_MODEL` | pool whose registry records count (required when on) |
 | `PTR_CAPACITY_HEADROOM` | 0.25 (0–4) | see above |
 | `PTR_CAPACITY_FLOOR` | 1 (1–4096) | lowest G (user decision; the design draft had 4) |
@@ -209,7 +221,8 @@ value); in-flight turns = min(Σ local caps, G).
 | `PTR_TURN_QUEUE`, `PTR_REGISTRY_PREFIX`, `PTR_GATEWAY_UPSTREAM_ALLOW` | as elsewhere | queue to control, registry namespace, record allowlist |
 
 Static discovery (env or file) keeps the controller off by default: G would only mirror a fixed file, and the startup
-warning stays the guard. Turning the controller off leaves the last G in Redis (`clear` removes it).
+warning stays the guard. Workers read G at startup in every mode: on → one info line; off with a G still set → a
+warning (only G turns run until an off-mode dispatcher clears it); keep → a note.
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -346,7 +359,7 @@ ptr:llm:up:<pool>:<id>   HASH {pool,id,baseUrl,maxSeqs,kvCapacityTokens,weight,s
 ptr:llm:ups:<pool>       ZSET member=<id> score=expiresAtMs   (read with ZRANGEBYSCORE now +inf; writers trim expired entries)
 ptr:llm:reg:ver          INCR on every new record, field change, drain or removal
 ptr:llm:reg              PUB/SUB, empty message = "poll now"
-ptr:llm:drain:<pool>:<id> STRING epoch, PX drain bound + TTL (130000): the drain tombstone
+ptr:llm:drain:<pool>:<id> STRING epoch, PX the record's drainMaxMs + TTL: the drain tombstone
 ptr:llm:cap / :cap:leader HASH status / leader lock of the capacity controller (S2b)
 ```
 
@@ -360,7 +373,10 @@ record as draining; a new id or epoch, or a changed field, bumps the version and
 also writes a **drain tombstone** for its epoch: if the record expires before its agent deletes it (agent crash, Redis
 blip) and an agent comes back on the same engine (same epoch), its heartbeat recreates the record draining and the
 agent finishes the drain, so a drain started from the CLI cannot be undone by an expiry. A new epoch (new engine
-process) is not affected.
+process) is not affected. The tombstone lives the publishing agent's own drain bound (`drainMaxMs`, which every agent
+puts in its record) + the TTL, or the CLI's `PTR_UPSTREAM_DRAIN_MAX_MS` + TTL for a record without one. Removing the
+record **with its epoch** (the agent finishing the drain) deletes the tombstone too, so a later start of the same engine
+is active; a forced `deregister` (no epoch) leaves it, so a crashed agent still resumes the drain.
 
 Gateway behaviour (`RedisRegistrySource` + `UpstreamPool`):
 - **Discovery:** polls every `PTR_GATEWAY_REGISTRY_POLL_MS` (2000) and at once on a nudge; lost nudges are covered by
@@ -369,9 +385,9 @@ Gateway behaviour (`RedisRegistrySource` + `UpstreamPool`):
 - **Slow start:** a newly added upstream's limit is `max(1, floor(maxSeqs · min(1, Δt / PTR_GATEWAY_SLOW_START_MS)))`
   (30000; 0 = off). This applies on every add, including an agent that comes back with the same epoch, so a flapping
   upstream never receives a burst.
-- **Selection (interim, until S3's credit-based scoring):** among upstreams that are active, not draining, with a closed
-  breaker and below their limit, the one with the fewest calls in flight (ties rotate). If all are at their limit the
-  request waits in the gateway (no spillover) up to `PTR_GATEWAY_QUEUE_TIMEOUT_MS`, then gets the marked 503
+- **Selection:** the pool's central queue and credit admission (next section): among upstreams that are active, not
+  draining, with a closed breaker and with credit, by `PTR_GATEWAY_ROUTING` (default `least_inflight`). Without credit
+  anywhere the request waits (no spillover) up to `PTR_GATEWAY_QUEUE_TIMEOUT_MS`, then gets the marked 503
   `GATEWAY_QUEUE_TIMEOUT` (nothing was sent, so the worker resends). An empty pool without failover waits the same way.
 - **Drain / expiry:** `state=draining` or a record that left the registry gets no new calls at once; its in-flight
   calls finish. A changed `maxSeqs` applies to the next dispatch (in-flight calls are kept).
@@ -419,7 +435,7 @@ ACL users, HMAC-signed records, a host/CIDR allowlist) is a later, separately ap
 | `PTR_UPSTREAM_HEARTBEAT_MS` / `PTR_UPSTREAM_TTL_MS` | 2000 / 10000 | agent heartbeat and record TTL (TTL ≥ 2 × heartbeat) |
 | `PTR_UPSTREAM_DRAIN_SETTLE_MS` | 4000 | agent drain: minimum wait before checking the engine is idle (two gateway polls) |
 | `PTR_UPSTREAM_DRAIN_MAX_MS` | 120000 | agent drain: upper bound before the record is deleted anyway; the CLI's drain tombstone lives this + TTL |
-| `PTR_UPSTREAM_HEALTH_TIMEOUT_MS` | 2500 (100–30000) | agent: timeout of one engine `/health` check (a busy engine may answer slowly) |
+| `PTR_UPSTREAM_HEALTH_TIMEOUT_MS` | 2500 (100–30000, and < TTL − heartbeat) | agent: timeout of one engine `/health` check (a busy engine may answer slowly); it must leave a heartbeat inside the TTL |
 
 `/metrics` with a pool adds `pool`: `members` {active, ramping, draining, gone, breakerOpen}, `waiting`,
 `retriedOnOtherPrimary`, `queueTimeouts` (marked 503s because no upstream slot freed in time; a subset of
@@ -464,6 +480,85 @@ Runbook:
   (capacity drops); restart the agent and it returns with the same epoch (slow start again).
 - **Redis outage:** nothing to do; check `registry.stale` and that `members` did not drop after it came back.
 - **Rejected records:** `registry.rejected` rising means someone registered a URL outside the allowlist; `list` shows it.
+
+### Credit admission, central queue and routing (–§4, stage S3)
+
+A pool from a file or the registry **owns admission**: the gateway's own limiter (`PTR_GATEWAY_MAX_CONCURRENCY`) is
+bypassed, requests wait in the pool's queue, and an upstream gets a request only when it has credit (late binding).
+The env-only single upstream and the failover wrapper keep the old limiter, so N = 1 behaves exactly as before.
+
+**Estimate per request:** T̂ = ceil(content bytes / `PTR_GATEWAY_BYTES_PER_TOKEN` (3.9)), conservative for ~90% of
+requests; M = `max_tokens` (else 512). G (the policy block) is the most common msg0 seen (bounded table), so one odd
+first request cannot set it for good; a request whose msg0 is that block has G cached (uncached = T̂ − G), any other
+has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. Until the
+per-server prefix table (S5), the global block is the only cached share.
+
+**Credit `fits_u(r)`** (all must hold; the same check for every routing policy):
+1. active (not draining), breaker closed (with no closed member and no secondary, open ones are still used);
+2. sequences: N_u + 1 ≤ S_u^eff (maxSeqs, ramped by slow start);
+3. KV, when `kvCapacityTokens` is known: Kres_u + (T̂ − G) + M ≤ κ·K_u − G (`PTR_GATEWAY_KV_OVERCOMMIT` κ = 0.9);
+   an idle upstream always takes one request so nothing waits forever;
+4. prefill, only when `prefillTokensPerSec` (R_u) is calibrated (record/file field; unset by default): U_u = 0 or
+   U_u + (T̂ − G) ≤ R_u · T_max (`PTR_GATEWAY_TTFT_PENALTY_MS` 1000).
+
+The ledger: N (in flight), Kres (reserved KV, released at the end), U (uncached prompt tokens, released at the first
+body chunk). Engine telemetry filters come in S4.
+
+**Queue:** bands from `X-PTR-Priority` (1 = a follow-up model call of a running turn, 0 = a turn's first call, the
+default, −1 = batch), strictly ordered (a waiting higher band holds back lower ones). Within a band FIFO, or deficit
+round robin per `X-PTR-Flow` (hex) with `PTR_GATEWAY_FAIRNESS=drr` and quantum `PTR_GATEWAY_DRR_QUANTUM_TOKENS` (4096).
+Up to `PTR_GATEWAY_LOOKAHEAD` (8) requests that do not fit are skipped so later ones can pass; a skipped request older
+than `PTR_GATEWAY_STARVATION_MS` (2000) stops its band instead (no overtaking forever). The loop runs on every enqueue,
+completion, first chunk, membership or breaker change, and every 250 ms while requests wait.
+
+**Selection** (`PTR_GATEWAY_ROUTING`) among the fitting upstreams:
+- `round_robin`: rotate;
+- `least_inflight`: fewest in flight, ties rotate (the S2 rule);
+- `scored` (§4.3, affinity off until S5): least cost (U + T̂ − G) / (R_u · T_max) + (N + 1) / S_eff, with
+  R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of hash(policy ‖ persona).
+
+The default is `least_inflight`. In the §9.1 comparison (fake engines, no affinity, R_u uncalibrated, single runs)
+`scored` did not meet its acceptance bar: in the heterogeneous W2 and W3 workloads it was not ≥ 10% better than
+`least_inflight` on throughput or TTFT p95; on homogeneous W1 it was within 5%. Under load every policy is limited by the
+same credits and late binding, and without a calibrated R_u or a prefix table the cost has little to tell the servers
+apart. `scored` stays selectable; re-run `scripts/routing-compare.ts` after the prefix table (S5) and R_u / S_u
+calibration on real engines (S8) before changing the default.
+
+Limits: `drr` needs `X-PTR-Flow` (the worker does not send one yet, so all traffic is one flow = FIFO with LOOKAHEAD);
+for non-streaming requests the first chunk is the whole reply, so U stays reserved to the end; requests waiting on a
+half-open probe (with a secondary) are not counted against the queue bound; a waiting band-1 retry that excludes the
+only upstream with credit still holds back lower bands (strict bands, as designed).
+
+**Rejections** (all marked `X-PTR-Gateway: rejected`, nothing was sent): queue over `PTR_GATEWAY_MAX_QUEUE` (256)
+after a dispatch attempt → 429 `queue_full` (a request with credit still runs at 0; when full, a higher band takes the
+place of the newest request of the lowest band below it, which gets the 429 instead); with `PTR_GATEWAY_REJECT_SATURATED=true` (default false) an estimated wait above the queue timeout → 429
+`saturated`; `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (10000) → 503 `queue_timeout`. Retry-After = clamp(ceil(queued uncached
+tokens at this band and above / recent prefill tokens per second), 1, 5) s (1 before any rate is known; only 2xx
+answers count toward the rate, and the early `saturated` refusal needs at least 20 of them in the last 10 s).
+
+**Worker:** turn calls send `X-PTR-Priority`: 0 on the turn's first model call, 1 on agent follow-up iterations, so a
+started turn finishes first (shorter e2e, shorter lease hold).
+
+**Metrics** (`pool` in `/metrics`): per upstream `reservedKvTokens`, `prefillTokens`, `kvCapacityTokens`,
+`prefillTokensPerSec`, `seqUtil`, `kvUtil`; `queue` {routing, fairness, queued by band, queuedTokens, waitMs p50/p95,
+rejected {queue_full, saturated, queue_timeout}, globalPrefixTokens, prefillTokensPerSec}. `capacity` reports
+Σ maxSeqs + the pool queue bound.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_ROUTING` | `least_inflight` | `round_robin`, `least_inflight`, `scored` |
+| `PTR_GATEWAY_KV_OVERCOMMIT` | 0.9 (0.1–1) | κ |
+| `PTR_GATEWAY_BYTES_PER_TOKEN` | 3.9 (0.5–20) | token estimate |
+| `PTR_GATEWAY_TTFT_PENALTY_MS` | 1000 | T_max (prefill gate and cost) |
+| `PTR_GATEWAY_LOOKAHEAD` / `PTR_GATEWAY_STARVATION_MS` | 8 / 2000 | queue head-of-line relief and aging |
+| `PTR_GATEWAY_FAIRNESS` / `PTR_GATEWAY_DRR_QUANTUM_TOKENS` | `fifo` / 4096 | `fifo` or `drr` |
+| `PTR_GATEWAY_REJECT_SATURATED` | false | early 429 `saturated` |
+| `PTR_GATEWAY_MAX_QUEUE` / `PTR_GATEWAY_QUEUE_TIMEOUT_MS` | 256 / 10000 | the pool queue bound and wait |
+
+Comparison harness: `scripts/fake-engine.ts` (FakeEngineUpstream: slots, prefill rate on one lane, batch-dependent
+TPOT, KV capacity, prefix LRU over message-chain hashes, vLLM-named `/metrics`, `/health`) and
+`scripts/routing-compare.ts` (W1–W4 × homogeneous / heterogeneous × the three policies, report in
+`reports/routing-compare-<run>.json`).
 
 ## Providers (direct, without the gateway)
 

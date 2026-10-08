@@ -53,7 +53,7 @@ const FILE_KEYS=new Set(['id','baseUrl','maxSeqs','kvCapacityTokens','weight','p
 /**
  * `{"pools":{"<pool = served model name>":{"upstreams":[{"id","baseUrl","maxSeqs"?,"kvCapacityTokens"?,"weight"?}]}}}`.
  * Operator config: loopback rule only (the registry allowlist is for records anyone with the Redis password can write).
- * `prefillTokensPerSec` is accepted for the later credit stage and ignored now.
+ * `prefillTokensPerSec` (R_u, calibrated) turns on the prefill gate for that upstream and replaces weight × 10000 in scoring.
  */
 export function readUpstreamsFile(text:string,pool:string):UpstreamRecord[] {
   const invalid=()=>new Error('INVALID_UPSTREAMS_FILE');
@@ -64,12 +64,13 @@ export function readUpstreamsFile(text:string,pool:string):UpstreamRecord[] {
   return entries.map(entry=>{
     const e=entry as Record<string,unknown>;
     if(!e||typeof e!=='object'||Object.keys(e).some(key=>!FILE_KEYS.has(key))) throw invalid();
-    const maxSeqs=e.maxSeqs??12, weight=e.weight??1, kv=e.kvCapacityTokens??null;
+    const maxSeqs=e.maxSeqs??12, weight=e.weight??1, kv=e.kvCapacityTokens??null, prefill=e.prefillTokensPerSec??null;
     if(typeof e.id!=='string'||!UPSTREAM_ID.test(e.id)||seen.has(e.id)||typeof e.baseUrl!=='string'||checkUpstreamUrl(e.baseUrl)
       ||!Number.isInteger(maxSeqs)||(maxSeqs as number)<1||(maxSeqs as number)>4096||typeof weight!=='number'||!(weight>0&&weight<=100)
-      ||(kv!==null&&(!Number.isInteger(kv)||(kv as number)<1))) throw invalid();
+      ||(kv!==null&&(!Number.isInteger(kv)||(kv as number)<1))||(prefill!==null&&(!Number.isInteger(prefill)||(prefill as number)<1))) throw invalid();
     seen.add(e.id);
-    return {pool,id:e.id,baseUrl:e.baseUrl,maxSeqs:maxSeqs as number,kvCapacityTokens:kv as number|null,weight,state:'active',epoch:'file',seq:0};
+    return {pool,id:e.id,baseUrl:e.baseUrl,maxSeqs:maxSeqs as number,kvCapacityTokens:kv as number|null,weight,state:'active',epoch:'file',seq:0,
+      ...(prefill!==null?{prefillTokensPerSec:prefill as number}:{})};
   });
 }
 

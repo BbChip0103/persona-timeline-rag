@@ -2,8 +2,10 @@ import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Perso
 /**
  * `requestKey`: a stable per-turn key (the turn id) a gateway may use to scope billing idempotency; providers may ignore it.
  * `deadlineAt`: when the turn times out (epoch ms), so a provider does not start retries the turn cannot wait for.
+ * `priority`: 0 = a turn's first model call, 1 = a follow-up call of the same turn (the LLM gateway serves those first so
+ * running turns finish), −1 = batch; providers may ignore it.
  */
-export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number}):Promise<string> }
+export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> }
 export interface Retrieval {
   search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
   resolve?(references:EvidenceCard[],trusted:{personId:string},options:{signal:AbortSignal;evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;

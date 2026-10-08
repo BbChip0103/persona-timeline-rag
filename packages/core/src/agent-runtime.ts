@@ -50,7 +50,8 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     if(Buffer.byteLength(JSON.stringify(messages),'utf8')>EXPERIMENT_PROMPT_BYTE_LIMIT || messages.length>64)throw new CoreError('CONTEXT_LIMIT');
     steps.push({phase:'context',iteration,sourceIds:context.sources.map(source=>source.id)});
     modelCalls++;steps.push({phase:'model',iteration});
-    const raw=await input.provider.generate(messages,{signal:input.signal,...(input.requestKey?{requestKey:input.requestKey}:{}),...(input.deadlineAt!==undefined?{deadlineAt:input.deadlineAt}:{})});
+    const raw=await input.provider.generate(messages,{signal:input.signal,...(input.requestKey?{requestKey:input.requestKey}:{}),...(input.deadlineAt!==undefined?{deadlineAt:input.deadlineAt}:{}),
+      priority:iteration>0?1:0});
     checkedSignal(input.signal);
     const response=parseAgentResponse(raw);
     if(containsInternalPathPattern(response.message)||containsInternalPathPattern(response.reasoning??'')

@@ -23,10 +23,11 @@ async function main() {
   process.stdout.write(`Turn worker ${workerId} started\n`);
   // With the capacity controller on, BullMQ's global concurrency enforces the capacity rule; log it once.
   const capacityMode=capacityControllerMode(process.env);
-  if(capacityMode==='on') void readGlobalConcurrency(process.env).then(globalConcurrency=>process.stderr.write(`${workerCapacityLine({mode:capacityMode,globalConcurrency})}\n`),
+  // Every mode reads G once: off with a G still set warns (only G turns run until a dispatcher clears it).
+  void readGlobalConcurrency(process.env).then(globalConcurrency=>{const line=workerCapacityLine({mode:capacityMode,globalConcurrency});if(line) process.stderr.write(`${line}\n`);},
     ()=>process.stderr.write('capacity check skipped: Redis unavailable\n'));
   // Controller off: advisory, never blocking: Σ worker concurrency (this × PTR_WORKER_REPLICAS_HINT) ≤ gateway caps + queue.
-  else if(runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
+  if(capacityMode!=='on'&&runtime.providerName==='gateway') void fetchGatewayCapacity(gatewayBaseUrls(process.env),process.env.PTR_GATEWAY_TOKEN??'').then(capacity=>{
     const warning=capacity?gatewayCapacityWarning({workerConcurrency:concurrency,replicas,capacity}):'gateway capacity check skipped: no gateway /metrics answered';
     if(warning) process.stderr.write(`${warning}\n`);
   });

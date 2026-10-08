@@ -55,19 +55,35 @@ export function registryContract(name:string,make:()=>Promise<RegistryHarness>) 
     });
     test('a drain outlives its record: a tombstone keeps the same epoch draining when its agent re-publishes after expiry',async()=>{
       await h.store.heartbeat(record(),300);
-      expect(await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',5000)).toBe(true);
+      expect(await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',{fallbackMs:5000})).toBe(true);
       await h.wait(450);
       expect(await live(h.store)).toEqual([]); // expired before the agent deleted it
       expect(await h.store.heartbeat(record({seq:7}),300)).toBe('draining'); // same engine comes back: still draining
       expect((await live(h.store))[0]).toMatchObject({state:'draining',seq:7});
+      expect(await h.store.heartbeat(record({epoch:'epoch-2',seq:0,id:'pod-z',baseUrl:'http://127.0.0.1:18009/v1'}),300)).toBe('created'); // other ids unaffected
+      // The drain finished (its agent removed the record): the tombstone goes with it, so a later start is active again.
       await h.store.remove('gemma-4-e4b-fp8','pod-a','epoch-1');
-      expect(await h.store.heartbeat(record({seq:8}),300)).toBe('draining'); // the tombstone outlives the removal too
-      expect(await h.store.heartbeat(record({epoch:'epoch-2',seq:0}),300)).toBe('created'); // a new engine is not drained
+      expect(await h.store.heartbeat(record({seq:8}),300)).toBe('created');
+      expect((await live(h.store)).find(r=>r.id==='pod-a')).toMatchObject({state:'active'});
+    });
+    test('a new epoch is never drained by an old tombstone',async()=>{
+      await h.store.heartbeat(record(),300);
+      await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',{fallbackMs:5000});
+      expect(await h.store.heartbeat(record({epoch:'epoch-2',seq:0}),300)).toBe('created');
       expect((await live(h.store))[0]).toMatchObject({state:'active',epoch:'epoch-2'});
+    });
+    test('the tombstone lifetime follows the agent\'s own drain bound (drainMaxMs in the record) + TTL',async()=>{
+      await h.store.heartbeat(record({drainMaxMs:100}),5000);
+      await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',{fallbackMs:60000,ttlMs:100});
+      await h.store.remove('gemma-4-e4b-fp8','pod-a','epoch-0'); // wrong epoch: nothing removed
+      await h.wait(50);expect(await h.store.heartbeat(record({drainMaxMs:100,seq:1}),5000)).toBe('draining');
+      await h.store.remove('gemma-4-e4b-fp8','pod-a'); // forced removal: the tombstone stays (not an epoch-matched finish)
+      await h.wait(250); // > 100 + 100
+      expect(await h.store.heartbeat(record({drainMaxMs:100,seq:2}),5000)).toBe('created');
     });
     test('the drain tombstone expires',async()=>{
       await h.store.heartbeat(record(),5000);
-      await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',200);
+      await h.store.setState('gemma-4-e4b-fp8','pod-a','draining',{fallbackMs:200});
       await h.store.remove('gemma-4-e4b-fp8','pod-a');
       await h.wait(300);
       expect(await h.store.heartbeat(record(),5000)).toBe('created');

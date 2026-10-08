@@ -1,7 +1,7 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { MemoryUpstreamRegistry, parseUpstreamRecord } from '@ptr/messaging';
-import { drainUpstream, engineEpoch, parseAgentArgs, parseEngineMetrics, runAgent, type AgentHandle } from '../upstream-agent';
+import { agentTimings, drainUpstream, engineEpoch, parseAgentArgs, parseEngineMetrics, runAgent, type AgentHandle } from '../upstream-agent';
 
 const VLLM_METRICS=`# HELP vllm:num_requests_running Number of requests in model execution batches.
 # TYPE vllm:num_requests_running gauge
@@ -121,7 +121,7 @@ describe('ptr-upstream-agent',()=>{
     const engine=fakeEngine();engine.state.running=1;const base=await listen(engine.server);
     const store=new MemoryUpstreamRegistry(Date.now);const first=agent(store,base);
     await until(async()=>(await live(store)).length===1);
-    const drained=drainUpstream(store,'m','pod-a',{timeoutMs:5000,pollMs:20,tombstoneMs:5000});
+    const drained=drainUpstream(store,'m','pod-a',{timeoutMs:5000,pollMs:20,tombstone:{fallbackMs:5000,ttlMs:400}});
     await until(()=>first.status().phase==='draining');
     first.kill();await first.done; // crashed mid-drain (engine still busy)
     await until(async()=>(await live(store)).length===0,2000); // record expired
@@ -167,6 +167,21 @@ describe('ptr-upstream-agent',()=>{
     expect(await drainUpstream(store,'m','pod-x',{timeoutMs:100,pollMs:10})).toBe('not_found');
     await store.heartbeat({pool:'m',id:'pod-x',baseUrl:'http://127.0.0.1:18000/v1',maxSeqs:12,kvCapacityTokens:null,weight:1,state:'active',epoch:'e',seq:0},60000);
     expect(await drainUpstream(store,'m','pod-x',{timeoutMs:100,pollMs:10})).toBe('timeout');
+  });
+});
+
+describe('agent timings',()=>{
+  test('defaults; a /health timeout must leave a heartbeat inside the TTL (timeout < TTL − heartbeat)',()=>{
+    expect(agentTimings({})).toEqual({heartbeatMs:2000,ttlMs:10000,drainMaxMs:120000,drainSettleMs:4000,healthTimeoutMs:2500});
+    expect(()=>agentTimings({PTR_UPSTREAM_HEALTH_TIMEOUT_MS:'8000'})).toThrow('INVALID_PTR_UPSTREAM_HEALTH_TIMEOUT_MS');
+    expect(agentTimings({PTR_UPSTREAM_HEALTH_TIMEOUT_MS:'7999'}).healthTimeoutMs).toBe(7999);
+    expect(()=>agentTimings({PTR_UPSTREAM_TTL_MS:'3000'})).toThrow('INVALID_PTR_UPSTREAM_TTL_MS');
+  });
+  test('the record carries the agent\'s drain bound so a CLI drain tombstone lives as long as that drain can take',async()=>{
+    const engine=fakeEngine();const base=await listen(engine.server);
+    const store=new MemoryUpstreamRegistry(Date.now);agent(store,base,{drainMaxMs:4321});
+    await until(async()=>(await live(store)).length===1);
+    expect((await live(store))[0]!.drainMaxMs).toBe(4321);
   });
 });
 

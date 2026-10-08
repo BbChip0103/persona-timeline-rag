@@ -3,7 +3,13 @@ import type { FailoverMetrics, PoolMetrics } from './pool';
 
 export interface ChatCompletionRequest { messages:{role:string;content:string}[]; stream?:boolean; [key:string]:unknown }
 /** Per-request context from the caller: `requestKey` (X-PTR-Request-Key, the worker's turn id) scopes billing idempotency. */
-export interface RequestContext { requestKey?:string }
+export interface RequestContext {
+  requestKey?:string;
+  /** X-PTR-Priority: 1 = a running turn's follow-up call, 0 = a turn's first call (default), −1 = batch (sheddable). */
+  priority?:1|0|-1;
+  /** X-PTR-Flow: fairness key for DRR (hex, e.g. a hash of the owner). */
+  flow?:string;
+}
 /** What an upstream hands back: an HTTP-like status and a body the gateway relays as-is. `upstream`: set by failover only. */
 export interface UpstreamResult { status:number; contentType:string; body:AsyncIterable<Uint8Array>|string; upstream?:'primary'|'secondary' }
 export interface Upstream {
@@ -13,6 +19,8 @@ export interface Upstream {
   poolMetrics?():PoolMetrics;
   /** Checked once before the gateway listens; a rejection fails startup. */
   ready?(signal:AbortSignal):Promise<void>;
+  /** A pool that owns admission (S3): the gateway skips its own limiter and reports these numbers. */
+  admission?():{inFlight:number;queued:number;maxConcurrent:number;maxQueue:number};
   /** Stops background work (registry polling) at shutdown. */
   close?():Promise<void>;
 }

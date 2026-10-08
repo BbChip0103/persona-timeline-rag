@@ -91,7 +91,7 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     this.endpoints=baseUrls.map(baseUrl=>`${baseUrl.replace(/\/$/,'')}/chat/completions`);
     this.fetcher=options.fetch??fetch;
   }
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number}):Promise<string> {
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> {
     if(options.signal.aborted) throw new ProviderError('CANCELLED');
     const started=performance.now();let ttftMs:number|null=null;
     let promptTokens:number|null=null, completionTokens:number|null=null, attempts=0;
@@ -113,7 +113,9 @@ export class OpenAICompatibleTextProvider implements TextProvider {
       const keyed=!!options.requestKey&&REQUEST_KEY.test(options.requestKey);
       const headers={'Content-Type':'application/json',...(this.options.apiKey?{Authorization:`Bearer ${this.options.apiKey}`}:{}),
         // The gateway scopes a billable secondary's ledger entry to this key (the turn id); malformed keys are not sent.
-        ...(keyed?{'X-PTR-Request-Key':options.requestKey!}:{})};
+        ...(keyed?{'X-PTR-Request-Key':options.requestKey!}:{}),
+        // The gateway's queue band: follow-up calls of a running turn (1) go before first calls (0).
+        ...(options.priority!==undefined?{'X-PTR-Priority':String(options.priority)}:{})};
       // Calls start at the first URL; `next()` moves on and reports whether it wrapped around to the first again.
       let index=0, refusedAttempt=0, resets=0;
       const next=()=>{index=(index+1)%this.endpoints.length;return index===0;};

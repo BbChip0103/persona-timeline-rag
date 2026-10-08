@@ -10,7 +10,8 @@ import { REDIS_PREFIX } from './redis.js';
  *   <prefix>:ups:<pool>       ZSET member=<id> score=expiresAtMs (index without SCAN; expired entries are trimmed by writers)
  *   <prefix>:reg:ver          INCR on every membership or field change
  *   <prefix>:reg              PUB/SUB channel, empty message: "poll now"
- *   <prefix>:drain:<pool>:<id> STRING epoch, PX drain bound + TTL: a drain outlives its record (see setState)
+ *   <prefix>:drain:<pool>:<id> STRING epoch, PX (record drainMaxMs, else the caller's fallback) + TTL: a drain outlives
+ *                              its record until that epoch's agent finishes it (remove with the epoch deletes it)
  *
  * Expiry scores use the Redis server clock (TIME inside the scripts), so publishers' and gateways' clocks never matter.
  * Records are not signed (single host; anyone with the Redis password can register). Gateways therefore check every
@@ -34,6 +35,10 @@ export interface UpstreamRecord {
   epoch: string;
   /** Heartbeat counter of the publishing agent. */
   seq: number;
+  /** The publishing agent's drain bound (PTR_UPSTREAM_DRAIN_MAX_MS): sizes a CLI drain's tombstone. Optional. */
+  drainMaxMs?: number;
+  /** R_u: calibrated prefill tokens per second (S8). Unset = no prefill gate, scoring uses weight × 10000. */
+  prefillTokensPerSec?: number;
 }
 export type HeartbeatResult = 'created' | 'changed' | 'active' | 'draining';
 
@@ -53,12 +58,16 @@ export interface RegistryWriter {
    */
   heartbeat(record: UpstreamRecord, ttlMs: number): Promise<HeartbeatResult>;
   /**
-   * Mark a live record draining; false when there is none. It also writes a tombstone for the record's epoch for
-   * `tombstoneMs` (default DRAIN_TOMBSTONE_MS): if the record expires before its agent deletes it, a heartbeat of that
+   * Mark a live record draining; false when there is none. It also writes a tombstone for the record's epoch, living
+   * the record's `drainMaxMs` + `ttlMs` (default the record TTL), or `fallbackMs` (default DRAIN_TOMBSTONE_MS) when the
+   * record does not say: if the record expires before its agent deletes it, a heartbeat of that
    * epoch recreates it draining (result 'draining'), so a drain started from the CLI cannot be undone by an expiry.
    */
-  setState(pool: string, id: string, state: 'draining', tombstoneMs?: number): Promise<boolean>;
-  /** Delete a record, only if its epoch matches when `epoch` is given. */
+  setState(pool: string, id: string, state: 'draining', tombstone?: { fallbackMs?: number; ttlMs?: number }): Promise<boolean>;
+  /**
+   * Delete a record, only if its epoch matches when `epoch` is given. With a matching `epoch` (the drain finished) the
+   * drain tombstone goes too; a forced removal (no epoch) leaves it, so a crashed agent still resumes the drain.
+   */
   remove(pool: string, id: string, epoch?: string): Promise<boolean>;
   /** Pools with at least one live index entry. */
   pools(): Promise<string[]>;
@@ -93,7 +102,9 @@ export function assertRegistryKey(pool: string, id?: string): void {
 export function serializeUpstreamRecord(record: UpstreamRecord): Record<string, string> {
   return { pool: record.pool, id: record.id, baseUrl: record.baseUrl, maxSeqs: String(record.maxSeqs),
     kvCapacityTokens: record.kvCapacityTokens === null ? '' : String(record.kvCapacityTokens), weight: String(record.weight),
-    state: record.state, epoch: record.epoch, seq: String(record.seq) };
+    state: record.state, epoch: record.epoch, seq: String(record.seq),
+    ...(record.drainMaxMs !== undefined ? { drainMaxMs: String(record.drainMaxMs) } : {}),
+    ...(record.prefillTokensPerSec !== undefined ? { prefillTokensPerSec: String(record.prefillTokensPerSec) } : {}) };
 }
 const integer = (raw: string | undefined, min: number, max: number) => {
   const value = Number(raw);
@@ -109,8 +120,12 @@ export function parseUpstreamRecord(hash: Record<string, string>): UpstreamRecor
   const maxSeqs = integer(hash.maxSeqs, 1, 4096), seq = integer(hash.seq, 0, Number.MAX_SAFE_INTEGER);
   const kv = hash.kvCapacityTokens === '' ? null : integer(hash.kvCapacityTokens, 1, 1e10);
   const weight = Number(hash.weight);
-  if (maxSeqs === undefined || seq === undefined || kv === undefined || !(weight > 0 && weight <= 100)) throw invalid();
-  return { pool, id, baseUrl, maxSeqs, kvCapacityTokens: kv, weight, state, epoch, seq };
+  const drainMaxMs = hash.drainMaxMs === undefined ? undefined : integer(hash.drainMaxMs, 0, 86400000);
+  const prefill = hash.prefillTokensPerSec === undefined ? undefined : integer(hash.prefillTokensPerSec, 1, 1e9);
+  if (maxSeqs === undefined || seq === undefined || kv === undefined || !(weight > 0 && weight <= 100)
+    || (hash.drainMaxMs !== undefined && drainMaxMs === undefined) || (hash.prefillTokensPerSec !== undefined && prefill === undefined)) throw invalid();
+  return { pool, id, baseUrl, maxSeqs, kvCapacityTokens: kv, weight, state, epoch, seq, ...(drainMaxMs !== undefined ? { drainMaxMs } : {}),
+    ...(prefill !== undefined ? { prefillTokensPerSec: prefill } : {}) };
 }
 
 export interface AllowRule { host: string; from: number; to: number }
@@ -199,17 +214,21 @@ if result ~= 'active' then
 end
 if drained then return 'draining' end
 return result`;
-// KEYS: record, version, drain tombstone. ARGV: channel, tombstoneMs.
+// KEYS: record, version, drain tombstone. ARGV: channel, fallbackMs, ttlMs.
 const SET_DRAINING = `
 local epoch = redis.call('HGET', KEYS[1], 'epoch')
 if not epoch then return 0 end
+local bound = tonumber(redis.call('HGET', KEYS[1], 'drainMaxMs') or '')
+local lifetime = tonumber(ARGV[2])
+if bound then lifetime = bound + tonumber(ARGV[3]) end
 redis.call('HSET', KEYS[1], 'state', 'draining')
-redis.call('SET', KEYS[3], epoch, 'PX', ARGV[2])
+redis.call('SET', KEYS[3], epoch, 'PX', lifetime)
 redis.call('INCR', KEYS[2])
 redis.call('PUBLISH', ARGV[1], '')
 return 1`;
-// KEYS: record, index, version. ARGV: id, channel, epoch ('' = any).
+// KEYS: record, index, version, drain tombstone. ARGV: id, channel, epoch ('' = any).
 const REMOVE = `
+if ARGV[3] ~= '' and redis.call('GET', KEYS[4]) == ARGV[3] then redis.call('DEL', KEYS[4]) end
 local epoch = redis.call('HGET', KEYS[1], 'epoch')
 if not epoch then redis.call('ZREM', KEYS[2], ARGV[1]) return 0 end
 if ARGV[3] ~= '' and epoch ~= ARGV[3] then return 0 end
@@ -238,14 +257,14 @@ export class RedisUpstreamRegistry implements RegistryReader, RegistryWriter {
     return (await this.redis.eval(HEARTBEAT, 4, this.keys.record(record.pool, record.id), this.keys.index(record.pool), this.keys.version,
       this.keys.drain(record.pool, record.id), String(ttlMs), '', record.epoch, record.id, this.keys.channel, ...fields)) as HeartbeatResult;
   }
-  async setState(pool: string, id: string, _state: 'draining', tombstoneMs = DRAIN_TOMBSTONE_MS): Promise<boolean> {
+  async setState(pool: string, id: string, _state: 'draining', tombstone: { fallbackMs?: number; ttlMs?: number } = {}): Promise<boolean> {
     assertRegistryKey(pool, id);
     return (await this.redis.eval(SET_DRAINING, 3, this.keys.record(pool, id), this.keys.version, this.keys.drain(pool, id),
-      this.keys.channel, String(tombstoneMs))) === 1;
+      this.keys.channel, String(tombstone.fallbackMs ?? DRAIN_TOMBSTONE_MS), String(tombstone.ttlMs ?? REGISTRY_TTL_MS))) === 1;
   }
   async remove(pool: string, id: string, epoch?: string): Promise<boolean> {
     assertRegistryKey(pool, id);
-    return (await this.redis.eval(REMOVE, 3, this.keys.record(pool, id), this.keys.index(pool), this.keys.version,
+    return (await this.redis.eval(REMOVE, 4, this.keys.record(pool, id), this.keys.index(pool), this.keys.version, this.keys.drain(pool, id),
       id, this.keys.channel, epoch ?? '')) === 1;
   }
   async list(pool: string): Promise<{ records: Record<string, string>[]; version: number }> {
@@ -327,17 +346,20 @@ export class MemoryUpstreamRegistry implements RegistryReader, RegistryWriter {
     if (result !== 'active') this.changed();
     return drained ? 'draining' : result;
   }
-  async setState(pool: string, id: string, state: 'draining', tombstoneMs = DRAIN_TOMBSTONE_MS): Promise<boolean> {
+  async setState(pool: string, id: string, state: 'draining', tombstone: { fallbackMs?: number; ttlMs?: number } = {}): Promise<boolean> {
     this.check(); assertRegistryKey(pool, id);
     const entry = this.live(`${pool}\u0000${id}`);
     if (!entry) return false;
     entry.hash.state = state; this.changed();
-    this.tombstones.set(`${pool}\u0000${id}`, { epoch: entry.hash.epoch!, expiresAt: this.now() + tombstoneMs });
+    const bound = entry.hash.drainMaxMs === undefined ? undefined : Number(entry.hash.drainMaxMs);
+    const lifetime = bound !== undefined ? bound + (tombstone.ttlMs ?? REGISTRY_TTL_MS) : (tombstone.fallbackMs ?? DRAIN_TOMBSTONE_MS);
+    this.tombstones.set(`${pool}\u0000${id}`, { epoch: entry.hash.epoch!, expiresAt: this.now() + lifetime });
     return true;
   }
   async remove(pool: string, id: string, epoch?: string): Promise<boolean> {
     this.check(); assertRegistryKey(pool, id);
     const key = `${pool}\u0000${id}`, entry = this.live(key);
+    if (epoch !== undefined && this.tombstones.get(key)?.epoch === epoch) this.tombstones.delete(key);
     if (!entry || (epoch !== undefined && entry.hash.epoch !== epoch)) return false;
     this.records.delete(key); this.changed();
     return true;

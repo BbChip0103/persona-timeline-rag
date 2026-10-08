@@ -98,7 +98,9 @@ export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle 
         epoch=options.epoch??(status?.startTimeSeconds?engineEpoch(options.id,options.baseUrl,status.startTimeSeconds):randomUUID());
         if(!options.epoch&&!status?.startTimeSeconds) event('epoch_random',{note:'no process_start_time_seconds: an agent restart will look like a new engine'});
         return {pool:options.pool,id:options.id,baseUrl:options.baseUrl,maxSeqs:options.maxSeqs??12,weight:options.weight??1,
-          kvCapacityTokens:status?.kvCapacityTokens??options.kvCapacityTokens??null,state:'active',epoch,seq:0};
+          kvCapacityTokens:status?.kvCapacityTokens??options.kvCapacityTokens??null,state:'active',epoch,seq:0,
+          // A CLI drain sizes its tombstone from this agent's own bound (+ TTL), not the operator shell's env.
+          drainMaxMs};
       }
       await sleep(options.healthPollMs??1000);
     }
@@ -169,11 +171,13 @@ export function runAgent(store:RegistryWriter,options:AgentOptions):AgentHandle 
 }
 
 /**
- * CLI `drain`: mark the record draining (with a tombstone for its epoch, `tombstoneMs` = drain bound + TTL, so an agent
+ * CLI `drain`: mark the record draining (with a tombstone for its epoch, living the agent's drain bound from the record
+ * + TTL, or `tombstone.fallbackMs` for a record without one, so an agent
  * that crashes and comes back on the same engine resumes the drain) and wait until it is gone.
  */
-export async function drainUpstream(store:RegistryReader&RegistryWriter,pool:string,id:string,options:{timeoutMs:number;pollMs?:number;tombstoneMs?:number}):Promise<'drained'|'not_found'|'timeout'> {
-  if(!await store.setState(pool,id,'draining',options.tombstoneMs)) return 'not_found';
+export async function drainUpstream(store:RegistryReader&RegistryWriter,pool:string,id:string,
+  options:{timeoutMs:number;pollMs?:number;tombstone?:{fallbackMs?:number;ttlMs?:number}}):Promise<'drained'|'not_found'|'timeout'> {
+  if(!await store.setState(pool,id,'draining',options.tombstone)) return 'not_found';
   const end=Date.now()+options.timeoutMs;
   while(Date.now()<end) {
     await new Promise(resolve=>setTimeout(resolve,options.pollMs??1000));
@@ -209,10 +213,21 @@ export function parseAgentArgs(argv:string[]):AgentCommand {
   return {command,pool:args.pool,id:args.id,baseUrl:args['base-url']!,maxSeqs:int(args['max-seqs'],12,1,4096)!,weight,
     kvCapacityTokens:int(args['kv-capacity-tokens'],null,1,1e10),...(args.epoch?{epoch:args.epoch}:{})};
 }
-function envInt(name:string,fallback:number,min:number,max:number):number {
-  const value=Number(process.env[name]??fallback);
-  if(!Number.isInteger(value)||value<min||value>max) throw new Error(`INVALID_${name}`);
-  return value;
+/**
+ * Agent timing settings. A `/health` check must finish with a heartbeat still inside the TTL, so its timeout must be
+ * below TTL − heartbeat; and the TTL must cover two heartbeats.
+ */
+export function agentTimings(env:NodeJS.ProcessEnv) {
+  const int=(name:string,fallback:number,min:number,max:number)=>{
+    const value=Number(env[name]??fallback);
+    if(!Number.isInteger(value)||value<min||value>max) throw new Error(`INVALID_${name}`);
+    return value;
+  };
+  const heartbeatMs=int('PTR_UPSTREAM_HEARTBEAT_MS',REGISTRY_HEARTBEAT_MS,200,60000), ttlMs=int('PTR_UPSTREAM_TTL_MS',REGISTRY_TTL_MS,1000,120000);
+  if(ttlMs<2*heartbeatMs) throw new Error('INVALID_PTR_UPSTREAM_TTL_MS');
+  const healthTimeoutMs=int('PTR_UPSTREAM_HEALTH_TIMEOUT_MS',2500,100,30000);
+  if(healthTimeoutMs>=ttlMs-heartbeatMs) throw new Error('INVALID_PTR_UPSTREAM_HEALTH_TIMEOUT_MS');
+  return {heartbeatMs,ttlMs,drainMaxMs:int('PTR_UPSTREAM_DRAIN_MAX_MS',120000,1000,3600000),drainSettleMs:int('PTR_UPSTREAM_DRAIN_SETTLE_MS',4000,0,600000),healthTimeoutMs};
 }
 
 async function main():Promise<number> {
@@ -223,12 +238,9 @@ async function main():Promise<number> {
   const store=new RedisUpstreamRegistry(redis,prefix);
   const print=(value:unknown)=>process.stdout.write(`${JSON.stringify(value)}\n`);
   try {
-    const drainMaxMs=envInt('PTR_UPSTREAM_DRAIN_MAX_MS',120000,1000,3600000), ttlMs=envInt('PTR_UPSTREAM_TTL_MS',REGISTRY_TTL_MS,1000,120000);
+    const timings=agentTimings(process.env), {drainMaxMs,ttlMs}=timings;
     if(parsed.command==='register') {
-      const heartbeatMs=envInt('PTR_UPSTREAM_HEARTBEAT_MS',REGISTRY_HEARTBEAT_MS,200,60000);
-      if(ttlMs<2*heartbeatMs) throw new Error('INVALID_PTR_UPSTREAM_TTL_MS');
-      const handle=runAgent(store,{...parsed,heartbeatMs,ttlMs,drainMaxMs,drainSettleMs:envInt('PTR_UPSTREAM_DRAIN_SETTLE_MS',4000,0,600000),
-        healthTimeoutMs:envInt('PTR_UPSTREAM_HEALTH_TIMEOUT_MS',2500,100,30000)});
+      const handle=runAgent(store,{...parsed,...timings});
       let signals=0;
       const stop=()=>{if(++signals>1) process.exit(1);handle.drain();};
       process.on('SIGTERM',stop);process.on('SIGINT',stop);
@@ -236,7 +248,10 @@ async function main():Promise<number> {
       return 0;
     }
     if(parsed.command==='drain') {
-      const result=await drainUpstream(store,parsed.pool,parsed.id,{timeoutMs:drainMaxMs+ttlMs+5000,tombstoneMs:drainMaxMs+ttlMs});
+      // Wait as long as the agent's own drain can take (its bound is in the record), not only this shell's setting.
+      const record=(await store.list(parsed.pool)).records.find(hash=>hash.id===parsed.id);
+      const bound=Math.max(drainMaxMs,Number(record?.drainMaxMs)||0);
+      const result=await drainUpstream(store,parsed.pool,parsed.id,{timeoutMs:bound+ttlMs+5000,tombstone:{fallbackMs:drainMaxMs+ttlMs,ttlMs}});
       print({pool:parsed.pool,id:parsed.id,result});return result==='drained'?0:1;
     }
     if(parsed.command==='deregister') {

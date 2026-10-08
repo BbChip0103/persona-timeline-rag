@@ -4,6 +4,7 @@ import { POOL_NAME, REGISTRY_PREFIX, RedisUpstreamRegistry, assertRegistryPrefix
 import { createGateway } from './server';
 import { FailoverUpstream } from './failover';
 import { DEFAULT_FAILOVER, UpstreamPool, type FailoverOptions } from './pool';
+import { ROUTING_POLICIES, type RoutingPolicy } from './admission';
 import { FileUpstreamSource, RedisRegistrySource, StaticUpstreamSource, checkUpstreamUrl, parseUpstreamAllow, type UpstreamSource } from './sources';
 import { OpenAICompatibleUpstream, TextProviderUpstream, type Upstream } from './upstreams';
 
@@ -13,6 +14,13 @@ import { OpenAICompatibleUpstream, TextProviderUpstream, type Upstream } from '.
  * Redis registry (PTR_GATEWAY_DISCOVERY=redis), see UpstreamPool. Either may add a failover secondary
  * (PTR_GATEWAY_FAILOVER=openrouter, or fake for load tests) used only when no primary received the request. Default off.
  */
+function decimal(env:NodeJS.ProcessEnv,name:string,fallback:number,min:number,max:number):number {
+  const value=Number(env[name]??fallback);
+  if(!Number.isFinite(value)||value<min||value>max) throw new Error(`INVALID_${name}`);
+  return value;
+}
+/** PTR_GATEWAY_ROUTING default for pools (decided by the §9.1 comparison, see docs/goal2-serving.md). */
+export const DEFAULT_ROUTING:RoutingPolicy='least_inflight';
 function integer(env:NodeJS.ProcessEnv,name:string,fallback:number,min:number,max:number):number {
   const value=Number(env[name]??fallback);
   if(!Number.isInteger(value)||value<min||value>max) throw new Error(`INVALID_${name}`);
@@ -71,8 +79,18 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
   if(!model) throw new Error('POOL_NOT_CONFIGURED');
   if(!POOL_NAME.test(model)) throw new Error('INVALID_PTR_GATEWAY_POOL');
   if(env.PTR_GATEWAY_UPSTREAMS_FILE&&env.PTR_SELFHOSTED_BASE_URL) throw new Error('SELFHOSTED_BASE_URL_WITH_UPSTREAMS_FILE');
+  const routing=env.PTR_GATEWAY_ROUTING??DEFAULT_ROUTING, fairness=env.PTR_GATEWAY_FAIRNESS??'fifo', saturated=env.PTR_GATEWAY_REJECT_SATURATED??'false';
+  if(!(ROUTING_POLICIES as readonly string[]).includes(routing)) throw new Error('INVALID_PTR_GATEWAY_ROUTING');
+  if(fairness!=='fifo'&&fairness!=='drr') throw new Error('INVALID_PTR_GATEWAY_FAIRNESS');
+  if(saturated!=='true'&&saturated!=='false') throw new Error('INVALID_PTR_GATEWAY_REJECT_SATURATED');
+  // The pool owns admission (S3): credits per upstream, one band queue; PTR_GATEWAY_MAX_CONCURRENCY does not apply.
   const options={failover:failoverOptions(env),primaryAttempts:integer(env,'PTR_GATEWAY_PRIMARY_ATTEMPTS',2,1,8),
-    slowStartMs:integer(env,'PTR_GATEWAY_SLOW_START_MS',30000,0,600000),queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000)};
+    slowStartMs:integer(env,'PTR_GATEWAY_SLOW_START_MS',30000,0,600000),queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),
+    admission:true,maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),routing:routing as RoutingPolicy,fairness:fairness as 'fifo'|'drr',
+    kappa:decimal(env,'PTR_GATEWAY_KV_OVERCOMMIT',0.9,0.1,1),bytesPerToken:decimal(env,'PTR_GATEWAY_BYTES_PER_TOKEN',3.9,0.5,20),
+    ttftPenaltyMs:integer(env,'PTR_GATEWAY_TTFT_PENALTY_MS',1000,1,60000),lookahead:integer(env,'PTR_GATEWAY_LOOKAHEAD',8,1,256),
+    starvationMs:integer(env,'PTR_GATEWAY_STARVATION_MS',2000,0,600000),drrQuantum:integer(env,'PTR_GATEWAY_DRR_QUANTUM_TOKENS',4096,1,1000000),
+    rejectSaturated:saturated==='true'};
   // The upstream deadline starts once the request is admitted, and the wait for a free upstream (up to the queue
   // timeout) runs inside it: if it were not longer, that wait would end as an unmarked 504 instead of the retryable 503.
   if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');

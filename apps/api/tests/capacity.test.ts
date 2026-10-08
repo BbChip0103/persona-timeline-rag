@@ -1,4 +1,4 @@
-import { capacitySettings, workerCapacityLine } from '../src/capacity';
+import { capacitySettings, startCapacityControllerSafely, workerCapacityLine } from '../src/capacity';
 
 describe('capacity controller settings (dispatcher)',()=>{
   const redis={PTR_GATEWAY_DISCOVERY:'redis',PTR_GATEWAY_POOL:'gemma-4-e4b-fp8'};
@@ -21,6 +21,17 @@ describe('worker startup line',()=>{
   test('controller on: only the current G is logged (the S1 Σ-concurrency warning is for off)',()=>{
     expect(workerCapacityLine({mode:'on',globalConcurrency:30})).toBe('capacity controller on: global concurrency G=30 (PTR_WORKER_CONCURRENCY is a local cap only)');
     expect(workerCapacityLine({mode:'on',globalConcurrency:null})).toBe('capacity controller on: global concurrency G=unset (PTR_WORKER_CONCURRENCY is a local cap only)');
-    expect(workerCapacityLine({mode:'off',globalConcurrency:12})).toBeNull();
+    expect(workerCapacityLine({mode:'off',globalConcurrency:null})).toBeNull();
+    expect(workerCapacityLine({mode:'off',globalConcurrency:12})).toBe('WARNING capacity controller off but global concurrency G=12 is set on the turn queue: a dispatcher in off mode clears it at startup; until then at most 12 turns run');
+    expect(workerCapacityLine({mode:'keep',globalConcurrency:12})).toBe('capacity controller keep: global concurrency G=12 left as set (nothing adjusts it)');
+  });
+});
+
+describe('dispatcher keeps running when the controller cannot start',()=>{
+  test('a configuration error disables the controller with one log line; lease recovery and the outbox go on',async()=>{
+    const lines:string[]=[];
+    const capacity=await startCapacityControllerSafely({PTR_CAPACITY_CONTROLLER:'on'},line=>lines.push(line));
+    await capacity.stop();
+    expect(lines).toEqual(['WARNING capacity controller disabled (INVALID_PTR_CAPACITY_POOL): turn dispatch, lease recovery and the outbox continue without it']);
   });
 });
