@@ -1,10 +1,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
-import { ChatService, CoreError, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
+import { ChatService, CoreError, DEFAULT_SAFETY_THRESHOLDS, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
 import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
+import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
   id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
   kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
@@ -18,8 +18,16 @@ export interface ApiRuntime {
   saveArtifact(artifact:CreativeArtifact):Promise<void>;
   providerName:string;model:string;close?():Promise<void>;
 }
+/** Fail-open stays visible: one sanitized stderr line per safety fallback (scope, reason class, running count), never text. */
+function logSafetyFallback():(event:{scope:'turn'|'draft';reason:string})=>void {
+  const counts=new Map<string,number>();
+  return ({scope,reason})=>{
+    const key=`${scope}:${reason}`;const count=(counts.get(key)??0)+1;counts.set(key,count);
+    process.stderr.write(`input_safety_fallback scope=${scope} reason=${reason} count=${count}\n`);
+  };
+}
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
-export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void}={}):ApiRuntime {
+export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void}={}):ApiRuntime {
   const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
   const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
   const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
@@ -65,16 +73,36 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     if(token.length<24) throw new CoreError('INVALID_INPUT');
     provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1'});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
-  // Optional ambiguity-only intent classifier (default off). Any failure falls back to the deterministic rules.
-  let intentClassifier:IntentClassifierOptions|undefined;
-  const classifierName=env.PTR_INTENT_CLASSIFIER??'off';
-  if(classifierName==='jev') {
+  // Optional Jev helpers, both default off; any failure falls back to the deterministic rules. With both on, one
+  // Jev request per turn answers the safety questions and (when the intent gate is open) the intent question.
+  let intentClassifier:IntentClassifierOptions|undefined;let inputSafety:InputSafetyOptions|undefined;
+  const classifierName=env.PTR_INTENT_CLASSIFIER??'off', safetyName=env.PTR_SAFETY_FILTER??'off';
+  if(!['jev','off'].includes(classifierName)||!['jev','off'].includes(safetyName)) throw new CoreError('INVALID_INPUT');
+  if(classifierName==='jev'||safetyName==='jev') {
     // Load-test latency injection never runs beside a billable classifier.
     if(env.PTR_FAKE_LATENCY!==undefined) throw new CoreError('INVALID_INPUT');
-    const minConfidence=Number(env.PTR_JEV_MIN_CONFIDENCE??0.6), timeoutMs=Number(env.PTR_JEV_TIMEOUT_MS??1500), jevModel=env.PTR_JEV_MODEL??DEFAULT_JEV_MODEL;
-    if(!(minConfidence>0&&minConfidence<=1)||!Number.isInteger(timeoutMs)||timeoutMs<50||timeoutMs>10000||!DECISION_MODEL_IDS.includes(jevModel)) throw new CoreError('INVALID_INPUT');
-    intentClassifier={classifier:new JevIntentClassifier(openRouter(),jevModel),minConfidence,timeoutMs};
-  } else if(classifierName!=='off') throw new CoreError('INVALID_INPUT');
+    const timeoutMs=Number(env.PTR_JEV_TIMEOUT_MS??1500), jevModel=env.PTR_JEV_MODEL??DEFAULT_JEV_MODEL;
+    if(!Number.isInteger(timeoutMs)||timeoutMs<50||timeoutMs>10000||!DECISION_MODEL_IDS.includes(jevModel)) throw new CoreError('INVALID_INPUT');
+    if(classifierName==='jev') {
+      const minConfidence=Number(env.PTR_JEV_MIN_CONFIDENCE??0.6);
+      if(!(minConfidence>0&&minConfidence<=1)) throw new CoreError('INVALID_INPUT');
+      intentClassifier={classifier:new JevIntentClassifier(openRouter(),jevModel),minConfidence,timeoutMs};
+    }
+    if(safetyName==='jev') {
+      // Per-category thresholds: PTR_SAFETY_THRESHOLD_<CATEGORY> (e.g. PTR_SAFETY_THRESHOLD_SELF_HARM), in (0,1].
+      const thresholds={...DEFAULT_SAFETY_THRESHOLDS};
+      for(const category of SAFETY_CATEGORIES) {
+        const raw=env[`PTR_SAFETY_THRESHOLD_${category.toUpperCase()}`];if(raw===undefined)continue;
+        const value=Number(raw);if(!(value>0&&value<=1)) throw new CoreError('INVALID_INPUT');
+        thresholds[category]=value;
+      }
+      // Own deadline: full 4100-code-point windows took p50 625 / max 1244 ms live (2026-10-08), above the intent
+      // classifier's 1500 ms comfort margin; short messages still answer in about 400 ms.
+      const safetyTimeoutMs=Number(env.PTR_SAFETY_TIMEOUT_MS??2500);
+      if(!Number.isInteger(safetyTimeoutMs)||safetyTimeoutMs<50||safetyTimeoutMs>10000) throw new CoreError('INVALID_INPUT');
+      inputSafety={classifier:new JevInputSafetyClassifier(openRouter(),jevModel),thresholds,timeoutMs:safetyTimeoutMs};
+    }
+  }
   const store=new PostgresConversationStore(pool);
   // Separate names let a load test run beside other users of the same Redis (and be wiped safely afterwards).
   const queueName=env.PTR_TURN_QUEUE??'turns', namespace=env.PTR_EVENTS_NAMESPACE??'events';
@@ -83,7 +111,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
     retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
-    ...(intentClassifier?{intentClassifier}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
+    ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
   return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');

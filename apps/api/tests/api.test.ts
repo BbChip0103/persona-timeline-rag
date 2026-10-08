@@ -1,6 +1,6 @@
 import type { INestApplication } from '@nestjs/common';
 import type { Persona, ChatSession, ChatTurn, ChatMessage } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat, type TurnEvent } from '@ptr/core';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, createLocalChat, safetyReply, type SafetyAssessInput, type SafetyScores, type TurnEvent } from '@ptr/core';
 const ChatServiceGetTurn=ChatService.prototype.getTurn;
 import { FakeTextProvider } from '@ptr/providers';
 import { createApiApplication } from '../src/app';
@@ -212,4 +212,56 @@ test('SSE: a client gone during the ownership check leaves no subscription behin
     const {events,closed}=await reading;
     expect(subscribes).toBe(1);expect(closed).toBe(true);expect(events.at(-1)!.data.state).toBe('completed');
   } finally {await app2.close();}
+});
+
+test('draft briefs pass the input safety filter when it is on: refuse/support without model or storage, deflect with the note',async()=>{
+  await app.close();
+  const score=(text:string):Partial<SafetyScores>=>Object.fromEntries(SAFETY_CATEGORIES.map(category=>[category,
+    category==='sexual'&&text.includes('REFUSE_ME')||category==='self_harm'&&text.includes('SUPPORT_ME')||category==='prompt_injection'&&text.includes('INJECT_ME')?0.95:0.01]));
+  const assess=jest.fn(async(input:SafetyAssessInput)=>({safety:score(input.text)}));
+  const onSafetyFallback=jest.fn();
+  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);
+  const calls:unknown[]=[];const provider={generate:async(messages:unknown)=>{calls.push(messages);return '합성 초안';}};
+  const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200},onSafetyFallback});
+  runtime={...runtime,chat,personas,provider};
+  app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
+  const refused=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'REFUSE_ME 초안'}});
+  expect(refused.status).toBe(201);expect(refused.body).toMatchObject({notice:{status:'out_of_scope',content:safetyReply('sexual','ko'),limitations:[]},image:{code:'IMAGE_RUNNER_ONLY'}});
+  expect(Object.keys(refused.body).sort()).toEqual(['image','notice']);expect(JSON.stringify(refused.body)).not.toMatch(/sexual|probabilit|synthetic\/safety/);
+  const support=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'SUPPORT_ME'}});
+  expect(support.body).toMatchObject({notice:{content:safetyReply('self_harm','ko'),limitations:['SAFETY_SUPPORT']}});
+  expect(calls).toHaveLength(0);expect(artifacts).toHaveLength(0);
+  const deflected=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'INJECT_ME 초안'}});
+  expect(deflected.status).toBe(201);expect(calls).toHaveLength(1);expect(JSON.stringify(calls[0])).toContain(SAFETY_DEFLECTION_NOTE);
+  // The draft id seeds the check and names the artifact; the whole brief is checked.
+  expect(assess.mock.calls.at(-1)![0]).toMatchObject({seed:deflected.body.artifact.id,recentUserTurns:[],intent:false,text:'INJECT_ME 초안'});
+  expect(artifacts).toHaveLength(1);
+  // Fail-open: an unavailable filter keeps drafting and is reported without text.
+  assess.mockRejectedValueOnce(Object.assign(new Error('raw'),{code:'BUDGET_EXCEEDED'}));
+  expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'평범한 초안'}})).status).toBe(201);
+  expect(onSafetyFallback).toHaveBeenCalledWith({scope:'draft',reason:'budget'});
+});
+
+test('draft cap applies only with the safety filter on; filter-off drafting is unchanged',async()=>{
+  await app.close();
+  app=await createApiApplication(runtime,token,{draftsPerOwnerPerMinute:1});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const off=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
+  for(let i=0;i<3;i++) expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
+});
+test('with the safety filter on, draft requests are capped per owner per minute before any safety check or model call',async()=>{
+  await app.close();
+  const assess=jest.fn(async(input:SafetyAssessInput)=>({safety:Object.fromEntries(input.categories.map(category=>[category,0.01]))}));
+  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();
+  const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200}});
+  runtime={...runtime,chat,personas,provider};
+  app=await createApiApplication(runtime,token,{draftsPerOwnerPerMinute:2});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
+  for(let i=0;i<2;i++) expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
+  const calls=(runtime.provider as FakeTextProvider).calls;
+  const limited=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}});
+  expect(limited.status).toBe(503);expect(limited.body).toEqual({error:{code:'QUEUE_FULL'}});expect((runtime.provider as FakeTextProvider).calls).toBe(calls);expect(assess).toHaveBeenCalledTimes(2);
+  const other=(await call('sessions',{method:'POST',owner:'owner_synthetic_b',body:{personId:persona.personId}})).body.session.id;
+  expect((await call(`sessions/${other}/drafts`,{method:'POST',owner:'owner_synthetic_b',body:{brief:'합성 초안'}})).status).toBe(201);
+  await expect(createApiApplication(runtime,token,{draftsPerOwnerPerMinute:0})).rejects.toThrow();
 });

@@ -84,6 +84,19 @@ integration('dedicated loopback Postgres storage (synthetic fixtures only)', () 
     expect((await conversations.history(session.id, session.ownerId)).map(message => message.content))
       .toEqual([persona.greeting, 'complete synthetic question', 'synthetic response']);
   });
+  it('lists refused turns from the stored reply record, owner-scoped', async () => {
+    const complete = async (key: string, action?: 'refuse' | 'support') => {
+      const { turn } = await conversations.reserveTurn(session.id, session.ownerId, key, `${key} synthetic question`);
+      await conversations.transitionTurn(turn.id, ['pending'], 'validating');
+      await conversations.completeTurn(turn.id, { sessionId: session.id, turnId: turn.id, messageId: randomUUID(), personId: scope, personaRevision: persona.revision,
+        responseKind: 'unsupported', status: 'out_of_scope', content: 'synthetic refusal', claims: [], evidence: [], limitations: [],
+        ...(action ? { inputSafety: { decidedBy: 'classifier' as const, action, fired: [] } } : {}) });
+      return turn.id;
+    };
+    const refused = await complete('refused-turn', 'refuse');await complete('support-turn', 'support');await complete('plain-turn');
+    expect(await conversations.refusedTurnIds(session.id, session.ownerId)).toEqual([refused]);
+    expect(await conversations.refusedTurnIds(session.id, 'wrong-owner')).toEqual([]);
+  });
   it('keeps failed partials out of history and permits the next turn', async () => {
     const { turn } = await conversations.reserveTurn(session.id, session.ownerId, 'fail', 'failed synthetic question');
     expect(await conversations.transitionTurn(turn.id, ['pending'], 'failed', 'SYNTHETIC_FAILURE')).toBe(true);

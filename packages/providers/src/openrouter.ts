@@ -37,6 +37,8 @@ const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json
 /** Decision models (Decisions API): input-only pricing ceiling in USD per million tokens; output tokens are free. Pinned ids only. */
 const DECISION_MODELS:Record<string,{prompt:number}>={'typesafe/jev-1.13':{prompt:0.05}};
 export const DECISION_MODEL_IDS=Object.keys(DECISION_MODELS);
+export const DECISION_BASE_ALLOWANCE=1024;
+export const DECISION_QUESTION_ALLOWANCE=512;
 const DECISIONS_URL='https://openrouter.ai/api/alpha/decisions';
 const SCHEMA_REVISION='goal1-provider-v1';
 type Fetch=typeof fetch;
@@ -56,11 +58,15 @@ function untilAborted<T>(work:Promise<T>,signal:AbortSignal):Promise<T> {
 export interface OpenRouterOptions {
   apiKey:string; liveEnabled:boolean; allowExternalData:boolean; databaseUrl:string; ledger:BudgetLedger;
   textModel?:string; maxOutputTokens?:number; maxInputBytes?:number; timeoutMs?:number; fetch?:Fetch;
+  /** Share of the ledger call_cap that decision (Jev) calls must leave free for chat; default 0.2, 0 disables. */
+  decisionReservedCallFraction?:number;
 }
 export function liveOptionsFromEnvironment(env:NodeJS.ProcessEnv,ledger:BudgetLedger):OpenRouterOptions {
   return {apiKey:env.OPENROUTER_API_KEY??'',liveEnabled:env.GOAL1_LIVE_ENABLED==='true',
     allowExternalData:env.GOAL1_ALLOW_EXTERNAL_DATA==='true',databaseUrl:env.GOAL1_DATABASE_URL??'',ledger,
-    textModel:env.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL};
+    textModel:env.GOAL1_TEXT_MODEL??DEFAULT_TEXT_MODEL,
+    // A blank value is an error (INVALID_LIMIT), never silently 0.
+    ...(env.PTR_JEV_RESERVED_CALL_FRACTION===undefined?{}:{decisionReservedCallFraction:env.PTR_JEV_RESERVED_CALL_FRACTION.trim()?Number(env.PTR_JEV_RESERVED_CALL_FRACTION):Number.NaN})};
 }
 export class OpenRouterClient {
   private readonly fetcher:Fetch;
@@ -68,6 +74,7 @@ export class OpenRouterClient {
   private readonly outputTokens:number;
   private readonly inputBytes:number;
   private readonly timeoutMs:number;
+  private readonly reservedCallFraction:number;
   private priceCheck:Promise<void>|undefined;
   /** From the verified catalog entry of the chat model. */
   private structuredOutputs=false;
@@ -80,6 +87,8 @@ export class OpenRouterClient {
     this.outputTokens=options.maxOutputTokens??512;
     this.inputBytes=options.maxInputBytes??32768;
     this.timeoutMs=options.timeoutMs??30000;
+    this.reservedCallFraction=options.decisionReservedCallFraction??0.2;
+    if (!(this.reservedCallFraction>=0&&this.reservedCallFraction<1)) throw new ProviderError('INVALID_LIMIT');
     if (!Number.isInteger(this.outputTokens)||this.outputTokens<1||this.outputTokens>1024||!Number.isInteger(this.inputBytes)||this.inputBytes<1||this.inputBytes>65536||!Number.isInteger(this.timeoutMs)||this.timeoutMs<1||this.timeoutMs>60000) throw new ProviderError('INVALID_LIMIT');
     this.options={...options};
     this.fetcher=options.fetch??fetch;
@@ -176,7 +185,8 @@ export class OpenRouterClient {
     // Decisions verify their own model's endpoint price; text/embedding catalogs are irrelevant to them.
     if (endpoint!=='decisions') await this.verifyPricing(signal);
     const key=hash({endpoint,body,schema:SCHEMA_REVISION,...(idempotencyKey===undefined?{}:{idempotencyKey})});
-    const saved=await this.options.ledger.reserve(key,reservation);
+    // Decisions are optional helpers: they keep a share of the call cap free so they can never starve chat.
+    const saved=endpoint==='decisions'?await this.options.ledger.reserve(key,reservation,{reservedCallFraction:this.reservedCallFraction}):await this.options.ledger.reserve(key,reservation);
     if (!saved.created) {
       if (saved.request.response!==null) {
         const result=object(saved.request.response);
@@ -242,8 +252,10 @@ export class OpenRouterClient {
     const bytes=Buffer.byteLength(JSON.stringify(body),'utf8');
     if (bytes>this.inputBytes) throw new ProviderError('INPUT_LIMIT');
     await untilAborted(this.checkDecisionPrice(request.model),options.signal);
-    // UTF8 bytes upper-bound tokens; the fixed allowance covers the provider's own decision template.
-    const result=await this.request(body,'decisions',Math.ceil((bytes+2048)*DECISION_MODELS[request.model]!.prompt),options.signal,options.idempotencyKey);
+    // UTF8 bytes upper-bound tokens; the allowance covers the provider's decision template (measured 2026-10-08: about
+    // 490 input tokens for one question and 1570 for eight, including state, so 1024 + 512 per question stays conservative).
+    const questions=Math.max(1,Object.keys(request.questions).length);
+    const result=await this.request(body,'decisions',Math.ceil((bytes+DECISION_BASE_ALLOWANCE+DECISION_QUESTION_ALLOWANCE*questions)*DECISION_MODELS[request.model]!.prompt),options.signal,options.idempotencyKey);
     // Responses name the dated snapshot that served the pinned release.
     if (typeof result.model!=='string'||result.model!==request.model&&!(result.model.startsWith(`${request.model}-`)&&/^\d{8}$/.test(result.model.slice(request.model.length+1)))) throw new ProviderError('MODEL_MISMATCH');
     return result;

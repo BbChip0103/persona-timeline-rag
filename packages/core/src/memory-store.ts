@@ -28,6 +28,10 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
     if (!await this.getOwnedSession(id,owner)) throw new CoreError('NOT_FOUND');
     return structuredClone(this.messages.get(id) ?? []);
   }
+  async refusedTurnIds(id:string,owner:string):Promise<string[]> {
+    if (!await this.getOwnedSession(id,owner)) throw new CoreError('NOT_FOUND');
+    return [...this.turns.values()].filter(turn=>turn.sessionId===id&&turn.state==='completed'&&turn.reply?.inputSafety?.action==='refuse').map(turn=>turn.id);
+  }
   async reserveTurn(sessionId:string,ownerId:string,clientRequestId:string,text:string,requestHash?:string,input?:SendTurnInput):Promise<{turn:ChatTurn;created:boolean;dispatch?:TurnDispatch}> {
     const fingerprint=requestHash??turnTextFingerprint(text);
     if(!/^[a-f0-9]{64}$/.test(fingerprint)) throw new CoreError('INVALID_INPUT');

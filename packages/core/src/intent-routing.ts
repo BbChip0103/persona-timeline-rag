@@ -71,11 +71,12 @@ export function ruleIntent(signals:IntentSignals):TurnIntent {
 export function needsIntentClassifier(signals:IntentSignals):boolean {
   return !signals.sensitive&&!signals.explicitIntent&&!signals.creative&&!signals.strongTimeline;
 }
-function fallbackReason(error:unknown,turn:AbortSignal):NonNullable<IntentRouting['fallbackReason']> {
+/** Failure class of a classifier call (shared with the input safety filter). */
+export function classifierFallbackReason(error:unknown,turn:AbortSignal):'aborted'|'timeout'|'budget'|'subcap'|'unresolved'|'error' {
   if(turn.aborted) return 'aborted';
   if(error==='timeout') return 'timeout';
   const code=error&&typeof error==='object'&&'code' in error?error.code:undefined;
-  return code==='BUDGET_EXCEEDED'?'budget':code==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'unresolved':'error';
+  return code==='BUDGET_EXCEEDED'?'budget':code==='DECISION_SUBCAP'?'subcap':code==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'unresolved':'error';
 }
 /** Combines the rules with an optional classifier. Any failure, timeout, abort or low confidence keeps the rule result. */
 export async function routeIntent(signals:IntentSignals,input:{text:string;recentUserTurns:string[];seed:string},options:IntentClassifierOptions|undefined,turn:AbortSignal):Promise<{intent:TurnIntent;routing?:IntentRouting}> {
@@ -98,7 +99,7 @@ export async function routeIntent(signals:IntentSignals,input:{text:string;recen
     if(!(result.confidence>=options.minConfidence)) return {intent:rule,routing:{decidedBy:'classifier_fallback',...base,...answer,fallbackReason:'below_threshold'}};
     return {intent:result.label,routing:{decidedBy:'classifier',...base,...answer}};
   } catch(error) {
-    return {intent:rule,routing:{decidedBy:'classifier_fallback',...base,fallbackReason:fallbackReason(error,turn)}};
+    return {intent:rule,routing:{decidedBy:'classifier_fallback',...base,fallbackReason:classifierFallbackReason(error,turn)}};
   } finally {
     if(timer) clearTimeout(timer);
     turn.removeEventListener('abort',stop);controller.abort();

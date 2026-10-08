@@ -10,6 +10,8 @@ export interface ConversationStore {
   getOwnedSession(sessionId:string,ownerId:string):Promise<ChatSession|undefined>;
   listOwnedSessions(ownerId:string):Promise<ChatSession[]>;
   history(sessionId:string,ownerId:string):Promise<ChatMessage[]>;
+  /** Completed turns of the session whose stored reply records an input-safety refusal (reply.inputSafety.action). */
+  refusedTurnIds(sessionId:string,ownerId:string):Promise<string[]>;
   /** With `input`, the exact structured request is persisted and an outbox dispatch is written in the same transaction. */
   reserveTurn(sessionId:string,ownerId:string,clientRequestId:string,text:string,requestHash?:string,input?:SendTurnInput):Promise<{turn:ChatTurn;created:boolean;dispatch?:TurnDispatch}>;
   /** With a fence, the write applies only while that worker still holds that attempt's lease. */

@@ -11,3 +11,10 @@ test('intent routing trace stays internal',()=>{
   const raw=JSON.stringify(publicTurn(turn));
   for(const value of ['intentRouting','typesafe','classifier'])expect(raw).not.toContain(value);
 });
+test('input safety trace stays internal',()=>{
+  const turn:ChatTurn={id:'turn',sessionId:'session',ownerId:'owner',clientRequestId:'req',userText:'안녕',sequence:1,state:'completed',createdAt:'2024-01-01T00:00:00Z',reply:{sessionId:'session',turnId:'turn',messageId:'message',personId:'person',personaRevision:'v1',responseKind:'unsupported',status:'out_of_scope',content:'그런 이야기는 어려워요.',claims:[],evidence:[],limitations:[],
+    inputSafety:{decidedBy:'classifier',classifier:'typesafe/jev-1.13',action:'refuse',category:'sexual',fired:['sexual'],probabilities:{prompt_injection:0.01,sexual:0.97,violence_gore:0.01,self_harm:0.01,hate_harassment:0.01,illegal_dangerous:0.01,private_info:0.01}}}};
+  const raw=JSON.stringify(publicTurn(turn));
+  expect(Object.keys(JSON.parse(raw).reply).sort()).toEqual(['claims','content','evidence','limitations','messageId','personId','personaRevision','responseKind','sessionId','status','turnId']);
+  for(const value of ['inputSafety','typesafe','sexual','probabilities','refuse'])expect(raw).not.toContain(value);
+});

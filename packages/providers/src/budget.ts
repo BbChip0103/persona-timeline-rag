@@ -7,12 +7,20 @@ export class ProviderError extends Error {
 export type RequestState='reserved'|'submitted'|'settled'|'unknown';
 export interface BudgetRequest { key:string; state:RequestState; reservedMicrousd:number; actualMicrousd:number|null; response:unknown|null; generationId:string|null }
 export interface BudgetLedger {
-  reserve(key:string,amountMicrousd:number):Promise<{created:boolean;request:BudgetRequest}>;
+  /**
+   * `reservedCallFraction`: refuse a new request (DECISION_SUBCAP) unless that share of call_cap stays free after it;
+   * decision calls use it so they can never take the last chat calls. Existing keys replay regardless.
+   */
+  reserve(key:string,amountMicrousd:number,options?:{reservedCallFraction?:number}):Promise<{created:boolean;request:BudgetRequest}>;
   submitted(key:string):Promise<void>;
   finish(key:string,costMicrousd:number|null,response:unknown|null,generationId:string|null):Promise<void>;
   get(key:string):Promise<BudgetRequest|undefined>;
 }
 export const MAX_TOTAL_MICROUSD=2_000_000;
+/** True when one more call would leave fewer than ceil(callCap·fraction) calls free. */
+export function decisionCallsExhausted(calls:number,callCap:number,reservedCallFraction:number):boolean {
+  return callCap-calls-1<Math.ceil(callCap*reservedCallFraction);
+}
 export const MAX_PROVIDER_CALLS=10_000;
 // Never reset this singleton budget between runs: all live callers share its ledger.
 export const BUDGET_SCHEMA_SQL=`
@@ -43,7 +51,7 @@ export class PostgresBudgetLedger implements BudgetLedger {
     try { await client.query('BEGIN'); const result=await run(client); await client.query('COMMIT'); return result; }
     catch(error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }
-  async reserve(key:string,amountMicrousd:number):Promise<{created:boolean;request:BudgetRequest}> {
+  async reserve(key:string,amountMicrousd:number,options?:{reservedCallFraction?:number}):Promise<{created:boolean;request:BudgetRequest}> {
     if (!Number.isSafeInteger(amountMicrousd)||amountMicrousd<1||amountMicrousd>MAX_TOTAL_MICROUSD) throw new ProviderError('BUDGET_EXCEEDED');
     return this.transaction(async client=>{
       const budget=await client.query("SELECT cap_microusd,call_cap FROM ptr_provider_budget WHERE id='global' FOR UPDATE");
@@ -52,6 +60,7 @@ export class PostgresBudgetLedger implements BudgetLedger {
       if (previous.rows[0]) return {created:false,request:mapped(previous.rows[0])};
       const aggregate=await client.query('SELECT COALESCE(SUM(GREATEST(reserved_microusd,COALESCE(actual_microusd,0))) FILTER (WHERE state <> \'settled\'),0)+COALESCE(SUM(actual_microusd) FILTER (WHERE state=\'settled\'),0) AS committed,COUNT(*) AS calls FROM ptr_provider_requests');
       if (Number(aggregate.rows[0].committed)+amountMicrousd>Math.min(Number(budget.rows[0].cap_microusd),MAX_TOTAL_MICROUSD)||Number(aggregate.rows[0].calls)>=Number(budget.rows[0].call_cap)) throw new ProviderError('BUDGET_EXCEEDED');
+      if (options?.reservedCallFraction!==undefined&&decisionCallsExhausted(Number(aggregate.rows[0].calls),Number(budget.rows[0].call_cap),options.reservedCallFraction)) throw new ProviderError('DECISION_SUBCAP');
       const inserted=await client.query("INSERT INTO ptr_provider_requests (key,state,reserved_microusd) VALUES ($1,'reserved',$2) RETURNING *",[key,amountMicrousd]);
       return {created:true,request:mapped(inserted.rows[0])};
     });

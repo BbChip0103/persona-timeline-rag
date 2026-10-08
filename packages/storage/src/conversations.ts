@@ -52,6 +52,11 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
     return result.rows.map(row => ({ id: row.id, sessionId: row.session_id, turnId: row.turn_id,
       role: row.role, content: row.content, createdAt: new Date(row.created_at).toISOString() }));
   }
+  async refusedTurnIds(sessionId: string, ownerId: string): Promise<string[]> {
+    const result = await this.pool.query(`SELECT t.id FROM turns t JOIN sessions s ON s.id=t.session_id
+      WHERE s.id=$1 AND s.owner_id=$2 AND t.state='completed' AND t.reply->'inputSafety'->>'action'='refuse'`, [sessionId, ownerId]);
+    return result.rows.map(row => String(row.id));
+  }
   async reserveTurn(sessionId: string, ownerId: string, clientRequestId: string, text: string, requestHash?: string, input?: SendTurnInput): Promise<{ turn: ChatTurn; created: boolean; dispatch?: TurnDispatch }> {
     const fingerprint=requestHash??turnTextFingerprint(text);
     if(!/^[a-f0-9]{64}$/.test(fingerprint)) throw new CoreError('INVALID_INPUT');

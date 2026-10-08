@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
+import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, LEASE_LOST, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
 import { containsCredentialPattern, containsUngroundedBiography } from './safety';
-import { intentSignals, isSensitive, routeIntent, ruleIntent, type IntentClassifierOptions } from './intent-routing';
+import { intentSignals, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, type IntentClassifierOptions } from './intent-routing';
+import { RULE_PATH_CATEGORIES, RULE_REFUSAL_REPLY, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
@@ -19,7 +20,14 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
   /** Observability hook: failed turns with a sanitized error class/code only (never messages or bodies). */
   onTurnFailure?:(failure:{turnId:string;code:string})=>void;
   /** Optional ambiguity-only intent classifier (off by default); rules stay authoritative for safety and strong signals. */
-  intentClassifier?:IntentClassifierOptions}
+  intentClassifier?:IntentClassifierOptions;
+  /**
+   * Optional input safety filter (off by default), asked on every turn the rules did not already refuse. When the
+   * intent gate is open too, its single request also answers the intent question in place of `intentClassifier`.
+   */
+  inputSafety?:InputSafetyOptions;
+  /** Observability: the safety filter fell back to rules only (fail-open). Reason class only, never text. */
+  onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void}
 /** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
 const DEPTH_READING_TTL_MS=200;
 const activeStates=['pending','retrieving','generating','validating'] as const;
@@ -32,7 +40,7 @@ function fencedStore(store:ConversationStore,fence:LeaseFence,events?:TurnEvents
   };
   return {
     create:(session,greeting)=>store.create(session,greeting),getOwnedSession:(id,owner)=>store.getOwnedSession(id,owner),
-    listOwnedSessions:owner=>store.listOwnedSessions(owner),history:(id,owner)=>store.history(id,owner),
+    listOwnedSessions:owner=>store.listOwnedSessions(owner),history:(id,owner)=>store.history(id,owner),refusedTurnIds:(id,owner)=>store.refusedTurnIds(id,owner),
     reserveTurn:(...args)=>store.reserveTurn(...args),getTurn:(id,owner)=>store.getTurn(id,owner),cancelTurn:(id,owner)=>store.cancelTurn(id,owner),
     transitionTurn:async(id,expected,next,errorCode)=>announce(await store.transitionTurn(id,expected,next,errorCode,fence),id,next,errorCode),
     completeTurn:async(id,reply)=>announce(await store.completeTurn(id,reply,fence),id,'completed'),
@@ -73,6 +81,22 @@ export class ChatService {
     // Not awaited: the cancel is committed; a slow or failing Redis must not hold the request.
     if(cancelled) void this.options.events?.publish({turnId,state:'cancelled'}).catch(()=>undefined);
     return cancelled;
+  }
+  /** Whether the input safety filter is configured (the API applies draft admission only then). */
+  get inputSafetyEnabled():boolean { return !!this.options.inputSafety; }
+  /**
+   * Input safety for a creative-draft brief: same questions, whole-text windows and fail-open as a turn, without
+   * history (seed = draft id). Refusal/support return the template to show instead of drafting; deflection returns the
+   * note for the draft's policy message. With the filter off nothing is checked.
+   */
+  async screenDraftBrief(brief:string,seed:string,language:string,signal:AbortSignal):Promise<{trace?:InputSafetyTrace;reply?:string;limitations:string[];policyNote?:string}> {
+    const options=this.options.inputSafety;
+    if(!options) return {limitations:[]};
+    const trace=safetyOutcome(await startSafetyAssessment(options,{text:brief,recentUserTurns:[],seed,intent:false,categories:SAFETY_CATEGORIES},signal).all,options,signal);
+    if(trace.fallbackReason) this.options.onSafetyFallback?.({scope:'draft',reason:trace.fallbackReason});
+    if((trace.action==='refuse'||trace.action==='support')&&trace.category)
+      return {trace,reply:safetyReply(trace.category as Exclude<SafetyCategory,'prompt_injection'>,language),limitations:trace.action==='support'?['SAFETY_SUPPORT']:[]};
+    return {trace,limitations:[],...(trace.action==='deflect'?{policyNote:SAFETY_DEFLECTION_NOTE}:{})};
   }
   /** Returns the reserved/current turn immediately; final output remains private until validation. */
   async startTurn(ownerId:string,input:SendTurnInput):Promise<ChatTurn> { return (await this.submitTurn(ownerId,input)).turn; }
@@ -154,10 +178,13 @@ export class ChatService {
     const raw=await this.options.personas.get(session.personaId,session.personaRevision);
     const persona=PersonaSchema.parse(raw);
     if(persona.id !== session.personaId || persona.personId !== session.personId || persona.revision !== session.personaRevision) throw new CoreError('PERSONA_UNAVAILABLE');
-    const context=retrievalContext(history,value.text,!!value.timeline);
+    // With the filter on, refused turns (from their turn records) are dropped from everything that builds prompts or
+    // retrieval queries; the full history still sizes the session and feeds the safety classifier's context.
+    const promptHistory=this.options.inputSafety?withoutRefusedTurns(history,await store.refusedTurnIds(session.id,session.ownerId)):history;
+    const context=retrievalContext(promptHistory,value.text,!!value.timeline);
     if(!value.timeline)query={...query,query:context.query};
     let memoryTrace:NonNullable<ChatReply['retrievalContext']>={revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]};
-    const previousMessage=[...history].reverse().find(message=>message.role==='user'&&message.turnId);
+    const previousMessage=[...promptHistory].reverse().find(message=>message.role==='user'&&message.turnId);
     const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await store.getTurn(previousMessage.turnId,session.ownerId):undefined;
     const ownedPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
       &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
@@ -170,9 +197,30 @@ export class ChatService {
     // Retrieval-off control sessions keep the pure rule routing (no classifier call) so experiment arms stay
     // unchanged; with a classifier configured, the internal trace still records that the rule decided.
     const control=session.retrievalMode==='off'&&!session.ragCondition;
-    const {intent,routing}=control&&this.options.intentClassifier?{intent:ruleIntent(signals),routing:{decidedBy:'rule' as const,ruleIntent:ruleIntent(signals)}}
-      :await routeIntent(signals,{text:[...value.text].slice(0,500).join(''),recentUserTurns,seed:turn.id},control?undefined:this.options.intentClassifier,controller.signal);
+    const classifierInput={text:[...value.text].slice(0,500).join(''),recentUserTurns,seed:turn.id};
+    // Input safety runs on every turn (control sessions included) over the whole message. Turns the rules refuse ask
+    // only self_harm (support may replace the refusal). When the intent gate is open, window 0 also answers intent.
+    const safetyOptions=this.options.inputSafety;const intentOptions=this.options.intentClassifier;
+    const rule=signals.sensitive?'sensitive_pattern' as const:signals.explicitIntent==='unsupported'?'client_unsupported' as const:undefined;
+    const combined=!!safetyOptions&&!!intentOptions&&!control&&needsIntentClassifier(signals);
+    const safetyRun=safetyOptions?startSafetyAssessment(safetyOptions,{text:value.text,recentUserTurns,seed:turn.id,intent:combined,categories:rule?RULE_PATH_CATEGORIES:SAFETY_CATEGORIES},controller.signal):undefined;
+    const classifier=safetyRun&&combined?{...intentOptions!,classifier:{name:intentOptions!.classifier.name,classify:async()=>{
+      const settled=await safetyRun.first;
+      if(!settled.ok) throw settled.error;
+      if(settled.value.intent instanceof Error) throw settled.value.intent;
+      return settled.value.intent;
+    }}}:intentOptions;
+    const routed=control&&intentOptions?{intent:ruleIntent(signals),routing:{decidedBy:'rule' as const,ruleIntent:ruleIntent(signals)}}
+      :await routeIntent(signals,classifierInput,control?undefined:classifier,controller.signal);
+    const routing=routed.routing;let intent=routed.intent;
+    let safety=safetyRun?safetyOutcome(await safetyRun.all,safetyOptions!,controller.signal,rule):undefined;
     if(controller.signal.aborted) return;
+    if(safety?.fallbackReason) this.options.onSafetyFallback?.({scope:'turn',reason:safety.fallbackReason});
+    // Refusal/support replies are deterministic templates (no chat model); deflection answers without retrieval.
+    const safetyCategory=safety?.decidedBy==='classifier'&&(safety.action==='refuse'||safety.action==='support')?safety.category as Exclude<SafetyCategory,'prompt_injection'>:undefined;
+    const deflect=safety?.action==='deflect';
+    if(safetyCategory) intent='unsupported';
+    else if(deflect&&intent==='timeline'&&session.retrievalMode!=='off') {intent='small_talk';safety={...safety!,intentOverride:'safety_deflect'};}
     let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
     let sources:SourcePost[]=[];
     let memorySources:SourcePost[]=[];
@@ -184,7 +232,7 @@ export class ChatService {
     let promptEvidence:ChatReply['promptEvidence'];
     let agent:ChatReply['agent'];
     if(intent==='clarification' || intent==='unsupported') {
-      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':'이 연구 자료 범위에서는 확인할 수 없어요.',claims:[],evidence:[],limitations:[]};
+      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':safetyCategory?safetyReply(safetyCategory,session.language):RULE_REFUSAL_REPLY,claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
     } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
       memoryTrace={...memoryTrace,action:'clarify'};
       output={status:'needs_clarification',content:'앞에서 여러 게시물을 봤어요. 어느 글이나 사진을 말하는 건가요?',claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
@@ -216,14 +264,15 @@ export class ChatService {
         if(session.ragCondition!=='caption_image') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
       if(!await store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
-      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,history,value.text,sources):undefined;
+      const policyNote=deflect?SAFETY_DEFLECTION_NOTE:undefined;
+      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,sources,policyNote?{policyNote}:undefined):undefined;
       memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
-        provider:this.options.provider,persona,history,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,
-        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),
-        ...(session.retrievalMode!=='off'&&!context.creative&&this.options.retrieval?{search:async(toolQuery:string)=>{
+        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,
+        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),
+        ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
           const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
           const found=filterEvidence(await this.options.retrieval!.search(scopedQuery,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic',
@@ -232,7 +281,7 @@ export class ChatService {
           return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
         }}:{}),
       }):undefined;
-      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,history,value.text,sources,intent==='timeline'),{signal:controller.signal});
+      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal});
       if(controller.signal.aborted) return;
       if(agentRun) {
         agent=agentRun.agent;memorySources=agentRun.context.sources;
@@ -250,7 +299,8 @@ export class ChatService {
             if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:'지금 자료만으로는 확실하게 이야기하기 어려워요.',claims:[],evidence:[],limitations:[`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
           }
         }
-        if(output.status==='answered')agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
+        // A deflected turn never updates the conversational state the injection attempt may have targeted.
+        if(output.status==='answered'&&!deflect)agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
         if(agentRun.serviceLimitation)output.limitations.push(agentRun.serviceLimitation);
         if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
       }
@@ -270,7 +320,7 @@ export class ChatService {
     if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
   }
 }

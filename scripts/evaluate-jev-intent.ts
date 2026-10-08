@@ -94,7 +94,7 @@ async function main():Promise<void> {
     if(before.callCap-before.calls<maxCalls||headroom<maxUsd*1e6) throw new Error('Ledger headroom below this run cap; not starting');
     let spentUsd=0;let calls=0;
     const ledger=new PostgresBudgetLedger(pool,databaseUrl);let created=false;let reservedMicrousd=0;
-    const traced={reserve:async(key:string,amount:number)=>{const saved=await ledger.reserve(key,amount);created=saved.created;reservedMicrousd=saved.request.reservedMicrousd;return saved;},
+    const traced={reserve:async(key:string,amount:number,reserveOptions?:{reservedCallFraction?:number})=>{const saved=await ledger.reserve(key,amount,reserveOptions);created=saved.created;reservedMicrousd=saved.request.reservedMicrousd;return saved;},
       submitted:(key:string)=>ledger.submitted(key),finish:(...a:Parameters<typeof ledger.finish>)=>ledger.finish(...a),get:(key:string)=>ledger.get(key)};
     // Generous transport timeout: the service's 1.5 s budget is applied when replaying, so no paid answer is abandoned.
     const client=new OpenRouterClient({...liveOptionsFromEnvironment({...process.env,GOAL1_DATABASE_URL:databaseUrl},traced),timeoutMs:15000});

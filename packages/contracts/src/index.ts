@@ -63,10 +63,26 @@ export interface ChatReply {
   retrievalContext?:{revision:string;action:'none'|'search'|'reuse'|'clarify';contextTurnIds:string[];query?:string;reusedSourceIds:string[]};
   /** Internal: which path decided intent when an intent classifier is configured. Never carries user text. */
   intentRouting?:IntentRouting;
+  /** Internal: input safety filter outcome when one is configured. Never carries user text. */
+  inputSafety?:InputSafetyTrace;
+}
+export type InputSafetyCategory='prompt_injection'|'sexual'|'violence_gore'|'self_harm'|'hate_harassment'|'illegal_dangerous'|'private_info';
+export interface InputSafetyTrace {
+  /** rule: a deterministic refusal stood (only the self_harm question was asked, and it did not fire or failed). */
+  decidedBy:'rule'|'classifier'|'classifier_fallback'; action:'none'|'refuse'|'support'|'deflect'; classifier?:string;
+  /** Which rule refused: the sensitive pattern, or the client's explicit `unsupported` intent (not a safety finding). */
+  rule?:'sensitive_pattern'|'client_unsupported';
+  /** The category that chose the action; fired lists every asked category at or above its threshold. */
+  category?:InputSafetyCategory; fired:InputSafetyCategory[]; probabilities?:Partial<Record<InputSafetyCategory,number>>;
+  /** Number of text windows checked when the message was longer than one window. */
+  windows?:number;
+  /** Set when deflection changed a timeline turn (which would have retrieved) to small talk. */
+  intentOverride?:'safety_deflect';
+  fallbackReason?:'timeout'|'aborted'|'budget'|'subcap'|'unresolved'|'error';
 }
 export interface IntentRouting {
   decidedBy:'rule'|'classifier'|'classifier_fallback'; ruleIntent:'small_talk'|'timeline'|'clarification'|'unsupported'; classifier?:string;
-  label?:'small_talk'|'timeline'; confidence?:number; fallbackReason?:'below_threshold'|'no_answer'|'timeout'|'aborted'|'budget'|'unresolved'|'error';
+  label?:'small_talk'|'timeline'; confidence?:number; fallbackReason?:'below_threshold'|'no_answer'|'timeout'|'aborted'|'budget'|'subcap'|'unresolved'|'error';
 }
 export interface ProviderMessage { role:'system'|'user'|'assistant'; content:string }
 export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'completed'|'failed'|'cancelled';

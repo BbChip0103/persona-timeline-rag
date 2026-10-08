@@ -1,5 +1,5 @@
 import { createLocalPool } from '@ptr/storage';
-import { MAX_TOTAL_MICROUSD, PostgresBudgetLedger } from '../src';
+import { MAX_TOTAL_MICROUSD, PostgresBudgetLedger, decisionCallsExhausted } from '../src';
 
 // Explicit test-only credential injection; never searches env files or touches shared DBs.
 const databaseUrl=process.env.GOAL1_TEST_DATABASE_URL;
@@ -40,5 +40,18 @@ const enabled=process.env.GOAL1_TEST_BUDGET_DB==='true'&&Boolean(databaseUrl);
   test('cap cannot be bypassed with unsafe pools or invalid reservation amounts',async()=>{
     expect(()=>new PostgresBudgetLedger({options:{connectionString:'postgresql://unsafe:unsafe@external/x'}} as never,databaseUrl!)).toThrow('UNSAFE_DATABASE_POOL');
     for(const amount of [0,-1,0.1,MAX_TOTAL_MICROUSD+1,Number.NaN]) await expect(ledger!.reserve(prefix+'invalid',amount)).rejects.toThrow('BUDGET_EXCEEDED');
+  });
+  test('decision sub-cap is checked in the reservation transaction; existing keys still replay',async()=>{
+    const budget=await pool!.query("SELECT b.call_cap,(SELECT count(*) FROM ptr_provider_requests) AS calls FROM ptr_provider_budget b WHERE b.id='global'");
+    const callCap=Number(budget.rows[0].call_cap),calls=Number(budget.rows[0].calls);
+    // Keep every remaining call free for chat: refused whatever the ledger holds; the shared global cap is never changed.
+    const share=(callCap-calls)/callCap;
+    expect(decisionCallsExhausted(calls,callCap,share)).toBe(true);
+    await expect(ledger!.reserve(prefix+'subcap',1,{reservedCallFraction:share})).rejects.toThrow('DECISION_SUBCAP');
+    expect(await ledger!.get(prefix+'subcap')).toBeUndefined();
+    const saved=await ledger!.reserve(prefix+'subcap',1,{reservedCallFraction:0});
+    expect(saved.created).toBe(true);
+    expect((await ledger!.reserve(prefix+'subcap',1,{reservedCallFraction:share})).created).toBe(false);
+    await ledger!.finish(prefix+'subcap',0,null,null);
   });
 });

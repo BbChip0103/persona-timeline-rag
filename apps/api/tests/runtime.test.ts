@@ -59,3 +59,26 @@ test('PTR_INTENT_CLASSIFIER=jev is off by default, needs the live gates, and val
   for(const env of [{PTR_INTENT_CLASSIFIER:'llm'},{PTR_JEV_MIN_CONFIDENCE:'0'},{PTR_JEV_MIN_CONFIDENCE:'1.2'},{PTR_JEV_MIN_CONFIDENCE:'x'},{PTR_JEV_TIMEOUT_MS:'10'},{PTR_JEV_TIMEOUT_MS:'1500.5'},{PTR_JEV_MODEL:'~typesafe/jev-latest'},{PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'}])
     expect(()=>createRuntime({...live,...env})).toThrow();
 });
+test('PTR_SAFETY_FILTER=jev is off by default, separate from the intent classifier, and validates its thresholds',async()=>{
+  type Options={inputSafety?:{classifier:{name:string};thresholds:Record<string,number>;timeoutMs:number};intentClassifier?:unknown};
+  const optionsOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.chat as unknown as {options:Options}).options;
+  const off=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl});
+  expect(optionsOf(off).inputSafety).toBeUndefined();await off.close?.();
+  const live={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_SAFETY_FILTER:'jev',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true',OPENROUTER_API_KEY:'synthetic-private-key'};
+  const safety=createRuntime({...live,PTR_SAFETY_THRESHOLD_SELF_HARM:'0.2'});
+  // Own deadline (default 2500 ms): full 4100-code-point windows measured p50 625 / max 1244 ms on 2026-10-08.
+  expect(optionsOf(safety).inputSafety).toMatchObject({classifier:{name:'typesafe/jev-1.13'},timeoutMs:2500,thresholds:{self_harm:0.2,sexual:expect.any(Number)}});
+  const tuned=createRuntime({...live,PTR_SAFETY_TIMEOUT_MS:'3000'});expect(optionsOf(tuned).inputSafety?.timeoutMs).toBe(3000);await tuned.close?.();
+  expect(optionsOf(safety).intentClassifier).toBeUndefined();expect(safety.provider).toBeInstanceOf(FakeTextProvider);
+  // Fallbacks are logged by default as a sanitized counter line.
+  const write=jest.spyOn(process.stderr,'write').mockImplementation(()=>true);
+  const log=(safety.chat as unknown as {options:{onSafetyFallback:(event:{scope:string;reason:string})=>void}}).options.onSafetyFallback;
+  log({scope:'turn',reason:'budget'});log({scope:'turn',reason:'budget'});
+  expect(write.mock.calls.map(([line])=>String(line))).toEqual(['input_safety_fallback scope=turn reason=budget count=1\n','input_safety_fallback scope=turn reason=budget count=2\n']);
+  write.mockRestore();await safety.close?.();
+  const both=createRuntime({...live,PTR_INTENT_CLASSIFIER:'jev'});
+  expect(optionsOf(both).intentClassifier).toBeDefined();expect(optionsOf(both).inputSafety).toBeDefined();await both.close?.();
+  expect(()=>createRuntime({...live,GOAL1_LIVE_ENABLED:'false'})).toThrow('LIVE_DISABLED');
+  for(const env of [{PTR_SAFETY_FILTER:'regex'},{PTR_SAFETY_THRESHOLD_SEXUAL:'0'},{PTR_SAFETY_THRESHOLD_SEXUAL:'1.1'},{PTR_SAFETY_THRESHOLD_PRIVATE_INFO:'x'},{PTR_JEV_TIMEOUT_MS:'10'},{PTR_JEV_RESERVED_CALL_FRACTION:'1'},{PTR_JEV_RESERVED_CALL_FRACTION:''},{PTR_SAFETY_TIMEOUT_MS:'10'},{PTR_SAFETY_TIMEOUT_MS:'2500.5'},{PTR_SAFETY_TIMEOUT_MS:'20000'},{PTR_JEV_RESERVED_CALL_FRACTION:' '},{PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'}])
+    expect(()=>createRuntime({...live,...env})).toThrow();
+});
