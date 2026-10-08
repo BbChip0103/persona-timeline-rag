@@ -1,1 +1,1 @@
-{"name":"@ptr/gateway","version":"0.1.0","private":true,"main":"src/main.ts","scripts":{"start":"tsx src/main.ts"},"dependencies":{"@ptr/contracts":"workspace:*","@ptr/core":"workspace:*","@ptr/providers":"workspace:*","@ptr/storage":"workspace:*"}}
+{"name":"@ptr/gateway","version":"0.1.0","private":true,"main":"src/main.ts","scripts":{"start":"tsx src/main.ts"},"dependencies":{"@ptr/contracts":"workspace:*","@ptr/core":"workspace:*","@ptr/messaging":"workspace:*","@ptr/providers":"workspace:*","@ptr/storage":"workspace:*"}}

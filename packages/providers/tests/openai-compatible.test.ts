@@ -216,10 +216,41 @@ describe('gateway connection resets, retries and URL rotation',()=>{
     await gatewayClient(full,{baseUrl:urls}).generate(messages,{signal:signal(),...key});
     expect(urlOf(full,1)).toContain(':18000/');
   });
-  test('every gateway URL must be loopback',()=>{
-    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://10.0.0.5:18001/v1']})).toThrow();
+  test('every gateway URL must be loopback; a duplicate URL has its own code',()=>{
+    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://10.0.0.5:18001/v1']})).toThrow(new ProviderError('ENDPOINT_NOT_LOOPBACK'));
     expect(()=>provider(jest.fn(),{baseUrl:[]})).toThrow();
-    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18000/v1/']})).toThrow();
+    expect(()=>provider(jest.fn(),{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18000/v1/']})).toThrow(new ProviderError('ENDPOINT_DUPLICATE'));
+  });
+  test('a marked rejection is not resent when its wait would leave less than retryMinRemainingMs of the turn: it fails with the rejection code',async()=>{
+    // Retry-After 4 s × U(0.5,1.5) with random 0 = 2 s wait; 6 s left < 2 s + 5 s.
+    const late=jest.fn().mockResolvedValueOnce(marked(429,'queue_full','4')).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    const started=Date.now();
+    await expect(gatewayClient(late,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+6000}))
+      .rejects.toEqual(new ProviderError('PROVIDER_HTTP_429'));
+    expect(late).toHaveBeenCalledTimes(1);expect(Date.now()-started).toBeLessThan(1000);
+    const timeout=jest.fn().mockResolvedValueOnce(marked(503,'queue_timeout','1'));
+    await expect(gatewayClient(timeout,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+5200}))
+      .rejects.toEqual(new ProviderError('PROVIDER_HTTP_503'));
+    // Enough time left: resent as before.
+    const early=jest.fn().mockResolvedValueOnce(marked(429,'queue_full','0')).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    expect(await gatewayClient(early,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+20000})).toBe('ok');
+  });
+  test('a draining rejection with no untried URL left is not resent late in the turn either',async()=>{
+    const draining=jest.fn().mockResolvedValue(marked(503,'draining','1'));
+    await expect(gatewayClient(draining,{baseUrl:['http://127.0.0.1:18000/v1','http://127.0.0.1:18001/v1'],timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+3000}))
+      .rejects.toEqual(new ProviderError('PROVIDER_HTTP_503'));
+    expect(draining).toHaveBeenCalledTimes(1);
+  });
+  test('a refused connection is not resent when less than wait + retryMinRemainingMs is left: PROVIDER_TRANSPORT at once',async()=>{
+    const fetcher=jest.fn(async()=>{throw refused();});
+    const started=Date.now();
+    await expect(gatewayClient(fetcher,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+3000}))
+      .rejects.toEqual(new ProviderError('PROVIDER_TRANSPORT'));
+    expect(fetcher).toHaveBeenCalledTimes(1);expect(Date.now()-started).toBeLessThan(1000);
+    // With time left it keeps retrying until the gateway is back.
+    const back=jest.fn().mockRejectedValueOnce(refused()).mockRejectedValueOnce(refused()).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    expect(await gatewayClient(back,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+20000})).toBe('ok');
+    expect(back).toHaveBeenCalledTimes(3);
   });
 });
 

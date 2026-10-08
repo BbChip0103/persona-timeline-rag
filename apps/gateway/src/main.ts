@@ -1,13 +1,17 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 import { createLocalPool } from '@ptr/storage';
+import { POOL_NAME, REGISTRY_PREFIX, RedisUpstreamRegistry, assertRegistryPrefix, createRedisConnection, type UpstreamRecord } from '@ptr/messaging';
 import { createGateway } from './server';
-import { DEFAULT_FAILOVER, FailoverUpstream, type FailoverOptions } from './failover';
+import { FailoverUpstream } from './failover';
+import { DEFAULT_FAILOVER, UpstreamPool, type FailoverOptions } from './pool';
+import { FileUpstreamSource, RedisRegistrySource, StaticUpstreamSource, checkUpstreamUrl, parseUpstreamAllow, type UpstreamSource } from './sources';
 import { OpenAICompatibleUpstream, TextProviderUpstream, type Upstream } from './upstreams';
 
 /**
- * LLM gateway process. One upstream per process, chosen by PTR_GATEWAY_UPSTREAM; a self-hosted primary may add a
- * failover secondary (PTR_GATEWAY_FAILOVER=openrouter, or fake for load tests) used only when the primary certainly
- * did not receive the request (see FailoverUpstream). Default off.
+ * LLM gateway process. PTR_GATEWAY_UPSTREAM picks the upstream kind. A self-hosted primary is either one engine
+ * (PTR_SELFHOSTED_BASE_URL, unchanged behaviour) or a pool whose members come from PTR_GATEWAY_UPSTREAMS_FILE and/or the
+ * Redis registry (PTR_GATEWAY_DISCOVERY=redis), see UpstreamPool. Either may add a failover secondary
+ * (PTR_GATEWAY_FAILOVER=openrouter, or fake for load tests) used only when no primary received the request. Default off.
  */
 function integer(env:NodeJS.ProcessEnv,name:string,fallback:number,min:number,max:number):number {
   const value=Number(env[name]??fallback);
@@ -44,27 +48,76 @@ function openRouterUpstream(env:NodeJS.ProcessEnv,model:string|undefined,checkAt
     return {upstream:new TextProviderUpstream(client,model??DEFAULT_TEXT_MODEL,checkAtStartup?secondaryReady(client,ledgerReady(pool)):undefined),close:()=>pool.end()};
   } catch(error) {void pool.end();throw error;}
 }
-export function upstreamFromEnvironment(env:NodeJS.ProcessEnv):{upstream:Upstream;close?:()=>Promise<void>} {
-  const kind=env.PTR_GATEWAY_UPSTREAM??'fake', failover=env.PTR_GATEWAY_FAILOVER??'off';
+/** Breaker / failover settings (self-hosted primaries). */
+function failoverOptions(env:NodeJS.ProcessEnv):FailoverOptions {
+  // The primary here is always self-hosted (not billed per request), so a close before any response fails over by default.
+  const onClose=env.PTR_GATEWAY_FAILOVER_ON_CLOSE??'true';
+  if(onClose!=='true'&&onClose!=='false') throw new Error('INVALID_PTR_GATEWAY_FAILOVER_ON_CLOSE');
+  return {failureThreshold:integer(env,'PTR_GATEWAY_BREAKER_FAILURES',DEFAULT_FAILOVER.failureThreshold,1,100),
+    timeoutThreshold:integer(env,'PTR_GATEWAY_BREAKER_TIMEOUTS',DEFAULT_FAILOVER.timeoutThreshold,1,100),
+    cooldownMs:integer(env,'PTR_GATEWAY_BREAKER_COOLDOWN_MS',DEFAULT_FAILOVER.cooldownMs,1000,3600000),
+    probeTimeoutMs:integer(env,'PTR_GATEWAY_BREAKER_PROBE_TIMEOUT_MS',DEFAULT_FAILOVER.probeTimeoutMs,100,30000),
+    headersTimeoutMs:integer(env,'PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS',DEFAULT_FAILOVER.headersTimeoutMs,0,600000),
+    maxPerMinute:integer(env,'PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE',DEFAULT_FAILOVER.maxPerMinute,1,100000),
+    failOverOnClose:onClose==='true'};
+}
+type Configured={upstream:Upstream;close?:()=>Promise<void>;reload?:()=>void};
+/**
+ * Pool of self-hosted engines : static discovery reads PTR_GATEWAY_UPSTREAMS_FILE (mtime + SIGHUP);
+ * redis discovery polls the registry and uses the file (or PTR_SELFHOSTED_BASE_URL as one entry) as its seed.
+ */
+function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:string):Configured {
+  const model=env.PTR_GATEWAY_POOL??env.PTR_SELFHOSTED_MODEL;
+  if(!model) throw new Error('POOL_NOT_CONFIGURED');
+  if(!POOL_NAME.test(model)) throw new Error('INVALID_PTR_GATEWAY_POOL');
+  if(env.PTR_GATEWAY_UPSTREAMS_FILE&&env.PTR_SELFHOSTED_BASE_URL) throw new Error('SELFHOSTED_BASE_URL_WITH_UPSTREAMS_FILE');
+  const options={failover:failoverOptions(env),primaryAttempts:integer(env,'PTR_GATEWAY_PRIMARY_ATTEMPTS',2,1,8),
+    slowStartMs:integer(env,'PTR_GATEWAY_SLOW_START_MS',30000,0,600000),queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000)};
+  // A request may wait the queue timeout twice (admission queue, then for a free upstream) inside the upstream deadline;
+  // past it a pool wait would end as an unmarked 504 instead of the retryable 503.
+  if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=2*options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');
+  const allow=parseUpstreamAllow(env.PTR_GATEWAY_UPSTREAM_ALLOW);
+  const pollMs=integer(env,'PTR_GATEWAY_REGISTRY_POLL_MS',2000,100,60000), graceMs=integer(env,'PTR_GATEWAY_REGISTRY_GRACE_MS',10000,0,600000);
+  const prefix=assertRegistryPrefix(env.PTR_REGISTRY_PREFIX??REGISTRY_PREFIX);
+  const file=env.PTR_GATEWAY_UPSTREAMS_FILE?new FileUpstreamSource(env.PTR_GATEWAY_UPSTREAMS_FILE,model):undefined;
+  let seed:UpstreamSource|undefined=file;
+  if(env.PTR_SELFHOSTED_BASE_URL) {
+    if(checkUpstreamUrl(env.PTR_SELFHOSTED_BASE_URL)) throw new Error('UPSTREAM_NOT_LOOPBACK');
+    const one:UpstreamRecord={pool:model,id:'selfhosted',baseUrl:env.PTR_SELFHOSTED_BASE_URL,maxSeqs:12,kvCapacityTokens:null,weight:1,state:'active',epoch:'env',seq:0};
+    seed=new StaticUpstreamSource([one]);
+  }
+  let source:UpstreamSource, redis:ReturnType<typeof createRedisConnection>|undefined;
+  if(discovery==='redis') {
+    redis=createRedisConnection(env.PTR_REDIS_URL??'');
+    redis.on('error',()=>undefined); // reconnects on its own; an outage shows as registry_stale
+    source=new RedisRegistrySource(new RedisUpstreamRegistry(redis,prefix),{pool:model,allow,pollMs,graceMs,seed});
+  } else source=file!;
+  let secondary:{upstream:Upstream;close?:()=>Promise<void>}|undefined;
+  try {
+    if(failover==='fake') secondary={upstream:fakeUpstream(env)};
+    else if(failover==='openrouter') secondary=openRouterUpstream(env,FAILOVER_MODEL,true);
+  } catch(error) {redis?.disconnect();throw error;}
+  const pool=new UpstreamPool({model,source,...options,...(secondary?{secondary:secondary.upstream}:{})});
+  return {upstream:pool,
+    close:async()=>{await pool.close();redis?.disconnect();await secondary?.close?.();},
+    ...(file?{reload:()=>file.reload()}:{})};
+}
+export function upstreamFromEnvironment(env:NodeJS.ProcessEnv):Configured {
+  const kind=env.PTR_GATEWAY_UPSTREAM??'fake', failover=env.PTR_GATEWAY_FAILOVER??'off', discovery=env.PTR_GATEWAY_DISCOVERY??'static';
   if(!['off','openrouter','fake'].includes(failover)) throw new Error('INVALID_PTR_GATEWAY_FAILOVER');
+  if(!['static','redis'].includes(discovery)) throw new Error('INVALID_PTR_GATEWAY_DISCOVERY');
+  const pooled=discovery==='redis'||!!env.PTR_GATEWAY_UPSTREAMS_FILE;
+  if(pooled&&kind!=='selfhosted') throw new Error('UPSTREAMS_REQUIRE_SELFHOSTED');
   if(failover!=='off'&&kind!=='selfhosted') throw new Error('FAILOVER_REQUIRES_SELFHOSTED');
   if(kind==='fake') return {upstream:fakeUpstream(env)};
   // Latency injection only ever wraps the fake model (here: the load-test fake failover secondary).
   if(env.PTR_FAKE_LATENCY!==undefined&&failover!=='fake') throw new Error('LATENCY_INJECTION_ONLY_FOR_FAKE');
   if(kind==='selfhosted') {
+    if(pooled) return poolFromEnvironment(env,discovery,failover);
     if(!env.PTR_SELFHOSTED_BASE_URL||!env.PTR_SELFHOSTED_MODEL) throw new Error('SELFHOSTED_NOT_CONFIGURED');
     const primary=new OpenAICompatibleUpstream({baseUrl:env.PTR_SELFHOSTED_BASE_URL,model:env.PTR_SELFHOSTED_MODEL});
     if(failover==='off') return {upstream:primary};
-    // The primary here is always self-hosted (not billed per request), so a close before any response fails over by default.
-    const onClose=env.PTR_GATEWAY_FAILOVER_ON_CLOSE??'true';
-    if(onClose!=='true'&&onClose!=='false') throw new Error('INVALID_PTR_GATEWAY_FAILOVER_ON_CLOSE');
-    const options:FailoverOptions={failureThreshold:integer(env,'PTR_GATEWAY_BREAKER_FAILURES',DEFAULT_FAILOVER.failureThreshold,1,100),
-      timeoutThreshold:integer(env,'PTR_GATEWAY_BREAKER_TIMEOUTS',DEFAULT_FAILOVER.timeoutThreshold,1,100),
-      cooldownMs:integer(env,'PTR_GATEWAY_BREAKER_COOLDOWN_MS',DEFAULT_FAILOVER.cooldownMs,1000,3600000),
-      probeTimeoutMs:integer(env,'PTR_GATEWAY_BREAKER_PROBE_TIMEOUT_MS',DEFAULT_FAILOVER.probeTimeoutMs,100,30000),
-      headersTimeoutMs:integer(env,'PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS',DEFAULT_FAILOVER.headersTimeoutMs,0,600000),
-      maxPerMinute:integer(env,'PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE',DEFAULT_FAILOVER.maxPerMinute,1,100000),
-      failOverOnClose:onClose==='true'};
+    const options=failoverOptions(env);
     if(failover==='fake') return {upstream:new FailoverUpstream(primary,fakeUpstream(env),options)};
     const secondary=openRouterUpstream(env,FAILOVER_MODEL,true);
     return {upstream:new FailoverUpstream(primary,secondary.upstream,options),close:secondary.close};
@@ -74,7 +127,7 @@ export function upstreamFromEnvironment(env:NodeJS.ProcessEnv):{upstream:Upstrea
 }
 async function main() {
   const env=process.env;
-  const {upstream,close}=upstreamFromEnvironment(env);
+  const {upstream,close,reload}=upstreamFromEnvironment(env);
   // Failover: the secondary must be usable (ledger readable, price verified) before any traffic is accepted.
   try {await upstream.ready?.(AbortSignal.timeout(30000));} catch(error) {await close?.();throw error;}
   const {server}=createGateway({token:env.PTR_GATEWAY_TOKEN??'',upstream,limits:{
@@ -92,5 +145,7 @@ async function main() {
     void Promise.race([drained,deadline]).then(()=>close?.()).finally(()=>process.exit(0));
   };
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
+  // PTR_GATEWAY_UPSTREAMS_FILE is re-read on SIGHUP (and when its mtime changes).
+  if(reload) process.on('SIGHUP',reload);
 }
 if(require.main===module) void main().catch(()=>{process.stderr.write('GATEWAY_STARTUP_FAILED\n');process.exitCode=1;});

@@ -114,6 +114,9 @@ importers:
       '@ptr/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@ptr/messaging':
+        specifier: workspace:*
+        version: link:../../packages/messaging
       '@ptr/providers':
         specifier: workspace:*
         version: link:../../packages/providers

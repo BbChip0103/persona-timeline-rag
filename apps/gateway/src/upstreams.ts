@@ -1,5 +1,5 @@
 import type { ProviderMessage } from '@ptr/contracts';
-import type { FailoverMetrics } from './failover';
+import type { FailoverMetrics, PoolMetrics } from './pool';
 
 export interface ChatCompletionRequest { messages:{role:string;content:string}[]; stream?:boolean; [key:string]:unknown }
 /** Per-request context from the caller: `requestKey` (X-PTR-Request-Key, the worker's turn id) scopes billing idempotency. */
@@ -9,8 +9,12 @@ export interface UpstreamResult { status:number; contentType:string; body:AsyncI
 export interface Upstream {
   readonly model:string; complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult>;
   failoverMetrics?():FailoverMetrics;
+  /** Upstream pools (file or registry discovery) only. */
+  poolMetrics?():PoolMetrics;
   /** Checked once before the gateway listens; a rejection fails startup. */
   ready?(signal:AbortSignal):Promise<void>;
+  /** Stops background work (registry polling) at shutdown. */
+  close?():Promise<void>;
 }
 
 /**

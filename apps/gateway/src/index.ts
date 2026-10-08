@@ -2,3 +2,6 @@ export * from './limiter';
 export * from './upstreams';
 export * from './server';
 export * from './failover';
+export * from './health';
+export * from './pool';
+export * from './sources';

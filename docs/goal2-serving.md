@@ -14,7 +14,8 @@ client ─POST /api/sessions/:id/turns──→ API ×N ── one transaction: 
                                             ▲   state notices ◀── publish ──┘   │
        dispatcher ×D: requeue expired leases / WORKER_LOST, re-publish unclaimed outbox entries
                                                                                 ▼
-                       LLM gateway (one upstream: fake | self-hosted vLLM [+ optional OpenRouter failover] | OpenRouter)
+                       LLM gateway (fake | self-hosted vLLM: one engine or a pool from a file / the Redis registry
+                                    [+ optional OpenRouter failover] | OpenRouter)
 ```
 
 Every turn runs queued; there is no inline mode (`PTR_EXECUTION` is rejected at startup). Processes:
@@ -98,13 +99,14 @@ client below.
 
 Retry rules (one `generate()` call, all inside the call deadline, the turn deadline and the caller's signal). The turn
 times out after 30 s (`ChatService` `timeoutMs`) and passes that deadline to every model call as `deadlineAt`; the
-provider's own 60 s timeout only matters for callers without a turn. Duplicate URLs are rejected at startup.
+provider's own 60 s timeout only matters for callers without a turn. Duplicate URLs are rejected at startup
+(`ENDPOINT_DUPLICATE`; a non-loopback URL is `ENDPOINT_NOT_LOOPBACK`).
 
 | Failure | Retried? | Next URL? | Wait |
 | --- | --- | --- | --- |
-| connection refused (`ECONNREFUSED`): nothing was sent | yes, until the deadline | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
-| 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, until the deadline | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
-| the same, reason `draining` (sent by drain, a later stage) | yes | yes | none before an untried URL, else as above |
+| connection refused (`ECONNREFUSED`): nothing was sent | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_TRANSPORT` at once | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
+| 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_HTTP_429` / `PROVIDER_HTTP_503` at once | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
+| the same, reason `draining` (sent by drain, a later stage) | yes (same time rule) | yes | none before an untried URL, else as above |
 | reset or close before the response headers, or a failed connect: a fetch `TypeError` whose cause code is `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET` ("other side closed"), `UND_ERR_CLOSED`, `UND_ERR_CONNECT_TIMEOUT`, `EHOSTUNREACH` or `ENETUNREACH` | only with a request key, at most `PTR_GATEWAY_RESET_RETRIES` in total, only with ≥ `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` left | yes | full jitter `U(0, min(2000, 200·2^k))` ms |
 | reset while reading the SSE body after a 200 (same codes), or a stream that ends cleanly without `[DONE]` or a `finish_reason` | as above; the partial text and its usage are discarded (only a complete answer is returned) | yes | as above |
 | any other HTTP status (502/504/500/4xx, an unmarked 503), our own abort or timeout, `INVALID_PROVIDER_RESPONSE` (empty or > 65536 chars), malformed SSE JSON, any other transport error (bad port, unexpected redirect, a `TypeError` without a known code) | never | — | — |
@@ -147,8 +149,10 @@ The load harness prints the same check (`report.capacityCheck`). Its fake-model 
 sized so the gateway is never the bottleneck. The S9 setting of 4 workers × 512 broke the rule; it measured fake
 throughput only.
 
-Upcoming upstream pools (design stage S3) replace the single cap with per-upstream caps `S_u`; the default will be
-`S_u = 12` concurrent sequences per upstream, and the rule becomes Σ worker concurrency ≤ Σ_u S_u + max queue.
+With an upstream pool (below) each upstream also has its own cap `maxSeqs` (default 12), and the rule becomes
+Σ worker concurrency ≤ min(`PTR_GATEWAY_MAX_CONCURRENCY`, Σ_u maxSeqs_u) + max queue. `/metrics` `capacity` still
+reports the gateway-wide numbers only; the capacity controller (design stage S2b) will enforce the rule from the
+registry.
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -252,6 +256,142 @@ Runbook:
 - **Breaker stuck open:** `/health` on the engine origin is failing; check the engine and the SSH tunnel (`curl http://127.0.0.1:<port>/health`).
 - **Stop paid traffic:** restart the gateway without `PTR_GATEWAY_FAILOVER`, lower `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE`, or lower the ledger caps. In-flight secondary calls finish within the shutdown drain.
 
+### Upstream pools and the GPU server registry (stage S2)
+
+A self-hosted gateway can front a **pool** of engines that serve the same model instead of one
+`PTR_SELFHOSTED_BASE_URL`. The member set is dynamic: engines join and leave while the gateway runs.
+
+Sources (`UpstreamSource`):
+- **env only** (`PTR_SELFHOSTED_BASE_URL` + `PTR_SELFHOSTED_MODEL`, nothing below set): the single upstream as before.
+  It behaves exactly like a pool built from a file with one entry (`apps/gateway/tests/pool.test.ts` compares the
+  bytes); the failover wrapper is now that one-entry pool internally.
+- **file** (`PTR_GATEWAY_UPSTREAMS_FILE`, `PTR_GATEWAY_DISCOVERY=static`): JSON as in
+  `configs/gateway-upstreams.example.json`. The gateway serves one pool, `PTR_GATEWAY_POOL` (default
+  `PTR_SELFHOSTED_MODEL`); the pool name is the model name sent to the engines (their `--served-model-name`).
+  Entries: `id`, `baseUrl` (loopback rule only: operator config), `maxSeqs` (12), `kvCapacityTokens` (null; used by the
+  credit stage later), `weight` (1). The file is re-read when its mtime changes (checked every 5 s) and on `SIGHUP`;
+  an invalid file fails startup, an invalid edit keeps the last good list (`fileErrors`, one stderr line, no contents).
+  `PTR_SELFHOSTED_BASE_URL` together with a file is a startup error.
+- **redis** (`PTR_GATEWAY_DISCOVERY=redis`, `PTR_REDIS_URL`): the registry below. The file (or else
+  `PTR_SELFHOSTED_BASE_URL` as one entry `selfhosted`) is only the seed: the membership until the registry has been
+  read once (Redis unreachable at startup). From the first successful read on, the registry is the only authority,
+  so a drained or removed upstream never comes back from the seed, and the seed's id never doubles an engine that its
+  agent registers under another id.
+
+Registry layout (`packages/messaging/src/upstream-registry.ts`, prefix `PTR_REGISTRY_PREFIX`, default `ptr:llm`; it must
+end in `:llm`, so it can never touch `ptr:turns:*` or `ptr:events:*`):
+
+```text
+ptr:llm:up:<pool>:<id>   HASH {pool,id,baseUrl,maxSeqs,kvCapacityTokens,weight,state(active|draining),epoch,seq}  PEXPIRE 10000
+ptr:llm:ups:<pool>       ZSET member=<id> score=expiresAtMs   (read with ZRANGEBYSCORE now +inf; writers trim expired entries)
+ptr:llm:reg:ver          INCR on every new record, field change, drain or removal
+ptr:llm:reg              PUB/SUB, empty message = "poll now"
+```
+
+Writes are Lua scripts (atomic): a heartbeat carries the publisher's state and refreshes TTL, index and `seq`; it never
+turns a `draining` record of the same epoch back to `active`, and a draining agent's heartbeat recreates an expired
+record as draining; a new id or epoch, or a changed field, bumps the version and publishes.
+
+Gateway behaviour (`RedisRegistrySource` + `UpstreamPool`):
+- **Discovery:** polls every `PTR_GATEWAY_REGISTRY_POLL_MS` (2000) and at once on a nudge; lost nudges are covered by
+  the next poll. A new id, or a new **epoch** for a known id (the engine restarted), is a new upstream: fresh breaker,
+  slow start. Upstreams present when the gateway starts begin at full capacity.
+- **Slow start:** a newly added upstream's limit is `max(1, floor(maxSeqs · min(1, Δt / PTR_GATEWAY_SLOW_START_MS)))`
+  (30000; 0 = off). This applies on every add, including an agent that comes back with the same epoch, so a flapping
+  upstream never receives a burst.
+- **Selection (interim, until S3's credit-based scoring):** among upstreams that are active, not draining, with a closed
+  breaker and below their limit, the one with the fewest calls in flight (ties rotate). If all are at their limit the
+  request waits in the gateway (no spillover) up to `PTR_GATEWAY_QUEUE_TIMEOUT_MS`, then gets the marked 503
+  `GATEWAY_QUEUE_TIMEOUT` (nothing was sent, so the worker resends). An empty pool without failover waits the same way.
+- **Drain / expiry:** `state=draining` or a record that left the registry gets no new calls at once; its in-flight
+  calls finish. A changed `maxSeqs` applies to the next dispatch (in-flight calls are kept).
+- **Breaker per upstream** (`UpstreamHealth`, the former failover breaker unchanged: `PTR_GATEWAY_BREAKER_*`). An open
+  upstream is skipped; others serve meanwhile and a background `/health` probe lets it back after the cooldown
+  (waiting requests are woken when a breaker closes). With no other upstream and no failover the open one is still
+  tried, exactly like a single upstream without a breaker.
+- **Connection failures** (nothing reached the engine; with `PTR_GATEWAY_FAILOVER_ON_CLOSE=true` also a close before
+  any response byte) are retried on another upstream, at most `PTR_GATEWAY_PRIMARY_ATTEMPTS` (2) upstreams per request,
+  then on the failover secondary if configured. If the other upstreams stay full until the queue timeout, the original
+  connection error is returned (or the secondary used), never the marked "nothing was sent" 503, because a close
+  before response may have reached the engine. Timeouts, HTTP errors and streams cut mid-response are not retried here
+  (a cut stream is retried by the worker's reset rule). The secondary is used only when no primary could take the
+  request: all breakers open, none registered (`no_upstream`), or all tried primaries failed to connect. "All busy"
+  waits; it never fails over.
+- **Redis unreachable:** the membership is **frozen** (no additions, no expiry; dead engines are left to the breakers),
+  `registry.stale=true`. Once readable again, records missing from the registry are kept for
+  `PTR_GATEWAY_REGISTRY_GRACE_MS` (10000 = the TTL) before they are dropped, because the agents' next heartbeat may not
+  have landed yet or Redis expired the records during the outage. One failed poll is enough to arm the grace, so an
+  upstream removed right after a short blip may stay listed for up to 10 s (its breaker covers it). BullMQ shares this
+  Redis, so no new turns start during the outage anyway.
+
+Security (single host): anyone with the Redis password can write a record, and a record decides where
+prompts (user data) are sent. The gateway therefore applies the existing loopback rule to every record's `baseUrl`
+(`http`, `127.0.0.1`, no credentials, query or fragment) **and** `PTR_GATEWAY_UPSTREAM_ALLOW`, a comma list of
+`127.0.0.1:<port>` or `127.0.0.1:<from>-<to>` (default `127.0.0.1:18000-18999`; anything else is a startup error).
+Records that fail are ignored and counted once per record version in `registry.rejected` / `rejectedReasons`
+(`not_loopback`, `not_allowed`, `invalid_record`, `pool_mismatch`, and `duplicate_url`: a second id for a `baseUrl`
+already listed, which would double that engine's `maxSeqs`); they are never logged with their URL. File and env
+entries are operator config and need only the loopback rule. Records are not signed; multi-host operation (TLS, Redis
+ACL users, HMAC-signed records, a host/CIDR allowlist) is a later, separately approved stage.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_DISCOVERY` | `static` | `static` (env or file) or `redis` |
+| `PTR_GATEWAY_UPSTREAMS_FILE` | — | pool file (static source, or seed for redis); requires `PTR_GATEWAY_UPSTREAM=selfhosted` |
+| `PTR_GATEWAY_POOL` | `PTR_SELFHOSTED_MODEL` | pool served by this gateway = model name sent upstream |
+| `PTR_GATEWAY_UPSTREAM_ALLOW` | `127.0.0.1:18000-18999` | ports registry records may use |
+| `PTR_GATEWAY_SLOW_START_MS` | 30000 (0–600000) | ramp of a newly added upstream's limit |
+| `PTR_GATEWAY_PRIMARY_ATTEMPTS` | 2 (1–8) | upstreams tried per request on connection failures |
+| `PTR_GATEWAY_REGISTRY_POLL_MS` | 2000 (100–60000) | registry poll interval |
+| `PTR_GATEWAY_REGISTRY_GRACE_MS` | 10000 (0–600000) | keep-missing-records grace after Redis comes back |
+| (check) | — | with a pool, `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` must exceed 2 × `PTR_GATEWAY_QUEUE_TIMEOUT_MS` (admission queue + upstream wait), else startup fails |
+| `PTR_REGISTRY_PREFIX` | `ptr:llm` | registry namespace (`…:llm`; tests use `ptrtest:<run>:llm`) |
+| `PTR_UPSTREAM_HEARTBEAT_MS` / `PTR_UPSTREAM_TTL_MS` | 2000 / 10000 | agent heartbeat and record TTL (TTL ≥ 2 × heartbeat) |
+| `PTR_UPSTREAM_DRAIN_SETTLE_MS` | 4000 | agent drain: minimum wait before checking the engine is idle (two gateway polls) |
+| `PTR_UPSTREAM_DRAIN_MAX_MS` | 120000 | agent drain: upper bound before the record is deleted anyway |
+
+`/metrics` with a pool adds `pool`: `members` {active, ramping, draining, gone, breakerOpen}, `waiting`,
+`retriedOnOtherPrimary`, `events` {added, removed, replaced, invalid}, `upstreams[]` {id, epoch, state, inFlight, limit,
+maxSeqs, weight, slowStart, breaker, dispatched, answered, connectFailures} and `registry` {discovery, stale
+(registry_stale), staleForMs, failedPolls, rejected (registry_rejected), rejectedReasons, graceRemainingMs, version,
+fileErrors}. With failover on, `failover.breaker` aggregates the members (closed if any is closed).
+
+Agent and CLI (`scripts/upstream-agent.ts`, needs `PTR_REDIS_URL`; prints JSON lines, never the Redis URL):
+
+```bash
+# foreground agent next to the engine's SSH tunnel; SIGTERM drains and deregisters
+pnpm exec tsx scripts/upstream-agent.ts register --pool=gemma-4-e4b-fp8 --id=pod-a --base-url=http://127.0.0.1:18000/v1 \
+  [--max-seqs=12] [--kv-capacity-tokens=347000] [--weight=1] [--epoch=<id>]
+pnpm exec tsx scripts/upstream-agent.ts drain --pool=gemma-4-e4b-fp8 --id=pod-a        # exit 0 once the record is gone
+pnpm exec tsx scripts/upstream-agent.ts deregister --pool=gemma-4-e4b-fp8 --id=pod-a   # immediate; a running agent re-registers
+pnpm exec tsx scripts/upstream-agent.ts list [--pool=gemma-4-e4b-fp8]
+```
+
+- `register` waits for the engine's `/health` = 200, reads `/metrics` once: KV capacity from
+  `vllm:cache_config_info` (`num_gpu_blocks × block_size`, else `--kv-capacity-tokens`, else null) and
+  `process_start_time_seconds` for the epoch (a hash of id, URL and start time: a restarted agent keeps the epoch, a
+  restarted engine gets a new one; `--epoch` overrides; without either the epoch is random). Both metric names are
+  unverified against the deployed vLLM (); the fallbacks keep the agent working either way.
+  It then heartbeats; three failed `/health` checks in a row deregister the engine until it is healthy again.
+- Drain (`SIGTERM`/`SIGINT` to the agent, or `drain` from anywhere): the agent heartbeats `state=draining` (every
+  tick until a write succeeds), waits `PTR_UPSTREAM_DRAIN_SETTLE_MS` counted from that confirmed write, then until `vllm:num_requests_running + vllm:num_requests_waiting = 0` on two checks in a
+  row (an unreachable engine counts as idle), bounded by `PTR_UPSTREAM_DRAIN_MAX_MS`; then the record is deleted
+  (`remove_failed` if Redis refuses: it then expires by TTL) and the agent exits. A second signal exits at once; a
+  drain requested before the first registration publishes nothing.
+
+Runbook:
+- **Scale up:** start the engine and its SSH tunnel on a port inside `PTR_GATEWAY_UPSTREAM_ALLOW`, then `register`. Within
+  one poll (usually at once, by nudge) every gateway adds it and ramps it over 30 s. Check `pool.upstreams[]` in
+  `/metrics`.
+- **Scale down:** `drain` (or `SIGTERM` the agent). New calls stop within a poll, in-flight calls finish, the record is
+  deleted, then stop the engine and the tunnel.
+- **Engine crash:** in-flight streams break (workers retry them with the turn key), new calls get connection errors and
+  move to another upstream, the breaker opens, and the record expires 10 s after the agent's last heartbeat.
+- **Agent crash only:** the engine keeps serving its in-flight calls but takes no new ones once the record expires
+  (capacity drops); restart the agent and it returns with the same epoch (slow start again).
+- **Redis outage:** nothing to do; check `registry.stale` and that `members` did not drop after it came back.
+- **Rejected records:** `registry.rejected` rising means someone registered a URL outside the allowlist; `list` shows it.
+
 ## Providers (direct, without the gateway)
 
 - `fake` (default): deterministic, no network. `PTR_FAKE_LATENCY='{"medianMs":1900,"p95Ms":3600,"seed":7}'`
@@ -308,6 +448,16 @@ vs HOT updates and dead tuples of `turns`; inserts, updates, HOT updates, delete
 Single-host replicas do not demonstrate multi-host fault tolerance. Fake-model results describe the serving
 architecture, never real LLM throughput.
 
+Registry acceptance (`scripts/registry-acceptance.ts`–T5, T7, T9): in-process fake engines (12
+sequences each, 600 ms per call, an engine-side queue beyond that), the real agent loop, gateway, pool and registry
+source, and closed-loop worker clients with the S1 retry settings. `--store=redis` (default) goes through a local TCP
+proxy to the isolated Redis (so the outage scenario never touches the shared container) in a `ptrtest:s2<run>:llm`
+namespace deleted afterwards; `--store=memory` uses the in-memory registry. Report: `reports/registry-acceptance-<run>.json`.
+
+```sh
+pnpm exec tsx scripts/registry-acceptance.ts [--store=redis|memory] [--scenarios=T1,T2,T3,T4,T5,T7,T7b,T9] [--users=24]
+```
+
 ## Engine benchmarks
 
 - GPU host scripts: `infra/gpu/` (vLLM vs SGLang, BF16 / online FP8 / NVFP4, same client and workloads); every script reads the engine directory from `PTR_GPU_ROOT`.
@@ -318,6 +468,7 @@ architecture, never real LLM throughput.
 ## Storage integration tests
 
 `RUN_STORAGE_DB_TESTS=1 DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm exec jest packages/storage/test --runInBand`
-(add `RUN_REDIS_TESTS=1` with `PTR_REDIS_URL` for `packages/messaging`). Lease recovery, reconciliation and
+(add `RUN_REDIS_TESTS=1` with `PTR_REDIS_URL` for `packages/messaging`; the registry contract runs its Lua scripts
+in a per-test `ptrtest:<uuid>:llm` namespace and deletes it). Lease recovery, reconciliation and
 outbox sweeps are database-wide, so run them while no dispatcher or load test uses the same database. Their
 assertions only look at the tests' own synthetic turns. The migration test creates and drops its own scratch schema.

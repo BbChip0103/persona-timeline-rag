@@ -80,7 +80,8 @@ export class OpenAICompatibleTextProvider implements TextProvider {
   private readonly endpoints:string[];
   constructor(private readonly options:OpenAICompatibleOptions) {
     const baseUrls=typeof options.baseUrl==='string'?[options.baseUrl]:[...options.baseUrl];
-    if(!baseUrls.length||new Set(baseUrls.map(baseUrl=>baseUrl.replace(/\/$/,''))).size!==baseUrls.length) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+    if(!baseUrls.length) throw new ProviderError('ENDPOINT_NOT_LOOPBACK');
+    if(new Set(baseUrls.map(baseUrl=>baseUrl.replace(/\/$/,''))).size!==baseUrls.length) throw new ProviderError('ENDPOINT_DUPLICATE');
     for(const baseUrl of baseUrls) {
       const url=new URL(baseUrl);
       if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password||url.search||url.hash)
@@ -119,9 +120,12 @@ export class OpenAICompatibleTextProvider implements TextProvider {
       // Time left: the earlier of this call's deadline and the turn's (the turn usually ends first: 30 s vs 60 s).
       const remainingMs=()=>Math.min(deadline-performance.now(),options.deadlineAt===undefined?Infinity:options.deadlineAt-Date.now());
       // A reset may have reached a model, but the request key makes the resend idempotent at the gateway (§ reset retries).
+      const minRemainingMs=this.options.retryMinRemainingMs??5000;
+      // A resend is pointless when its wait would leave less than retryMinRemainingMs of the call or turn.
+      const canResend=(waitMs:number)=>remainingMs()>=waitMs+minRemainingMs;
       const retryReset=async(error:unknown)=>{
         if(signal.aborted||!keyed||!transportReset(error)||resets>=(this.options.resetRetries??0)
-          ||remainingMs()<(this.options.retryMinRemainingMs??5000)) throw error;
+          ||!canResend(0)) throw error;
         next();await sleep(gatewayResetBackoffMs(resets++,random),signal);
       };
       for(;;) {
@@ -129,14 +133,23 @@ export class OpenAICompatibleTextProvider implements TextProvider {
         attempts++;
         try {response=await this.fetcher(this.endpoints[index]!,{method:'POST',headers,body:JSON.stringify(body),signal,redirect:'error'});}
         catch(error) {
-          if(refused(error)&&!signal.aborted) {if(next())await sleep(Math.min(100*2**refusedAttempt++,1000),signal);continue;}
+          if(refused(error)&&!signal.aborted) {
+            const wrapped=next(), waitMs=wrapped?Math.min(100*2**refusedAttempt,1000):0;
+            if(!canResend(waitMs)) throw error;
+            if(wrapped) {refusedAttempt++;await sleep(waitMs,signal);}
+            continue;
+          }
           await retryReset(error);continue;
         }
         if((response.status===429||response.status===503)&&response.headers.get('x-ptr-gateway')===GATEWAY_REJECTED) {
           await response.body?.cancel().catch(()=>undefined);
           // A draining gateway sends us to the next URL at once; otherwise wait (jittered) and try the same one again.
-          if(response.headers.get('x-ptr-gateway-reason')==='draining'&&!next()) continue;
-          await sleep(gatewayRejectedBackoffMs(response.headers.get('retry-after'),random),signal);
+          // Either way, too little time left for the wait plus retryMinRemainingMs fails now with the rejection's code.
+          const rejected=new ProviderError(`PROVIDER_HTTP_${response.status}`);
+          if(response.headers.get('x-ptr-gateway-reason')==='draining'&&!next()) {if(!canResend(0)) throw rejected;continue;}
+          const waitMs=gatewayRejectedBackoffMs(response.headers.get('retry-after'),random);
+          if(!canResend(waitMs)) throw rejected;
+          await sleep(waitMs,signal);
           continue;
         }
         if(!response.ok||!response.body) throw new ProviderError(`PROVIDER_HTTP_${response.status}`);

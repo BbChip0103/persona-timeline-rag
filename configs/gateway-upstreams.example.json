@@ -1,0 +1,10 @@
+{
+  "pools": {
+    "gemma-4-e4b-fp8": {
+      "upstreams": [
+        { "id": "pod-a", "baseUrl": "http://127.0.0.1:18000/v1", "maxSeqs": 12, "kvCapacityTokens": 347000, "weight": 1.0 },
+        { "id": "pod-b", "baseUrl": "http://127.0.0.1:18001/v1", "maxSeqs": 12, "kvCapacityTokens": null, "weight": 1.0 }
+      ]
+    }
+  }
+}

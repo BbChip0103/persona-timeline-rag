@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { REQUEST_KEY } from '@ptr/providers';
-import type { FailoverMetrics } from './failover';
+import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
 import type { ChatCompletionRequest, Upstream } from './upstreams';
 
@@ -19,6 +19,8 @@ export interface GatewayMetrics {
   queueWaitMs:{p50:number|null;p95:number|null}; upstreamMs:{p50:number|null;p95:number|null};
   /** Only when failover is configured. */
   failover?:FailoverMetrics;
+  /** Only for upstream pools (PTR_GATEWAY_UPSTREAMS_FILE or PTR_GATEWAY_DISCOVERY=redis): members, per-upstream state, registry health. */
+  pool?:PoolMetrics;
   /** Admission capacity: upstream concurrency cap + queue bound. Workers warn when Σ worker concurrency exceeds `total`. */
   capacity:{maxConcurrent:number;maxQueue:number;total:number};
 }
@@ -58,6 +60,7 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
     rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout},
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
     ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
+    ...(options.upstream.poolMetrics?{pool:options.upstream.poolMetrics()}:{}),
     capacity:{maxConcurrent,maxQueue,total:maxConcurrent+maxQueue}});
   const authorized=(req:IncomingMessage)=>{
     const header=req.headers.authorization??'';const supplied=header.startsWith('Bearer ')?header.slice(7):'';
@@ -111,6 +114,11 @@ export function createGateway(options:GatewayOptions):{server:Server;metrics:()=
       // Successful calls only: fast failures would shorten the estimate and hung ones lengthen it.
       const elapsed=performance.now()-started;meanUpstreamMs=meanUpstreamMs===null?elapsed:meanUpstreamMs+0.1*(elapsed-meanUpstreamMs);
     } catch(error) {
+      // A pool found no free upstream within the queue timeout: nothing was sent, so it is a marked (retryable) rejection.
+      if(error instanceof GatewayRejection&&error.code==='GATEWAY_QUEUE_TIMEOUT'&&!caller.signal.aborted&&!res.headersSent) {
+        counters.queueTimeout++;
+        return json(res,503,{error:{code:error.code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});
+      }
       // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';
       if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}});else res.destroy();}
