@@ -35,7 +35,7 @@ describe('vLLM /metrics parsing',()=>{
 
 describe('engine telemetry : a filter only, fail-open when stale',()=>{
   function setup(options:{interval?:number;kvHigh?:number;waitingMax?:number}={}) {
-    let now=1_000_000;let body:string|null=text({running:1,waiting:0,kv:0.3,start:100});let fail=false;const events:{restarted:boolean}[]=[];const warnings:string[]=[];
+    let now=1_000_000;let body:string|null=text({running:1,waiting:0,kv:0.3,start:100});let fail=false;const events:{restarted:boolean;detectionOff?:boolean}[]=[];const warnings:string[]=[];
     const t=new EngineTelemetry(async()=>{if(fail) throw new Error('down');return body;},
       {intervalMs:options.interval??1000,kvHigh:options.kvHigh??0.95,waitingMax:options.waitingMax??2,now:()=>now,maxSeqs:()=>12,warn:line=>warnings.push(line)},event=>events.push(event));
     return {t,events,warnings,advance:(ms:number)=>{now+=ms;},set:(next:string|null)=>{body=next;},fail:(value:boolean)=>{fail=value;}};
@@ -88,6 +88,51 @@ describe('engine telemetry : a filter only, fail-open when stale',()=>{
     const s=setup();
     for(let i=0;i<6;i++) {s.set(text({running:0,waiting:0,kv:0,start:i%2?100:150}));await s.t.poll();}
     expect(s.t.metrics().restarts).toBe(0);
+  });
+  test('A,B,B,A with B later: the B,B pair is taken for a restart once, then A (earlier than the current start) reappears and detection is off for good',async()=>{
+    const s=setup();
+    for(const start of [100,200,200,100]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restarts:1,restartDetectionDisabled:true});
+    expect(s.warnings.filter(w=>/restart detection off/.test(w))).toHaveLength(1);
+    for(const start of [100,100,200,200,300,300]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restarts:1,restartDetectionDisabled:true});
+    expect(s.events.filter(e=>e.restarted)).toHaveLength(1);
+    expect(s.warnings.filter(w=>/restart detection off/.test(w))).toHaveLength(1); // warned once
+  });
+  test('A,B,B,A with B earlier: B is never a restart (only a later start time can be) and turns detection off at once',async()=>{
+    const s=setup();
+    for(const start of [200,100,100,200]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restarts:0,restartDetectionDisabled:true});
+    expect(s.events.filter(e=>e.restarted)).toHaveLength(0);
+  });
+  test('A,B,A,B,B: an earlier start after any later one (even an unconfirmed candidate) is two processes: off before B,B can count',async()=>{
+    const s=setup();
+    for(const start of [100,200,100,200,200]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restarts:0,restartDetectionDisabled:true});
+  });
+  test('after detection went off, 30 polls in a row with one start time re-arm it with that value as the new baseline',async()=>{
+    const s=setup();
+    for(const start of [200,100]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics().restartDetectionDisabled).toBe(true);
+    expect(s.events.filter(e=>e.detectionOff)).toHaveLength(1); // the pool clears its prefix table once
+    s.set(text({running:0,waiting:0,kv:0,start:100}));
+    for(let i=0;i<28;i++) await s.t.poll(); // 29 in a row with the poll above
+    expect(s.t.metrics().restartDetectionDisabled).toBe(true);
+    await s.t.poll();
+    expect(s.t.metrics()).toMatchObject({restartDetectionDisabled:false,restarts:0});
+    expect(s.warnings.filter(w=>/restart detection back on/.test(w))).toHaveLength(1);
+    for(const start of [300,300]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics().restarts).toBe(1);
+  });
+  test('alternating start times never re-arm detection',async()=>{
+    const s=setup();
+    for(let i=0;i<80;i++) {s.set(text({running:0,waiting:0,kv:0,start:i%2?100:150}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restartDetectionDisabled:true,restarts:0});
+  });
+  test('real restarts only move forward: 100 → 300,300 → 400,400 counts two, detection stays on',async()=>{
+    const s=setup();
+    for(const start of [100,100,300,300,300,400,400]) {s.set(text({running:0,waiting:0,kv:0,start}));await s.t.poll();}
+    expect(s.t.metrics()).toMatchObject({restarts:2,restartDetectionDisabled:false});
   });
   test('implausible values (KV usage outside [0, 1], negative counts) are unknown, never a block, and counted',async()=>{
     const s=setup();

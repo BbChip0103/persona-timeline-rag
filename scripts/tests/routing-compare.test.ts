@@ -1,4 +1,4 @@
-import { acceptance, findKnee, meanInterval, medianKnee, mergePoints, plan, pointStats, type Sample } from '../routing-compare';
+import { acceptance, affinityAcceptance, assertSameMethod, findKnee, imbalance, meanInterval, medianKnee, mergePoints, parseVariant, plan, pointStats, reportMethod, type Sample } from '../routing-compare';
 
 describe('routing comparison methodology',()=>{
   test('arrivals are fully seeded: the same seed gives byte-identical plans (token lengths, flows, W3 turns); another seed differs',()=>{
@@ -72,5 +72,58 @@ describe('routing comparison methodology',()=>{
     expect(mergePoints([[point(1)],[point(2)]])).toHaveLength(2);
     expect(()=>mergePoints([[point(1)],[point(1)]])).toThrow('MERGE_DUPLICATE_POINT');
     expect(medianKnee([6,7.5,9])).toBe(7.5);expect(medianKnee([6,9])).toBe(7.5);expect(medianKnee([4])).toBe(4);
+  });
+  test('the stored method includes --knee-seeds, so --merge refuses runs whose knees came from different seed counts',()=>{
+    const o={measureMs:15000,warmupMs:3000,drainMs:65000,arrivals:'open' as const};
+    const three=reportMethod({grid:[0.8,1],seeds:3,kneeSeeds:3,o}), one=reportMethod({grid:[0.8,1],seeds:3,kneeSeeds:1,o});
+    expect(three).toMatchObject({kneeSeeds:3,seeds:3,grid:[0.8,1],measureMs:15000,promptLayout:'state_after_history',fakeEngine:'kv-shared-running'});
+    expect(()=>assertSameMethod([three,reportMethod({grid:[0.8,1],seeds:3,kneeSeeds:3,o})])).not.toThrow();
+    expect(()=>assertSameMethod([three,one])).toThrow('MERGE_METHOD_MISMATCH');
+    // A report written before kneeSeeds was stored does not merge with a new one either.
+    const {kneeSeeds:_,...old}=three;
+    expect(()=>assertSameMethod([three,old])).toThrow('MERGE_METHOD_MISMATCH');
+  });
+  test('W3 sessions share a growing prefix: the agent state comes after the history (S7 P2 layout), so turn k + 1 starts with all of turn k but its state and user message',()=>{
+    const arrivals=plan('W3',6,30000,5,'open');
+    const bySession=new Map<string,typeof arrivals>();
+    for(const a of arrivals) bySession.set(a.flow,[...(bySession.get(a.flow)??[]),a]);
+    let checked=0;
+    for(const turns of bySession.values()) for(let i=1;i<turns.length;i++) {
+      const before=turns[i-1]!.messages, after=turns[i]!.messages;
+      expect(after.at(-2)!.content.startsWith('AGENT_STATE_JSON_DATA')).toBe(true);
+      expect(after.slice(0,before.length-2)).toEqual(before.slice(0,-2)); // policy, persona, earlier history
+      expect(after.slice(before.length-2,before.length)).toEqual([before.at(-1),expect.objectContaining({role:'assistant'})]); // + last exchange
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(10);
+    // W1/W2 (no history) keep policy, persona, state, user.
+    expect(plan('W1',6,5000,1,'open')[0]!.messages.map(m=>m.content.slice(0,6))).toEqual([expect.any(String),'person','AGENT_',expect.any(String)]);
+  });
+  test('variants: a routing policy, optionally +affinity',()=>{
+    expect(parseVariant('least_inflight')).toEqual({routing:'least_inflight',affinity:false});
+    expect(parseVariant('least_inflight+affinity')).toEqual({routing:'least_inflight',affinity:true});
+    expect(parseVariant('scored+affinity')).toEqual({routing:'scored',affinity:true});
+    expect(()=>parseVariant('fastest')).toThrow('INVALID_VARIANT');expect(()=>parseVariant('scored+cache')).toThrow('INVALID_VARIANT');
+  });
+  test('imbalance = max / mean of the dispatches per upstream (1 = even, 2 = all on one of two)',()=>{
+    expect(imbalance({a:50,b:50})).toBe(1);expect(imbalance({a:100,b:0})).toBe(2);expect(imbalance({a:60,b:40})).toBe(1.2);expect(imbalance({})).toBeNull();
+  });
+  test('affinity bar (pre-registered in S5 before any run): W3 both configs TTFT p95 ≥ 10% better with throughput ≤ 5% worse; W1 both configs both ≤ 5% worse',()=>{
+    const per=(thr:number[],ttft:(number|null)[])=>({maxThroughputUnderSlo:thr,ttftP95AtKnee:ttft});
+    const off=per([10,10,10],[1000,1000,1000]);
+    const pass=affinityAcceptance({
+      homogeneousW3:{on:per([10,10,10],[880,890,900]),off},heterogeneousW3:{on:per([9.6,9.6,9.6],[850,850,850]),off},
+      homogeneousW1:{on:per([9.6,9.6,9.6],[1040,1040,1040]),off},heterogeneousW1:{on:per([10,10,10],[1000,1000,1000]),off}});
+    expect(pass.verdict).toEqual({homogeneousW3:true,heterogeneousW3:true,homogeneousW1:true,heterogeneousW1:true,affinityBecomesDefault:true});
+    // A throughput gain alone does not pass W3 (the bar is on TTFT p95); W1 6% slower fails.
+    const fail=affinityAcceptance({
+      homogeneousW3:{on:per([12,12,12],[950,950,950]),off},heterogeneousW3:{on:per([10,10,10],[850,850,850]),off},
+      homogeneousW1:{on:per([10,10,10],[1060,1060,1060]),off},heterogeneousW1:{on:per([10,10,10],[1000,1000,1000]),off}});
+    expect(fail.verdict).toEqual({homogeneousW3:false,heterogeneousW3:true,homogeneousW1:false,heterogeneousW1:true,affinityBecomesDefault:false});
+    expect(fail.comparisons.homogeneousW3).toMatchObject({throughputGain:0.2,ttftP95Gain:0.05});
+    // ∞ for affinity on (a seed with > 5% failures) is a loss.
+    const inf=affinityAcceptance({homogeneousW3:{on:per([10],[null]),off:per([10],[1000])},heterogeneousW3:{on:per([10],[800]),off:per([10],[1000])},
+      homogeneousW1:{on:per([10],[1000]),off:per([10],[1000])},heterogeneousW1:{on:per([10],[1000]),off:per([10],[1000])}});
+    expect(inf.comparisons.homogeneousW3.ttftP95Gain).toBe(-Infinity);expect(inf.verdict.homogeneousW3).toBe(false);
   });
 });

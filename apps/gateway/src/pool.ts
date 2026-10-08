@@ -1,7 +1,9 @@
+import { createHash } from 'node:crypto';
 import type { UpstreamRecord } from '@ptr/messaging/registry';
 import { UpstreamHealth, type BreakerMetrics, type BreakerOptions, type BreakerState } from './health';
-import { CentralQueue, chooseUpstream, estimateRequest, kvReservation, queueRetryAfterSeconds, uncachedTokens, type Band, type QueuedRequest,
-  type RequestEstimate, type RoutingPolicy } from './admission';
+import { CentralQueue, cachedOn, chooseUpstream, estimateRequest, kvReservation, queueRetryAfterSeconds, uncachedTokens, type AffinityOptions,
+  type AffinityOutcome, type Band, type QueuedRequest, type RequestEstimate, type RouteDecision, type RoutingPolicy } from './admission';
+import { HASH_SALT, PrefixTable } from './prefix';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
 import { EngineTelemetry, type TelemetryMetrics, type TelemetryOptions } from './telemetry';
@@ -50,7 +52,14 @@ export interface UpstreamMemberMetrics {
   dispatched:number; answered:number; connectFailures:number;
   /** Engine telemetry (S4; null when off or the client has no /metrics). */
   telemetry:TelemetryMetrics|null;
+  /** 2xx calls: dispatch → first body chunk (the engine's TTFT as the gateway sees it) and dispatch → end, ms. */
+  ttftMs:Quantiles; e2eMs:Quantiles;
+  /** T̂ / usage.prompt_tokens of 2xx calls whose stream or body reported usage (n = how many did). */
+  estOverActualTokens:Quantiles&{n:number};
+  /** Prefix table (S5): entries, their own tokens, clears (breaker open, restart), dispatches with a match longer than G. */
+  prefix:{entries:number;tokens:number;cleared:number;extraHits:number};
 }
+export interface Quantiles {p50:number|null;p95:number|null}
 export interface PoolQueueMetrics {
   routing:RoutingPolicy; fairness:'fifo'|'drr';
   queued:Record<'1'|'0'|'-1',number>; queuedTokens:number;
@@ -78,6 +87,12 @@ export interface PoolMetrics {
   /** The telemetry filter settings (null = off). */
   telemetry:{intervalMs:number;kvHigh:number;waitingMax:number}|null;
   queue:PoolQueueMetrics;
+  /** 2xx calls: arrival at the pool (queue wait included) → first body chunk / → end, ms. */
+  latency:{ttftMs:Quantiles;e2eMs:Quantiles};
+  /** Cache affinity (§4.3): settings and outcomes (counted only when on). */
+  affinity:{mode:'on'|'off';minTokens:number;slack:number}&Record<AffinityOutcome,number>;
+  /** PTR_GATEWAY_PREFIX_TTL_MS. */
+  prefixTtlMs:number;
   upstreams:UpstreamMemberMetrics[];
   registry?:SourceMetrics;
 }
@@ -115,6 +130,14 @@ export interface PoolOptions {
    * while fresh, KV usage ≥ `kvHigh` or waiting > `waitingMax` takes the member out of selection. Off when absent.
    */
   telemetry?:Pick<TelemetryOptions,'intervalMs'|'kvHigh'|'waitingMax'|'timeoutMs'>;
+  /** Cache affinity (PTR_GATEWAY_AFFINITY=on, §4.3: sticky until the slack is used up); absent = off. */
+  affinity?:AffinityOptions;
+  /** Prefix-table entry lifetime (PTR_GATEWAY_PREFIX_TTL_MS). Default 120000. */
+  prefixTtlMs?:number;
+  /** Share of routing decisions written as a `route …` log line without text (PTR_GATEWAY_ROUTE_LOG_SAMPLE). Default 0.01. */
+  routeLogSample?:number;
+  /** Random source of the log sampling (tests). */
+  random?:()=>number;
   /** Clock for slow start (tests). */
   now?:()=>number;
   /** Operator warnings (default stderr); never contains URLs or request content. */
@@ -125,35 +148,63 @@ const isTimeout=(reason:unknown)=>(reason as {name?:unknown})?.name==='TimeoutEr
 // The early `saturated` refusal trusts the observed prefill rate only with this many recent answers behind it.
 const TICK_MS=250, SAMPLE=2000, RATE_WINDOW_MS=10000, MIN_RATE_SAMPLES=20;
 const PREFIX_HALF_LIFE=256, PREFIX_DECAY=Math.pow(0.5,1/PREFIX_HALF_LIFE);
+/** Prefix-table entries per upstream, always (a known KV capacity bounds the table's tokens as well, see PrefixTable). */
+const PREFIX_MAX_ENTRIES=4096;
+/** Last chunks of a stream kept to read its usage (vLLM sends it in the last event before [DONE]). */
+const USAGE_CHUNKS=4;
+const DEFAULT_AFFINITY:AffinityOptions={minTokens:256,slack:0.5};
 class Member {
-  inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;kvReserved=0;prefill=0;
-  health!:UpstreamHealth;telemetry:EngineTelemetry|undefined;
+  inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;kvReserved=0;prefill=0;extraHits=0;
+  health!:UpstreamHealth;telemetry:EngineTelemetry|undefined;prefix!:PrefixTable;
+  readonly ttfts:number[]=[];readonly e2es:number[]=[];
+  /** T̂ / prompt_tokens × 1000 (integers for the percentile helper). */
+  readonly ratios:number[]=[];
   /** Start of the current slow-start ramp (−∞ = full capacity) and its cause. */
   constructor(public record:UpstreamRecord,readonly upstream:Primary,public rampFrom:number,public rampReason:RampReason) {}
 }
-interface Reservation { kv:number; prefill:number; firstChunk:boolean; released:boolean }
+interface Reservation {
+  kv:number; prefill:number; firstChunk:boolean; released:boolean;
+  /** For the latency metrics and the prefix table: when it was dispatched and arrived, T̂, its chain; ok = a 2xx answer. */
+  dispatchedAt:number; arrivedAt:number; estimate:RequestEstimate; ok:boolean;
+}
 interface Pending extends QueuedRequest {
   estimate:RequestEstimate&{cachedPrefix:number}; exclude:Set<Member>;
+  /** For the routing log: the caller's request key (hashed there), a retry on another primary, arrival at the pool. */
+  requestKey:string|undefined; retry:boolean; arrivedAt:number;
   settle:(result:{member:Member;reservation:Reservation}|{none:string|undefined})=>void; reject:(error:unknown)=>void;
 }
-/** Relays the body; marks the first chunk (prefill done) and releases the slot when it ends, fails, is closed, or the call is aborted. */
-function relaying(body:AsyncIterable<Uint8Array>,first:()=>void,release:()=>void,signal:AbortSignal):AsyncIterable<Uint8Array> {
-  const onAbort=()=>release();
-  const done=()=>{signal.removeEventListener('abort',onAbort);release();};
-  if(signal.aborted) release();else signal.addEventListener('abort',onAbort,{once:true});
+/**
+ * Relays the body; passes each chunk on (the first marks prefill done) and releases the slot when it ends (completed =
+ * true), fails, is closed, or the call is aborted.
+ */
+function relaying(body:AsyncIterable<Uint8Array>,chunk:(data:Uint8Array)=>void,release:(completed:boolean)=>void,signal:AbortSignal):AsyncIterable<Uint8Array> {
+  const onAbort=()=>release(false);
+  const done=(completed:boolean)=>{signal.removeEventListener('abort',onAbort);release(completed);};
+  if(signal.aborted) release(false);else signal.addEventListener('abort',onAbort,{once:true});
   return {[Symbol.asyncIterator]() {
     const iterator=body[Symbol.asyncIterator]();
     return {
       async next() {
-        try {const result=await iterator.next();if(result.done) done();else first();return result;} catch(error) {done();throw error;}
+        try {const result=await iterator.next();if(result.done) done(true);else chunk(result.value);return result;} catch(error) {done(false);throw error;}
       },
-      async return(value?:unknown) {done();await iterator.return?.(value);return {done:true as const,value:undefined};},
+      async return(value?:unknown) {done(false);await iterator.return?.(value);return {done:true as const,value:undefined};},
     };
   }};
+}
+/** usage.prompt_tokens in the end of an answer (the last occurrence: vLLM's usage event follows the content). */
+function promptTokens(tail:string):number|null {
+  const found=[...tail.matchAll(/"prompt_tokens"\s*:\s*(\d+)/g)].at(-1);
+  const value=found?Number(found[1]):NaN;
+  return value>0?value:null;
 }
 const percentile=(values:number[],p:number)=>{
   if(!values.length) return null;const sorted=[...values].sort((a,b)=>a-b);
   return Math.round(sorted[Math.min(sorted.length-1,Math.ceil(p*sorted.length)-1)]!);
+};
+/** p50/p95 of a sample; `scale` divides integer-stored values (ratios × 1000). */
+const quantiles=(values:number[],scale=1):Quantiles=>{
+  const at=(p:number)=>{const value=percentile(values,p);return value===null?null:value/scale;};
+  return {p50:at(0.5),p95:at(0.95)};
 };
 
 /**
@@ -192,6 +243,8 @@ export class UpstreamPool implements Upstream {
   private readonly processed:{at:number;tokens:number}[]=[];
   private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
   private readonly rejected={queue_full:0,saturated:0,queue_timeout:0};
+  private readonly affinityCounts:Record<AffinityOutcome,number>={picked:0,brokenBySlack:0,none:0};
+  private readonly ttfts:number[]=[];private readonly e2es:number[]=[];
   private readonly failovers:Record<string,number>={};
   private readonly events={added:0,removed:0,replaced:0,invalid:0,restarted:0};
   constructor(private readonly pool:PoolOptions) {
@@ -222,13 +275,14 @@ export class UpstreamPool implements Upstream {
   }
 
   async complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult> {
+    const arrivedAt=Date.now();
     const estimate=this.learnPrefix(estimateRequest(request,this.pool.bytesPerToken??3.9));
     const tried=new Set<Member>();let reason='breaker_open';let lastError:unknown;let waitUntil:number|undefined;
     const deadline=()=>waitUntil??=Date.now()+(this.pool.queueTimeoutMs??10000);
     const attempts=Math.max(1,this.pool.primaryAttempts??2);
     for(let attempt=0;attempt<attempts;attempt++) {
       let routed:Awaited<ReturnType<UpstreamPool['route']>>;
-      try {routed=await this.route(estimate,context,signal,tried,deadline,attempt>0);}
+      try {routed=await this.route(estimate,context,signal,tried,deadline,attempt>0,arrivedAt);}
       catch(error) {
         // After a failed attempt the request may have reached an engine (closed before response): no other upstream
         // in time must not become a marked "nothing was sent" rejection. Fall through to the secondary or the error.
@@ -256,6 +310,7 @@ export class UpstreamPool implements Upstream {
     if(this.started.length>=this.options.maxPerMinute) {this.counts.rateLimited++;throw new Error('FAILOVER_RATE_LIMITED');}
     this.started.push(now);
     this.failovers[reason]=(this.failovers[reason]??0)+1;
+    this.routeLog(context?.requestKey,context?.priority??0,estimate.tokens,[],'secondary','failover',null,now-arrivedAt);
     try {
       const result=await secondary.complete(request,signal,context);
       this.counts.secondary++;
@@ -284,7 +339,7 @@ export class UpstreamPool implements Upstream {
     }
     return {...estimate,cachedPrefix:estimate.prefixKey&&estimate.prefixKey===this.prefixKey?this.globalPrefix:0};
   }
-  private async route(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,tried:Set<Member>,deadline:()=>number,retry:boolean):
+  private async route(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,tried:Set<Member>,deadline:()=>number,retry:boolean,arrivedAt:number):
     Promise<{member:Member;reservation:Reservation;openGeneration?:number}|{none:string|undefined}> {
     for(;;) {
       const live=this.candidates(tried);
@@ -301,7 +356,7 @@ export class UpstreamPool implements Upstream {
           if(!healthy) return {none:'breaker_open'};
         } else for(const member of halfOpen) void member.health.probeHealth();
       }
-      const result=await this.enqueue(estimate,context,signal,tried,deadline(),retry);
+      const result=await this.enqueue(estimate,context,signal,tried,deadline(),retry,arrivedAt);
       if('member' in result) return {...result,...(result.member.health.isOpen?{openGeneration:result.member.health.generation}:{})};
       return result;
     }
@@ -309,7 +364,7 @@ export class UpstreamPool implements Upstream {
   private candidates(exclude:Set<Member>):Member[] {
     return [...this.members.values()].filter(member=>member.record.state==='active'&&!exclude.has(member));
   }
-  private enqueue(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,exclude:Set<Member>,deadlineAt:number,retry:boolean):
+  private enqueue(estimate:RequestEstimate&{cachedPrefix:number},context:RequestContext|undefined,signal:AbortSignal,exclude:Set<Member>,deadlineAt:number,retry:boolean,arrivedAt:number):
     Promise<{member:Member;reservation:Reservation}|{none:string|undefined}> {
     const band:Band=context?.priority??0, cost=uncachedTokens(estimate,this.globalPrefix);
     if(!retry&&this.pool.rejectSaturated&&this.queue.size) {
@@ -323,7 +378,7 @@ export class UpstreamPool implements Upstream {
       const remaining=deadlineAt-Date.now();
       const cleanup=()=>{clearTimeout(timer);signal.removeEventListener('abort',onAbort);};
       let settled=false;
-      const pending:Pending={id:++this.nextId,band,flow:context?.flow??'',cost,enqueuedAt:Date.now(),estimate,exclude,
+      const pending:Pending={id:++this.nextId,band,flow:context?.flow??'',cost,enqueuedAt:Date.now(),estimate,exclude,requestKey:context?.requestKey,retry,arrivedAt,
         settle:result=>{settled=true;cleanup();this.record(this.waits,Date.now()-pending.enqueuedAt);resolve(result);},
         reject:error=>{settled=true;cleanup();reject(error);}};
       // Leaving frees the head of a band: run a pass so the requests behind it do not wait for the next tick.
@@ -372,16 +427,25 @@ export class UpstreamPool implements Upstream {
       // No closed member and no secondary: the open ones are the only alternative (a single upstream has no breaker).
       const usable=closed.length?closed:live;
       // Engine telemetry is a filter only (§4.4): a blocked member is "busy" (the request waits), never "unavailable".
+      // matched: this request's prefix in the member's table (S5), for its prefill credit, cost and cache affinity; with
+      // affinity off the table is not consulted (S4 behaviour exactly) and only kept for the metrics.
       const states=usable.map(member=>({id:member.record.id,member,inFlight:member.inFlight,limit:this.limit(member,now),kvReserved:member.kvReserved,
         prefill:member.prefill,kvCapacity:member.record.kvCapacityTokens,prefillPerSec:member.record.prefillTokensPerSec??null,weight:member.record.weight,
-        engineBlocked:member.telemetry?.blocked()??false}));
-      const chosen=chooseUpstream(this.routing,states,pending.estimate,{kappa:this.pool.kappa??0.9,globalPrefix:this.globalPrefix,
-        ttftPenaltyMs:this.pool.ttftPenaltyMs??1000},this.rr);
-      if(!chosen) return false;
+        engineBlocked:member.telemetry?.blocked()??false,matched:this.pool.affinity?member.prefix.match(pending.estimate.chain):0}));
+      const decision=chooseUpstream(this.routing,states,pending.estimate,{kappa:this.pool.kappa??0.9,globalPrefix:this.globalPrefix,
+        ttftPenaltyMs:this.pool.ttftPenaltyMs??1000,...(this.pool.affinity?{affinity:this.pool.affinity}:{})},this.rr);
+      if(!decision) return false;
       this.rr++;
-      const member=chosen.member;
-      const reservation:Reservation={kv:kvReservation(pending.estimate,this.globalPrefix),prefill:uncachedTokens(pending.estimate,this.globalPrefix),firstChunk:false,released:false};
+      const member=decision.member.member, cached=cachedOn(decision.member,pending.estimate,this.globalPrefix);
+      const own={...pending.estimate,cachedPrefix:cached};
+      // KV: (T̂ − G) + M only. A prefix hit saves prefill, but KV only for blocks a RUNNING request holds; a session's
+      // history is held by none (one turn per session at a time), so the engine allocates those blocks again.
+      const reservation:Reservation={kv:kvReservation(pending.estimate,this.globalPrefix),prefill:uncachedTokens(own,this.globalPrefix),firstChunk:false,released:false,
+        dispatchedAt:Date.now(),arrivedAt:pending.arrivedAt,estimate:pending.estimate,ok:false};
       member.inFlight++;member.dispatched++;member.kvReserved+=reservation.kv;member.prefill+=reservation.prefill;
+      if(cached>pending.estimate.cachedPrefix) member.extraHits++;
+      if(decision.affinity) this.affinityCounts[decision.affinity]++;
+      this.logDecision(pending,decision);
       pending.settle({member,reservation});
       return true;
     });
@@ -402,17 +466,24 @@ export class UpstreamPool implements Upstream {
     });
   }
   private async callPrimary(member:Member,reservation:Reservation,request:ChatCompletionRequest,signal:AbortSignal,openGeneration:number|undefined):Promise<UpstreamResult> {
-    const release=()=>this.release(member,reservation);
-    let ok=true;
-    const first=()=>this.firstChunk(member,reservation,ok);
+    const tail:Uint8Array[]=[];
+    const release=(completed=false)=>{
+      if(completed&&reservation.ok) {
+        const actual=promptTokens(Buffer.concat(tail).toString('utf8'));
+        if(actual) this.record(member.ratios,reservation.estimate.tokens/actual*1000);
+      }
+      this.release(member,reservation,completed);
+    };
+    const first=()=>this.firstChunk(member,reservation);
+    const chunk=(data:Uint8Array)=>{first();tail.push(data);if(tail.length>USAGE_CHUNKS) tail.shift();};
     const headers=new AbortController();
     const timer=this.options.headersTimeoutMs?setTimeout(()=>headers.abort(new DOMException('primary headers timeout','TimeoutError')),this.options.headersTimeoutMs):undefined;
     const primarySignal=AbortSignal.any([signal,headers.signal]);
     try {
       // The request key is for billing on the secondary; it is not sent to the engine.
       const result=await member.upstream.complete(request,primarySignal);
-      member.health.answered(openGeneration);member.answered++;this.counts.primary++;ok=result.status>=200&&result.status<300;
-      const body=typeof result.body==='string'?(first(),release(),result.body):relaying(result.body,first,release,signal);
+      member.health.answered(openGeneration);member.answered++;this.counts.primary++;reservation.ok=result.status>=200&&result.status<300;
+      const body=typeof result.body==='string'?(chunk(Buffer.from(result.body)),release(true),result.body):relaying(result.body,chunk,release,signal);
       return {...result,body,...(this.pool.secondary?{upstream:'primary' as const}:{})};
     } catch(error) {
       // The breaker learns of the failure before the slot is handed to a queued request.
@@ -429,16 +500,25 @@ export class UpstreamPool implements Upstream {
       throw error;
     } finally {clearTimeout(timer);}
   }
-  /** Prefill done: U is released; only successful answers count toward the prefill rate (fast errors would inflate it). */
-  private firstChunk(member:Member,reservation:Reservation,ok:boolean):void {
+  /**
+   * Prefill done: U is released. Successful answers only: they count toward the prefill rate (fast errors would inflate
+   * it) and the TTFT metrics, and their prefixes are now in the engine's cache (recorded in its table).
+   */
+  private firstChunk(member:Member,reservation:Reservation):void {
     if(reservation.firstChunk||reservation.released) return;
     reservation.firstChunk=true;member.prefill-=reservation.prefill;
-    if(ok) this.processed.push({at:Date.now(),tokens:reservation.prefill});
+    if(reservation.ok) {
+      const now=Date.now();
+      this.processed.push({at:now,tokens:reservation.prefill});
+      this.record(member.ttfts,now-reservation.dispatchedAt);this.record(this.ttfts,now-reservation.arrivedAt);
+      if(!member.gone) member.prefix.record(reservation.estimate.chain);
+    }
     while(this.processed.length&&Date.now()-this.processed[0]!.at>RATE_WINDOW_MS) this.processed.shift();
     this.kick();
   }
-  private release(member:Member,reservation:Reservation):void {
+  private release(member:Member,reservation:Reservation,completed=false):void {
     if(reservation.released) return;reservation.released=true;
+    if(reservation.ok&&completed) {const now=Date.now();this.record(member.e2es,now-reservation.dispatchedAt);this.record(this.e2es,now-reservation.arrivedAt);}
     member.inFlight--;member.kvReserved-=reservation.kv;
     if(!reservation.firstChunk) member.prefill-=reservation.prefill;
     if(member.gone&&member.inFlight<=0) this.retiring.delete(member);
@@ -455,6 +535,24 @@ export class UpstreamPool implements Upstream {
   /** Retry-After for a marked rejection: the tokens queued at this band and above over the recent prefill rate. */
   retryAfterSeconds(band:Band=0):number {return queueRetryAfterSeconds(this.queue.tokensAhead(band),this.prefillRate());}
   private record(list:number[],value:number):void {list.push(value);if(list.length>SAMPLE) list.shift();}
+  private log(line:string):void {(this.pool.log??((text:string)=>process.stderr.write(`${text}\n`)))(line);}
+  private logDecision(pending:Pending,decision:RouteDecision<{id:string}>):void {
+    this.routeLog(pending.requestKey,pending.band,pending.estimate.tokens,decision.scores,decision.member.id,pending.retry?'retry':decision.reason,
+      decision.affinity,Date.now()-pending.arrivedAt);
+  }
+  /**
+   * §8 routing decision log, sampled (PTR_GATEWAY_ROUTE_LOG_SAMPLE): no text, the request key only as a per-process salted sha256[:12], member
+   * ids (registry ids, never URLs), h_u and cost_u of the candidates. `affinity` (outcome) only when affinity is on.
+   */
+  private routeLog(requestKey:string|undefined,band:Band,tokens:number,scores:{id:string;h:number;cost:number}[],pick:string,reason:string,
+    affinity:AffinityOutcome|null,waitMs:number):void {
+    const sample=this.pool.routeLogSample??0.01;
+    if(!(sample>0&&(this.pool.random??Math.random)()<sample)) return;
+    const rk=requestKey?createHash('sha256').update(HASH_SALT).update(requestKey).digest('hex').slice(0,12):'-';
+    const map=(key:'h'|'cost')=>`{${scores.map(score=>`${score.id}:${score[key]}`).join(',')}}`;
+    this.log(`route rk=${rk} pool=${this.model} band=${band} est=${tokens} h=${map('h')} cost=${map('cost')} pick=${pick} reason=${reason}`
+      +`${affinity?` affinity=${affinity}`:''} wait=${Math.max(0,Math.round(waitMs))}ms`);
+  }
   private limit(member:Member,now:number):number {
     const max=member.record.maxSeqs, ramp=this.pool.slowStartMs??30000;
     if(!Number.isFinite(max)||ramp<=0) return max;
@@ -467,6 +565,8 @@ export class UpstreamPool implements Upstream {
       // Called on open and on close: closed now means it just closed (a cold engine must not get the whole queue).
       // Not when a call sent while open closed it: that upstream was the only alternative and is already serving.
       if(!health.isOpen&&!health.closedByAnswer&&member.health===health) {member.rampFrom=this.now();member.rampReason='breaker_closed';}
+      // Open: the engine is unreachable and may come back empty (restarted), so what the table says is no longer known.
+      if(health.isOpen&&member.health===health) member.prefix.clear();
       this.kick();
     });
     return health;
@@ -474,7 +574,7 @@ export class UpstreamPool implements Upstream {
   /** Engine restart seen in telemetry (file/env sources keep their epoch; a registry epoch override may too): start over. */
   private restarted(member:Member,breaker:BreakerOptions):void {
     if(member.gone) return;
-    member.health=this.newHealth(member,breaker);member.rampFrom=this.now();member.rampReason='restarted';this.events.restarted++;
+    member.health=this.newHealth(member,breaker);member.rampFrom=this.now();member.rampReason='restarted';this.events.restarted++;member.prefix.clear();
   }
   /** Applies the source's snapshot: add (slow start unless loading at startup), update, drain, retire. */
   private sync():void {
@@ -492,11 +592,16 @@ export class UpstreamPool implements Upstream {
       try {upstream=this.create(record);} catch {this.events.invalid++;continue;}
       const added=new Member(record,upstream,this.startingUp?-Infinity:now,'added');
       added.health=this.newHealth(added,breaker);
+      // A new member (or a new epoch / address of one) starts with an empty table: nothing of ours is cached there yet.
+      added.prefix=new PrefixTable({ttlMs:this.pool.prefixTtlMs??120000,capacityTokens:()=>added.record.kvCapacityTokens,maxEntries:PREFIX_MAX_ENTRIES,now:this.now});
       const telemetry=this.pool.telemetry, metrics=upstream.metrics?.bind(upstream);
       if(telemetry&&metrics) {
-        const log=this.pool.log??((line:string)=>process.stderr.write(`${line}\n`));
         added.telemetry=new EngineTelemetry(metrics,{...telemetry,now:this.now,maxSeqs:()=>added.record.maxSeqs,
-          warn:line=>log(`WARNING gateway upstream ${added.record.id}: ${line}`)},event=>{if(event.restarted) this.restarted(added,breaker);this.kick();});
+          warn:line=>this.log(`WARNING gateway upstream ${added.record.id}: ${line}`)},event=>{
+          if(event.restarted) this.restarted(added,breaker);
+          // Several processes answer on the port: one of them may be a restarted (empty) engine the table knows nothing about.
+          if(event.detectionOff) added.prefix.clear();
+          this.kick();});
         added.telemetry.start();
       }
       this.members.set(record.id,added);
@@ -520,7 +625,9 @@ export class UpstreamPool implements Upstream {
         reservedKvTokens:member.kvReserved,prefillTokens:member.prefill,kvCapacityTokens:capacity,prefillTokensPerSec:member.record.prefillTokensPerSec??null,
         seqUtil:Number.isFinite(limit)?Math.round(member.inFlight/limit*1000)/1000:null,kvUtil:budget&&budget>0?Math.round(member.kvReserved/budget*1000)/1000:null,
         dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures,
-        telemetry:member.telemetry&&!member.gone?member.telemetry.metrics():null};
+        telemetry:member.telemetry&&!member.gone?member.telemetry.metrics():null,
+        ttftMs:quantiles(member.ttfts),e2eMs:quantiles(member.e2es),
+        estOverActualTokens:{...quantiles(member.ratios,1000),n:member.ratios.length},prefix:{...member.prefix.metrics(),extraHits:member.extraHits}};
     });
     const count=(check:(u:UpstreamMemberMetrics)=>boolean)=>upstreams.filter(check).length;
     const rate=this.prefillRate();
@@ -533,6 +640,8 @@ export class UpstreamPool implements Upstream {
         waitMs:{p50:percentile(this.waits,0.5),p95:percentile(this.waits,0.95)},rejected:{...this.rejected},globalPrefixTokens:this.globalPrefix,
         prefillTokensPerSec:rate===null?null:Math.round(rate)},
       telemetry:this.pool.telemetry?{intervalMs:this.pool.telemetry.intervalMs,kvHigh:this.pool.telemetry.kvHigh,waitingMax:this.pool.telemetry.waitingMax}:null,
+      latency:{ttftMs:quantiles(this.ttfts),e2eMs:quantiles(this.e2es)},
+      affinity:{mode:this.pool.affinity?'on':'off',...(this.pool.affinity??DEFAULT_AFFINITY),...this.affinityCounts},prefixTtlMs:this.pool.prefixTtlMs??120000,
       upstreams,...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
   }
   private secondaryMetrics():FailoverMetrics {

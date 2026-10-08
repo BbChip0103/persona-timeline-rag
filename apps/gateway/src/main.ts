@@ -93,6 +93,10 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
   if(!(ROUTING_POLICIES as readonly string[]).includes(routing)) throw new Error('INVALID_PTR_GATEWAY_ROUTING');
   if(fairness!=='fifo'&&fairness!=='drr') throw new Error('INVALID_PTR_GATEWAY_FAIRNESS');
   if(saturated!=='true'&&saturated!=='false') throw new Error('INVALID_PTR_GATEWAY_REJECT_SATURATED');
+  // Cache affinity (§4.3, S5): off by default — the §9.1 comparison did not meet its pre-registered bar (docs/goal2-serving.md).
+  const affinity=env.PTR_GATEWAY_AFFINITY??'off';
+  if(affinity!=='off'&&affinity!=='on') throw new Error('INVALID_PTR_GATEWAY_AFFINITY');
+  const affinityOptions={minTokens:integer(env,'PTR_GATEWAY_AFFINITY_MIN_TOKENS',256,0,1000000),slack:decimal(env,'PTR_GATEWAY_AFFINITY_SLACK',0.5,0,100)};
   // The pool owns admission (S3): credits per upstream, one band queue; PTR_GATEWAY_MAX_CONCURRENCY does not apply.
   const options={failover:failoverOptions(env),primaryAttempts:integer(env,'PTR_GATEWAY_PRIMARY_ATTEMPTS',2,1,8),
     slowStartMs:integer(env,'PTR_GATEWAY_SLOW_START_MS',30000,0,600000),queueTimeoutMs:integer(env,'PTR_GATEWAY_QUEUE_TIMEOUT_MS',10000,1,600000),
@@ -100,7 +104,8 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
     kappa:decimal(env,'PTR_GATEWAY_KV_OVERCOMMIT',0.9,0.1,1),bytesPerToken:decimal(env,'PTR_GATEWAY_BYTES_PER_TOKEN',3.9,0.5,20),
     ttftPenaltyMs:integer(env,'PTR_GATEWAY_TTFT_PENALTY_MS',1000,1,60000),lookahead:integer(env,'PTR_GATEWAY_LOOKAHEAD',8,1,256),
     starvationMs:integer(env,'PTR_GATEWAY_STARVATION_MS',2000,0,600000),drrQuantum:integer(env,'PTR_GATEWAY_DRR_QUANTUM_TOKENS',4096,1,1000000),
-    rejectSaturated:saturated==='true',...engineTelemetry(env)};
+    rejectSaturated:saturated==='true',...engineTelemetry(env),...(affinity==='on'?{affinity:affinityOptions}:{}),
+    prefixTtlMs:integer(env,'PTR_GATEWAY_PREFIX_TTL_MS',120000,1000,3600000),routeLogSample:decimal(env,'PTR_GATEWAY_ROUTE_LOG_SAMPLE',0.01,0,1)};
   // The upstream deadline starts once the request is admitted, and the wait for a free upstream (up to the queue
   // timeout) runs inside it: if it were not longer, that wait would end as an unmarked 504 instead of the retryable 503.
   if(integer(env,'PTR_GATEWAY_UPSTREAM_TIMEOUT_MS',60000,1000,600000)<=options.queueTimeoutMs) throw new Error('INVALID_PTR_GATEWAY_UPSTREAM_TIMEOUT_MS');

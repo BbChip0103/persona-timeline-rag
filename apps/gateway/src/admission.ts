@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { chainHashes, type ChainHash } from './prefix';
 
 /**
  * Credit admission and the per-pool central queue (routing –§4, stage S3). Pure parts: request estimate,
@@ -18,6 +19,8 @@ export interface RequestEstimate {
   prefixTokens:number; prefixKey:string;
   /** H_2 = sha256(policy ‖ persona): ties go to its rendezvous-hash order, so a persona's requests gather. */
   affinityKey:string;
+  /** Message-boundary chain H_1..H_{m−1} with cumulative tokens (§4.2): looked up in each upstream's prefix table. */
+  chain:ChainHash[];
 }
 const bytes=(text:string)=>Buffer.byteLength(text,'utf8');
 export function estimateRequest(request:{messages:{role:string;content:string}[];max_tokens?:unknown},bytesPerToken:number):RequestEstimate {
@@ -28,7 +31,7 @@ export function estimateRequest(request:{messages:{role:string;content:string}[]
   for(const message of request.messages.slice(0,2)) key.update(`${message.role}\u0000${message.content}\u0000`);
   const system=first?.role==='system';
   return {tokens:Math.ceil(total/bytesPerToken),maxTokens,prefixTokens:system?Math.ceil(bytes(first.content)/bytesPerToken):0,
-    prefixKey:system?createHash('sha256').update(first.content).digest('hex'):'',affinityKey:key.digest('hex')};
+    prefixKey:system?createHash('sha256').update(first.content).digest('hex'):'',affinityKey:key.digest('hex'),chain:chainHashes(request.messages,bytesPerToken)};
 }
 
 /** The gateway's ledger of one upstream plus what it is configured with. */
@@ -42,6 +45,8 @@ export interface CreditState {
   weight:number;
   /** Fresh engine telemetry over the filter limits (§3.1 item 5, S4): no new request while it lasts (see chooseUpstream). */
   engineBlocked?:boolean;
+  /** Tokens of this request's prefix found in this upstream's prefix table (S5; the longest fresh H_k, 0 = none); prefill only. */
+  matched?:number;
 }
 export interface CreditOptions {
   /** κ (PTR_GATEWAY_KV_OVERCOMMIT, 0.9). */
@@ -50,6 +55,14 @@ export interface CreditOptions {
   globalPrefix:number;
   /** T_max (PTR_GATEWAY_TTFT_PENALTY_MS, 1000). */
   ttftPenaltyMs:number;
+  /** Cache affinity (PTR_GATEWAY_AFFINITY=on, §4.3); absent = off. */
+  affinity?:AffinityOptions;
+}
+export interface AffinityOptions {
+  /** PTR_GATEWAY_AFFINITY_MIN_TOKENS (256): the extra cached tokens g = matched − G that make a member sticky. */
+  minTokens:number;
+  /** PTR_GATEWAY_AFFINITY_SLACK (0.5): how much higher (in cost units) the sticky member's cost may be than the cheapest. */
+  slack:number;
 }
 /**
  * `cachedPrefix`: the tokens of this request already cached on every warm server: G when its msg0 is the pool's policy
@@ -60,6 +73,13 @@ export interface CreditRequest { tokens:number; maxTokens:number; cachedPrefix?:
 export const uncachedTokens=(r:CreditRequest,globalPrefix:number)=>Math.max(0,r.tokens-(r.cachedPrefix??globalPrefix));
 /** The KV this request reserves until it ends: (1 − h)·T̂ + M. */
 export const kvReservation=(r:CreditRequest,globalPrefix:number)=>uncachedTokens(r,globalPrefix)+r.maxTokens;
+/**
+ * h_u·T̂ on one upstream for PREFILL (U, the τ gate, the cost): its prefix-table match where longer than the
+ * policy-block share (S5), else that share. Never for KV: a cached prefix saves KV only while a running request holds it.
+ */
+export const cachedOn=(state:{matched?:number},r:CreditRequest,globalPrefix:number)=>Math.max(r.cachedPrefix??globalPrefix,state.matched??0);
+/** The request as seen by one upstream (its cached prefix applied). */
+const onMember=(state:{matched?:number},r:CreditRequest,globalPrefix:number):CreditRequest=>({...r,cachedPrefix:cachedOn(state,r,globalPrefix)});
 
 /** fits_u(r), §3.1 conditions 2–5 (the member state, condition 1, is checked by the caller). */
 export function fitsCredit(state:CreditState,r:CreditRequest,options:CreditOptions):boolean {
@@ -69,19 +89,32 @@ export function fitsCredit(state:CreditState,r:CreditRequest,options:CreditOptio
   // capped at half the budget so a wrongly learned block cannot starve a server.
   const budget=state.kvCapacity===null?Infinity:options.kappa*state.kvCapacity-Math.min(options.globalPrefix,options.kappa*state.kvCapacity/2);
   if(state.inFlight>0&&state.kvReserved+kvReservation(r,options.globalPrefix)>budget) return false;
+  // The prefix-table match saves prefill only (KV above: only the policy block is shared with running requests).
   if(state.prefillPerSec!==null&&state.prefill>0
-    &&state.prefill+uncachedTokens(r,options.globalPrefix)>state.prefillPerSec*options.ttftPenaltyMs/1000) return false;
+    &&state.prefill+uncachedTokens(onMember(state,r,options.globalPrefix),options.globalPrefix)>state.prefillPerSec*options.ttftPenaltyMs/1000) return false;
   return true;
 }
 const rendezvous=(key:string,id:string)=>createHash('sha256').update(`${key}\n${id}`).digest('hex');
+/** Why a member was picked: cache affinity, the policy's load rule, or the policy's tie-break among equals. */
+export type RouteReason='affinity'|'load'|'tie';
+/** Affinity outcome (null when affinity is off): sticky pick, a candidate over the slack, or no candidate (g < min). */
+export type AffinityOutcome='picked'|'brokenBySlack'|'none';
+export interface RouteDecision<T> {
+  member:T; reason:RouteReason; affinity:AffinityOutcome|null;
+  /** Every candidate (fitting member): h_u = cached share of T̂ and cost_u, rounded (for the routing log). */
+  scores:{id:string;h:number;cost:number}[];
+}
 /**
- * Picks among the members whose credit fits (§4.3 without affinity): `scored` = least cost
- * (U + (1 − h)·T̂) / (R_u·T_max) + (N + 1) / S_eff with R_u = weight × 10000 until calibrated, ties by rendezvous hash
- * of the policy+persona key; `least_inflight` = fewest in flight, ties rotate; `round_robin` = rotate. `turn` drives the
- * rotation. Undefined when nothing fits.
+ * Picks among the members whose credit fits (§4.3). cost_u = (U + (1 − h_u)·T̂) / (R_u·T_max) + (N + 1) / S_eff with
+ * R_u = weight × 10000 until calibrated and h_u from the upstream's prefix table (S5). With affinity on, the member
+ * with the largest g_u = matched_u − G (the cheapest of those) is picked when g ≥ minTokens and its cost is within
+ * `slack` of the cheapest candidate; otherwise the configured policy decides: `scored` = least cost, ties by the
+ * rendezvous hash of the policy+persona key; `least_inflight` = fewest in flight, ties rotate (affinity on: rendezvous,
+ * so a persona's cold-start requests gather); `round_robin` = rotate. `turn` drives the rotation. Undefined when
+ * nothing fits.
  */
 export function chooseUpstream<T extends CreditState&{id:string}>(policy:RoutingPolicy,members:T[],r:CreditRequest&{affinityKey:string},
-  options:CreditOptions,turn:number):T|undefined {
+  options:CreditOptions,turn:number):RouteDecision<T>|undefined {
   let fitting=members.filter(member=>fitsCredit(member,r,options));
   // Only when no member fits: a telemetry-blocked member with nothing of this gateway's in flight takes one request
   // (like the KV rule's idle exception). A misread or stuck engine metric (names and semantics unverified on the
@@ -89,18 +122,34 @@ export function chooseUpstream<T extends CreditState&{id:string}>(policy:Routing
   // cannot starve this gateway completely. One per gateway: with k gateways an engine may get k such calls.
   if(!fitting.length) fitting=members.filter(member=>member.engineBlocked&&member.inFlight===0&&fitsCredit({...member,engineBlocked:false},r,options));
   if(!fitting.length) return undefined;
-  if(policy==='round_robin') return fitting[turn%fitting.length];
+  const G=options.globalPrefix;
+  const cost=(member:T)=>(member.prefill+uncachedTokens(onMember(member,r,G),G))/((member.prefillPerSec??member.weight*10000)*options.ttftPenaltyMs/1000)
+    +(Number.isFinite(member.limit)?(member.inFlight+1)/member.limit:0);
+  const costs=fitting.map(cost), cheapest=Math.min(...costs);
+  const round=(x:number)=>Math.round(x*1000)/1000;
+  const scores=fitting.map((member,index)=>({id:member.id,h:round(r.tokens>0?cachedOn(member,r,G)/r.tokens:0),cost:round(costs[index]!)}));
+  const ranked=(list:T[])=>list.reduce((top,member)=>rendezvous(r.affinityKey,member.id)>rendezvous(r.affinityKey,top.id)?member:top);
+  const cheapestOf=(list:T[])=>{const best=Math.min(...list.map(member=>costs[fitting.indexOf(member)]!));
+    return list.filter(member=>costs[fitting.indexOf(member)]!-best<1e-9);};
+  let affinity:AffinityOutcome|null=null;
+  const decide=(member:T,reason:RouteReason):RouteDecision<T>=>({member,reason,affinity,scores});
+  if(options.affinity) {
+    const gains=fitting.map(member=>(member.matched??0)-G), best=Math.max(...gains);
+    if(best>=options.affinity.minTokens) {
+      const sticky=ranked(cheapestOf(fitting.filter((_,index)=>gains[index]===best)));
+      if(costs[fitting.indexOf(sticky)]!<=cheapest+options.affinity.slack+1e-9) {affinity='picked';return decide(sticky,'affinity');}
+      affinity='brokenBySlack';
+    } else affinity='none';
+  }
+  if(policy==='round_robin') return decide(fitting[turn%fitting.length]!,'load');
   if(policy==='least_inflight') {
     const least=Math.min(...fitting.map(member=>member.inFlight));
     const tied=fitting.filter(member=>member.inFlight===least);
-    return tied[turn%tied.length];
+    if(tied.length===1) return decide(tied[0]!,'load');
+    return decide(options.affinity?ranked(tied):tied[turn%tied.length]!,'tie');
   }
-  const uncached=uncachedTokens(r,options.globalPrefix);
-  const cost=(member:T)=>(member.prefill+uncached)/((member.prefillPerSec??member.weight*10000)*options.ttftPenaltyMs/1000)
-    +(Number.isFinite(member.limit)?(member.inFlight+1)/member.limit:0);
-  const costs=fitting.map(cost), best=Math.min(...costs);
-  const tied=fitting.filter((_,index)=>costs[index]!-best<1e-9);
-  return tied.reduce((top,member)=>rendezvous(r.affinityKey,member.id)>rendezvous(r.affinityKey,top.id)?member:top);
+  const tied=cheapestOf(fitting);
+  return decide(ranked(tied),tied.length>1?'tie':'load');
 }
 
 /** Retry-After for a marked rejection: the queued uncached tokens over the pool's recent prefill rate, 1–5 s. */

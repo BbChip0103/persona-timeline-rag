@@ -514,8 +514,8 @@ The env-only single upstream and the failover wrapper keep the old limiter, so N
 requests; M = `max_tokens` (else 512). G (the policy block) is the most common msg0 seen (bounded table of 16, counts
 decayed with a half-life of 256 requests), so one odd first request or a short batch with another system message
 cannot set it, while a policy-prompt deploy re-learns G after about 256 requests (fewer when the old block was rare); a request whose msg0 is that block has G cached (uncached = T̂ − G), any other
-has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. Until the
-per-server prefix table (S5), the global block is the only cached share.
+has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. Since S5 the
+cached share on an upstream is the larger of that and the request's match in the upstream's prefix table (next sections).
 
 **Credit `fits_u(r)`** (all must hold; the same check for every routing policy):
 1. active (not draining), breaker closed (with no closed member and no secondary, open ones are still used);
@@ -541,8 +541,9 @@ completion, first chunk, membership or breaker change, and every 250 ms while re
 **Selection** (`PTR_GATEWAY_ROUTING`) among the fitting upstreams:
 - `round_robin`: rotate;
 - `least_inflight`: fewest in flight, ties rotate (the S2 rule);
-- `scored` (§4.3, affinity off until S5): least cost (U + T̂ − G) / (R_u · T_max) + (N + 1) / S_eff, with
-  R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of hash(policy ‖ persona).
+- `scored` (§4.3): least cost (U + (1 − h_u)·T̂) / (R_u · T_max) + (N + 1) / S_eff (h_u·T̂ = G, or the prefix-table
+  match when longer, S5), with R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of
+  hash(policy ‖ persona). Cache affinity (`PTR_GATEWAY_AFFINITY`, S5) can come before any of the three.
 
 The default is `least_inflight`; `scored` stays selectable. It has not met the §9.1 acceptance bar (fixed before the
 first run: heterogeneous W2 and W3, one of {max throughput with TTFT p95 ≤ 2 s, TTFT p95 at the knee} ≥ 10% better and
@@ -584,7 +585,10 @@ awaited (60 s client timeout) and requests still open are counted as unfinished;
 unfinished requests as ∞. In the acceptance an infinite mean TTFT p95 (any seed over 5% failures) is a loss: only
 `scored` ∞ → gain −∞ (fails both "better" and "not worse"), only `least_inflight` ∞ → +∞, both → no comparison; gains
 are written as the strings "Infinity" / "-Infinity" in the JSON. `--merge=a.json,b.json` combines runs made in
-parallel into one verdict; the same point twice is an error (`MERGE_DUPLICATE_POINT`).
+parallel into one verdict; the same point twice is an error (`MERGE_DUPLICATE_POINT`), and so are runs whose stored
+`method` differs in anything that shapes points or knees — grid, seeds, `kneeSeeds`, windows, drain, arrivals, SLO, knee
+sweep, prompt layout (`MERGE_METHOD_MISMATCH`; reports written before `kneeSeeds` was stored never merge with new ones).
+`--policies` also takes `<policy>+affinity` variants (S5).
 
 Limits: `drr` needs `X-PTR-Flow` (the worker does not send one yet, so all traffic is one flow = FIFO with LOOKAHEAD);
 for non-streaming requests the first chunk is the whole reply, so U stays reserved to the end; requests waiting on a
@@ -677,10 +681,17 @@ open (no other member and no secondary, so the open upstream was used and answer
 already serving, and ramping the only member would throttle the whole pool.
 
 **Engine restarts:** a registry record's new epoch already makes a new member (S2). For file and env members the epoch
-never changes, and an agent started with `--epoch` keeps it too, so a changed `process_start_time_seconds` clears the
-member once two polls in a row report the same new value (several API server processes behind one port, each with its
-own start time, answering in turn are therefore never taken for restarts): a fresh breaker, slow start from 1 (`rampReason: restarted`), the
-telemetry streaks reset, `events.restarted` + 1. In-flight calls of the old process end on their own (cut streams are
+never changes, and an agent started with `--epoch` keeps it too, so a **later** `process_start_time_seconds` clears the
+member once two polls in a row report the same new value: a fresh breaker, slow start from 1 (`rampReason: restarted`),
+the telemetry streaks reset, the prefix table emptied (S5), `events.restarted` + 1. A restart only ever moves the start
+time forward, so a value **earlier** than the latest one seen (current or pending candidate) means several processes
+answer on that port (e.g. API server processes behind one port, each with its own start time): restart detection is
+then turned off for that member (`telemetry.restartDetectionDisabled`, one `WARNING gateway upstream <id>:
+restart detection off …` line, the prefix table cleared once), because alternating start times would otherwise be read
+as restarts back and forth (S4 re-review). In the worst order (A, B, B, A with B later) the B, B pair still counts one
+restart before the earlier A turns detection off. While off, only the breaker reacts to real restarts; 30 polls in a
+row with one start time (one process again) re-arm it with that value as the new baseline (`restart detection back
+on` line). In-flight calls of the old process end on their own (cut streams are
 retried by the worker's reset rule). Without the metric nothing is detected (only the breaker reacts).
 
 **Primary-to-primary retry and failover (§5, verified):** retried on another member only for connection-phase errors
@@ -700,7 +711,7 @@ stay busy until the queue timeout, the request goes to the secondary (or the con
 | `PTR_GATEWAY_ENGINE_WAITING_MAX` | 2 (0–100000) | engine waiting above it filters a member out |
 
 **Metrics:** per upstream `rampReason` and `telemetry` {stale, ageMs, staleEpisodes, failedPolls, running, waiting,
-kvUsage, prefixHitRate, blocked, blockedPolls, creditModelMiss, waitingStreak, restarts, implausible, suspectBlocked}
+kvUsage, prefixHitRate, blocked, blockedPolls, creditModelMiss, waitingStreak, restarts, restartDetectionDisabled, implausible, suspectBlocked}
 (null when off); `members`
 adds `telemetryBlocked` and `telemetryStale`; `events.restarted`; pool `telemetry` {intervalMs, kvHigh, waitingMax} or
 null.
@@ -715,6 +726,129 @@ null.
 | A2 b blocked, then its /metrics hangs at 5 s | stale 2.8 s after the hang (3 × interval minus the poll phase); b dispatches 2 before 5 s, 1 until stale, 47 after; 0 failed |
 | A3 b's engine down 2–5 s (telemetry off) | breaker open at 2.2 s, closed at 5.2 s (3 s cooldown), b's limit 1 → 2 → 5 → 8 → 12 at +0/2.5/5/7.5/10 s (10 s ramp), at most 2 in flight in the first 2 s; 5 failed = the streams on b cut when it stopped (the worker retries those) |
 | A4 b's engine restarts at 5 s (same port and epoch) | restart confirmed at 6.8 s (two polls), b's limit 1 then 5 after 5 s, breaker closed, `events.restarted` 1; 4 failed = streams cut by the restart |
+
+### Prefix table, cache affinity, routing log and §8 metrics (–4.3, §8, stage S5)
+
+Pools only (file or registry).
+
+**Prefix table (always kept).** Every request carries its message-boundary chain H_k = sha256(salt ‖ message 1 ‖ … ‖
+message k) (one running hash, each message's role and content length-prefixed, first 128 bits; the salt is random per
+gateway process, so the in-memory hashes cannot be checked against guessed content) for k = 1..m−1 (the last message,
+the new user turn, is never a cached prefix), each with the
+cumulative token estimate ceil(bytes / `PTR_GATEWAY_BYTES_PER_TOKEN`), the same rule as T̂ and G. Each upstream has a
+table of the chains the gateway has seen it serve: a request's chain is recorded at its **first 2xx body chunk** (its
+prefill is done, so the engine holds it; refused, failed and non-2xx calls are not recorded), tail first so that a
+request's longest prefixes are the least recently seen and evicted first (vLLM frees a sequence's tail blocks first).
+Entries expire after `PTR_GATEWAY_PREFIX_TTL_MS` (120000, Dynamo's approximate-mode default). Size: the own tokens of
+the resident entries (H_k counts only message k, so a shared policy block counts once) stay within the upstream's
+`kvCapacityTokens`, like the engine's prefix cache, which lives in the KV pool; and at most 4096 entries in any case. **Agent decision (deviation):** the design's bound "K_u / mean request tokens × 4 entries" counts requests,
+but the table stores one entry per message; a token bound measures the same thing at that granularity. A table is
+emptied when its upstream's breaker opens, when an engine restart is detected, and once when restart detection turns
+off (several processes on the port, one may be a fresh engine); a new member (new id, epoch or address) starts empty. h_u(r) = the cumulative tokens of the longest fresh H_k in u's table / T̂.
+
+**What the table changes (only with affinity on):** the cached share of a request on upstream u becomes
+max(policy-block share G, its table match on u) for **prefill only**: the prefill ledger U, the calibrated prefill gate
+and the §4.3 cost (and so `scored`'s choice) use (1 − h_u)·T̂. The **KV reservation stays (T̂ − G) + M**: a prefix hit
+saves prefill compute, but KV only for blocks that a *running* request holds, and a session's history is held by none
+(one turn per session at a time), so vLLM allocates those blocks again (its free cached blocks move into use). The
+policy block is the one prefix that running requests always share. With affinity off the table is not consulted at all
+(matched = 0), so credit, `scored` cost and selection are exactly as in S4; the table is still kept so its metrics show
+what affinity would see.
+
+**Cache affinity (`PTR_GATEWAY_AFFINITY=off|on`, default `off`).** Among the candidates whose credit fits:
+g_u = matched_u − G (cached tokens beyond the policy block, which every warm server holds). The member with the largest
+g (the cheapest of those, then the rendezvous order) is picked if g ≥ `PTR_GATEWAY_AFFINITY_MIN_TOKENS` (256) and its
+cost_u ≤ min cost + `PTR_GATEWAY_AFFINITY_SLACK` (0.5), with cost_u = (U_u + (1 − h_u)·T̂) / (R_u·T_max) + (N_u + 1) /
+S_eff (R_u = weight × 10000 until calibrated). Otherwise the configured `PTR_GATEWAY_ROUTING` decides. **Composition
+(agent decision):** the slack is measured with the §4.3 cost whatever the routing policy, so its meaning ("at most
+0.5 more occupancy / prefill pressure than the least loaded candidate") is the same for every policy; the fallback is
+the policy itself — `least_inflight` (fewest in flight; with affinity on its ties go to the rendezvous order of
+hash(policy ‖ persona) instead of rotating, so a persona's cold-start requests gather on one server), `scored` (least
+cost, rendezvous ties) or `round_robin`. With today's prompts persona-only matches give g ≈ 220 < 256: only a
+session's own history makes a server sticky, as the design intends.
+
+**Routing decision log** (sampled, `PTR_GATEWAY_ROUTE_LOG_SAMPLE`, default 0.01, 0 = off; no message text, the
+request key only as sha256[:12], member ids not URLs; to the gateway's stderr):
+
+```text
+route rk=3f2a9c0d1b7e pool=gemma-4-e4b-fp8 band=0 est=1912 h={a:0.71,b:0.59} cost={a:0.42,b:0.3} pick=a reason=affinity affinity=picked wait=12ms
+```
+
+`rk` is salted per process (comparable within one gateway's log, not across processes). `reason`: `affinity`, `load`
+(the policy's pick), `tie` (the policy's tie-break), `retry` (another primary after a
+connection failure), `failover` (`pick=secondary`, h and cost empty); `affinity=` (picked | brokenBySlack | none) only
+when affinity is on; h and cost list the candidates that fit.
+
+**Metrics (§8)** added to `pool` in `/metrics`: per upstream `ttftMs` and `e2eMs` {p50, p95} (2xx calls, from dispatch
+to the first body chunk / to the end of a completed stream; a stream the caller closed early counts for TTFT only), `estOverActualTokens` {p50, p95, n} (T̂ / `usage.prompt_tokens` read from the
+end of the answer; the worker asks for usage with `stream_options.include_usage`), `prefix` {entries, tokens, cleared,
+extraHits (affinity on: dispatches whose table match exceeded G)}; per pool `latency` {ttftMs, e2eMs} (from arrival at the pool,
+queue wait included), `affinity` {mode, minTokens, slack, picked, brokenBySlack, none} (counted only when on),
+`prefixTtlMs`. Already present and named differently from §8: `retriedOnOtherPrimary` (= primaryRetries),
+`failover.failovers` by reason, `queue.queued` by band, `queue.rejected` by reason (`draining` comes with S6),
+`seqUtil`, `kvUtil`, `telemetry`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PTR_GATEWAY_AFFINITY` | `off` | `on` = cache affinity before the routing policy |
+| `PTR_GATEWAY_AFFINITY_MIN_TOKENS` | 256 (0–1000000) | g needed to stick |
+| `PTR_GATEWAY_AFFINITY_SLACK` | 0.5 (0–100) | cost over the cheapest candidate that still sticks |
+| `PTR_GATEWAY_PREFIX_TTL_MS` | 120000 (1000–3600000) | prefix-table entry lifetime |
+| `PTR_GATEWAY_ROUTE_LOG_SAMPLE` | 0.01 (0–1) | share of routing decisions logged |
+
+**Affinity evaluation — pre-registered before the first run** (`scripts/routing-compare.ts`, `affinityAcceptance`):
+`least_inflight+affinity` (256 / 0.5) against `least_inflight` (the default), homogeneous and heterogeneous configs,
+W3 and W1, the S4 method (median knee of `least_inflight` over 3 knee seeds, grid 0.8–1.2 × knee, open loop, 15 s
+windows, failures = ∞) with **5 seeds**. Affinity becomes the default only if **all** hold, on seed means:
+W3 on both configs — TTFT p95 at the knee ≥ 10% better and max throughput with TTFT p95 ≤ 2 s ≤ 5% worse; W1 on both
+configs — both ≤ 5% worse. Reported next to it, not part of the bar: TTFT p50, engine prefix hit rate (requests and
+tokens), dispatch imbalance (max / mean per upstream), affinity outcomes. Workload change for this run: W3 requests put
+the agent state after the history (the approved S7 P2 layout), so a session's turns share a prefix that grows with
+its history; with the current layout (state before the history) the shared prefix stops at the persona and affinity
+has nothing to act on. The fake engine now models vLLM's KV: a request holds prompt − (prefix shared with running
+requests) + output, so a cached history saves prefill but not KV, and cached prefixes live in the free KV (capacity −
+KV in use, so load evicts them; the old model was 2000 entries and subtracted every cached token from KV). It counts
+hit tokens. The fake cache has the gateway table's message-boundary granularity and sees exactly the gateway's
+requests, so these runs do not exercise table staleness (other clients, engine eviction policy, real tokenization). Expectation from the design (§0, §1.2): small, because the
+policy block (~60% of a prompt) is cached on every server whatever the routing.
+
+**Result.** Two runs; the second is the one that counts for W3. Both: 5 seeds per point, knees from 3 seeds, seed
+means with 95% t intervals, gains positive = affinity better, paired = mean of the per-seed relative differences,
+runs made in parallel (one process per config × workload, one 12-core host, shared CPU).
+
+1. `reports/routing-compare-muzzck15899f.json` (all four combinations) used the first S5 code: the KV reservation
+   subtracted the table match and the fake engine subtracted every cached token from KV. Both overstated what a
+   history hit saves (review finding; fixed above).
+2. `reports/routing-compare-mv00vpea57e4.json` (W3 only, after the fix: KV = (T̂ − G) + M, table off when affinity is
+   off, fake engine KV = prompt − prefix shared with running requests + output). W1 was not re-run: it has no history,
+   so affinity changes only its tie-break, and the bar fails on W3 whatever W1 shows.
+
+| Combination | Knee (req/s; per seed) | Max throughput with TTFT p95 ≤ 2 s: on vs off | TTFT p95 at the knee (ms): on vs off | Bar |
+| --- | --- | --- | --- | --- |
+| homogeneous W3 (run 2) | 10.5 (15, 10.5, 10.5) | 11.99 vs 11.99 [10.84, 13.14] → 0% | 1255 [118, 2392] vs 1263 [169, 2357] → +0.6%; paired +7.3% [−15.2, +29.7] | needs ≥ 10%: **FAIL** |
+| heterogeneous W3 (run 2) | 7 (9, 5, 7) | 7.47 [6.45, 8.49] vs 7.25 [6.33, 8.17] → +2.9% | 1838 [−342, 4018] vs 1893 [−215, 4001] → +2.9%; paired +8.4% [−13.7, +30.5] | needs ≥ 10%: **FAIL** |
+| homogeneous W1 (run 1) | 7.5 (7.5 × 3) | 7.99 [6.57, 9.40] vs 8.15 [7.02, 9.27] → −2.0% | 1558 [990, 2126] vs 1539 [896, 2182] → −1.2% | ≤ 5% worse: PASS |
+| heterogeneous W1 (run 1) | 5 (5 × 3) | 4.63 [3.68, 5.58] vs 4.69 [3.81, 5.58] → −1.4% | 1955 [559, 3352] vs 1884 [560, 3208] → −3.8% | ≤ 5% worse: PASS |
+
+Run 1's W3 rows were +1.4% and +4.2% (also FAIL).
+
+**Verdict: the bar is not met (W3 fails on both configs in both runs), so `PTR_GATEWAY_AFFINITY` stays `off` by
+default.** Supporting numbers (run 2, at the knee unless noted; not part of the bar):
+
+- Engine prompt tokens served from cache, on vs off: homogeneous W3 0.772 vs 0.756, heterogeneous W3 0.777 vs 0.768
+  (median paired difference over the 25 seed × rate cells +1.0 and +0.6 points). As the design expected, most cached
+  tokens are the policy block that every server holds.
+- Affinity outcomes: about half the W3 decisions `picked` (homogeneous: 512 picked / 512 none over 5 seeds; `none` =
+  a session's first or second turn or a persona-only match); `brokenBySlack` 1 in heterogeneous, 0 in homogeneous.
+- TTFT p50: homogeneous 840 vs 846 ms, heterogeneous 717 vs 759. Dispatch imbalance (max / mean): 1.03 vs 1.03 and
+  1.51 vs 1.54: affinity did not concentrate load.
+- Over the 25 seed × rate cells affinity had the lower TTFT p95 in 12 (homogeneous) and 12 (heterogeneous), median
+  paired gain 0.0% in both: run 1's heterogeneous lean (19 of 25) did not survive the KV fix. The seed spread is far
+  larger than the difference; as in S4, throughput in an open loop equals the offered rate unless a policy crosses
+  2 s somewhere on the grid, so that half of the bar barely moves.
+
+Revisit only with a reason to expect more: the approved S7 prompt reordering in the app (this run assumed it), longer
+histories (more prefill saved per sticky turn), or real-engine calibration (S8). Reusing history never saves KV.
 
 ## Providers (direct, without the gateway)
 

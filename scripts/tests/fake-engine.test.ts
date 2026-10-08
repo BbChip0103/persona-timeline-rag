@@ -23,6 +23,39 @@ describe('FakeEngineUpstream (§9.1)',()=>{
     expect(warm.ttft).toBeLessThan(150);
     expect(e.stats).toMatchObject({prefixHits:1,completed:2});
   });
+  test('the prefix cache lives in the KV pool: resident prefixes beyond kvCapacityTokens evict the least recently used; token-level hit stats',async()=>{
+    const e=await engine({kvCapacityTokens:3000}); // 8900 B = 2000 tokens per system block
+    await call(e,msgs('a',8900));await call(e,msgs('b',8900)); // same block: hit
+    expect(e.stats).toMatchObject({prefixHits:1,cachedTokens:2000});
+    expect(e.stats.promptTokens).toBeCloseTo(2*(2000+1/4.45),3);
+    await call(e,[{role:'system',content:'B'.repeat(8900)},{role:'user',content:'c'}]); // 2000 + 2000 > 3000: the P block goes
+    await call(e,msgs('d',8900));
+    expect(e.stats.prefixHits).toBe(1);
+    const big=await engine({kvCapacityTokens:100000});
+    await call(big,[{role:'system',content:'B'.repeat(8900)},{role:'user',content:'c'}]);await call(big,msgs('a',8900));await call(big,msgs('d',8900));
+    expect(big.stats.prefixHits).toBe(1);
+  });
+  test('KV like vLLM: a cached prefix saves KV only while a running request holds it; a finished session\'s history is allocated again',async()=>{
+    const e=await engine({slots:4,tpotMs:10,kvCapacityTokens:100000,prefillTokensPerSec:100000});
+    const usage=()=>Number(/vllm:kv_cache_usage_perc\{[^}]*\} (\S+)/.exec(e.metricsText())![1]);
+    const history=[{role:'system',content:'P'.repeat(8900)},{role:'user',content:'u1'},{role:'assistant',content:'a1'}];
+    await call(e,[...history,{role:'user',content:'u2'}],5); // the history is now cached, nothing runs
+    const alone=call(e,[...history,{role:'user',content:'u3'}],200);
+    await new Promise(r=>setTimeout(r,100));
+    expect(e.stats.cachedTokens).toBeGreaterThan(2000); // prefill skipped the cached history…
+    expect(usage()*100000).toBeGreaterThan(2000+200); // …but its KV is allocated again (prompt + output)
+    const shared=call(e,[...history,{role:'user',content:'u4'}],200); // same prefix as the running request: shared blocks
+    await new Promise(r=>setTimeout(r,100));
+    expect(usage()*100000).toBeLessThan(2*(2000+200)-1500);
+    await Promise.all([alone,shared]);
+  });
+  test('the cache holds at most K − KV in use: a long running request evicts idle cached prefixes',async()=>{
+    const e=await engine({slots:4,tpotMs:1,kvCapacityTokens:4000,prefillTokensPerSec:100000});
+    await call(e,msgs('a',8900)); // P (2000 tokens) cached; P + Q = 4000 would fit an idle cache
+    await call(e,[{role:'system',content:'Q'.repeat(8900)},{role:'user',content:'b'}],512); // 2000 + 512 in use → room for ~1488: P goes
+    await call(e,msgs('c',8900));
+    expect(e.stats.prefixHits).toBe(0);
+  });
   test('more requests than slots wait inside the engine; /metrics and /health use vLLM names',async()=>{
     const e=await engine({slots:1,tpotMs:20});
     const calls=[call(e,msgs('a',100),20),call(e,msgs('b',100),20)];

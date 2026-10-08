@@ -70,6 +70,8 @@ export interface TelemetryOptions {
    * than maxSeqs / 4 sequences is suspicious (a metric that does not mean what we assume), warned once per episode.
    */
   maxSeqs?:()=>number; warn?:(line:string)=>void; suspectPolls?:number;
+  /** Polls in a row with one start time that re-arm restart detection after it was turned off (default 30). */
+  rearmPolls?:number;
   now:()=>number;
 }
 export interface TelemetryMetrics {
@@ -83,6 +85,8 @@ export interface TelemetryMetrics {
   /** credit_model_miss episodes, and the current run of polls with waiting > 0. */
   creditModelMiss:number; waitingStreak:number;
   restarts:number;
+  /** True after a start time earlier than the latest seen appeared (several processes on one port) until 30 polls in a row agree again. */
+  restartDetectionDisabled:boolean;
   /** Polls with an impossible value (KV usage outside [0, 1], a negative count), which is then treated as unknown. */
   implausible:number;
   /** Episodes of "blocked while running < maxSeqs / 4" (see TelemetryOptions.maxSeqs). */
@@ -91,11 +95,11 @@ export interface TelemetryMetrics {
 /** One upstream's poller. `onChange` runs when a poll flips the filter result or reveals an engine restart. */
 export class EngineTelemetry {
   private last:EngineMetrics|undefined;private lastOkAt:number|undefined;private staleCountedFor:number|undefined;
-  private startTime:number|null=null;private startCandidate:number|null=null;private hitRate:number|null=null;private suspectStreak=0;
+  private startTime:number|null=null;private startCandidate:number|null=null;private restartDetectionOff=false;private lastStart:number|null=null;private sameStart=0;private hitRate:number|null=null;private suspectStreak=0;
   private timer:NodeJS.Timeout|undefined;private polling:Promise<void>|undefined;private stopped=false;
   private readonly counts={staleEpisodes:0,failedPolls:0,blockedPolls:0,creditModelMiss:0,waitingStreak:0,restarts:0,implausible:0,suspectBlocked:0};
   constructor(private readonly fetchMetrics:(signal:AbortSignal)=>Promise<string|null>,private readonly options:TelemetryOptions,
-    private readonly onChange:(event:{restarted:boolean})=>void) {}
+    private readonly onChange:(event:{restarted:boolean;detectionOff:boolean})=>void) {}
   start():void {
     if(this.timer||this.stopped) return;
     void this.poll();
@@ -131,12 +135,25 @@ export class EngineTelemetry {
     if(parsed.waiting!==null&&parsed.waiting<0) {parsed.waiting=null;implausible=true;}
     if(implausible) this.counts.implausible++;
     this.last=parsed;this.lastOkAt=this.options.now();
-    // A restart needs two polls in a row with the same new start time: several API servers behind one port (each its
-    // own process start) answering in turn must not look like restarts.
-    let restarted=false;
+    // A restart is a LATER start time seen on two polls in a row. A start time earlier than the latest one seen (current
+    // or candidate) cannot come from a restart: several processes answer on this port (API servers each with its own
+    // start), so detection is turned off for this member (one warning) instead of flapping between them. It re-arms once
+    // `rearmPolls` polls in a row report one start time (one process again), with that value as the new baseline.
+    let restarted=false, detectionOff=false;
     const start=parsed.startTimeSeconds;
-    if(start!==null) {
+    if(start!==null&&this.restartDetectionOff) {
+      this.sameStart=start===this.lastStart?this.sameStart+1:1;this.lastStart=start;
+      if(this.sameStart>=(this.options.rearmPolls??30)) {
+        this.restartDetectionOff=false;this.startTime=start;this.startCandidate=null;
+        this.options.warn?.(`restart detection back on: ${this.sameStart} polls in a row with one process_start_time_seconds`);
+      }
+    } else if(start!==null) {
+      const latest=Math.max(this.startTime??-Infinity,this.startCandidate??-Infinity);
       if(this.startTime===null) this.startTime=start;
+      else if(start<latest) {
+        this.restartDetectionOff=true;this.startCandidate=null;this.lastStart=start;this.sameStart=1;detectionOff=true;
+        this.options.warn?.('restart detection off: process_start_time_seconds went back to an earlier value, so several processes answer on this port');
+      }
       else if(start===this.startTime) this.startCandidate=null;
       else if(start===this.startCandidate) {restarted=true;this.startTime=start;this.startCandidate=null;}
       else this.startCandidate=start;
@@ -157,13 +174,13 @@ export class EngineTelemetry {
           +`(kv_cache_usage_perc ${parsed.kvUsage}, waiting ${parsed.waiting}): check that the engine's metrics mean what the filter assumes`);
       }
     } else this.suspectStreak=0;
-    if(restarted||after!==before) this.onChange({restarted});
+    if(restarted||detectionOff||after!==before) this.onChange({restarted,detectionOff});
   }
   metrics():TelemetryMetrics {
     const stale=this.stale(), now=this.options.now();
     return {stale,ageMs:this.lastOkAt===undefined?null:now-this.lastOkAt,staleEpisodes:this.counts.staleEpisodes,failedPolls:this.counts.failedPolls,
       running:this.last?.running??null,waiting:this.last?.waiting??null,kvUsage:this.last?.kvUsage??null,prefixHitRate:this.hitRate,
       blocked:this.blocked(),blockedPolls:this.counts.blockedPolls,creditModelMiss:this.counts.creditModelMiss,waitingStreak:this.counts.waitingStreak,
-      restarts:this.counts.restarts,implausible:this.counts.implausible,suspectBlocked:this.counts.suspectBlocked};
+      restarts:this.counts.restarts,restartDetectionDisabled:this.restartDetectionOff,implausible:this.counts.implausible,suspectBlocked:this.counts.suspectBlocked};
   }
 }
