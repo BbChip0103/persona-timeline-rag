@@ -1,9 +1,12 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ProviderError, type BudgetLedger, type BudgetRequest } from '@ptr/providers';
 import type { TurnTrace } from '../evaluate';
-import { PILOT_LIMITS, PilotLedger, selectMemoryPilot, validatePilotArguments, validatePilotBudget } from '../evaluate-memory-context';
+import { PILOT_LIMITS, PilotLedger, loadPilotCases, selectMemoryPilot, validatePilotArguments, validatePilotBudget } from '../evaluate-memory-context';
 import { userConversation, type ChatCase, type ChatTestset } from '../prepare-character-chat-testset';
 
-const bindings = [['creator_a', 'caption_memory'], ['creator_b', 'image_memory'], ['creator_c', 'creative_preference'], ['creator_d', 'mixed_memory']] as const;
+const bindings = [['synthetic-person-a', 'caption_memory'], ['synthetic-person-b', 'image_memory'], ['synthetic-person-c', 'creative_preference'], ['synthetic-person-d', 'mixed_memory']] as const;
 function fixture() {
   const conversations = bindings.map(([personId, category], index) => ({ id: `synthetic-${index}`, personId, category, personaId: `synthetic-persona-${index}`, personaRevision: 'synthetic-v1',
     turns: [0, 1, 2].map(turn => ({ id: `synthetic-${index}-${turn}`, text: `Synthetic natural turn ${turn}`, evaluator: { hidden: 'never exposed' } })) })) as unknown as ChatCase[];
@@ -12,15 +15,15 @@ function fixture() {
 }
 const budget = { cap_microusd: 1_000_000, call_cap: 1000, calls: 940, actual_microusd: '208327', unresolved_microusd: '7625' };
 test('pilot selects exactly four frozen user-only three-turn conversations without evaluator metadata', () => {
-  const f = fixture(), result = selectMemoryPilot(f.testset, f.users);
+  const f = fixture(), result = selectMemoryPilot(f.testset, f.users, bindings);
   expect(result).toHaveLength(4); expect(result.map(item => item.personId)).toEqual(bindings.map(item => item[0]));
   expect(result.flatMap(item => item.turns)).toHaveLength(12); expect(JSON.stringify(result)).not.toMatch(/evaluator|hidden|category/);
   expect(PILOT_LIMITS).toEqual({ turns: 36, textCalls: 36, embeddingCalls: 24, freshRequests: 60 });
 });
 test('pilot fails closed on changed text, missing cases or non-frozen selection', () => {
-  const f = fixture(); f.users[0]!.turns[0]!.text = 'Changed'; expect(() => selectMemoryPilot(f.testset, f.users)).toThrow('mismatch');
-  const g = fixture(); g.testset.smokeIds.pop(); expect(() => selectMemoryPilot(g.testset, g.users)).toThrow('missing');
-  const h = fixture(); h.testset.conversations.push(h.testset.conversations[0]!); expect(() => selectMemoryPilot(h.testset, h.users)).toThrow('duplicated');
+  const f = fixture(); f.users[0]!.turns[0]!.text = 'Changed'; expect(() => selectMemoryPilot(f.testset, f.users, bindings)).toThrow('mismatch');
+  const g = fixture(); g.testset.smokeIds.pop(); expect(() => selectMemoryPilot(g.testset, g.users, bindings)).toThrow('missing');
+  const h = fixture(); h.testset.conversations.push(h.testset.conversations[0]!); expect(() => selectMemoryPilot(h.testset, h.users, bindings)).toThrow('duplicated');
 });
 test('live pilot requires explicit opt-ins and preserves the original model', () => {
   const env = { GOAL1_LIVE_ENABLED: 'true', GOAL1_ALLOW_EXTERNAL_DATA: 'true', GOAL1_TEXT_MODEL: 'google/gemini-3-flash-preview' };
@@ -75,4 +78,21 @@ test('global reservation rejection sets sticky stop even below current budget ca
   const f=ledgerFixture();jest.mocked(f.ledger.reserve).mockRejectedValueOnce(new ProviderError('BUDGET_EXCEEDED'));
   await expect(f.pilot.reserve('synthetic',900000)).rejects.toThrow('BUDGET_EXCEEDED');
   expect(f.pilot.stoppedReason()).toBe('BUDGET_EXCEEDED');
+});
+
+function targetsFile(content: string): { path: string; cleanup: () => void } {
+  const directory = mkdtempSync(join(tmpdir(), 'ptr-targets-')), path = join(directory, 'targets.json'); writeFileSync(path, content);
+  return { path, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+}
+test('pilot targets are read at runtime from the private file named by PTR_EVAL_TARGETS_FILE in order', () => {
+  const file = targetsFile(JSON.stringify(bindings));
+  try { expect(loadPilotCases({ PTR_EVAL_TARGETS_FILE: file.path })).toEqual(bindings.map(item => [...item])); } finally { file.cleanup(); }
+});
+test('pilot targets fail clearly when the source is unset, missing or malformed', () => {
+  expect(() => loadPilotCases({})).toThrow('PTR_EVAL_TARGETS_FILE');
+  expect(() => loadPilotCases({ PTR_EVAL_TARGETS_FILE: join(tmpdir(), 'ptr-targets-does-not-exist.json') })).toThrow('PTR_EVAL_TARGETS_FILE');
+  for (const content of ['not json', '{}', '[]', JSON.stringify(bindings.slice(0, 3)), JSON.stringify([...bindings.slice(0, 3), ['synthetic-person-d']])]) {
+    const file = targetsFile(content);
+    try { expect(() => loadPilotCases({ PTR_EVAL_TARGETS_FILE: file.path })).toThrow('PTR_EVAL_TARGETS_FILE'); } finally { file.cleanup(); }
+  }
 });

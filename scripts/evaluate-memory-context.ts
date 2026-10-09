@@ -1,6 +1,7 @@
 /** Historical legacy regression only; forward three-condition evaluation uses evaluate-character-chat.ts. */
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Pool } from 'pg';
@@ -16,11 +17,21 @@ import { prepareImageAnnotations, type AnnotationPlan } from './import-image-ann
 import { prepareChatTestset, testsetHash, userConversation, type ChatTestset } from './prepare-character-chat-testset';
 import { privateJson } from './prepare-research';
 
-const PILOT_CASES = [['creator_a', 'caption_memory'], ['creator_b', 'image_memory'], ['creator_c', 'creative_preference'], ['creator_d', 'mixed_memory']] as const;
+export type PilotCase = readonly [personId: string, category: string];
+/** Real person IDs never live in the repo: ordered [personId, category] pairs come from a private, gitignored JSON file. */
+export function loadPilotCases(env: NodeJS.ProcessEnv): PilotCase[] {
+  const path = env.PTR_EVAL_TARGETS_FILE, fail = (reason: string): never => { throw new Error(`PTR_EVAL_TARGETS_FILE ${reason}`); };
+  if (!path) return fail('must point to the private pilot targets JSON (ordered [personId, category] x4, under data/)');
+  let parsed: unknown;
+  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return fail('is unreadable or not valid JSON'); }
+  if (!Array.isArray(parsed) || parsed.length !== 4 || !parsed.every(item => Array.isArray(item) && item.length === 2 && item.every(part => typeof part === 'string' && part)))
+    return fail('must hold exactly four non-empty [personId, category] string pairs');
+  return parsed as PilotCase[];
+}
 export const PILOT_LIMITS = { turns: 36, textCalls: 36, embeddingCalls: 24, freshRequests: 60 } as const;
 export interface MemoryTrace extends TurnTrace { sourceLookupCalls: number; searchQueries: string[]; resolvedIds: string[] }
-export function selectMemoryPilot(testset: ChatTestset, users: UserConversation[]): UserConversation[] {
-  const selected = PILOT_CASES.map(([person, category]) => {
+export function selectMemoryPilot(testset: ChatTestset, users: UserConversation[], cases: readonly PilotCase[] = loadPilotCases(process.env)): UserConversation[] {
+  const selected = cases.map(([person, category]) => {
     const matches = testset.conversations.filter(item => item.personId === person && item.category === category && testset.smokeIds.includes(item.id));
     if (matches.length !== 1) throw new Error('Frozen pilot case missing or duplicated');
     const visible = userConversation(matches[0]!); const found = users.find(item => item.id === visible.id);

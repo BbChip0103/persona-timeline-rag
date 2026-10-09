@@ -6,9 +6,12 @@
 
 The pilot reuses four conversations from the existing frozen natural-chat smoke set: one memory conversation per Korean persona, one imaginary-photo conversation and one caption/photo conversation. Each uses three genuine evolving turns in each of `off`, `caption`, and `caption_image`: **36 answer turns**. Selection metadata is never sent to the chatbot; its input remains session/request IDs and natural user text only.
 
+The four target conversations are selected by real person IDs, which are never committed. `selectMemoryPilot` (also used by `evaluate-korean-chat.ts`, `evaluate-agent-profile.ts` and the S8 gates, including the recollection gate c) reads them at runtime from a private, gitignored JSON file named by `PTR_EVAL_TARGETS_FILE`: an ordered array of four `[personId, category]` pairs, in the order `caption_memory`, `image_memory`, `creative_preference`, `mixed_memory`. Keep it under the main checkout's ignored `data/` (for example `data/research/memory-pilot-targets.private.json`) and pass an absolute path when running from a worktree. If the variable is unset, or the file is missing or malformed, the run fails before any provider call. To verify a rebuilt file, compare the SHA-256 of the selected conversation IDs with the `selectedConversationIds` of an earlier `reports/memory-context/pilot-*/preflight.json`; print only the hash, never the IDs.
+
 ```bash
 # Run from repository root with existing ignored personal-provider/local-DB configuration.
-# Explicit opt-ins and the baseline model must already be set:
+# Explicit opt-ins, the baseline model and the private targets file must already be set:
+# PTR_EVAL_TARGETS_FILE=/abs/path/to/data/research/memory-pilot-targets.private.json
 # GOAL1_LIVE_ENABLED=true
 # GOAL1_ALLOW_EXTERNAL_DATA=true
 # GOAL1_TEXT_MODEL=google/gemini-3-flash-preview
