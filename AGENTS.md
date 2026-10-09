@@ -16,6 +16,7 @@
 - 실행별 code/persona/prompt/model/case revision과 private 결과/trace/비용·오류를 기록한다. fake/live·고정history/누적대화를 구분하고, image task 재개와 submit retry를 분리해 중복과금을 막는다. 같은 core/검증 규칙을 쓰며 runner에 정책을 따로 구현하지 않는다.
 - 커밋 전에 `git diff --cached --check`와 staged 파일/내용을 검토한다. 원본 데이터/캡션/이미지·실제persona/대화·보고서·승인/배포정보·키·다른 프로젝트 자료가 들어가지 않아야 한다. `.gitignore`는 secret 검사나 접근통제를 대신하지 않는다.
 - `data/`, `reports/`, `*.private.md`, `.env` 등은 비공개로 유지한다. 공개 fixture/CI 출력은 합성 데이터만 쓴다.
+- 에이전트는 `reports/review/**`(사람 검수 시트)와 S8 결과 파일의 행 내용을 읽거나 출력하지 않는다. 확인은 파일 존재·권한·행 수만 한다([사람 검수 표본](docs/review-sampling.md)).
 - **push는 사용자의 명시적 요청이 있을 때만 한다.** remote 설정/로컬 commit과 GitHub 업로드는 구분한다. force push/amend/reset으로 공유 이력을 덮지 않는다.
 
 ## 논의·진행 이력
