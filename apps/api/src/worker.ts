@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { TurnWorker } from '@ptr/core';
 import { capacityControllerMode, startTurnConsumer } from '@ptr/messaging';
+import { loadConfig } from '@ptr/ops';
 import { fetchGatewayCapacity, gatewayCapacityWarning } from '@ptr/providers';
 import { readCapacityState, workerCapacityLine } from './capacity';
 import { createRuntime, gatewayBaseUrls } from './runtime';
@@ -12,6 +13,7 @@ function integer(name:string,fallback:number,min:number,max:number):number {
   return value;
 }
 async function main() {
+  loadConfig('worker',process.env);
   const runtime=createRuntime(process.env,{onTurnFailure:({code})=>process.stderr.write(`turn failed ${code}\n`)});
   const workerId=process.env.PTR_WORKER_ID??`worker-${randomUUID().slice(0,8)}`;
   // Lease must outlive several heartbeats (lease/3); the dispatcher requeues turns whose lease expired.

@@ -17,7 +17,8 @@
     "db:migrate": "tsx scripts/db-migrate.ts",
     "prepare:research": "tsx scripts/prepare-research.ts",
     "harness:smoke": "tsx scripts/harness-smoke.ts",
-    "evaluate": "tsx scripts/evaluate.ts"
+    "evaluate": "tsx scripts/evaluate.ts",
+    "ops:check-env": "tsx packages/ops/scripts/check-env.ts"
   },
   "dependencies": {
     "@nestjs/common": "10.4.22",

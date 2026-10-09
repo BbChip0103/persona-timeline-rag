@@ -1,12 +1,17 @@
 # Private local chat UI
 
 Run `pnpm --filter @ptr/web dev` (or build, then start). Both server commands bind
-only `127.0.0.1:56440`. The API must be at `http://127.0.0.1:56441`.
+only `127.0.0.1:56440`. The API target is the constant `http://127.0.0.1:56441`.
 
-Private `apps/web/.env.local` holds `PTR_API_URL`, `PTR_API_TOKEN`,
+Private `apps/web/.env.local` holds `PTR_API_TOKEN` (24–512 characters),
 `PTR_UI_PASSWORD` (at least 12 characters), and `PTR_SESSION_SECRET` (at least
-32 characters). Do not use `NEXT_PUBLIC_*` for secrets. Missing settings fail
-closed. This app does not locate credentials or contact model providers.
+32 characters). `PTR_API_URL` is no longer read: the constant value only gives a
+startup warning (`constant_ignored`), any other value stops startup
+(`api_url_constant`). `instrumentation.ts` checks these keys at startup (rules in
+`packages/ops/src/config/web.ts`, imported as `@ptr/ops/web`; see
+`docs/configuration.md`) and exits with one `config_invalid` line of key names and
+rule ids; `next build` skips the check. Do not use `NEXT_PUBLIC_*` for secrets.
+This app does not locate credentials or contact model providers.
 
 Login issues an HMAC-signed, expiring HttpOnly / SameSite=Strict cookie. Owner
 identity derives from the private signing secret, so logging in again preserves

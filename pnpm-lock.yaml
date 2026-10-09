@@ -87,6 +87,9 @@ importers:
       '@ptr/messaging':
         specifier: workspace:*
         version: link:../../packages/messaging
+      '@ptr/ops':
+        specifier: workspace:*
+        version: link:../../packages/ops
       '@ptr/providers':
         specifier: workspace:*
         version: link:../../packages/providers
@@ -117,6 +120,9 @@ importers:
       '@ptr/messaging':
         specifier: workspace:*
         version: link:../../packages/messaging
+      '@ptr/ops':
+        specifier: workspace:*
+        version: link:../../packages/ops
       '@ptr/providers':
         specifier: workspace:*
         version: link:../../packages/providers
@@ -126,6 +132,9 @@ importers:
 
   apps/web:
     dependencies:
+      '@ptr/ops':
+        specifier: workspace:*
+        version: link:../../packages/ops
       next:
         specifier: 15.5.27
         version: 15.5.27(@babel/core@7.29.7)(@playwright/test@1.56.1)(@types/node@22.15.30)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
@@ -178,6 +187,24 @@ importers:
       ioredis:
         specifier: 6.0.0
         version: 6.0.0
+      zod:
+        specifier: 3.24.2
+        version: 3.24.2
+
+  packages/ops:
+    dependencies:
+      '@ptr/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ptr/messaging':
+        specifier: workspace:*
+        version: link:../messaging
+      '@ptr/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@ptr/storage':
+        specifier: workspace:*
+        version: link:../storage
       zod:
         specifier: 3.24.2
         version: 3.24.2

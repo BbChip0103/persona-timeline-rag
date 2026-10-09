@@ -65,16 +65,33 @@ export async function readPersonaCatalogue(env:NodeJS.ProcessEnv,databaseUrl:str
   }
   return mergePersonaLists(generated,authored.personas);
 }
+/** Database pool (aliases: GOAL1_DATABASE_URL) and the validated queue/event names shared by all roles. */
+function messagingSettings(env:NodeJS.ProcessEnv) {
+  const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
+  const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
+  const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
+  // Separate names let a load test run beside other users of the same Redis (and be wiped safely afterwards).
+  const queueName=env.PTR_TURN_QUEUE??'turns', namespace=env.PTR_EVENTS_NAMESPACE??'events';
+  if(!/^[a-z0-9-]{1,40}$/.test(queueName)||!/^[a-z0-9-]{1,40}$/.test(namespace)) throw new CoreError('INVALID_INPUT');
+  return {databaseUrl,pool,redisUrl:env.PTR_REDIS_URL??'',queueName,namespace};
+}
+/**
+ * Dispatcher runtime : lease recovery, outbox republish and queue timeouts need the turn store, delivery
+ * and events only, so no chat provider, persona list or classifier is configured (no provider keys are read).
+ */
+export function createRecoveryRuntime(env:NodeJS.ProcessEnv=process.env):{leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;close():Promise<void>} {
+  const {pool,redisUrl,queueName,namespace}=messagingSettings(env);
+  const delivery=new BullMqTurnDelivery(redisUrl,{queueName}), events=new RedisTurnEvents(redisUrl,{namespace});
+  return {leases:new PostgresConversationStore(pool),delivery,events,
+    async close() {await Promise.allSettled([delivery.close(),events.close()]);await pool.end();}};
+}
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
 export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
   /** Tests: read the gateway registry from this store instead of Redis. */
   gatewayRegistry?:GatewayRegistryReader}={}):ApiRuntime {
-  const databaseUrl=env.GOAL1_DATABASE_URL??env.DATABASE_URL??'';
-  const poolMax=env.PTR_DB_POOL_MAX===undefined?undefined:Number(env.PTR_DB_POOL_MAX);
-  const pool=createLocalPool(databaseUrl,poolMax===undefined?{}:{max:poolMax});
+  const {databaseUrl,pool,redisUrl,queueName,namespace}=messagingSettings(env);
   // Inline and Postgres-polling execution were removed; fail loudly instead of silently ignoring an old setting.
   if(env.PTR_EXECUTION!==undefined) throw new CoreError('INVALID_INPUT','PTR_EXECUTION was removed: turns always run through Redis workers');
-  const redisUrl=env.PTR_REDIS_URL??'';
   const queueMaxDepth=Number(env.PTR_QUEUE_MAX_DEPTH??256);
   if(!Number.isInteger(queueMaxDepth)||queueMaxDepth<1) throw new CoreError('INVALID_INPUT');
   const personas=new PostgresPersonaRepository(pool);
@@ -134,12 +151,13 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
       stopGateways=async()=>{await directory.close();await stopRedis?.();};
       gateways=directory;baseUrl=()=>directory.urls();
     }
+    // Structured agent replies are on unless PTR_GATEWAY_STRUCTURED=0 (demo layer); S8 passed with them on .
     // Connection resets are retried for keyed turn calls (the turn id makes the resend idempotent at the gateway).
     // Number('') is 0: an empty or blank value is a configuration error, not "off".
     if([env.PTR_GATEWAY_RESET_RETRIES,env.PTR_GATEWAY_RETRY_MIN_REMAINING_MS].some(value=>value!==undefined&&!value.trim())) throw new CoreError('INVALID_INPUT');
     const resetRetries=Number(env.PTR_GATEWAY_RESET_RETRIES??2), retryMinRemainingMs=Number(env.PTR_GATEWAY_RETRY_MIN_REMAINING_MS??5000);
     if(!Number.isInteger(resetRetries)||resetRetries<0||resetRetries>10||!Number.isInteger(retryMinRemainingMs)||retryMinRemainingMs<0||retryMinRemainingMs>60000) throw new CoreError('INVALID_INPUT');
-    provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED==='1',
+    provider=new OpenAICompatibleTextProvider({baseUrl,model:'gateway',apiKey:token,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_GATEWAY_STRUCTURED!=='0',
       resetRetries,retryMinRemainingMs});model='gateway';
   } else if(providerName!=='fake') throw new CoreError('INVALID_INPUT');
   // Optional Jev helpers, both default off; any failure falls back to the deterministic rules. With both on, one
@@ -173,9 +191,6 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     }
   }
   const store=new PostgresConversationStore(pool);
-  // Separate names let a load test run beside other users of the same Redis (and be wiped safely afterwards).
-  const queueName=env.PTR_TURN_QUEUE??'turns', namespace=env.PTR_EVENTS_NAMESPACE??'events';
-  if(!/^[a-z0-9-]{1,40}$/.test(queueName)||!/^[a-z0-9-]{1,40}$/.test(namespace)) throw new CoreError('INVALID_INPUT');
   const delivery=new BullMqTurnDelivery(redisUrl,{queueName});
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   // R10: self-hosted and gateway chat embed queries with the fake hash model, whose space holds no licensed source

@@ -49,7 +49,7 @@ async function waitHealthy(port:number):Promise<void> {
 /** One gateway process with an explicit environment (no inherited credentials). */
 async function startGateway(name:string,port:number,env:NodeJS.ProcessEnv,preload?:string):Promise<Gw> {
   const child=spawn(process.execPath,['--import','tsx',...(preload?['--import',preload]:[]),'apps/gateway/src/main.ts'],{stdio:['ignore','pipe','pipe'],
-    env:{PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_GATEWAY_PORT:String(port),PTR_GATEWAY_TOKEN:TOKEN,PTR_GATEWAY_ID:name,
+    env:{PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_DEMO_SCALING:'1',PTR_GATEWAY_PORT:String(port),PTR_GATEWAY_TOKEN:TOKEN,PTR_GATEWAY_ID:name,
       PTR_GATEWAY_REGISTRY:'on',PTR_REDIS_URL:process.env.PTR_REDIS_URL,PTR_REGISTRY_PREFIX:PREFIX,PTR_GATEWAY_ALLOW:ALLOW,PTR_GATEWAY_ROUTE_LOG_SAMPLE:'0',
       // Fake engines send headers with the first token, not at once like vLLM: keep the headers timeout off, as before.
       PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_GATEWAY_POOL:POOL,PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS:'0',...env}});

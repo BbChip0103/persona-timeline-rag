@@ -10,7 +10,8 @@
   "dependencies": {
     "next": "15.5.27",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "@ptr/ops": "workspace:*"
   },
   "devDependencies": {
     "@types/react": "19.2.2",

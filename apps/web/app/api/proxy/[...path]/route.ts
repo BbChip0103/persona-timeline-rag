@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { localHost, sameOrigin, signedOwner } from '../../../../lib/auth';
+import { apiUrl } from '../../../../lib/config';
 export const runtime='nodejs';
 const id='[a-zA-Z0-9_-]{1,200}';
 const events=new RegExp(`^turns/${id}/events$`);
@@ -10,8 +11,8 @@ async function proxy(request:Request,context:{params:Promise<{path:string[]}>}) 
   const path=(await context.params).path.join('/');
   if(!(request.method==='GET'?routes.GET:routes.POST).test(path)||new URL(request.url).search) return NextResponse.json({error:{code:'NOT_FOUND'}},{status:404});
   try {
-    const origin=process.env.PTR_API_URL;
-    if(origin!=='http://127.0.0.1:56441') throw new Error('INVALID_API_TARGET');
+    // Fixed loopback target : PTR_API_URL is no longer read; instrumentation.ts refuses a different value.
+    const origin=apiUrl();
     const token=process.env.PTR_API_TOKEN??'';if(token.length<24) throw new Error('API_UNAVAILABLE');
     const body=request.method==='POST'?await request.text():undefined;
     if(body&&Buffer.byteLength(body)>16384) return NextResponse.json({error:{code:'BODY_TOO_LARGE'}},{status:413});

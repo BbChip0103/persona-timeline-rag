@@ -98,7 +98,8 @@ class Fleet {
       :t.provider==='selfhosted'
         ?{PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel,PTR_SELFHOSTED_STRUCTURED:t.structured?'1':'0'}
         :{PTR_CHAT_PROVIDER:'fake',...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
-    return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',DATABASE_URL:loadtestUrl(),PTR_REDIS_URL:redisUrl(),
+    // PTR_DEMO_SCALING=1: the fleet sets demo-layer knobs (queue names, leases, fake/selfhosted models).
+    return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_DEMO_SCALING:'1',DATABASE_URL:loadtestUrl(),PTR_REDIS_URL:redisUrl(),
       PTR_TURN_QUEUE:QUEUE,PTR_EVENTS_NAMESPACE:NAMESPACE,PTR_API_TOKEN:this.apiToken,PTR_PERSONAS_FILE:this.personasFile,
       PTR_QUEUE_MAX_DEPTH:String(t.queueMax),PTR_DB_POOL_MAX:String(t.poolMax),PTR_WORKER_CONCURRENCY:String(t.workerConcurrency),
       PTR_LEASE_MS:String(t.leaseMs),PTR_DISPATCH_GRACE_MS:'2000',PTR_DISPATCH_INTERVAL_MS:'500',...model,...extra};

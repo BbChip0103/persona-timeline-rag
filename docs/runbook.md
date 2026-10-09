@@ -81,7 +81,9 @@ pnpm --filter @ptr/web start
 ```
 
 API56441/UI56440 bind **127.0.0.1**. Web's private `.env.local` needs only UI password/session
-secret/API token/API URL; provider keys/database credentials stay server-side. Fake is default;
+secret/API token; the API URL is a constant (`PTR_API_URL` only gives a warning, a different value stops the web).
+Provider keys/database credentials stay server-side. Production needs `PTR_CHAT_PROVIDER=gateway|openrouter`
+(`fake` only with `PTR_DEMO_SCALING=1`; see [configuration.md](configuration.md), `pnpm ops:check-env`);
 for paid chat explicitly set `PTR_CHAT_PROVIDER=openrouter` and `GOAL1_LIVE_ENABLED=true`.
 The ledger must already be initialized. It stops further paid requests at the same research cap.
 Login with private configured password. Do not expose these localHTTP services on a public interface.

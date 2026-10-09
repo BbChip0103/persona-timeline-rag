@@ -33,6 +33,12 @@
       ],
       "@ptr/messaging/registry": [
         "packages/messaging/src/registry.ts"
+      ],
+      "@ptr/ops": [
+        "packages/ops/src/index.ts"
+      ],
+      "@ptr/ops/web": [
+        "packages/ops/src/config/web.ts"
       ]
     }
   }

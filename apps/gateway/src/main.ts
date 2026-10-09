@@ -1,4 +1,5 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
+import { loadConfig } from '@ptr/ops';
 import { createLocalPool } from '@ptr/storage';
 import { randomUUID } from 'node:crypto';
 import { GATEWAY_ID, GatewayPublisher, POOL_NAME, RedisGatewayRegistry, RedisUpstreamRegistry, checkGatewayUrl, createRedisConnection, parseGatewayAllow,
@@ -21,7 +22,7 @@ function decimal(env:NodeJS.ProcessEnv,name:string,fallback:number,min:number,ma
   if(!Number.isFinite(value)||value<min||value>max) throw new Error(`INVALID_${name}`);
   return value;
 }
-/** PTR_GATEWAY_ROUTING default for pools (decided by the §9.1 comparison, see docs/goal2-serving.md). */
+/** PTR_GATEWAY_ROUTING default for pools (decided by the §9.1 comparison, see docs/demo-mode.md). */
 export const DEFAULT_ROUTING:RoutingPolicy='least_inflight';
 function integer(env:NodeJS.ProcessEnv,name:string,fallback:number,min:number,max:number):number {
   const value=Number(env[name]??fallback);
@@ -99,7 +100,7 @@ function poolFromEnvironment(env:NodeJS.ProcessEnv,discovery:string,failover:str
   if(!(ROUTING_POLICIES as readonly string[]).includes(routing)) throw new Error('INVALID_PTR_GATEWAY_ROUTING');
   if(fairness!=='fifo'&&fairness!=='drr') throw new Error('INVALID_PTR_GATEWAY_FAIRNESS');
   if(saturated!=='true'&&saturated!=='false') throw new Error('INVALID_PTR_GATEWAY_REJECT_SATURATED');
-  // Cache affinity (§4.3, S5): off by default — the §9.1 comparison did not meet its pre-registered bar (docs/goal2-serving.md).
+  // Cache affinity (§4.3, S5): off by default — the §9.1 comparison did not meet its pre-registered bar (docs/demo-mode.md).
   const affinity=env.PTR_GATEWAY_AFFINITY??'off';
   if(affinity!=='off'&&affinity!=='on') throw new Error('INVALID_PTR_GATEWAY_AFFINITY');
   const affinityOptions={minTokens:integer(env,'PTR_GATEWAY_AFFINITY_MIN_TOKENS',256,0,1000000),slack:decimal(env,'PTR_GATEWAY_AFFINITY_SLACK',0.5,0,100)};
@@ -187,8 +188,16 @@ export function gatewayRegistrySettings(env:NodeJS.ProcessEnv,port:number,starte
   if(checkGatewayUrl(url,allow)) throw new Error('INVALID_PTR_GATEWAY_ADVERTISE_URL');
   return {id,url,maxQueue:integer(env,'PTR_GATEWAY_MAX_QUEUE',256,0,100000),startedAt,prefix:registryPrefixFromEnv(env),allow};
 }
+/**
+ * Production profile (no PTR_DEMO_SCALING): the upstreams file is the only source and its single pool's
+ * name is the served model. The config gate already required the file and checked that it holds exactly one pool.
+ */
+export function productionEnvironment(env:NodeJS.ProcessEnv,pool:string):NodeJS.ProcessEnv {
+  return {...env,PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_GATEWAY_POOL:pool};
+}
 async function main() {
-  const env=process.env;
+  const config=loadConfig('gateway',process.env);
+  const env=config.demo?process.env:productionEnvironment(process.env,config.pool!);
   const port=integer(env,'PTR_GATEWAY_PORT',56460,1024,65535);
   const shutdownMs=integer(env,'PTR_GATEWAY_SHUTDOWN_MS',30000,0,600000); // validated at startup, not in the signal handler
   const registered=gatewayRegistrySettings(env,port);
