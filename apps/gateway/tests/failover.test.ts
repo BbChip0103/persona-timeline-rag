@@ -1,5 +1,6 @@
 import { createServer, type Server, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
+import { readFile } from 'node:fs/promises';
+import { createConnection, createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider, OpenRouterClient, ProviderError, type BudgetLedger, type BudgetRequest, type CallMetrics } from '@ptr/providers';
@@ -14,11 +15,13 @@ afterEach(async()=>{
   await Promise.all(servers.splice(0).map(server=>{(server as Server).closeAllConnections?.();return new Promise(resolve=>server.close(resolve));}));
 });
 async function listen(server:Server|TcpServer):Promise<string> {servers.push(server);await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;}
-/** A loopback port nothing listens on: connecting is refused, so nothing is ever sent. */
-async function closedPort():Promise<string> {
-  const probe=createServer();const base=await listen(probe);servers.splice(servers.indexOf(probe),1);
-  await new Promise(r=>probe.close(r));return base;
-}
+/**
+ * A loopback port nothing listens on: connecting is refused, so nothing is ever sent. It is a fixed port below the
+ * kernel's ephemeral range (and not on fetch's blocked-port list), never a just-freed ephemeral one: another listener or
+ * connection could take such a port before the request arrives and answer it instead of refusing it, which looked
+ * like a primary that fails without a failover (no secondary call).
+ */
+async function closedPort():Promise<string> {return 'http://127.0.0.1:2';}
 /** Accepts, reads the request, closes without a response byte (a dead engine behind an SSH tunnel looks like this). */
 const closingServer=()=>createTcpServer(socket=>socket.once('data',()=>socket.destroy()));
 const sse=(text:string)=>`data: ${JSON.stringify({choices:[{delta:{content:text}}]})}\n\ndata: [DONE]\n\n`;
@@ -46,6 +49,16 @@ const post=(base:string,body:unknown=({messages,stream:true}),headers:Record<str
 const primaryAt=(base:string)=>new OpenAICompatibleUpstream({baseUrl:`${base}/v1`,model:'gemma-4-e4b-fp8'});
 const until=async(check:()=>boolean,ms=2000)=>{const end=Date.now()+ms;while(Date.now()<end){if(check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
 const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+
+describe('closedPort test helper',()=>{
+  test('is refused every time, and is a port the kernel never hands out again (a freed ephemeral port can be taken by another process, which then answers instead of refusing)',async()=>{
+    const port=Number(new URL(await closedPort()).port);
+    const [low]=(await readFile('/proc/sys/net/ipv4/ip_local_port_range','utf8').catch(()=>'32768 60999')).trim().split(/\s+/).map(Number);
+    expect(port).toBeLessThan(low!);
+    const error=await new Promise<NodeJS.ErrnoException>(resolve=>createConnection({port,host:'127.0.0.1'}).once('error',resolve).once('connect',()=>resolve(new Error('connected'))));
+    expect(error.code).toBe('ECONNREFUSED');
+  });
+});
 
 describe('primary transport failure classification',()=>{
   const failure=(cause:Record<string,string>)=>Object.assign(new TypeError('fetch failed'),{cause});

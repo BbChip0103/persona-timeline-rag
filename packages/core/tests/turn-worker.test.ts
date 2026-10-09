@@ -268,7 +268,33 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'timeout',text:'안녕'});
     await new TurnWorker({chat,leases:store,workerId:'w-t',leaseMs:5000}).handle(dispatch!);
     expect((await chat.getTurn('owner_q',turn.id))).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
-    expect(failures).toHaveLength(1);
+    expect(failures).toEqual([{turnId:turn.id,code:'TURN_TIMEOUT'}]); // a reason code, not the bare TURN_FAILED
+  });
+  test('a turn cancelled while it runs is reported as TURN_ABORTED, not as a bare TURN_FAILED',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:5000,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate:(_m,{signal})=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}))},
+      onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const {turn}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'abort',text:'안녕'});
+    const claimed=await store.claimTurn(turn.id,'w-a',5000);
+    const controller=new AbortController();
+    const running=chat.executeQueued(claimed!,controller);
+    await new Promise(r=>setTimeout(r,20));controller.abort();await running;
+    expect(failures).toEqual([{turnId:turn.id,code:'TURN_ABORTED'}]);
+  });
+  test('a queued turn whose request no longer prepares is failed with its reason reported (it was logged nowhere before)',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate:async()=> '반가워요.'},onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const {turn}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'unprepared',text:'안녕'});
+    const claimed=await store.claimTurn(turn.id,'w-a',5000);
+    await chat.executeQueued({...claimed!,input:{...claimed!.input,sessionId:'missing-session'}},new AbortController());
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
+    expect(failures).toEqual([{turnId:turn.id,code:'NOT_FOUND'}]);
   });
   test('the dispatcher reconciles leases at most once per reconcile interval and publishes WORKER_LOST failures',async()=>{
     const {store,delivery,events}=setup();

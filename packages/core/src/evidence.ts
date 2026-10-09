@@ -97,7 +97,7 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
   const fallback={status:'insufficient_evidence' as const,content:replyText('invalid_evidence',language),claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked',language)]};
   let result:z.infer<typeof ExperimentModelReplySchema>;
   try { result=ExperimentModelReplySchema.parse(JSON.parse(raw)); } catch { return fallback; }
-  if(containsCredentialPattern(result.answer) || containsInternalPathPattern(result.answer) || result.answer.length>8000) throw new CoreError('TURN_FAILED');
+  if(containsCredentialPattern(result.answer) || containsInternalPathPattern(result.answer) || result.answer.length>8000) throw new CoreError('TURN_FAILED','REPLY_REJECTED');
   if(condition==='off' && result.evidenceRefs.length) return fallback;
   const evidence:ChatReply['evidence']=[];
   const refs:EvidenceRef[]=[];

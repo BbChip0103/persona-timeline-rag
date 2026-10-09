@@ -141,8 +141,10 @@ export class ChatService {
     const store=fencedStore(this.options.store,queued.fence,this.options.events);
     let prepared:Awaited<ReturnType<ChatService['prepare']>>;
     try {prepared=await this.prepare(queued.turn.ownerId,queued.input);}
-    catch {
-      if(controller.signal.reason!==LEASE_LOST) await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');
+    catch(error) {
+      if(controller.signal.reason===LEASE_LOST) return;
+      await store.transitionTurn(queued.turn.id,[...activeStates],'failed','TURN_FAILED');
+      this.options.onTurnFailure?.({turnId:queued.turn.id,code:error instanceof CoreError?error.code:'PREPARE_FAILED'});
       return;
     }
     await this.runReserved(prepared.session,queued.turn,prepared.value,prepared.query,controller,store);
@@ -164,8 +166,9 @@ export class ChatService {
       const timeoutMs=this.options.timeoutMs ?? 30000, deadlineAt=Date.now()+timeoutMs;
       const execution=this.execute(session,turn,value,query,controller,store,deadlineAt);
       const timeout=new Promise<void>((_,reject)=>{
-        timer=setTimeout(()=>{controller.abort();reject(new CoreError('TURN_FAILED'));},timeoutMs);
-        controller.signal.addEventListener('abort',()=>reject(new CoreError('TURN_FAILED')),{once:true});
+        // Reject before aborting: the abort listener fires synchronously and would otherwise win with TURN_ABORTED.
+        timer=setTimeout(()=>{reject(new CoreError('TURN_FAILED','TURN_TIMEOUT'));controller.abort();},timeoutMs);
+        controller.signal.addEventListener('abort',()=>reject(new CoreError('TURN_FAILED','TURN_ABORTED')),{once:true});
       });
       await Promise.race([execution,timeout]);
     } catch (error) {
@@ -177,8 +180,10 @@ export class ChatService {
         :providerCode==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED'
         :providerCode==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED';
       await store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
-      this.options.onTurnFailure?.({turnId:turn.id,code:typeof providerCode==='string'?providerCode
-        :error instanceof Error?error.constructor.name:'UNKNOWN'});
+      // A TURN_FAILED CoreError carries its reason (a constant, never raw text) as the message.
+      const reason=error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
+      this.options.onTurnFailure?.({turnId:turn.id,code:reason??(typeof providerCode==='string'?providerCode
+        :error instanceof Error?error.constructor.name:'UNKNOWN')});
     } finally { if(timer) clearTimeout(timer); }
   }
   private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {
@@ -261,7 +266,7 @@ export class ChatService {
       output={status:'insufficient_evidence',content:replyText('retrieval_off',session.language),claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
     } else {
       if(intent==='timeline' && session.retrievalMode!=='off') {
-        if(!this.options.retrieval) throw new CoreError('TURN_FAILED');
+        if(!this.options.retrieval) throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
         if(!await store.transitionTurn(turn.id,['pending'],'retrieving') || controller.signal.aborted) return;
         const lookupOptions={signal:controller.signal,...(session.ragCondition && session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})};
         if(references.length&&this.options.retrieval.resolve) {
@@ -306,7 +311,7 @@ export class ChatService {
         provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
         variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
-          if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
+          if(controller.signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');
           const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
           const found=filterEvidence(await this.options.retrieval!.search(scopedQuery,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic',
             ...(session.ragCondition&&session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})}),scopedQuery,session.personId);
@@ -345,7 +350,7 @@ export class ChatService {
       else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
       else {
         const safe=result.trim();
-        if(!safe || safe.length>8000 || containsCredentialPattern(safe)) throw new CoreError('TURN_FAILED');
+        if(!safe || safe.length>8000 || containsCredentialPattern(safe)) throw new CoreError('TURN_FAILED','REPLY_REJECTED');
         output=containsUngroundedBiography(safe)
           ? {status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']}
           : {status:'answered',content:safe,claims:[],evidence:[],limitations:[]};
