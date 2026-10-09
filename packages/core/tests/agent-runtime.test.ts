@@ -7,9 +7,9 @@ const tool=(query='숲',patch:object={})=>final({message:'',function:{name:'time
 const create={personId:persona.personId,personaId:persona.id,personaRevision:persona.revision,executionProfile:'agent_loop' as const};
 function setup(outputs:string[]=[]) {
   const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>outputs.shift()??final())};
-  const retrieval={search:jest.fn(async()=>[source])};const store=new InMemoryConversationStore();
-  const chat=createLocalChat({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval});
-  return {provider,retrieval,store,chat};
+  const retrieval={search:jest.fn(async()=>[source])};const store=new InMemoryConversationStore();const failures:{turnId:string;code:string}[]=[];
+  const chat=createLocalChat({store,personas:new InMemoryPersonaRepository([persona]),provider,retrieval,onTurnFailure:failure=>failures.push(failure)});
+  return {provider,retrieval,store,chat,failures};
 }
 async function send(h:ReturnType<typeof setup>,sessionId:string,text='안녕',clientRequestId='req') {return h.chat.sendTurn('owner',{sessionId,text,clientRequestId});}
 function state(messages:ProviderMessage[]) {return JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length));}
@@ -97,6 +97,17 @@ test('duplicate tool query and max loop exhaustion stop without extra calls',asy
     const turn=await send(h,session.id);expect(turn.state).toBe('failed');expect(h.provider.generate.mock.calls.length).toBe(expectedModels);
     expect(h.retrieval.search.mock.calls.length).toBe(expectedTools);
   }
+});
+test.each([
+  {reason:'AGENT_REPLY_INVALID',outputs:['not JSON']},
+  {reason:'REPLY_REJECTED',outputs:[final({message:'see /home/agent/notes'})]},
+  {reason:'TOOL_QUERY_REJECTED',outputs:[tool('file:///etc/passwd')]},
+  {reason:'TOOL_LIMIT',outputs:[tool('one'),tool('two'),tool('three')]},
+  {reason:'TOOL_REPEATED',outputs:[tool('숲'),tool('숲')]},
+])('a failed turn names its reason: $reason',async({reason,outputs})=>{
+  const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>outputs.shift()??final())};
+  await expect(runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[source],signal:new AbortController().signal,search:async()=>[source]}))
+    .rejects.toMatchObject({code:'TURN_FAILED',message:reason});
 });
 test('empty search results yield one follow-up model and unverified final, never fabricated references',async()=>{
   const h=setup([tool(),final({status:'insufficient_evidence',message:'자료가 없네요.'})]);h.retrieval.search.mockResolvedValue([]);
@@ -196,6 +207,8 @@ test.each(['REQUEST_UNRESOLVED_NO_RESUBMIT','PROVIDER_REQUEST_FAILED','arbitrary
   const first=await send(h,session.id);
   expect(first.state).toBe('failed');expect(first.errorCode).toBe(code==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED':code==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED');
   expect(JSON.stringify(first)).not.toContain('private details');expect(JSON.stringify(first)).not.toContain('arbitrary-private-code');
+  // The failure log gets the provider code only when it looks like a constant; anything else is UNSPECIFIED.
+  expect(h.failures).toEqual([{turnId:first.id,code:code==='arbitrary-private-code'?'UNSPECIFIED':code}]);
   await send(h,session.id);expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(await h.chat.history('owner',session.id)).toHaveLength(1);
 });
 test('bounded roleplay policy allows light embellishment, preserves core events and source/actor boundaries',async()=>{

@@ -273,16 +273,42 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
   test('a turn cancelled while it runs is reported as TURN_ABORTED, not as a bare TURN_FAILED',async()=>{
     const failures:{turnId:string;code:string}[]=[];
     const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const generate=jest.fn<ReturnType<TextProvider['generate']>,Parameters<TextProvider['generate']>>((_m,{signal})=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true})));
     const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:5000,leases:store,delivery,events,maxQueueDepth:10,
-      provider:{generate:(_m,{signal})=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}))},
+      provider:{generate},
       onTurnFailure:failure=>failures.push(failure)});
     const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
     const {turn}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'abort',text:'안녕'});
     const claimed=await store.claimTurn(turn.id,'w-a',5000);
     const controller=new AbortController();
     const running=chat.executeQueued(claimed!,controller);
-    await new Promise(r=>setTimeout(r,20));controller.abort();await running;
+    await until(()=>generate.mock.calls.length>0);controller.abort();await running;
     expect(failures).toEqual([{turnId:turn.id,code:'TURN_ABORTED'}]);
+  });
+  test('a timeline turn with no retrieval configured is reported as RETRIEVAL_UNAVAILABLE',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const generate=jest.fn(async()=> '반가워요.');
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate},onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'lexical',timezone:'UTC'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'no-retrieval',text:'그때 뭐 했어?',timeline:{query:'숲',dateBasis:'posted'}});
+    await new TurnWorker({chat,leases:store,workerId:'w-r',leaseMs:5000}).handle(dispatch!);
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
+    expect(failures).toEqual([{turnId:turn.id,code:'RETRIEVAL_UNAVAILABLE'}]);
+    expect(generate).not.toHaveBeenCalled();
+  });
+  test('free text in a TURN_FAILED message never reaches the failure log (UNSPECIFIED instead)',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,leases:store,delivery,events,maxQueueDepth:10,
+      // @ts-expect-error a TURN_FAILED reason is a TurnFailureReason constant; free text does not compile
+      provider:{generate:async()=>{throw new CoreError('TURN_FAILED','private /home/user path sk-secret');}},onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'free-text',text:'안녕'});
+    await new TurnWorker({chat,leases:store,workerId:'w-f',leaseMs:5000}).handle(dispatch!);
+    expect(failures).toEqual([{turnId:turn.id,code:'UNSPECIFIED'}]);
+    expect(JSON.stringify(failures)).not.toContain('private');
   });
   test('a queued turn whose request no longer prepares is failed with its reason reported (it was logged nowhere before)',async()=>{
     const failures:{turnId:string;code:string}[]=[];

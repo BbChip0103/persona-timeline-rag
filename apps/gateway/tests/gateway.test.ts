@@ -5,6 +5,7 @@ import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider } from '@ptr/providers';
 import { createGateway, OpenAICompatibleUpstream, TextProviderUpstream, queueFullRetryAfterSeconds, type GatewayOptions } from '../src';
 import { upstreamFromEnvironment } from '../src/main';
+import { closedPort } from './closed-port';
 import { GatewayPublisher, MemoryGatewayRegistry, parseGatewayAllow } from '@ptr/messaging/registry';
 
 const token='synthetic_gateway_token_abcdefghij';
@@ -198,6 +199,7 @@ describe('gateway upstream configuration',()=>{
 });
 describe('OpenAI-compatible client when the gateway restarts',()=>{
   test('connection refused (nothing was sent) is retried until the gateway is back; the caller signal still ends it',async()=>{
+    // A freed ephemeral port, not closedPort(): the gateway comes back on this same port below, and port 2 cannot be bound.
     const probe=createServer();const base=await listen(probe);const port=Number(new URL(base).port);
     await new Promise(r=>probe.close(r));servers.splice(servers.indexOf(probe),1); // port now refuses connections
     const client=new OpenAICompatibleTextProvider({baseUrl:`${base}/v1`,model:'gateway',apiKey:token});
@@ -206,7 +208,7 @@ describe('OpenAI-compatible client when the gateway restarts',()=>{
     const back=createServer((req,res)=>{req.resume();req.on('end',()=>{res.writeHead(200,{'Content-Type':'text/event-stream'});res.end(`data: ${JSON.stringify({choices:[{delta:{content:'돌아왔어'}}]})}\n\ndata: [DONE]\n\n`);});});
     servers.push(back);await new Promise<void>(r=>back.listen(port,'127.0.0.1',r));
     expect(await pending).toBe('돌아왔어');
-    const gone=createServer();const goneBase=await listen(gone);await new Promise(r=>gone.close(r));servers.splice(servers.indexOf(gone),1);
+    const goneBase=await closedPort();
     const controller=new AbortController();setTimeout(()=>controller.abort(),200);
     await expect(new OpenAICompatibleTextProvider({baseUrl:`${goneBase}/v1`,model:'gateway',apiKey:token}).generate([{role:'user',content:'x'}],{signal:controller.signal})).rejects.toMatchObject({code:'CANCELLED'});
   });

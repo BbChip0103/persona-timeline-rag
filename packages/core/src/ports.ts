@@ -74,6 +74,11 @@ export interface TurnEvent { turnId:string; state:TurnState; errorCode?:string }
 export interface TurnEvents { publish(event:TurnEvent):Promise<void> }
 /** Listening side of turn events (SSE readers; workers watching for cancellation). Returns an unsubscribe function. */
 export interface TurnEventSource { subscribe(turnId:string,listener:(event:TurnEvent)=>void):Promise<()=>void> }
+export type CoreErrorCode='NOT_FOUND'|'FORBIDDEN'|'TURN_ACTIVE'|'IDEMPOTENCY_CONFLICT'|'INVALID_INPUT'|'TURN_FAILED'|'CONTEXT_LIMIT'|'PERSONA_UNAVAILABLE'|'QUEUE_FULL';
+/** Why a turn failed: a constant logged by onTurnFailure, never free text (the stored/client code stays TURN_FAILED). */
+export type TurnFailureReason='TURN_ABORTED'|'TURN_TIMEOUT'|'AGENT_REPLY_INVALID'|'REPLY_REJECTED'|'TOOL_QUERY_REJECTED'|'TOOL_LIMIT'|'TOOL_REPEATED'|'RETRIEVAL_UNAVAILABLE';
 export class CoreError extends Error {
-  constructor(public readonly code:'NOT_FOUND'|'FORBIDDEN'|'TURN_ACTIVE'|'IDEMPOTENCY_CONFLICT'|'INVALID_INPUT'|'TURN_FAILED'|'CONTEXT_LIMIT'|'PERSONA_UNAVAILABLE'|'QUEUE_FULL',message:string = code) { super(message); this.name='CoreError'; }
+  constructor(code:'TURN_FAILED',reason?:TurnFailureReason);
+  constructor(code:Exclude<CoreErrorCode,'TURN_FAILED'>,message?:string);
+  constructor(public readonly code:CoreErrorCode,message:string = code) { super(message); this.name='CoreError'; }
 }

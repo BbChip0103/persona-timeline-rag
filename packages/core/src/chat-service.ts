@@ -180,10 +180,13 @@ export class ChatService {
         :providerCode==='REQUEST_UNRESOLVED_NO_RESUBMIT'?'PROVIDER_REQUEST_UNRESOLVED'
         :providerCode==='PROVIDER_REQUEST_FAILED'?'PROVIDER_UNAVAILABLE':'TURN_FAILED';
       await store.transitionTurn(turn.id,[...activeStates],'failed',errorCode);
-      // A TURN_FAILED CoreError carries its reason (a constant, never raw text) as the message.
-      const reason=error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
-      this.options.onTurnFailure?.({turnId:turn.id,code:reason??(typeof providerCode==='string'?providerCode
-        :error instanceof Error?error.constructor.name:'UNKNOWN')});
+      // A TURN_FAILED CoreError carries its reason (a TurnFailureReason constant) as the message. That reason and a
+      // provider error code are logged only when they look like a constant, otherwise as UNSPECIFIED, so free text
+      // can never reach the log.
+      const constant=(value:string)=>/^[A-Z_]{1,40}$/.test(value)?value:'UNSPECIFIED';
+      const message=error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
+      this.options.onTurnFailure?.({turnId:turn.id,code:message!==undefined?constant(message):typeof providerCode==='string'?constant(providerCode)
+        :error instanceof Error?error.constructor.name:'UNKNOWN'});
     } finally { if(timer) clearTimeout(timer); }
   }
   private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {

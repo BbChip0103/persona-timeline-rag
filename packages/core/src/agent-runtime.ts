@@ -85,7 +85,8 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
         serviceLimitation:'AGENT_TOOL_UNAVAILABLE',
         agent:{revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls,toolCalls,variables,steps,validator:'disabled'}};
     }
-    if(iteration>=max||called.has(query))throw new CoreError('TURN_FAILED','TOOL_LIMIT');
+    if(iteration>=max)throw new CoreError('TURN_FAILED','TOOL_LIMIT');
+    if(called.has(query))throw new CoreError('TURN_FAILED','TOOL_REPEATED');
     called.add(query);toolCalls++;
     steps.push({phase:'tool',iteration,query});
     const result=await input.search(query);

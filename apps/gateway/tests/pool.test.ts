@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { UpstreamRecord } from '@ptr/messaging';
 import { createGateway, TextProviderUpstream, UpstreamConnectError, UpstreamPool, type GatewayOptions, type Upstream, type UpstreamResult, type UpstreamSource } from '../src';
 import { upstreamFromEnvironment } from '../src/main';
+import { closedPort } from './closed-port';
 
 const token='synthetic_gateway_token_abcdefghij';
 const messages=[{role:'user',content:'안녕'}];
@@ -15,7 +16,6 @@ afterEach(async()=>{
   await Promise.all(servers.splice(0).map(server=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve));}));
 });
 async function listen(server:Server):Promise<string> {servers.push(server);await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;}
-async function closedPort():Promise<string> {const probe=createServer();const base=await listen(probe);servers.splice(servers.indexOf(probe),1);await new Promise(r=>probe.close(r));return base;}
 const sse=(text:string)=>`data: ${JSON.stringify({choices:[{delta:{content:text}}]})}\n\ndata: [DONE]\n\n`;
 /** Fake engine whose completions are held until released one by one (FIFO). */
 function heldEngine(name:string) {
@@ -85,7 +85,9 @@ describe('N=1: env-only PTR_SELFHOSTED_* behaves as a one-entry upstreams file',
     expect(other).toEqual(same);expect(same.upstream).toBe('secondary');
   });
   test('without a breaker alternative a single upstream is still tried (recovers at once, like the plain upstream)',async()=>{
-    const closed=await closedPort();const port=Number(new URL(closed).port);
+    // A freed ephemeral port, not closedPort(): the engine comes back on this same port below, and port 2 cannot be bound.
+    const probe=createServer();const closed=await listen(probe);servers.splice(servers.indexOf(probe),1);await new Promise(r=>probe.close(r));
+    const port=Number(new URL(closed).port);
     const pool=new UpstreamPool({model:'m',source:new TestSource([rec('a',closed)]),failover:{failureThreshold:1}});
     const {base}=await gateway(pool);
     for(let i=0;i<3;i++) expect((await post(base)).status).toBe(502);

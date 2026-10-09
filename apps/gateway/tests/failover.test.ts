@@ -6,6 +6,7 @@ import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider, OpenRouterClient, ProviderError, type BudgetLedger, type BudgetRequest, type CallMetrics } from '@ptr/providers';
 import { classifyTransportError, createGateway, FailoverUpstream, OpenAICompatibleUpstream, TextProviderUpstream, UpstreamConnectError, type FailoverOptions, type GatewayOptions, type Upstream, type UpstreamResult } from '../src';
 import { ledgerReady, secondaryReady, upstreamFromEnvironment } from '../src/main';
+import { closedPort } from './closed-port';
 
 const token='synthetic_gateway_token_abcdefghij';
 const messages=[{role:'user',content:'안녕'}];
@@ -15,13 +16,6 @@ afterEach(async()=>{
   await Promise.all(servers.splice(0).map(server=>{(server as Server).closeAllConnections?.();return new Promise(resolve=>server.close(resolve));}));
 });
 async function listen(server:Server|TcpServer):Promise<string> {servers.push(server);await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;}
-/**
- * A loopback port nothing listens on: connecting is refused, so nothing is ever sent. It is a fixed port below the
- * kernel's ephemeral range (and not on fetch's blocked-port list), never a just-freed ephemeral one: another listener or
- * connection could take such a port before the request arrives and answer it instead of refusing it, which looked
- * like a primary that fails without a failover (no secondary call).
- */
-async function closedPort():Promise<string> {return 'http://127.0.0.1:2';}
 /** Accepts, reads the request, closes without a response byte (a dead engine behind an SSH tunnel looks like this). */
 const closingServer=()=>createTcpServer(socket=>socket.once('data',()=>socket.destroy()));
 const sse=(text:string)=>`data: ${JSON.stringify({choices:[{delta:{content:text}}]})}\n\ndata: [DONE]\n\n`;
