@@ -90,15 +90,20 @@ retrieval; it does not establish annotation accuracy or faithful real-person int
 The chat UI pins `off`, `caption`, or `caption_image` to each new session. Explicit
 `off` now asks the same model without retrieval and labels responses unverified;
 legacy sessions without a condition retain their previous abstention behavior.
-The two RAG conditions share semantic top-5 retrieval by default. Original caption
+The two RAG conditions share semantic top-5 retrieval by default; the prompt carries at most 3 of those posts (`EVIDENCE_POST_LIMIT`). Original caption
 quotes and AI image-annotation quotes have distinct provenance cards. Exact quote
 binding is not validation of answer truth, intent, or semantic entailment.
 
 The common experimental prompt budgets the complete JSON messages at 30,000
-UTF-8 bytes. It keeps original captions/history/user input intact and allocates
-whole image annotations round-robin. Omitted counts and actually supplied IDs are
-reported in `promptEvidence`; quotes from omitted annotations are rejected.
-Oversize base context fails before text generation with `CONTEXT_LIMIT`.
+UTF-8 bytes and carries at most 3 parent posts (`EVIDENCE_POST_LIMIT`).
+It keeps original captions/history/user input intact: whole posts are added in
+relevance (retrieval) order, a post that does not fit the budget is skipped and
+the next ones still fill the remaining slots, then whole image annotations of the
+kept posts are allocated round-robin. Omitted counts, omitted
+post IDs (`omittedSourceIds`: beyond the cap or skipped for the budget) and actually supplied IDs are reported in
+`promptEvidence`; quotes from omitted posts or annotations are rejected. Only a
+base context that does not fit with no post fails before text generation with
+`CONTEXT_LIMIT`.
 
 ```sh
 # Freeze private assets and source-derived silver probes before seeing answers:

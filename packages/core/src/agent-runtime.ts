@@ -22,8 +22,12 @@ export const AGENT_RUNTIME_REVISION='agent-loop-json-action-v1';
  * recollection voice has no quotable example lines.
  * v11 : no evidence means an in-character answer (IDENTITY_AND_PRIVACY), not an "explicitly uncertain" one; the
  * recollection voice no longer speaks of database records or unavailable records/data/evidence (the model echoed them).
+ * v12 (user decision): at most EVIDENCE_POST_LIMIT (3) posts in the prompt. A tool search puts its results first
+ * (the model chose that query for this turn), then the earlier candidates, each group in retrieval order; posts are added
+ * whole in that order, one that does not fit the byte budget is skipped (context step omittedSourceIds) and CONTEXT_LIMIT
+ * is left for a prompt that does not fit without posts.
  */
-export const AGENT_PROMPT_REVISION='character-agent-context-v11-no-meta-talk';
+export const AGENT_PROMPT_REVISION='character-agent-context-v12-evidence-cap';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
@@ -87,8 +91,13 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
   const transcript:ProviderMessage[]=[];
   const called=new Set<string>();
   const steps:AgentExecution['steps']=[];
-  // Keep the first authorized snapshot per source ID for this turn, bounded to twenty parents.
-  let sources=input.sources.slice(0,20);
+  // The first authorized snapshot per source ID is kept for the whole turn. Candidates stay in relevance order, bounded
+  // to twenty parents; buildExperimentContext puts at most EVIDENCE_POST_LIMIT of them, whole, into the prompt.
+  const firstSeen=new Map<string,SourcePost>();
+  const remember=(items:SourcePost[])=>{for(const source of items)if(!firstSeen.has(source.id))firstSeen.set(source.id,source);};
+  const candidates=(items:SourcePost[])=>[...new Set(items.map(source=>source.id))].slice(0,20).map(id=>firstSeen.get(id)!);
+  remember(input.sources);
+  let sources=candidates(input.sources);
   let modelCalls=0,toolCalls=0;
   for(let iteration=0;iteration<=max;iteration++) {
     checkedSignal(input.signal);
@@ -103,7 +112,7 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     });
     const messages=context.messages;
     if(Buffer.byteLength(JSON.stringify(messages),'utf8')>EXPERIMENT_PROMPT_BYTE_LIMIT || messages.length>64)throw new CoreError('CONTEXT_LIMIT');
-    steps.push({phase:'context',iteration,sourceIds:context.sources.map(source=>source.id)});
+    steps.push({phase:'context',iteration,sourceIds:context.sources.map(source=>source.id),...(context.omittedSourceIds.length?{omittedSourceIds:context.omittedSourceIds}:{})});
     modelCalls++;steps.push({phase:'model',iteration});
     const raw=await input.provider.generate(messages,{signal:input.signal,...(input.requestKey?{requestKey:input.requestKey}:{}),...(input.deadlineAt!==undefined?{deadlineAt:input.deadlineAt}:{}),
       priority:iteration>0?1:0});
@@ -139,10 +148,10 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     steps.push({phase:'tool',iteration,query});
     const result=await input.search(query);
     checkedSignal(input.signal);
-    // Search callback is an authorized read-only port; source filtering/budgeting is repeated by its owner.
-    const pinned=new Map(sources.map(source=>[source.id,source]));
-    for(const source of result)if(!pinned.has(source.id)&&pinned.size<20)pinned.set(source.id,source);
-    sources=[...pinned.values()];
+    // Search callback is an authorized read-only port; source filtering/budgeting is repeated by its owner. The tool
+    // results go first (relevance order = this merged order), then the earlier candidates.
+    remember(result);
+    sources=candidates([...result,...sources]);
     transcript.push({role:'assistant',content:JSON.stringify({status:response.status,message:'',evidenceRefs:[],variableUpdates:{},function:response.function})},
       {role:'user',content:`TOOL_RESULT_JSON_DATA ${JSON.stringify({name:'timeline_search',sourceIds:result.map(source=>source.id),empty:!result.length,availableSourceIds:sources.map(source=>source.id)})}`});
   }

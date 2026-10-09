@@ -203,8 +203,8 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const lorePresent=(messages:readonly ProviderMessage[])=>at(messages,'UNTRUSTED_PERSONA_LORE_JSON_DATA')>=0;
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
-  test('revisions: agent v11 and experiment v14 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v14-no-meta-talk');
+  test('revisions: agent v12 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v12-evidence-cap');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
   test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with four pinned rewordings are the only change from v4/v7',async()=>{

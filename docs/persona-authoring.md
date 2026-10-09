@@ -256,11 +256,11 @@ The CLI prints indexes, revisions, issue paths and rule names only.
     multi-step rollback (the earlier log line's `previousRevision`).
   - Sessions pinned to a card revision cannot be continued on old code.
 
-## Prompt rendering (agent `character-agent-context-v11-no-meta-talk`, experiment `persona-chat-v14-no-meta-talk`)
+## Prompt rendering (agent `character-agent-context-v12-evidence-cap`, experiment `persona-chat-v15-evidence-cap`)
 
 v5/v8 introduced the card rendering below; v6/v9 (S8 follow-up) added the identity/privacy policy and the reply guard,
 v7/v10 corrected that policy's voice rule, v8/v11 allowed light everyday small talk, v9/v12 added the persona-voice
-rules, v10/v13 steadied them and v11/v14 removed meta talk (see "Identity, privacy and the reply guard", "Persona voice" and "No meta talk" at the end). The message layout is the same.
+rules, v10/v13 steadied them, v11/v14 removed meta talk and v12/v15 cap the evidence at 3 posts (see "Identity, privacy and the reply guard", "Persona voice" and "No meta talk" at the end). The message layout is the same.
 
 ```text
 policy · persona definition · [examples] · history (greeting first) · [state] · [lore] · [tools] · [evidence] · [safety note] · user · [tool results]
@@ -313,7 +313,9 @@ policy · persona definition · [examples] · history (greeting first) · [state
 - **Context limits:**
   - Examples and lore add up to two messages. Under the agent's 64-message cap, with two tool rounds, 25 turns fit
     and 26 fail with `CONTEXT_LIMIT` (tested).
-  - The 30,000-byte limit is unchanged. Nothing is truncated.
+  - The 30,000-byte limit is unchanged. Nothing is truncated: the evidence holds at most 3 posts, added whole in
+    relevance order, and a post that does not fit is skipped (v12/v15); only a prompt that does not fit with no post
+    fails with `CONTEXT_LIMIT`.
 
 ## Identity, privacy and the reply guard (v6/v9, corrected in v7/v10)
 

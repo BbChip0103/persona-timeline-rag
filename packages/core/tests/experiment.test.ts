@@ -126,11 +126,16 @@ test('over-budget base history is rejected instead of slicing captions or user i
   expect(()=>buildExperimentPrompt(persona,[{id:'h',sessionId:'s',turnId:null,role:'user',content:'😀'.repeat(12000),createdAt:'2020-01-01T00:00:00Z'}],'user input',[source])).toThrow(expect.objectContaining({code:'CONTEXT_LIMIT'}));
 });
 
-test('service exposes safe context limit without invoking provider or leaking errors',async()=>{
+test('service omits an oversize caption  and exposes a safe context limit only when no evidence fits, without invoking provider',async()=>{
   const h=setup();h.retrieval.search.mockResolvedValue([{...source,caption:'😀'.repeat(10000)}]);
   const session=await h.service.createSession('synthetic-owner',{...query,ragCondition:'caption'});
-  const turn=await h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'oversize',text:'이미지 설명'});
-  expect(turn.state).toBe('failed');expect(turn.errorCode).toBe('CONTEXT_LIMIT');expect(h.provider.generate).not.toHaveBeenCalled();
+  const omitted=await h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'oversize',text:'이미지 설명'});
+  expect(omitted.state).toBe('completed');expect(omitted.reply?.promptEvidence).toMatchObject({sourceIds:[],omittedSourceIds:[source.id]});
+  const large={...persona,concept:'😀'.repeat(8000)},provider={generate:jest.fn(async()=>reply())};
+  const service=createLocalChat({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([large]),provider,retrieval:h.retrieval});
+  const tooLarge=await service.createSession('synthetic-owner',{...query,ragCondition:'caption'});
+  const turn=await service.sendTurn('synthetic-owner',{sessionId:tooLarge.id,clientRequestId:'oversize',text:'이미지 설명'});
+  expect(turn.state).toBe('failed');expect(turn.errorCode).toBe('CONTEXT_LIMIT');expect(provider.generate).not.toHaveBeenCalled();
 });
 
 test('experimental output guidance bounds prose and supplies exact short annotation quotes',()=>{

@@ -317,7 +317,8 @@ export class ChatService {
       const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,sources,policyNote||lore?{...(policyNote?{policyNote}:{}),...(lore?{afterHistory:[lore]}:{})}:undefined):undefined;
       memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
-        omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
+        omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8'),
+        ...(experiment.omittedSourceIds.length?{omittedSourceIds:experiment.omittedSourceIds}:{})};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
         provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
         variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
@@ -335,7 +336,8 @@ export class ChatService {
       if(agentRun) {
         agent=agentRun.agent;memorySources=agentRun.context.sources;
         promptEvidence={sourceIds:memorySources.map(source=>source.id),annotationIds:memorySources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
-          omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8')};
+          omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8'),
+          ...(agentRun.context.omittedSourceIds.length?{omittedSourceIds:agentRun.context.omittedSourceIds}:{})};
         output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),replyLanguage,level);
         if(!session.ragCondition&&intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
         if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};

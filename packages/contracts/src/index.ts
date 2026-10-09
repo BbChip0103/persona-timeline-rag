@@ -73,7 +73,7 @@ export interface AgentExecution {
   revision:string; promptRevision:string; modelCalls:number; toolCalls:number;
   variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful'};
   decisionSummary?:string;
-  steps:Array<{phase:'context'|'model'|'tool'|'validation';iteration:number;sourceIds?:string[];query?:string}>;
+  steps:Array<{phase:'context'|'model'|'tool'|'validation';iteration:number;sourceIds?:string[];omittedSourceIds?:string[];query?:string}>;
   validator:'disabled'|'skipped_tool_followup'|'accepted'|'rejected'|'error';
 }
 export const ExecutionProfileSchema=z.enum(['legacy','agent_loop']);
@@ -84,7 +84,7 @@ export interface ChatReply {
   grounding?:'unverified_model'|'source_bound_quotes'; content:string; claims:FactualClaim[]; evidence:EvidenceCard[]; limitations:string[];
   /** Internal execution/state; must not be exposed by public API DTOs. */
   agent?:AgentExecution;
-  promptEvidence?:{sourceIds:string[];annotationIds:string[];omittedAnnotations:number;promptBytes:number};
+  promptEvidence?:{sourceIds:string[];annotationIds:string[];omittedAnnotations:number;promptBytes:number;omittedSourceIds?:string[]};
   sourceContext?:{revision:string;references:EvidenceCard[]};
   retrievalContext?:{revision:string;action:'none'|'search'|'reuse'|'clarify';contextTurnIds:string[];query?:string;reusedSourceIds:string[]};
   /** Internal: which path decided intent when an intent classifier is configured. Never carries user text. */

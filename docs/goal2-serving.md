@@ -326,7 +326,7 @@ Request shape:
 - **Temperature:** fixed at 0, which is what the worker sends.
 - **`chat_template_kwargs.enable_thinking:false`:** corresponds to the client's `reasoning: {enabled:false}`.
 
-Input limits: 32 KiB of message JSON and 64 messages. The app caps agent and experiment prompts at 30000 bytes (`EXPERIMENT_PROMPT_BYTE_LIMIT`; the captured Jev/Gemma workload had p50 8983 / p95 29427 / max 30016 bytes measured with Python spacing, at most 11 messages). Legacy (non-agent) prompts carry the full history and can exceed 64 messages; those are refused with 502.
+Input limits: 32 KiB of message JSON and 64 messages. The app caps agent and experiment prompts at 30000 bytes and 3 evidence posts (`EXPERIMENT_PROMPT_BYTE_LIMIT`, `EVIDENCE_POST_LIMIT`; posts are added whole in relevance order, one that does not fit is skipped, and only a prompt that does not fit without posts is `CONTEXT_LIMIT`; the captured Jev/Gemma workload had p50 8983 / p95 29427 / max 30016 bytes measured with Python spacing, at most 11 messages). Legacy (non-agent) prompts carry the full history and can exceed 64 messages; those are refused with 502.
 
 Response shape: the secondary is called non-streaming, and the gateway returns the reply as one SSE chunk with `usage` when OpenRouter reports it (or JSON for `stream:false`). The worker's measured TTFT for a secondary answer therefore equals its total time. A secondary error (budget cap, price change, rate ceiling, transport) is a 502 without the rejection marker, the same provider failure as the `openrouter` upstream.
 
@@ -1060,7 +1060,10 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   Korean speech level carried in the state message; same layout), then by `character-agent-context-v11-no-meta-talk` /
   `persona-chat-v14-no-meta-talk` (persona data named only by block names, no talk about it, unknown details
   answered like a person, only important real-world facts never invented; reply guard v7 removes meta-talk sentences; same
-  layout). v11/v14 need S8 gates a–f (a only when the layout changes) before serving or baselining. See
+  layout), then by `character-agent-context-v12-evidence-cap` / `persona-chat-v15-evidence-cap` (at most 3
+  evidence posts in the character prompts, tool results first in the agent, a post that does not fit skipped whole instead
+  of a `CONTEXT_LIMIT` turn failure; retrieval and the legacy path keep their limit; policy text and layout unchanged). v12/v15 need S8 gates b–f, with c re-measuring recall
+  under the cap, before serving or baselining; a only when the layout changes. See
   docs/persona-authoring.md (persona authoring, CLI, deploy order, reply guard, persona voice).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
