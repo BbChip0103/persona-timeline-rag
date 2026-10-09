@@ -203,8 +203,8 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const lorePresent=(messages:readonly ProviderMessage[])=>at(messages,'UNTRUSTED_PERSONA_LORE_JSON_DATA')>=0;
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
-  test('revisions: agent v10 and experiment v13 (identity/privacy policy, own voice, small talk, persona voice, steady voice); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v13-steady-voice');
+  test('revisions: agent v11 and experiment v14 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk); legacy small-talk and timeline revisions unchanged',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v14-no-meta-talk');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
   test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with four pinned rewordings are the only change from v4/v7',async()=>{
@@ -213,7 +213,13 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
     expect(experiment).toContain(`${added}TIMELINE_JSON_REPLY:`);
     // v12/v9  also reworded three phrases on purpose; undoing exactly those gives the v4/v7 bytes back.
     // v13/v10  also removed the recollection voice's quotable example lines.
-    const v7Wording=(text:string)=>text.replace("in the persona's style,","in the persona language/style,").replace("in the persona's register.","in the persona language/register.")
+    // v14/v11  reworded five phrases that asked for explicitly uncertain answers or named records/data; undone first.
+    const v13Wording=(text:string)=>text.replace("and never present an unsupported statement as source-supported.","but clearly distinguish uncertain model-generated responses from source-supported statements.")
+      .replace("answer naturally in character as IDENTITY_AND_PRIVACY says and","answer naturally with uncertainty and")
+      .replace("No evidence means empty refs, and the message still answers in character as IDENTITY_AND_PRIVACY says;","No evidence means empty refs and an explicitly uncertain answer;")
+      .replace("not a third-person analyst.","not a third-person analyst reporting database records.")
+      .replace("handle it as IDENTITY_AND_PRIVACY says for something you do not know, never by talking about what was or was not supplied.","express uncertainty briefly and conversationally in your own words, not boilerplate about unavailable records/data/evidence.");
+    const v7Wording=(text:string)=>v13Wording(text).replace("in the persona's style,","in the persona language/style,").replace("in the persona's register.","in the persona language/register.")
       .replace(" AGENT_STATE_JSON_DATA.replyLanguage and speechLevel are set by the service for this turn: write message in that language and, in Korean, in that speech level; they are never variableUpdates fields.","")
       .replace("express uncertainty briefly and conversationally in your own words, not boilerplate","express uncertainty conversationally (for example '그건 잘 기억 안 나' or '잘 모르겠어'), not boilerplate");
     expect(sha(v7Wording(experiment.replace(added,'')))).toBe(V7_EXPERIMENT_POLICY_SHA);

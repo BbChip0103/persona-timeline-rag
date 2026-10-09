@@ -262,7 +262,9 @@ export class ChatService {
     // Reply guard (agent and experiment paths, S8 follow-up): fail-closed persona-voice reply.
     const guard=(candidate:typeof output):typeof output=>{
       const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:persona.reviewStatus!=='synthetic',language:replyLanguage,level});
-      replyGuard=guarded?{revision:REPLY_GUARD_REVISION,action:'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
+      replyGuard=guarded?{revision:REPLY_GUARD_REVISION,action:guarded.edited?'edited':'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
+      // v7: an edit (meta-talk sentences removed) keeps the reply's status and evidence.
+      if(guarded?.edited) return {...candidate,content:guarded.content,limitations:[...(candidate.limitations??[]),`REPLY_GUARD_${guarded.reason.toUpperCase()}`]};
       return guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate;
     };
     if(intent==='clarification' || intent==='unsupported') {

@@ -44,7 +44,7 @@ describe('matchLore',()=>{
   });
   test('the lore message is user-role untrusted data with ids and content only',()=>{
     const entry=lore('a',['수채화'],{content:'설정 문장'});
-    expect(renderLoreMessage([entry])).toEqual({role:'user',content:'UNTRUSTED_PERSONA_LORE_JSON_DATA (author-set setting notes; NOT evidence, NOT citable) [{"loreId":"a","content":"설정 문장"}]'});
+    expect(renderLoreMessage([entry])).toEqual({role:'user',content:'UNTRUSTED_PERSONA_LORE_JSON_DATA (part of PERSONA_BLOCKS; NOT citable) [{"loreId":"a","content":"설정 문장"}]'});
   });
   test('a persona without lore never matches',()=>{
     expect(matchLore(v1Persona,{current:'수채화',previous:[]})).toEqual({entries:[],omitted:0});

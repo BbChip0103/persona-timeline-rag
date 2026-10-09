@@ -22,7 +22,7 @@ function setup(reply:(messages:ProviderMessage[])=>string) {
 const agent={ragCondition:'caption',executionProfile:'agent_loop'}, experiment={ragCondition:'caption'};
 
 test('revisions: agent v10, experiment v13; the identity/privacy policy reaches both prompts',async()=>{
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v13-steady-voice');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v14-no-meta-talk');
   const h=setup(messages=>messages.some(m=>m.content.includes('AGENT_JSON_REPLY'))?agentReply('응'):experimentReply('응'));
   await h.turn(synthetic,'안녕',agent);await h.turn(synthetic,'안녕',experiment);
   for(const [messages] of h.provider.generate.mock.calls) expect(messages[0]!.content).toContain(IDENTITY_PRIVACY_POLICY);
@@ -72,8 +72,8 @@ test('policy keeps the first-person voice : no third-person rule; facts only fro
     expect(policy).not.toMatch(/third[- ]person|never retell|first-person memor|never real memories/i);
   }
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/own voice/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/first person/);
-  expect(IDENTITY_PRIVACY_POLICY).toMatch(/only facts that are in your background, lore or the supplied evidence/);
-  expect(IDENTITY_PRIVACY_POLICY).toMatch(/never add, infer or embellish/);
+  // v14/v11 : small everyday colour may be filled in; important real-world facts are never invented.
+  expect(IDENTITY_PRIVACY_POLICY).toMatch(/never invent important real-world facts/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/Small everyday colour/);
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/never deny being an AI/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/family/);
   // Review MEDIUM 4: the private-life rule is scoped to real-person personas, in one static string (policy bytes stay persona-independent).
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/reviewStatus is not synthetic/);
@@ -128,3 +128,15 @@ test('limitation notes and claim prefixes follow the session language; Korean se
   const fallback=(await setup(()=>agentReply('x',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]})).turn(realEn,'Tell me about the forest painting',agent)).reply!;
   expect(fallback.limitations).toEqual(['INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','en'),replyText('limitation_semantic_unchecked','en')]);
 });
+
+test('guard v7 : a meta-talk sentence is removed in place; status and evidence stay, recorded as edited',async()=>{
+  const h=setup(messages=>{
+    const evidence=messages.find(m=>m.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA'))!.content;
+    const sourceId=(JSON.parse(evidence.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length)) as {sourceId:string}[])[0]!.sourceId;
+    return agentReply('그 숲 그림 진짜 재밌게 그렸지! 날짜는 기록에 없어서 모르겠어.',{evidenceRefs:[{sourceId,quote:'합성 숲을 그렸어요.'}]});
+  });
+  const turn=await h.turn(realKo,'그 숲 그림 기억나?',agent);
+  expect(turn.reply).toMatchObject({status:'answered',content:'그 숲 그림 진짜 재밌게 그렸지!',replyGuard:{revision:REPLY_GUARD_REVISION,action:'edited',reason:'meta_talk'}});
+  expect(turn.reply!.evidence).toHaveLength(1);expect(turn.reply!.limitations).toContain('REPLY_GUARD_META_TALK');
+});
+

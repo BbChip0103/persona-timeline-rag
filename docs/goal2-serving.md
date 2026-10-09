@@ -1057,8 +1057,10 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   asked, no disowned background, replies in the user's language, persona-voice fixed texts, agent message cap 400
   code points instead of 180; same layout), then by `character-agent-context-v10-steady-voice` /
   `persona-chat-v13-steady-voice` (light fictional likes allowed, no quotable policy lines, origin stated, one
-  Korean speech level carried in the state message; same layout). v10/v13 need S8 gates a–f before serving or
-  baselining. See
+  Korean speech level carried in the state message; same layout), then by `character-agent-context-v11-no-meta-talk` /
+  `persona-chat-v14-no-meta-talk` (persona data named only by block names, no talk about it, unknown details
+  answered like a person, only important real-world facts never invented; reply guard v7 removes meta-talk sentences; same
+  layout). v11/v14 need S8 gates a–f (a only when the layout changes) before serving or baselining. See
   docs/persona-authoring.md (persona authoring, CLI, deploy order, reply guard, persona voice).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and

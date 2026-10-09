@@ -18,10 +18,10 @@ test.each(['off','caption','caption_image'] as const)('recollection voice reache
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
-  expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('express uncertainty briefly and conversationally in your own words');
+  expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('handle it as IDENTITY_AND_PRIVACY says for something you do not know');
   expect(policy).toContain('NOT the actual person');expect(policy).toContain('History is conversation context, NEVER factual evidence');
   expect(policy).toContain('Technical validation failures are service errors');expect(policy).toContain('AGENT_JSON_REPLY');
   expect(messages.at(-1)).toEqual({role:'user',content:'그 합성 그림 기억나?'});

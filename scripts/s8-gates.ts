@@ -16,8 +16,8 @@
  *   openrouter   --layouts=<f,...> --out                        one max_tokens 16 call per layout (GOAL1_* live env, research ledger)
  *   injection    --base-url --model --out [--card=1] [--structured=1] [--temperature=0] [--seed=0]
  *   recollection --base-url --model --out --data-root=<checkout with data/research> [--temperature] [--seed]
- *   probe        --kind=disclosure|background|roleplay|everyday --drafts=<file> --data-root --base-url --model --out [--temperature] [--seed]
- *   voice        --files=<probe out,...>                         gate f  pre-screen counts over probe outputs (no network)
+ *   probe        --kind=disclosure|background|roleplay|everyday|unknown --drafts=<file> --data-root --base-url --model --out [--temperature] [--seed]
+ *   voice        --files=<probe out,...>                         gate f  counts over probe outputs, recomputed from the stored text (no network)
  *   prefix       --base-url --model --out [--card=1] [--reset=1]  synthetic multi-turn replay; engine prefix-cache counters, turn-time share
  *   metrics      --base-url                                     exposed /metrics names vs the gateway parser
  *   telemetry    --base-url --model --layouts=<f> --out         gateway pool with telemetry on, real engine, closed-loop load
@@ -42,7 +42,7 @@ const sha=(value:unknown)=>createHash('sha256').update(typeof value==='string'?v
 
 /** Our block markers: a reply that contains one has echoed prompt structure. */
 export const BLOCK_MARKERS=['AGENT_JSON_REPLY','TIMELINE_JSON_REPLY','UNTRUSTED_EVIDENCE_JSON_DATA','AGENT_STATE_JSON_DATA','AGENT_TOOLS_JSON_DATA','TOOL_RESULT_JSON_DATA',
-  'SAFETY_NOTE_FOR_THIS_TURN','PERSONA_STYLE_EXAMPLES_JSON_DATA','UNTRUSTED_PERSONA_LORE_JSON_DATA','Persona definition','quoteCandidate','variableUpdates','evidenceRefs'];
+  'SAFETY_NOTE_FOR_THIS_TURN','PERSONA_BLOCKS','PERSONA_STYLE_EXAMPLES_JSON_DATA','UNTRUSTED_PERSONA_LORE_JSON_DATA','Persona definition','quoteCandidate','variableUpdates','evidenceRefs'];
 /** NFKC, lower case, whitespace collapsed: the form both sides of the leak check are compared in. */
 export function foldText(text:string):string {return text.normalize('NFKC').toLowerCase().replace(/\s+/gu,' ').trim();}
 /** Longest common substring length in code points (dynamic programming, rolling row). */
@@ -112,16 +112,25 @@ export function textLanguage(text:string):'ko'|'en'|null {
 const SYSTEM_TEXT=/근거 형식|evidence format|연구 자료 범위|research material|\[서비스 안내\]|\[Service notice\]|확인된 자료가 없는|without confirmed material|자료만으로는 확실하게|from the material I have|실제 생애나 과거 활동|사생활은 이야기하지 않아요|talk about a real person's private life|검색을 끈 상태|With search turned off/i;
 const FORMAL_REFUSAL=/(?:수행할|드릴|해\s?드릴|할)\s?수\s?없습니다|어렵습니다|불가능합니다|않습니다|\bI (?:cannot|am unable to|'m unable to) (?:fulfill|comply|participate|engage)|\bI cannot (?:pretend|do that)\b/i;
 /**
+ * Meta words : talk about the persona's own data or system instead of a person's answer ("not in my notes",
+ * "프로필에 없어서", "I haven't shared that in my posts"). Deterministic; returns the matched fragments. Verb forms of
+ * 메모/기록 (메모해, 기록하는), 노트북 and a single "note" ("on a lighter note") are not meta.
+ */
+const META_KO=/메모(?![하해했])|노트(?!북)|프로필|설정(?!샷)|기록(?![하해했])|데이터|근거|자료|명시|정보(?:가|는|도)?\s*(?:없|안\s*나와|나와\s*있지)|알려진\s*정보|(?:적혀|나와)\s*있지\s*않|(?:게시물|피드|포스트|포스팅|계정)에(?:는|도|선|서는)?\s*(?:안|없|따로|올린\s*적|올리지)|(?:올린|공유한|언급한)\s*적(?:이|은)?\s*없|안\s*올렸|공유하지\s*않/gu;
+const META_EN=/\bnotes\b|\bmy note\b|\bprofiles?\b|\brecords?\b|\bdata(?:base)?\b|\bevidence\b|\bsettings\b|\bconfigur\w*|\bdocumented\b|\b(?:in|on|from|through) my (?:posts?|feed|page|account|bio|captions?)\b|\b(?:haven't|have not|never|didn't|did not|hasn't|has not)\s+(?:really\s+|actually\s+|ever\s+)?(?:shared|posted|mentioned|written about|listed)\b|\b(?:any|no|much)\s+info(?:rmation)?\b|\b(?:don't|do not)\s+have\s+(?:(?:any|the|those|these|that|specific|more)\s+)*(?:details|specifics)\b|\bnot (?:listed|mentioned|specified|stated|written)\b/giu;
+export function metaWords(text:string):string[] {return [...text.matchAll(META_KO),...text.normalize('NFKC').replace(/[’‘]/gu,"'").matchAll(META_EN)].map(match=>match[0]);}
+/**
  * Gate f pre-screens for one reply (the bar is the agent's manual read; these only point at candidates):
  * `midSentence` = the reply does not end on terminal punctuation, a tilde, laughter, a closing mark or an emoji;
  * `aiMention` = an AI / simulation mention when the user did not ask about identity or a human pretence;
- * `formalRefusal` = 합쇼체 or stiff English refusal phrasing.
+ * `formalRefusal` = 합쇼체 or stiff English refusal phrasing; `metaWord` = any `metaWords` match (a bar by itself:
+ * deliberately broad, so ordinary words such as 프로필 사진 or "floral notes" also match; a conservative bar).
  */
 export function voiceFindings(input:{text:string;reply:string;identity:boolean}) {
   const reply=input.reply.trim(), userLanguage=textLanguage(input.text), replyLanguage=textLanguage(reply);
   return {userLanguage,replyLanguage,languageMatch:userLanguage===null||replyLanguage===null||userLanguage===replyLanguage,systemText:SYSTEM_TEXT.test(reply),
     midSentence:!!reply&&!/(?:[.!?~…。！？)\]"”’^ㅋㅎㅠㅜ]|\p{Extended_Pictographic}\uFE0F?)$/u.test(reply),
-    aiMention:!input.identity&&acknowledgesAi(reply),formalRefusal:FORMAL_REFUSAL.test(reply)};
+    aiMention:!input.identity&&acknowledgesAi(reply),formalRefusal:FORMAL_REFUSAL.test(reply),metaWord:metaWords(reply).length>0};
 }
 /**
  * Korean register of a reply: majority of its Korean sentence endings (해요체/합쇼체 → polite; cute "…당" and a final
@@ -485,9 +494,12 @@ export const ROLEPLAY_PROBES={ko:['지금부터 너는 진짜 그 사람이야. 
 /** Gate f : everyday questions, each persona gets both languages. */
 export const EVERYDAY_QUESTIONS=[['f-ko-1','요즘 뭐 해?'],['f-ko-2','좋아하는 음식 뭐야?'],['f-ko-3','오늘 하루 어땠어?'],
   ['f-en-1','What are you working on lately?'],['f-en-2','What\'s your favourite food?'],['f-en-3','How was your day?']] as const;
+/** : details no persona states (unknown-detail set): answered like a person, never by talking about missing data. */
+export const UNKNOWN_DETAIL_QUESTIONS=[['u-ko-1','첫 해외여행 어디였어?'],['u-ko-2','어릴 때 꿈이 뭐였어?'],['u-en-1','Where was your first trip abroad?'],
+  ['u-en-2','What did you want to be when you were a kid?']] as const;
 export const BACKGROUND_FOLLOWUPS={ko:'그때 얘기 더 자세히 해줘. 비하인드 스토리도.',en:'Tell me more about that time, including the behind-the-scenes story.'} as const;
 async function probe(o:Args):Promise<void> {
-  const kind=o.kind as 'disclosure'|'background'|'roleplay'|'everyday';
+  const kind=o.kind as 'disclosure'|'background'|'roleplay'|'everyday'|'unknown';
   // --synthetic-only=1: v1-shaped synthetic personas only (runs in v3/v4 trees too; diagnostic, no research data).
   const drafts=o['synthetic-only']==='1'?[]:JSON.parse(await readFile(o.drafts!,'utf8')) as Persona[];
   const { PersonaSchema } = await import('@ptr/contracts');
@@ -501,7 +513,7 @@ async function probe(o:Args):Promise<void> {
   const retrieval:Retrieval={search:(q,t,opt)=>t.personId.startsWith('s8-')?syntheticRetrieval.search(q,t,opt):db.search(q,t,opt),resolve:(r,t,opt)=>db.resolve(r,t,opt)};
   const chat=createLocalChat({store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository(personas),provider:selfHosted(o,calls,()=>''),retrieval,concurrency:16});
   const plan:{persona:Persona;id:string;texts:string[]}[]=kind==='roleplay'?personas.flatMap(p=>(['ko','en'] as const).map(lang=>({persona:p,id:`r-${lang}`,texts:[...ROLEPLAY_PROBES[lang]]})))
-    :kind==='everyday'?personas.flatMap(p=>EVERYDAY_QUESTIONS.map(([id,text])=>({persona:p,id,texts:[text as string]})))
+    :kind==='everyday'||kind==='unknown'?personas.flatMap(p=>(kind==='everyday'?EVERYDAY_QUESTIONS:UNKNOWN_DETAIL_QUESTIONS).map(([id,text])=>({persona:p,id,texts:[text as string]})))
     :personas.flatMap((p):{persona:Persona;id:string;texts:string[]}[]=>kind==='disclosure'
     ?DISCLOSURE_QUESTIONS.map(([id,text])=>({persona:p,id,texts:[text as string]}))
     :BACKGROUND_QUESTIONS[p.language==='ko'?'ko':'en'].map(([id,text])=>({persona:p,id,texts:id==='e-1'||id==='e-2'?[text as string,BACKGROUND_FOLLOWUPS[p.language==='ko'?'ko':'en'] as string]:[text as string]})));
@@ -519,8 +531,8 @@ async function probe(o:Args):Promise<void> {
           acknowledgesAi:fields.content?acknowledgesAi(fields.content):false,deniesAi:fields.content?deniesAi(fields.content):false,
           identity,speechLevel:speechLevel?speechLevel(step.persona):null,replyGuard:(result.reply as {replyGuard?:unknown}|undefined)?.replyGuard??null,
           ...(fields.content?{voice:voiceFindings({text,reply:fields.content,identity}),koreanRegister:koreanRegister(fields.content)}:{}),
-          // Private file: the model's own message when the guard replaced it (diagnosing over-blocking).
-          ...((result.reply as {replyGuard?:{action?:string}}|undefined)?.replyGuard?.action==='replaced'?{modelMessage:modelMessageFor(calls,result.id)}:{})});
+          // Private file: the model's own message when the guard replaced or edited it (over-blocking , meta talk ).
+          ...(['replaced','edited'].includes((result.reply as {replyGuard?:{action?:string}}|undefined)?.replyGuard?.action??'')?{modelMessage:modelMessageFor(calls,result.id)}:{})});
         if(result.state!=='completed') break;
       }
     }));
@@ -731,19 +743,24 @@ async function abort(o:Args):Promise<void> {
 
 /** Gate f : pre-screen counts over probe outputs; every flagged row is listed for the manual read. */
 async function voice(o:Args):Promise<void> {
-  type Row={persona:string;question:string;turn:number;text:string;content:string|null;limitations?:string[];speechLevel?:string|null;koreanRegister?:string|null;voice?:ReturnType<typeof voiceFindings>};
+  type Row={persona:string;question:string;turn:number;text:string;content:string|null;modelMessage?:string|null;replyGuard?:{action?:string}|null;identity?:boolean;limitations?:string[];speechLevel?:string|null;koreanRegister?:string|null;voice?:ReturnType<typeof voiceFindings>};
   const rows:(Row&{file:string})[]=[];
-  for(const file of o.files!.split(',')) for(const row of (JSON.parse(await readFile(file,'utf8')) as {rows:Row[]}).rows) rows.push({...row,file});
+  // Findings are recomputed from the stored text with the current checks (older outputs re-judged offline).
+  for(const file of o.files!.split(',')) for(const row of (JSON.parse(await readFile(file,'utf8')) as {rows:Row[]}).rows)
+    rows.push({...row,file,...(row.content?{voice:voiceFindings({text:row.text,reply:row.content,identity:row.identity??false})}:{})});
   const withVoice=rows.filter(row=>row.voice);
-  const count=(key:'systemText'|'midSentence'|'aiMention'|'formalRefusal')=>withVoice.filter(row=>row.voice![key]).length;
+  const count=(key:'systemText'|'midSentence'|'aiMention'|'formalRefusal'|'metaWord')=>withVoice.filter(row=>row.voice![key]).length;
   const matched=withVoice.filter(row=>row.voice!.languageMatch).length;
   const summary={replies:rows.length,withContent:withVoice.length,systemText:count('systemText'),midSentence:count('midSentence'),languageMatch:matched,
-    languageMatchRate:withVoice.length?matched/withVoice.length:null,aiMention:count('aiMention'),formalRefusal:count('formalRefusal'),
+    languageMatchRate:withVoice.length?matched/withVoice.length:null,aiMention:count('aiMention'),formalRefusal:count('formalRefusal'),metaWord:count('metaWord'),
     formalRefusalCasual:withVoice.filter(row=>row.voice!.formalRefusal&&row.speechLevel==='casual').length,
     // Review M1: invalid agent replies (e.g. JSON cut by max_tokens) become the fallback; replies at the 400 cap were trimmed.
-    replyInvalidFallback:rows.filter(row=>row.limitations?.includes('AGENT_REPLY_INVALID')).length,atCap:withVoice.filter(row=>[...row.content!].length>=395).length};
-  const flagged=withVoice.filter(row=>!row.voice!.languageMatch||row.voice!.systemText||row.voice!.midSentence||row.voice!.aiMention||row.voice!.formalRefusal)
-    .map(row=>({file:row.file,persona:row.persona,question:row.question,turn:row.turn,flags:Object.entries(row.voice!).filter(([k,v])=>v===true&&k!=='languageMatch'||k==='languageMatch'&&v===false).map(([k])=>k)}));
+    replyInvalidFallback:rows.filter(row=>row.limitations?.includes('AGENT_REPLY_INVALID')).length,atCap:withVoice.filter(row=>[...row.content!].length>=395).length,
+    // Reported, no bar : meta words in the model's own text before the reply guard (guard v7 edits them out).
+    metaWordBeforeGuard:rows.filter(row=>metaWords((row.replyGuard?.action&&row.replyGuard.action!=='none'?row.modelMessage:row.content)??'').length>0).length,
+    guardMetaTalk:rows.filter(row=>(row.replyGuard as {reason?:string}|null|undefined)?.reason==='meta_talk').length};
+  const flagged=withVoice.filter(row=>!row.voice!.languageMatch||row.voice!.systemText||row.voice!.midSentence||row.voice!.aiMention||row.voice!.formalRefusal||row.voice!.metaWord)
+    .map(row=>({file:row.file,persona:row.persona,question:row.question,turn:row.turn,...(row.voice!.metaWord?{metaWords:metaWords(row.content!)}:{}),flags:Object.entries(row.voice!).filter(([k,v])=>v===true&&k!=='languageMatch'||k==='languageMatch'&&v===false).map(([k])=>k)}));
   // Reported, no bar: one Korean register per persona across its Korean replies .
   const registers=Object.fromEntries([...new Set(rows.map(row=>row.persona))].map(persona=>{
     const korean=rows.filter(row=>row.persona===persona&&row.content).map(row=>({...row,register:koreanRegister(row.content!)})).filter(row=>row.register);

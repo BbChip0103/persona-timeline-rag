@@ -1,5 +1,5 @@
 import { GEMMA4_SPECIAL_TOKENS, neutralizeControlTokens } from '@ptr/providers';
-import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, EVERYDAY_QUESTIONS, ROLEPLAY_PROBES, koreanRegister, modelMessageFor, textLanguage, voiceFindings, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
+import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, EVERYDAY_QUESTIONS, ROLEPLAY_PROBES, UNKNOWN_DETAIL_QUESTIONS, koreanRegister, metaWords, modelMessageFor, textLanguage, voiceFindings, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
   percentile, promValues, systemAfterAssistant, type TemplateMarkers } from '../s8-gates';
 
 /** A Gemma-like template rendering (markers are parameters of the check, so any template can be described). */
@@ -108,7 +108,7 @@ describe('gate f (persona voice) pre-screens',()=>{
   });
   test('a clean in-voice reply has no findings',()=>{
     expect(voiceFindings({text:'요즘 뭐 해?',reply:'요즘은 새 메이크업 조합 실험 중이야~ 너는?',identity:false})).toEqual({userLanguage:'ko',replyLanguage:'ko',languageMatch:true,systemText:false,
-      midSentence:false,aiMention:false,formalRefusal:false});
+      midSentence:false,aiMention:false,formalRefusal:false,metaWord:false});
   });
   test('system texts, mid-sentence cuts, a language mismatch, unprompted AI mentions and formal refusals are flagged',()=>{
     expect(voiceFindings({text:'경력 말해줘',reply:'응답의 근거 형식을 확인하지 못했어요.',identity:false}).systemText).toBe(true);
@@ -146,4 +146,30 @@ describe('v10 harness additions',()=>{
     expect(koreanRegister('오늘 진짜 맛있당')).toBe('casual');expect(koreanRegister('그러니까')).toBe('casual');expect(koreanRegister('괜찮습니까?')).toBe('polite');
   });
 
+});
+
+describe('v11 harness additions (no meta words about the persona\'s data or system)',()=>{
+  // Synthetic replies only.
+  test.each([
+    ['출신은 산골 마을이에요! 학교 이름은 메모에 없어서 잘 모르겠어요.','메모'],['그건 노트에 안 적혀 있어~','노트'],['공개된 프로필에는 그런 얘기가 없어!','프로필'],
+    ['내 설정상 그건 말할 수 없어~','설정'],['그건 기록에 따로 없어서 모르겠어요.','기록'],['제공된 데이터를 바탕으로 이야기해요.','데이터'],['근거가 없어서 말하기 어려워.','근거'],
+    ['가진 자료로는 확실하지 않아요.','자료'],['그런 건 게시물에 안 올렸어~','게시물에 안'],['그 얘기는 올린 적이 없어서!','올린 적이 없'],['공개된 정보가 없어서 잘 몰라용','정보가 없'],
+    ['학교 이름은 적혀 있지 않아요','적혀 있지 않'],
+    ['Sorry, my notes are blank on the kiln story!','notes'],['That isn\'t in my profile, sorry!','profile'],['My records don\'t say.','records'],['I only know what the data says.','data'],
+    ['There is no evidence of that.','evidence'],['My settings keep that private.','settings'],['I talk about that in my posts all the time!','in my posts'],
+    ['I haven\'t shared much about the kiln yet.','haven\'t shared'],['I haven\'t actually posted about it.','haven\'t actually posted'],['I don\'t have any info on that.','any info'],
+  ])('meta: %s',(reply,hit)=>expect(metaWords(reply)).toContain(hit));
+  test.each([
+    '노트북 새로 샀어!','요즘 맛집 기록하는 재미에 빠졌어~','오늘 메모해 둔 레시피로 요리했어요!','바다 사진 진짜 예쁘게 나왔지?',
+    'On a lighter note, the sunset was amazing!','I recorded a new vlog yesterday~','I posted a beach photo last week!','Hmm, that one slips my mind~ What about you?',
+  ])('not meta: %s',reply=>expect(metaWords(reply)).toEqual([]));
+  test('voiceFindings flags a meta-word reply',()=>{
+    expect(voiceFindings({text:'어디 출신이야?',reply:'나 산골 출신이야! 학교는 프로필에 없어서 몰라~',identity:false}).metaWord).toBe(true);
+    expect(voiceFindings({text:'Are you an AI?',reply:'Yes, I\'m an AI built from public data!',identity:true}).metaWord).toBe(true);
+  });
+  test('unknown-detail questions: both languages, fixed',()=>{
+    expect(UNKNOWN_DETAIL_QUESTIONS.map(([id])=>id)).toEqual(['u-ko-1','u-ko-2','u-en-1','u-en-2']);
+    expect(UNKNOWN_DETAIL_QUESTIONS.filter(([,text])=>textLanguage(text)==='ko')).toHaveLength(2);
+  });
+  test('the new block name counts as a leak marker',()=>expect(leakFindings('Sorry, PERSONA_BLOCKS say nothing about that.',[])).toEqual([{kind:'marker',name:'PERSONA_BLOCKS',length:14}]));
 });

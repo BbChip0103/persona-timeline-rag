@@ -34,8 +34,41 @@ import { voiceText, type SpeechLevel } from './reply-texts';
  * replacement is the identity line (keeps the AI disclosure). Past-tense origin phrasing that answers an origin question
  * ("어릴 때 부산에서 살았어", "I grew up in …") is not residence (the v13/v10 policy asks for origin in the first person).
  */
-export const REPLY_GUARD_REVISION='reply-guard-v6';
-export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial';
+/**
+ * v7 : a sentence that explains a gap by the persona's data or system ("메모에 따로 없어서", "말해 줄 수 있는 정보가
+ * 없어", "게시물에 안 올렸던", "from my notes", "isn't in my profile", "I haven't shared any details") is removed (`meta_talk`,
+ * every persona) and the rest of the reply, its status and evidence are kept; a reply that is only such sentences becomes the
+ * fallback (identity line on an identity question, the private-life decline on a real person's private question). Only "not in
+ * my data" constructions count; bare data words, perfume notes, notes apps, "on my feed" and questions back stay (pinned in
+ * reply-guard.test.ts). The other checks then run on the edited text. Known limits (the policy is the first control): "My
+ * bio doesn't say", "설정상 말 못 해", "공개 안 했어", and how-it-was-made talk on identity answers pass.
+ */
+export const REPLY_GUARD_REVISION='reply-guard-v7';
+export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk';
+// Only "not in my data" constructions (review HIGH: bare data words, perfume notes, notes apps, "on my feed" and questions back
+// to the user are ordinary chat); a sentence ending in a question mark is never meta talk.
+const META_GAP:RegExp[]=[
+  // A data noun with a locative/source particle, then "absent / not written": "메모에 따로 없어서", "프로필에 안 나와", "기록상 없어".
+  /(?<![가-힣])(?<!(?:폰|카메라|앱|휴대폰|핸드폰|지도|메뉴)\s?)(?:메모|노트|프로필|설정|기록|자료|데이터)(?:에|에는|엔|에도|상|상으로는|에서는|으로는)\s?(?:따로\s?|딱히\s?|아직\s?|전혀\s?)?(?:없|안\s?나와|나와\s?있지\s?않|적혀\s?있지\s?않|안\s?적혀|안\s?써)/,
+  // Self-knowledge: "말해 줄 수 있는 정보가 없어", "아는/가진/알려진 정보가 없네".
+  /(?:말할|말해\s?줄|말씀드릴|알려\s?줄|알려\s?드릴)\s?수\s?있는\s?정보(?:가|는)?\s?(?:딱히\s?|하나도\s?)?없|(?:(?<![가-힣])(?:내가|제가|나는|저는|난|전)\s?(?:[^.!?~\n]{0,12}\s)?(?:아는|가진|알고\s?있는)|알려진|공개된)\s?정보(?:가|는|도)?\s?(?:딱히\s?|하나도\s?|따로\s?)?없/,
+  // Posts as the reason: "게시물에 안 올렸던", "피드에 올린 적 없어".
+  /(?:게시물|피드|포스트|포스팅)(?:에|에는|엔|에도)\s?(?:따로\s?)?(?:안\s?올렸|안\s?올린|올린\s?적(?:이|은)?\s?없|없)/,
+  /^(?=[^\n]*(?:\b(?:not|no|nothing|hard|tricky)\b|n['’]t\b))[^\n]*\b(?:in|from)\s+my\s+(?:notes|profile|records?|data|database|files?)\b(?!\s+app)/i,
+  /\b(?:not|isn't|wasn't|aren't|nothing)\b[^.?!\n]{0,30}\b(?:in|on)\s+my\s+(?:posts?|feed|bio|captions?)\b(?!\s+list)/i,
+  /\b(?:haven['’]?t|have\s+not|didn['’]?t|did\s+not)\s+(?:really\s+|actually\s+|ever\s+)?(?:shared|posted)\s+(?:any\s+|those\s+|these\s+|the\s+|much\s+)?(?:details|info|information|specifics)\b/i,
+  /\bI\s+(?:don['’]?t|do\s+not)\s+have\s+(?:any\s+|much\s+|the\s+|that\s+kind\s+of\s+)?(?:info|information|details|records?)\s+(?:on|about|for|regarding)\s+(?:that|this|it|those|these|my|me|where|which|what)\b|\bno\s+(?:info|information|records?)\s+(?:on|about)\s+(?:that|this|it|those|these|my|me)\b/i,
+];
+/**
+ * The reply without its meta-talk sentences (split at line breaks and after terminal punctuation, a tilde or an emoji, with
+ * or without a following space; trailing emoji and flags stay with their sentence), and whether any went.
+ */
+function withoutMetaTalk(reply:string):{text:string;removed:boolean} {
+  const sentences=reply.trim().split(/\s*\n\s*|(?<=[.!?。！？~…]|\p{Extended_Pictographic}️?|\p{Regional_Indicator})(?:\s+|(?<=[!?~…])(?=[\p{L}\p{N}])|(?<=\.)(?=[가-힣]))(?![\p{Extended_Pictographic}\p{Regional_Indicator}])/u).filter(Boolean);
+  const meta=(sentence:string)=>!/[?？]\s*\p{Extended_Pictographic}*️?\s*$/u.test(sentence)&&META_GAP.some(pattern=>pattern.test(sentence));
+  const kept=sentences.filter(sentence=>!meta(sentence));
+  return {text:kept.join(' ').trim(),removed:kept.length<sentences.length};
+}
 
 const AI='(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)';
 const KO_SUBJECT='(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?';
@@ -125,12 +158,21 @@ const BACKGROUND_DISOWNED:RegExp[]=[
   // Only the listed nouns, optionally paired ("고향이나 학교가"), then a clause-final 없어(요): "학교 숙제가 없어서" stays.
   /(?<![가-힣])(?:고향|출신|학교|경력|과거)(?:(?:이나|나|랑|이랑)\s?(?:고향|출신|학교|경력|과거))?(?:이|가|은|는|도)?\s?(?:없어요|없어|없거든요?|없답니다|없습니다)(?=$|[\s.!?~,ㅋㅎ^])/,
 ];
-export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel}):{reason:ReplyGuardReason;content:string}|undefined {
+export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel}):{reason:ReplyGuardReason;content:string;edited?:true}|undefined {
   const level=input.level??'polite';
-  const artTalk=ART_UTTERANCE.test(input.utterance)||ART_REPLY.test(input.reply);
   // "이 그림 AI야?" asks about an artwork, not the persona (unless it also addresses the persona).
   const identityQuestion=IDENTITY_QUESTION.some(pattern=>pattern.test(input.utterance))
     &&(!ART_UTTERANCE.test(input.utterance)||/(?:너|넌|당신|니가|네가)|\byou\b/i.test(input.utterance));
+  const meta=withoutMetaTalk(input.reply);
+  if(meta.removed) {
+    // The other checks see the edited reply. With nothing left: the identity line (identity question), the private-life
+    // decline (a real person's private question), otherwise the fallback.
+    if(/[\p{L}\p{N}]/u.test(meta.text)) return guardReply({...input,reply:meta.text})??{reason:'meta_talk',content:meta.text,edited:true};
+    if(identityQuestion) return {reason:'missing_ai_disclosure',content:voiceText('identity',input.language,level)};
+    if(input.realPerson&&PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))) return {reason:'private_life',content:voiceText('decline_private',input.language,level)};
+    return {reason:'meta_talk',content:voiceText('fallback',input.language,level)};
+  }
+  const artTalk=ART_UTTERANCE.test(input.utterance)||ART_REPLY.test(input.reply);
   // A human claim is never shown. The replacement says "I'm an AI" only when the user asked about identity or a human
   // pretence; otherwise it is the plain in-voice fallback (no unprompted AI mention).
   if(HUMAN_CLAIM.some(pattern=>pattern.test(input.reply))||!artTalk&&BARE_DENIAL.some(pattern=>pattern.test(input.reply)))

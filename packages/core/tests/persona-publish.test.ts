@@ -226,7 +226,7 @@ describe('renderPersonaBlock',()=>{
     const [definition,examples,...rest]=renderPersonaBlock(cardPersona);
     expect(rest).toEqual([]);
     expect(definition!.content).toContain('"personality":{"summary"');
-    expect(definition!.content).toContain(`"background":{"text":${JSON.stringify(cardPersona.background!.text)},"note":"author-set public profile notes; NOT evidence"}`);
+    expect(definition!.content).toContain(`"background":{"text":${JSON.stringify(cardPersona.background!.text)},"label":"part of PERSONA_BLOCKS; NOT citable"}`);
     expect(definition!.content).not.toContain('sourceRefs');
     expect(examples).toEqual({role:'system',content:`PERSONA_STYLE_EXAMPLES_JSON_DATA (style/tone reference only; NOT facts, memories or evidence) ${JSON.stringify([[{speaker:'user',text:'요즘 뭐 그려?'},{speaker:'character',text:'하늘 색 섞는 연습 중이야~'}]])}`});
     const all=JSON.stringify(renderPersonaBlock(cardPersona));

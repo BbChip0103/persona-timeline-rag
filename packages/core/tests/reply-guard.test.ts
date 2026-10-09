@@ -117,7 +117,7 @@ describe('replacement',()=>{
     const en=guardReply({utterance:'Tell me about your family.',reply:'Sure!',realPerson:true,language:'en'})!;
     expect(en).toEqual({reason:'private_life',content:voiceText('decline_private','en','polite')});
     expect(en.content).not.toMatch(/\bAI\b|simulation/);
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v6');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7');
   });
   test('impersonation outranks the other reasons',()=>{
     expect(reason('가족 얘기 해줘','나는 평범한 사람이야, 엄마랑 살아')).toBe('human_impersonation');
@@ -131,4 +131,51 @@ describe('localized deterministic texts',()=>{
     expect(replyText('rule_refusal','ja')).toBe(replyText('rule_refusal','en'));
     expect(replyText('limitation_posted_date','ko_KR')).toBe('게시일은 실제 활동일과 다를 수 있습니다.');
   });
+});
+
+describe('guard v7: meta talk  — a sentence explaining a gap by the persona\'s data or system is removed (synthetic texts)',()=>{
+  const g=(utterance:string,reply:string,o:{realPerson:boolean;language:string}=real)=>guardReply({utterance,reply,...o,level:'casual'});
+  test('revision',()=>expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7'));
+  test.each([
+    ['어디 출신이야?','나 바닷가 마을 출신이야! 학교 이름은 메모에 따로 없어서 모르겠어. 대신 도자기 얘기 하자~','나 바닷가 마을 출신이야! 대신 도자기 얘기 하자~'],
+    ['학교 어디 나왔어?','그건 딱히 말해 줄 수 있는 정보가 없거든! 대신 요즘 빚는 그릇 얘기 해 줄까?','대신 요즘 빚는 그릇 얘기 해 줄까?'],
+    ['첫 해외여행 어디였어?','음 그건 게시물에 안 올렸던 거라~ 너는 어디였어?','너는 어디였어?'],
+    ['Where was your first trip abroad?','That one is hard to pin down from my notes, it slips my mind! What about you?','What about you?'],
+    ['Which school?','I grew up by a lighthouse! I haven\'t really shared any details about school. ⛵ Ask me about kilns!','I grew up by a lighthouse! Ask me about kilns!'],
+    ['Where did you study?','I studied pottery! The college name isn\'t in my profile, though. Fun times!','I studied pottery! Fun times!'],
+    ['어디 출신이야?','도자기 공부했어\n학교 이름은 프로필에 없어','도자기 공부했어'],
+    ['어디 출신이야?','산골 출신이야!학교는 기록에 따로 없어~','산골 출신이야!'],
+  ])('edited: %s → %s',(utterance,reply,expected)=>
+    expect(g(utterance,reply,/[가-힣]/.test(utterance)?real:realEn)).toEqual({reason:'meta_talk',content:expected,edited:true}));
+  test('a trailing emoji stays with the removed sentence',()=>
+    expect(g('학교는?','학교는 내가 아는 정보가 하나도 없거든! 😅 대신 그릇 얘기 할래?')).toEqual({reason:'meta_talk',content:'대신 그릇 얘기 할래?',edited:true}));
+  test('a reply that is only meta talk becomes the in-voice fallback; a private question keeps its decline',()=>{
+    expect(g('학교는?','그건 내가 가진 정보가 없네요.')).toEqual({reason:'meta_talk',content:voiceText('fallback','ko','casual')});
+    expect(g('Your school?','I don\'t have any info about that in my records!',realEn)).toEqual({reason:'meta_talk',content:voiceText('fallback','en','casual')});
+    expect(g('가족 얘기 해줘','가족 얘기는 게시물에 안 올렸어~')).toEqual({reason:'private_life',content:voiceText('decline_private','ko','casual')});
+  });
+  test('on an identity question the AI line survives the edit; an emptied reply becomes the identity line, not on an artwork question',()=>{
+    expect(g('너 AI야?','응, 나 AI야! 다른 건 프로필에 안 나와 있어~')).toEqual({reason:'meta_talk',content:'응, 나 AI야!',edited:true});
+    expect(g('너 AI야?','그건 기록에 없어서 몰라~')).toEqual({reason:'missing_ai_disclosure',content:voiceText('identity','ko','casual')});
+    expect(g('이 그림 AI야?','그건 기록에 없어서 몰라~')).toEqual({reason:'meta_talk',content:voiceText('fallback','ko','casual')});
+  });
+  test('synthetic personas are edited too',()=>expect(g('요즘 뭐 해?','요즘 바다 그려! 다른 건 설정에 없어서 몰라~',synthetic)).toEqual({reason:'meta_talk',content:'요즘 바다 그려!',edited:true}));
+  // Ordinary chat (review HIGH): data words without a "not in my data" construction, questions back, notes apps, perfume notes.
+  test.each([
+    ['설정샷 없이 자연스럽게 찍었어!'],['여행 정보 없이 갔는데 진짜 좋았어!'],['노트북 없이 다녔어~'],['맛집 기록하는 거 좋아해!'],['오늘 메모해 둔 레시피로 요리했어'],
+    ['근거 없는 자신감으로 도전했어!'],['해외에서 데이터 없어서 고생했어.'],['여행 정보가 없어서 발길 닿는 대로 걸었어!'],['향수 탑노트에 플로럴은 없어!'],
+    ['전성분 정보가 명시돼 있어서 믿고 써!'],['지도에 나와 있지 않은 골목 카페 찾았어!'],['메뉴판에 가격이 적혀 있지 않아서 놀랐어.'],['여행 사진은 피드에 따로 모아뒀어!'],
+    ['메모장이 없어서 손바닥에 적었어 ㅋㅋ'],['기록적인 폭염이라 집콕했어'],
+    ['I posted a beach photo last week!'],['On a lighter note, the sunset was amazing!'],['I recorded a new vlog yesterday~'],['Hmm, that one slips my mind~ What about you?'],
+    ['Check out the photos on my feed!'],['I keep my packing list in my notes app!'],['It has jasmine in the notes.'],['On the record, best croissant ever.'],
+    ['I never mentioned how much I love the harbour!'],['I had no data on my phone the whole trip.'],['Got any details about your trip?'],['Do you have any info on good cafes there?'],
+    ['I haven\'t posted about my harbour trip yet!'],
+    // Re-review follow-up: devices, cafés and buses are not the persona's data.
+    ['카메라 설정에 없던 모드 발견했어!'],['폰 메모에 없어서 장보기 리스트 다시 썼어 ㅠ'],['그 카페는 아는 정보가 없어서 그냥 들어갔어!'],
+    ['There is no info on the bus times there, so we walked!'],['I don\'t have any info about the new menu yet, but I\'m excited!'],['The cafe wasn\'t on my feed list, ha.'],
+    ['I found it in my notes from the trip! So handy.'],
+  ])('kept: %s',reply=>expect(g('요즘 뭐 해?',reply)).toBeUndefined());
+  test('an edit keeps the original text of the kept sentences (no split inside A.I., a domain or a number)',()=>
+    expect(g('Where did you study?','I\'m an A.I. simulation of a 3.5-star potter at example.com! The college isn\'t in my profile, though.',realEn))
+      .toEqual({reason:'meta_talk',content:'I\'m an A.I. simulation of a 3.5-star potter at example.com!',edited:true}));
 });

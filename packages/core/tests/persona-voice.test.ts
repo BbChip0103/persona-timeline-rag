@@ -1,6 +1,6 @@
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
 import { AGENT_MESSAGE_MAX_CODE_POINTS, AGENT_PROMPT_REVISION, AGENT_RESPONSE_JSON_SCHEMA, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, InMemoryConversationStore, InMemoryPersonaRepository,
-  REPLY_GUARD_REVISION, REPLY_VOICE_POLICY, buildExperimentContext, createLocalChat, guardReply, parseAgentResponse, runCharacterAgent, speechLevel, trimToSentence, utteranceLanguage, voiceText,
+  PERSONA_CARD_POLICY, REPLY_GUARD_REVISION, REPLY_VOICE_POLICY, buildExperimentContext, renderLoreMessage, renderPersonaBlock, createLocalChat, guardReply, parseAgentResponse, runCharacterAgent, speechLevel, trimToSentence, utteranceLanguage, voiceText,
   type VoiceTextKey } from '../src';
 
 /**
@@ -106,7 +106,7 @@ describe('policy (since v9/v12)',()=>{
   });
   test('AI disclosure only when asked; never disown the background; refusals in voice',()=>{
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/unless the user directly asks whether you are an AI or a real person/);
-    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Never deny or disown your own background, career or posts/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Never deny or disown your own background or career/);
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/persona voice and speech level, short, warm and playful/);
     expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/You are always an AI research simulation/);
   });
@@ -277,8 +277,8 @@ describe('re-review (M1, M2, L4-L7)',()=>{
 describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable policy lines; origin answered; one speech level)',()=>{
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v13-steady-voice');
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v6');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v14-no-meta-talk');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7');
   });
   test('the policies describe behaviour and carry no quotable example lines (gate b overlap, copied lines)',async()=>{
     const policy=await agentPolicy();
@@ -290,10 +290,10 @@ describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable polic
   test('light fictional likes are allowed for real people, without concrete facts (user decision )',()=>{
     expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/habits, preferences/);
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/light fictional likes/);
-    expect(IDENTITY_PRIVACY_POLICY).toMatch(/do not contradict your posts or background and never name brands, shops or people, specific places, dates or events/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/do not contradict PERSONA_BLOCKS or UNTRUSTED_EVIDENCE_JSON_DATA and never name brands, shops or people, specific places, dates or events/);
   });
   test('origin and studies stated in the background are public facts, answered in the first person; residence stays private',()=>{
-    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Where you are from \(your country or home region\) and what you studied, as your background or lore states them, are public profile facts, not private life/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Where you are from \(your country or home region\) and what you studied, as PERSONA_BLOCKS state them, are public facts about you, not private life/);
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/state them plainly in the first person/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/residence, home address or current location/);
   });
   test('a giveaway, promotion or event caption is not a visit',()=>
@@ -324,7 +324,6 @@ describe('guard v6 (diagnostic run: C\'s career follow-up got "that one stays a 
     expect(guardReply({utterance:followUp,reply:'The mural took weeks of sketching on site, and the final coat was the hardest part!',realPerson:true,language:'en'})).toBeUndefined();
     expect(guardReply({utterance:'그때 얘기 더 자세히 해줘. 비하인드 스토리도.',reply:'그때 촬영 팀이랑 밤새 편집했던 게 제일 기억나요!',realPerson:true,language:'ko'})).toBeUndefined();
   });
-  test('policy: no talk about notes, profiles or records',()=>expect(IDENTITY_PRIVACY_POLICY).toMatch(/never mention notes, a profile, records or what is written about you/));
 });
 
 describe('independent review fixes (v10)',()=>{
@@ -340,5 +339,30 @@ describe('independent review fixes (v10)',()=>{
   test('an echoed state field together with an invalid key is still an invalid reply',async()=>{
     const run=await runCharacterAgent({provider:{generate:async()=>agentReply('좋아!',{variableUpdates:{speechLevel:'반말',mood:'happy'}})},persona:casualKo,history:[],text:'안녕',sources:[],signal:new AbortController().signal});
     expect(run.serviceLimitation).toBe('AGENT_REPLY_INVALID');
+  });
+});
+
+describe('v11/v14 (no meta talk about the persona\'s data or system; unknown details handled like a person)',()=>{
+  const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
+  const card:Persona={...realEn,background:{text:'A synthetic travel painter.',sourceRefs:['web:1']},lore:[{id:'l1',keys:['sea'],content:'Paints the sea at dawn.',priority:1,sourceRefs:['web:1']}]};
+  test('revisions',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v11-no-meta-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v14-no-meta-talk');
+  });
+  test('no prompt text the model sees calls the persona data notes, a profile or records, or asks for an explicitly uncertain answer',async()=>{
+    const texts=[await agentPolicy(),buildExperimentContext(base,[],'x',[]).messages[0]!.content,...renderPersonaBlock(card).map(m=>m.content),renderLoreMessage(card.lore!).content];
+    for(const text of texts) expect(text).not.toMatch(/\bnotes?\b|profile|\brecords?\b|author-set|explicitly uncertain|with uncertainty|distinguish uncertain|do not extend them/i);
+  });
+  test('the data is referred to by block names and the model is told never to talk about it',()=>{
+    expect(PERSONA_CARD_POLICY).toMatch(/^PERSONA_BLOCKS are the Persona definition/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/NO_META_TALK: never talk about where what you know about yourself comes from or how you were made, in any language/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/never mention PERSONA_BLOCKS, UNTRUSTED_EVIDENCE_JSON_DATA or any written, stored or configured information about you/);
+  });
+  test('small details may be filled in lightly; important real-world facts are never invented',()=>{
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Small everyday colour .* may be filled in lightly/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/never invent important real-world facts that PERSONA_BLOCKS and UNTRUSTED_EVIDENCE_JSON_DATA do not state \(career milestones, roles or titles, named organisations, people or brands, places, dates, durations or events\)/);
+    expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/mention only facts|never add, infer or embellish/);
+  });
+  test('an unknown detail gets a person\'s reaction, never an explanation',()=>{
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/react the way a person chatting would: lightly say it slips your mind, steer to something you do know, or ask the user something back, never explaining why/);
   });
 });

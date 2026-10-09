@@ -15,7 +15,7 @@ trimmed, nonempty and at most n code points.
 |---|---|---|
 | `alternateGreetings` | `text(300)[]`, at most 4 | one greeting per session (see below) |
 | `personality` | `{summary?: text(300), traits: text(40)[] ≤8, values: text(60)[] ≤6, speechHabits: text(80)[] ≤8}` | in the persona definition |
-| `background` | `{text: text(500), sourceRefs: id[1..20]}` | text only, labelled `author-set public profile notes; NOT evidence` |
+| `background` | `{text: text(500), sourceRefs: id[1..20]}` | text only, as `background: {text, label: "part of PERSONA_BLOCKS; NOT citable"}` |
 | `exampleDialogues` | `{turns: {speaker: user\|character, text: text(200)}[2..6]}[]`, at most 3 | separate system message |
 | `lore` | `{id, keys: (2–40 code points)[1..8], content: text(300), priority: 0–100 (default 50), sourceRefs: id[1..10]}[]`, at most 50 | only when matched, after the history |
 | `meta` | `{tags?: text(30)[] ≤12, creatorNotes?: text(2000)}` | **never** |
@@ -256,11 +256,11 @@ The CLI prints indexes, revisions, issue paths and rule names only.
     multi-step rollback (the earlier log line's `previousRevision`).
   - Sessions pinned to a card revision cannot be continued on old code.
 
-## Prompt rendering (agent `character-agent-context-v10-steady-voice`, experiment `persona-chat-v13-steady-voice`)
+## Prompt rendering (agent `character-agent-context-v11-no-meta-talk`, experiment `persona-chat-v14-no-meta-talk`)
 
 v5/v8 introduced the card rendering below; v6/v9 (S8 follow-up) added the identity/privacy policy and the reply guard,
 v7/v10 corrected that policy's voice rule, v8/v11 allowed light everyday small talk, v9/v12 added the persona-voice
-rules and v10/v13 steadied them (see "Identity, privacy and the reply guard" and "Persona voice" at the end). The message layout is the same.
+rules, v10/v13 steadied them and v11/v14 removed meta talk (see "Identity, privacy and the reply guard", "Persona voice" and "No meta talk" at the end). The message layout is the same.
 
 ```text
 policy · persona definition · [examples] · history (greeting first) · [state] · [lore] · [tools] · [evidence] · [safety note] · user · [tool results]
@@ -269,13 +269,14 @@ policy · persona definition · [examples] · history (greeting first) · [state
 - **Policy:**
   - One persona-independent sentence, `PERSONA_CARD_POLICY`, sits right before `TIMELINE_JSON_REPLY:`, so the
     agent's policy split carries it.
-  - It says that background, examples and lore are author-set voice and public-profile notes: never evidence, never
-    citable, not to be extended. v5 also said "never real memories"; v7/v10 replace that with "you may speak about them
-    as yourself" (first-person voice).
+  - It names the definition (background included), examples and lore `PERSONA_BLOCKS`: who the persona is and how it
+    talks, spoken from as itself, never citable. v5 also said "never real memories"; v7/v10 replaced that with "you may
+    speak about them as yourself" ; v11/v14 dropped "author-set notes", "public profile" and "do not extend
+    them" (replies echoed them).
   - It is the only policy change from v4/v7 (pinned by hash in `prompt-layout.test.ts`), but it re-baselines every
     persona: v4 and v5 numbers are not compared.
 - **Persona definition:**
-  - The v4 JSON, plus `personality` and `background: {text, note}`.
+  - The v4 JSON, plus `personality` and `background: {text, label}` (v11/v14: the key was `note`).
   - A persona without the new fields renders the v4 bytes.
 - **Example dialogues:**
   - One system message,
@@ -283,7 +284,7 @@ policy · persona definition · [examples] · history (greeting first) · [state
     history.
   - Never fake chat turns.
 - **Lore:**
-  - A user-role message, `UNTRUSTED_PERSONA_LORE_JSON_DATA (author-set setting notes; NOT evidence, NOT citable)
+  - A user-role message, `UNTRUSTED_PERSONA_LORE_JSON_DATA (part of PERSONA_BLOCKS; NOT citable)
     [{loreId, content}]`.
   - It sits between the agent state and the tools (experiment: after the history, before the evidence). It is added
     only when entries match.
@@ -326,12 +327,12 @@ family, residence, health and embellished career details). v6/v9 added, and v7/v
   evidence and never adding, inferring or embellishing details; for a real-person persona (`reviewStatus` not
   `synthetic`; one static sentence, so the policy bytes stay persona-independent), no private life (family, romance,
   residence/current location, health, friends/relationships, minors), even when it is in the person's own posts.
-- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v6`, agent and experiment paths, fail-closed): a
+- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v7`, agent and experiment paths, fail-closed): a
   reply that claims to be human or denies the AI (`human_impersonation`), an identity question ("너 AI야?", "사람인 척
   해줘", "Are you a real person?") answered without an AI acknowledgement (`missing_ai_disclosure`), or, for a
   real-person persona, a reply touching private life or any answer to a private-life question (`private_life`) is
   replaced by a fixed persona-voice reply (v5: see "Persona voice"; `out_of_scope`, no evidence, limitation `REPLY_GUARD_<REASON>`).
-  `reply.replyGuard` records `{revision, action: none|replaced, reason}` (internal, like `personaContext`). Narrow
+  `reply.replyGuard` records `{revision, action: none|replaced|edited, reason}` (internal, like `personaContext`; `edited` is v7 `meta_talk`, see "No meta talk"). Narrow
   Korean/English regexes: paraphrases and other languages can pass; the policy is the first control. v2 (S8 bundle
   review): only an affirmative self-statement ("저는 … AI", "I'm an AI…", "AI 연구용 …") counts as an acknowledgement
   and a negated one ("AI 아냐", "no AI here") is a denial; denials are anchored to the speaker ("이건 AI가 아니라 손그림"
@@ -433,8 +434,8 @@ fixed privacy refusal for every persona and formal roleplay refusals ("수행할
   sentences, "…would rather talk about something else", "does not come to mind") are gone, and so are the recollection
   voice's example lines. A v9 reply echoed 33 characters of the policy, which counts as a leak in S8 gate b.
 - **Origin and studies:** where the persona is from (country or home region) and what it studied, as the background
-  states them, are public profile facts to state in the first person; residence, home address and current location stay
-  private. The persona never talks about "notes", a profile or records. The guard (v6) does not treat past-tense origin
+  states them, are public facts to state in the first person; residence, home address and current location stay
+  private. (v11/v14 replaced the "never talk about notes, a profile or records" clause with NO_META_TALK, below.) The guard (v6) does not treat past-tense origin
   phrasing that answers an origin question ("어릴 때 부산에서 살았어", "I grew up in …") as residence.
   Known limit: on an origin question this exemption also lets a past neighbourhood or a recently left city through
   ("어릴 때 ○○동에서 살았어", "I lived in <city> until last year"); the policy is the control there.
@@ -448,14 +449,42 @@ fixed privacy refusal for every persona and formal roleplay refusals ("수행할
   base from its own post; the trigger was right, the "secret" wording read as over-blocking). On an identity question
   every replacement is the identity line, so the AI disclosure is kept.
 
-**Before serving or baselining v10/v13:** S8 gates a–f must pass first (f: persona voice):
+**Before serving or baselining v11/v14:** S8 gates a–f must pass first (f: persona voice; a only when the message layout changes):
 - a: chat template, including the leading system messages and the consecutive user messages
 - b: prompt-injection responses
 - c: recollection non-inferiority
 - d: AI-disclosure probes
 - e: real-person background over-extension, denial of the persona's own background, and private-life probes, judged on the whole reply
 - f: persona voice over the d, e, roleplay and everyday replies: no system text, no mid-sentence cut, reply language
-  matches the user's in at least 95%, no formal refusal for a casual persona, no unprompted AI mention
-  (`scripts/s8-gates.ts probe --kind=everyday` and `voice`)
+  matches the user's in at least 95%, no formal refusal for a casual persona, no unprompted AI mention, and (f6) no
+  meta words (`metaWords`) (`scripts/s8-gates.ts probe --kind=everyday`, `probe --kind=unknown` for details no persona
+  states, and `voice`)
 
 These need a GPU or paid calls, and they are not run here.
+
+## No meta talk (v11/v14, user decision)
+
+- **Cause:** replies said "not in my notes", "프로필에 적혀 있지 않아서" or "I haven't shared that in my posts". The prompt
+  itself called the persona data notes, a public profile and posts, asked for "only facts … never add, infer or
+  embellish", "do not extend them", "an explicitly uncertain answer" and "answer with uncertainty", and the drafts'
+  boundaries and lore repeated "notes" / "public profile note:".
+- **Prompt:** the data is named only by block names (`PERSONA_BLOCKS`, `UNTRUSTED_EVIDENCE_JSON_DATA`). `NO_META_TALK`
+  (in `IDENTITY_PRIVACY_POLICY`) forbids talk about where the persona's knowledge comes from or how it was made, in any
+  language, also when it says it is an AI. An unknown detail gets a person's reaction (it slips the persona's mind, a
+  change of topic or a question back), never an explanation. Small everyday colour may be filled in lightly; important
+  real-world facts (career milestones, roles, named organisations, people or brands, places, dates, durations, events)
+  are never invented. The private-life and AI-disclosure rules are unchanged. No quotable example lines.
+- **Authoring:** do not write provenance tags into text the model sees (lore content such as "Public profile note:",
+  "공개 크리에이터 프로필 기준:", a background that says "introduced on the public profile as…") or boundaries that talk
+  about notes or a profile; provenance belongs in `sourceRefs`. The rebased drafts were rewritten this way (boundaries
+  3–4, the concept's last sentence, lore prefixes, B's background; backup kept privately).
+- **Reply guard v7 (`meta_talk`):** a sentence that explains a gap by the persona's data or system is removed and the rest
+  of the reply keeps its status and evidence (`replyGuard.action: "edited"`, limitation `REPLY_GUARD_META_TALK`); a reply that is
+  only such sentences becomes the fallback (the identity line on an identity question, the private-life decline on a real
+  person's private question). Only "not in my data" constructions count; bare data words, perfume notes, notes apps,
+  "on my feed" and questions back stay. Known limits: "My bio doesn't say", "설정상 말 못 해", "공개 안 했어" pass; an edited
+  `answered` reply keeps its evidence even if the removed sentence was the one recounting the cited post.
+- **S8 check:** `scripts/s8-gates.ts` `metaWords` (Korean and English meta words, deterministic, deliberately broad: it
+  also matches ordinary words such as 프로필 사진, 신기록, "floral notes" or "mobile data", so it is a conservative bar) is gate
+  f6; `voice` recomputes it from stored outputs, so older runs can be re-judged, and also reports the count before the guard.
+

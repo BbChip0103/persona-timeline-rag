@@ -11,7 +11,8 @@ export const LORE_BYTE_LIMIT=2048;
 export const LORE_MAX_ENTRIES=3;
 export const PERSONA_STYLE_EXAMPLES_MARKER='PERSONA_STYLE_EXAMPLES_JSON_DATA';
 export const PERSONA_LORE_MARKER='UNTRUSTED_PERSONA_LORE_JSON_DATA';
-const BACKGROUND_NOTE='author-set public profile notes; NOT evidence';
+// : no "notes"/"profile" wording (not even as a key) the model can echo; the block name is the only label.
+const BACKGROUND_LABEL='part of PERSONA_BLOCKS; NOT citable';
 
 /** Persona definition (system) and, when the persona has example dialogues, the style examples (system). */
 export function renderPersonaBlock(persona:Persona):ProviderMessage[] {
@@ -19,7 +20,7 @@ export function renderPersonaBlock(persona:Persona):ProviderMessage[] {
     traits:persona.personality.traits,values:persona.personality.values,speechHabits:persona.personality.speechHabits};
   const definition={id:persona.id,revision:persona.revision,reviewStatus:persona.reviewStatus,language:persona.language,identity:persona.identity,
     concept:persona.concept,style:persona.style,boundaries:persona.boundaries,
-    ...(personality?{personality}:{}),...(persona.background?{background:{text:persona.background.text,note:BACKGROUND_NOTE}}:{})};
+    ...(personality?{personality}:{}),...(persona.background?{background:{text:persona.background.text,label:BACKGROUND_LABEL}}:{})};
   const examples=persona.exampleDialogues?.length?[{role:'system' as const,content:`${PERSONA_STYLE_EXAMPLES_MARKER} (style/tone reference only; NOT facts, memories or evidence) ${
     JSON.stringify(persona.exampleDialogues.map(dialogue=>dialogue.turns.map(turn=>({speaker:turn.speaker,text:turn.text}))))}`}]:[];
   return [{role:'system',content:`Persona definition (subordinate to policy): ${JSON.stringify(definition)}`},...examples];
@@ -29,7 +30,7 @@ export const serializedBytes=(messages:readonly ProviderMessage[])=>Buffer.byteL
 export const personaBlockBytes=(persona:Persona)=>serializedBytes(renderPersonaBlock(persona));
 /** Matched lore as untrusted user-role data after the history ; entries keep document order. */
 export function renderLoreMessage(entries:readonly Pick<LoreEntry,'id'|'content'>[]):ProviderMessage {
-  return {role:'user',content:`${PERSONA_LORE_MARKER} (author-set setting notes; NOT evidence, NOT citable) ${JSON.stringify(entries.map(entry=>({loreId:entry.id,content:entry.content})))}`};
+  return {role:'user',content:`${PERSONA_LORE_MARKER} (part of PERSONA_BLOCKS; NOT citable) ${JSON.stringify(entries.map(entry=>({loreId:entry.id,content:entry.content})))}`};
 }
 /** Lore budget unit: UTF-8 bytes of the serialized lore message (header included). */
 export const loreBytes=(entries:readonly Pick<LoreEntry,'id'|'content'>[])=>Buffer.byteLength(JSON.stringify(renderLoreMessage(entries)),'utf8');
