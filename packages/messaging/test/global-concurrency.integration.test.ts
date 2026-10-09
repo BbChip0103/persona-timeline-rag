@@ -78,7 +78,7 @@ run('BullMQ global concurrency (opt-in RUN_REDIS_TESTS=1)', () => {
       await second.stop();
     } finally {
       await queue.obliterate({ force: true }).catch(() => undefined); await queue.close();
-      const keys = await redis.keys(`${prefix}:*`); if (keys.length) await redis.del(...keys);
+      for await (const keys of redis.scanStream({ match: `${prefix}:*`, count: 500 }) as AsyncIterable<string[]>) if (keys.length) await redis.del(...keys); // SCAN: KEYS is refused to ptr
       redis.disconnect();
     }
   });

@@ -10,7 +10,7 @@ const userKeys=(overrides:Record<string,string>={})=>({
   GOAL1_ALLOW_EXTERNAL_DATA:'true',GOAL1_BUDGET_USD:SENTINEL,GOAL1_LIVE_ENABLED:'true',OPENROUTER_API_KEY:SENTINEL,
   PTR_API_TOKEN:`${SENTINEL}-api-token`,PTR_API_URL:'http://127.0.0.1:56441',PTR_CHAT_PROVIDER:'openrouter',PTR_DB_PASSWORD:SENTINEL,
   PTR_EMBEDDING_MODEL:SENTINEL,PTR_LOADTEST_DATABASE_URL:SENTINEL,PTR_LOADTEST_DB_PASSWORD:SENTINEL,PTR_MODEL:'google/gemma-4-26b-a4b-it',
-  PTR_PERSONAS_FILE:'personas.json',PTR_REDIS_PASSWORD:SENTINEL,PTR_REDIS_URL:`redis://:${SENTINEL}@127.0.0.1:56479/0`,
+  PTR_PERSONAS_FILE:'personas.json',PTR_REDIS_PASSWORD:SENTINEL,PTR_REDIS_URL:`redis://ptr:${SENTINEL}@127.0.0.1:56479/0`,
   PTR_SESSION_SECRET:`${SENTINEL}-session-secret`,PTR_UI_PASSWORD:SENTINEL,REPLICATE_API_TOKEN:SENTINEL,...overrides});
 let dir:string;
 beforeAll(()=>{dir=mkdtempSync(join(tmpdir(),'ptr-check-env-'));writeFileSync(join(dir,'personas.json'),'[]');});
@@ -50,6 +50,12 @@ test('value rules print rule ids only; absolute persona paths are flagged for Co
   expect(lines).toEqual(['roles api,worker,dispatcher,web (demo off)','warning all unused_key GOAL1_BUDGET_USD','warning all unused_key PTR_EMBEDDING_MODEL',
     'warning all unused_key REPLICATE_API_TOKEN','warning all path_not_repo_relative PTR_PERSONAS_FILE','error all api_url_constant PTR_API_URL',
     'error api production_provider PTR_CHAT_PROVIDER','error worker production_provider PTR_CHAT_PROVIDER','errors 3 warnings 4']);
+  expect(code).toBe(1);
+});
+test('a Redis URL without the ACL user ptr is flagged for every role that reads it ',()=>{
+  const {code,lines}=run(userKeys({PTR_REDIS_URL:`redis://:${SENTINEL}@127.0.0.1:56479/0`}));
+  expect(lines.filter(line=>line.startsWith('error '))).toEqual(['error api redis_username_ptr PTR_REDIS_URL','error worker redis_username_ptr PTR_REDIS_URL',
+    'error dispatcher redis_username_ptr PTR_REDIS_URL']);
   expect(code).toBe(1);
 });
 test('a missing file is a usage error, named by its path only',()=>{

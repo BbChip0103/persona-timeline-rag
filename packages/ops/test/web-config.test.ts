@@ -2,7 +2,7 @@ import { register } from '../../../apps/web/instrumentation';
 import { apiUrl, checkWebConfig, registerWebConfig } from '../../../apps/web/lib/config';
 
 // : the web validates its keys in instrumentation.ts register(), except during `next build`.
-const valid={PTR_API_TOKEN:'synthetic-api-token-at-least-24-characters',PTR_SESSION_SECRET:'synthetic-session-secret-at-least-32-characters',PTR_UI_PASSWORD:'synthetic'};
+const valid={PTR_API_TOKEN:'synthetic-api-token-at-least-24-characters',PTR_SESSION_SECRET:'synthetic-session-secret-at-least-32-characters',PTR_UI_PASSWORD:'synthetic-ui-pass'};
 const SENTINEL='SENTINEL-web-value-0123456789';
 
 describe('web register()',()=>{
@@ -28,6 +28,11 @@ describe('web register()',()=>{
     process.env={...valid};
     const exit=jest.fn();await register(exit);expect(exit).not.toHaveBeenCalled();
   });
+});
+test('PTR_UI_PASSWORD: the login route\'s 12-character minimum is a startup rule',()=>{
+  expect(checkWebConfig({...valid,PTR_UI_PASSWORD:'x'.repeat(11)}).errors).toEqual([{key:'PTR_UI_PASSWORD',rule:'password_length'}]);
+  expect(checkWebConfig({...valid,PTR_UI_PASSWORD:'x'.repeat(12)}).errors).toEqual([]);
+  expect(checkWebConfig({...valid,PTR_UI_PASSWORD:' '}).errors).toEqual([{key:'PTR_UI_PASSWORD',rule:'missing'}]);
 });
 test('PTR_API_URL: the constant warns, anything else fails; the synthetic UI keeps its own port',()=>{
   const lines:string[]=[];

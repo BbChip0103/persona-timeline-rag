@@ -8,15 +8,18 @@ services:
     restart: "no"
     environment:
       PTR_REDIS_PASSWORD: ${PTR_REDIS_PASSWORD:?Set PTR_REDIS_PASSWORD in the private .env.local}
-    # The password is written to a container-local config file, never passed as an argument.
+    # ACL : one app user `ptr` limited to the ptr:* / ptrtest:* keys and channels, every command but the
+    # @dangerous ones (KEYS, CONFIG, FLUSHALL, ...) plus INFO, which BullMQ reads. The default user is off and there is
+    # no admin user: break-glass is the rollback in docs/runbook.md. PTR_REDIS_PASSWORD is the ptr password; only its
+    # SHA-256 is written to a container-local config file, and it is never passed as an argument.
     # BullMQ requires noeviction; AOF keeps queued jobs across a Redis restart.
-    command: [sh, -c, 'umask 077; printf "requirepass %s\nappendonly yes\nmaxmemory-policy noeviction\nprotected-mode yes\n" "$$PTR_REDIS_PASSWORD" > /tmp/redis.conf && exec redis-server /tmp/redis.conf']
+    command: [sh, -c, 'umask 077; hash=$$(printf %s "$$PTR_REDIS_PASSWORD" | sha256sum | cut -d " " -f 1); printf "user default off resetpass -@all\nuser ptr on #%s ~ptr:* ~ptrtest:* &ptr:* &ptrtest:* +@all -@dangerous +info\nappendonly yes\nmaxmemory-policy noeviction\nprotected-mode yes\n" "$$hash" > /tmp/redis.conf && exec redis-server /tmp/redis.conf']
     ports:
       - "127.0.0.1:56479:6379"
     volumes:
       - ptr_goal2_redis_data:/data
     healthcheck:
-      test: [CMD-SHELL, 'REDISCLI_AUTH="$$PTR_REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$PTR_REDIS_PASSWORD" redis-cli --user ptr ping | grep -q PONG']
       interval: 3s
       timeout: 3s
       retries: 20

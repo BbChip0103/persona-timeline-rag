@@ -246,6 +246,10 @@ async function scenarioD(redis:ReturnType<typeof createRedisConnection>) {
   }
 }
 
+/** SCAN, not KEYS: KEYS is @dangerous and refused to the Redis ACL user ptr . */
+async function deleteKeys(redis:ReturnType<typeof createRedisConnection>):Promise<void> {
+  for await (const keys of redis.scanStream({match:`${PREFIX}:*`,count:500}) as AsyncIterable<string[]>) if(keys.length) await redis.del(...keys);
+}
 async function main():Promise<void> {
   const redis=createRedisConnection(assertLocalRedisUrl(process.env.PTR_REDIS_URL??''));redis.on('error',()=>undefined);
   const scenarios=(args.scenarios??'C,E,T6,D').split(',');
@@ -258,10 +262,10 @@ async function main():Promise<void> {
       const r=result as {total:{calls:number;failed:number;codes:unknown}};
       console.log(JSON.stringify({scenario,calls:r.total.calls,failed:r.total.failed,codes:r.total.codes}));
       // Let the dead gateways' records expire between scenarios (same names are reused).
-      for(const key of await redis.keys(`${PREFIX}:*`)) await redis.del(key);
+      await deleteKeys(redis);
     }
   } finally {
-    const keys=await redis.keys(`${PREFIX}:*`);if(keys.length) await redis.del(...keys);
+    await deleteKeys(redis);
     redis.disconnect();
     report.finishedAt=new Date().toISOString();
     const out=join(DIR,`gateway-ha-acceptance-${RUN}.json`);

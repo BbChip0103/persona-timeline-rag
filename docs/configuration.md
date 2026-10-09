@@ -25,18 +25,19 @@ code that call `createRuntime(env)` directly are not gated. The order of the che
 5. renamed keys: warning `renamed_key` for one release; a different value under the old and the new name → `alias_conflict`;
 6. the role's production keys (below). With `PTR_DEMO_SCALING=1` this step is skipped, except that api and worker
    still need an explicit `PTR_CHAT_PROVIDER`; each demo setting is checked by its own parser when the role starts.
+   In either mode the api refuses a harness token equal to the production token (`synthetic_token_reuse`).
 
 ## The 19 production variables
 
 | Variable | Roles | Rule (rule id) |
 | --- | --- | --- |
 | `DATABASE_URL` | api, worker, dispatcher; gateway with OpenRouter failover | required (`missing`); the isolated loopback database (`database_url_guard`) |
-| `PTR_REDIS_URL` | api, worker, dispatcher | required; the isolated loopback Redis (`redis_url_guard`) |
+| `PTR_REDIS_URL` | api, worker, dispatcher | required; the isolated loopback Redis (`redis_url_guard`) as the ACL user `ptr`: `redis://ptr:<password>@127.0.0.1:56479/0` (`redis_username_ptr`) |
 | `PTR_CHAT_PROVIDER` | api, worker | required; `gateway` or `openrouter` (`production_provider`) |
 | `PTR_MODEL` | api, worker | required with `openrouter`; an allowlisted OpenRouter chat model (`model_allowlist`) |
 | `PTR_API_TOKEN` | api, web | required; 24–512 characters (`token_length`) |
 | `PTR_SESSION_SECRET` | web | required; at least 32 characters (`secret_length`) |
-| `PTR_UI_PASSWORD` | web | required, not blank |
+| `PTR_UI_PASSWORD` | web | required; at least 12 characters, the login route's own minimum (`password_length`) |
 | `PTR_GATEWAY_TOKEN` | gateway; api and worker with the `gateway` provider | required there; 24–512 characters |
 | `PTR_GATEWAY_UPSTREAMS_FILE` | gateway | required; the file exists (`file_missing`), parses (`upstreams_file_invalid`) and holds exactly one pool (`upstreams_pool_count`), whose name is the served model |
 | `PTR_GATEWAY_FAILOVER` | gateway | `off` (default) or `openrouter` (`invalid_value`) |
@@ -73,7 +74,7 @@ paths are resolved against the current directory.
 | `PTR_CHAT_PROVIDER` | P | must be `gateway` or `openrouter`; `fake` and `selfhosted` need `PTR_DEMO_SCALING=1` | `production_provider` otherwise |
 | `PTR_MODEL` | P | keep (now a production key) | `model_allowlist` if not allowlisted |
 | `GOAL1_LIVE_ENABLED`, `GOAL1_ALLOW_EXTERNAL_DATA`, `OPENROUTER_API_KEY` | P | keep | `live_trio` when needed and incomplete |
-| `PTR_REDIS_URL` | P | keep | nothing |
+| `PTR_REDIS_URL` | P | add the user name `ptr` when Redis moves to the ACL ([runbook](runbook.md#redis-acl-migration-and-rollback)) | `redis_username_ptr` without it |
 | `PTR_API_URL` | R | can be deleted: the proxy uses the constant | warning `constant_ignored`; error `api_url_constant` if it differs |
 | `GOAL1_BUDGET_USD`, `PTR_EMBEDDING_MODEL`, `REPLICATE_API_TOKEN`, `INSTAGRAM_DATASET_FOLDER_URL` | R | can be deleted (the budget is the Postgres `ptr_provider_budget` row) | warning `unused_key` |
 | `GOAL1_DATABASE_URL`; `GOAL1_TEXT_MODEL`, `TEXT_MODEL` | R | rename to `DATABASE_URL`; `PTR_MODEL` (removed in the next round) | warning `renamed_key`; `alias_conflict` if both differ |
@@ -84,7 +85,7 @@ paths are resolved against the current directory.
 With the keys of the current `.env.local` and the default roles, the expected result is no errors and four warnings:
 `constant_ignored PTR_API_URL` and `unused_key` for `GOAL1_BUDGET_USD`, `PTR_EMBEDDING_MODEL`, `REPLICATE_API_TOKEN`.
 Value-dependent rules (`production_provider`, `model_allowlist`, `live_trio`, `api_url_constant`,
-`path_not_repo_relative`, `file_missing`) can add lines. With `PTR_CHAT_PROVIDER=gateway` the gateway role is added and
+`path_not_repo_relative`, `file_missing`, `password_length`, `redis_username_ptr`) can add lines. With `PTR_CHAT_PROVIDER=gateway` the gateway role is added and
 reports `missing PTR_GATEWAY_TOKEN` and `missing PTR_GATEWAY_UPSTREAMS_FILE`; api and worker report
 `missing PTR_GATEWAY_TOKEN` too.
 

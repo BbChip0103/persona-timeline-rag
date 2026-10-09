@@ -84,6 +84,8 @@ interface ApiJson {session?:{id:string};turn?:{id:string;state:string;errorCode?
 class Fleet {
   private procs:Proc[]=[];
   readonly apiToken=randomBytes(24).toString('hex');
+  /** The clients use the harness token : it admits only synthetic owners (`lt-*`), never the web's. */
+  readonly harnessToken=randomBytes(24).toString('hex');
   readonly gatewayToken=randomBytes(24).toString('hex');
   /** Primary (port +50) first, then the optional standby (+51). */
   readonly gatewayPorts:number[];
@@ -100,7 +102,7 @@ class Fleet {
         :{PTR_CHAT_PROVIDER:'fake',...(this.latency?{PTR_FAKE_LATENCY:this.latency}:{})};
     // PTR_DEMO_SCALING=1: the fleet sets demo-layer knobs (queue names, leases, fake/selfhosted models).
     return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_DEMO_SCALING:'1',DATABASE_URL:loadtestUrl(),PTR_REDIS_URL:redisUrl(),
-      PTR_TURN_QUEUE:QUEUE,PTR_EVENTS_NAMESPACE:NAMESPACE,PTR_API_TOKEN:this.apiToken,PTR_PERSONAS_FILE:this.personasFile,
+      PTR_TURN_QUEUE:QUEUE,PTR_EVENTS_NAMESPACE:NAMESPACE,PTR_API_TOKEN:this.apiToken,PTR_API_SYNTHETIC_TOKEN:this.harnessToken,PTR_PERSONAS_FILE:this.personasFile,
       PTR_QUEUE_MAX_DEPTH:String(t.queueMax),PTR_DB_POOL_MAX:String(t.poolMax),PTR_WORKER_CONCURRENCY:String(t.workerConcurrency),
       PTR_LEASE_MS:String(t.leaseMs),PTR_DISPATCH_GRACE_MS:'2000',PTR_DISPATCH_INTERVAL_MS:'500',...model,...extra};
   }
@@ -158,7 +160,7 @@ class Fleet {
   }
   async call(base:string,path:string,owner:string,body?:unknown):Promise<{status:number;json:ApiJson;retryAfterMs:number|null}> {
     const response=await fetch(`${base}/${path}`,{method:body===undefined?'GET':'POST',
-      headers:{Authorization:`Bearer ${this.apiToken}`,'X-PTR-Owner':owner,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
+      headers:{Authorization:`Bearer ${this.harnessToken}`,'X-PTR-Owner':owner,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
     const retryAfter=Number(response.headers.get('retry-after'));
     return {status:response.status,json:await response.json().catch(()=>({})) as ApiJson,retryAfterMs:Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:null};
   }
@@ -241,7 +243,7 @@ async function followSse(o:UserOptions,owner:string,turnId:string,started:number
   while(!TERMINAL.includes(state)&&Date.now()-started<o.turnTimeoutMs) {
     const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),Math.max(1,o.turnTimeoutMs-(Date.now()-started)));
     try {
-      const response=await fetch(`${pickBase()}/turns/${turnId}/events`,{headers:{Authorization:`Bearer ${o.fleet.apiToken}`,'X-PTR-Owner':owner},signal:controller.signal});
+      const response=await fetch(`${pickBase()}/turns/${turnId}/events`,{headers:{Authorization:`Bearer ${o.fleet.harnessToken}`,'X-PTR-Owner':owner},signal:controller.signal});
       if(!response.ok||!response.body){await sleep(200);continue;}
       const feed=sseParser();const decoder=new TextDecoder();
       for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {

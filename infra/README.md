@@ -61,13 +61,18 @@ DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm db:migrate
 ## Goal2 scale rework: local Redis
 
 `compose.redis.yml` runs `ptr_goal2_redis` (Redis 8.10.2, pinned by digest) on
-`127.0.0.1:56479` only, with a password, `maxmemory-policy noeviction` (required by
-BullMQ) and AOF. It carries the BullMQ turn queue and turn-event pub/sub; it is not a
-source of truth (turns and the outbox in Postgres are). The URL guard
-(`@ptr/messaging` `assertLocalRedisUrl`) accepts only this loopback target.
+`127.0.0.1:56479` only, with `maxmemory-policy noeviction` (required by BullMQ) and AOF.
+Access is an ACL : one app user `ptr` whose password is `PTR_REDIS_PASSWORD`,
+limited to the `ptr:*` / `ptrtest:*` keys and channels and to every command except the
+`@dangerous` ones (`KEYS`, `CONFIG`, `FLUSHALL`, `CLIENT LIST`, ...) plus `INFO`, which BullMQ
+reads. The `default` user is off and there is no admin user; use `SCAN`, not `KEYS`, and
+`INFO memory`, not `CONFIG GET`. It carries the BullMQ turn queue and turn-event pub/sub; it
+is not a source of truth (turns and the outbox in Postgres are). The URL guard
+(`@ptr/messaging` `assertLocalRedisUrl`) accepts only this loopback target. Migration from
+the earlier `requirepass` container and its rollback: [runbook](../docs/runbook.md#redis-acl-migration-and-rollback).
 
 ```sh
-# Private .env.local holds PTR_REDIS_PASSWORD and PTR_REDIS_URL (redis://:<pw>@127.0.0.1:56479/0).
+# Private .env.local holds PTR_REDIS_PASSWORD and PTR_REDIS_URL (redis://ptr:<pw>@127.0.0.1:56479/0).
 docker compose --env-file .env.local -f infra/compose.redis.yml up -d redis
-RUN_REDIS_TESTS=1 pnpm exec jest packages/messaging --runInBand
+RUN_REDIS_TESTS=1 node --env-file=.env.local node_modules/jest/bin/jest.js packages/messaging --runInBand
 ```

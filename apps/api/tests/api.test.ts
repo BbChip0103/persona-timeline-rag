@@ -5,7 +5,11 @@ const ChatServiceGetTurn=ChatService.prototype.getTurn;
 import { FakeTextProvider } from '@ptr/providers';
 import { createApiApplication } from '../src/app';
 import type { ApiRuntime, CreativeArtifact } from '../src/runtime';
+// Two owner spaces : the web's production token sends `local-<40 hex>` owners only; this harness token
+// (PTR_API_SYNTHETIC_TOKEN) sends synthetic owners only. Most tests use the harness token.
 const token='synthetic_api_token_abcdefghijklmnop';
+const productionToken='production_api_token_abcdefghijklmnop';
+const webOwner='local-0123456789abcdef0123456789abcdef01234567';
 const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',label:'Synthetic Painter',language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Synthetic conversation',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
 let app:INestApplication;let base:string;let runtime:ApiRuntime;let artifacts:CreativeArtifact[];
 async function call(path:string,options:{method?:string;body?:unknown;owner?:string;auth?:string}={}) {
@@ -19,7 +23,7 @@ async function waitTurn(id:string):Promise<ChatTurn> {
 beforeEach(async()=>{
   const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();artifacts=[];
   const chat=createLocalChat({store,personas,provider});runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[persona],saveArtifact:async artifact=>{artifacts.push(artifact);}};
-  app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
 });
 afterEach(async()=>{await app.close();});
 test('health safe; authentication required and invalid owner rejected',async()=>{
@@ -27,6 +31,25 @@ test('health safe; authentication required and invalid owner rejected',async()=>
   expect((await call('personas',{auth:'Bearer wrong'})).status).toBe(403);
   expect((await call('personas',{owner:'../unsafe'})).status).toBe(403);
   const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toContain('AI');expect(listed.body.personas[0].identity).toBeUndefined();
+});
+test('owner spaces: the production token takes only web owners, the harness token only synthetic owners ',async()=>{
+  const production=`Bearer ${productionToken}`;
+  expect((await call('personas',{auth:production,owner:webOwner})).status).toBe(200);
+  for(const owner of ['lt-x','owner_synthetic_a','local-'+'0'.repeat(39),'local-'+'A'.repeat(40),'local-'+'0'.repeat(41),'../unsafe'])
+    expect([owner,(await call('personas',{auth:production,owner})).status]).toEqual([owner,403]);
+  for(const owner of ['lt-x','lt-1a2b3c4d','owner_synthetic_a','owner_synthetic_other']) expect([owner,(await call('personas',{owner})).status]).toEqual([owner,200]);
+  for(const owner of [webOwner,'lt-','lt-UPPER','owner_synthetic_','smoke-owner-1','lt-'+'a'.repeat(41)])
+    expect([owner,(await call('personas',{owner})).status]).toEqual([owner,403]);
+  const refused=await call('personas',{auth:production,owner:'lt-x'});expect(refused.body).toEqual({error:{code:'UNAUTHORIZED'}});
+  // Without a harness token only the production space exists.
+  await app.close();
+  app=await createApiApplication(runtime,productionToken);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  expect((await call('personas',{owner:'owner_synthetic_a'})).status).toBe(403);
+  expect((await call('personas',{auth:production,owner:webOwner})).status).toBe(200);
+});
+test('the harness token must differ from the production token and pass the token length rule',async()=>{
+  await expect(createApiApplication(runtime,productionToken,{syntheticToken:productionToken})).rejects.toThrow();
+  await expect(createApiApplication(runtime,productionToken,{syntheticToken:'short'})).rejects.toThrow();
 });
 test('sessions pin server persona revision, owner isolation and completed history',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});expect(created.status).toBe(201);
@@ -92,7 +115,7 @@ test('explicit conditions persist, default algorithm consistently, reject contra
     expect(created.status).toBe(201);expect(created.body.session.ragCondition).toBe(ragCondition);
     expect(created.body.session.retrievalMode).toBe(ragCondition==='off'?'off':'semantic');
     expect((await call(`sessions/${created.body.session.id}`)).body.session.ragCondition).toBe(ragCondition);
-    expect((await call(`sessions/${created.body.session.id}`,{owner:'synthetic-other'})).status).toBe(404);
+    expect((await call(`sessions/${created.body.session.id}`,{owner:'owner_synthetic_other'})).status).toBe(404);
   }
   for(const body of [{ragCondition:'off',retrievalMode:'semantic'},{ragCondition:'caption',retrievalMode:'off'},{ragCondition:'caption_image',retrievalMode:'off'}]) expect((await call('sessions',{method:'POST',body:{personId:persona.personId,...body}})).status).toBe(400);
 });
@@ -178,7 +201,7 @@ test('SSE: if pub/sub notices are lost, the periodic store re-check still delive
   const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
   const chat=createLocalChat({store,personas:runtime.personas,provider});
   const silent:ApiRuntime={...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:{subscribe:async()=>()=>undefined}};
-  const quiet=await createApiApplication(silent,token,{sse:{recheckMs:50}});await quiet.listen(0,'127.0.0.1');const quietBase=await quiet.getUrl();
+  const quiet=await createApiApplication(silent,productionToken,{syntheticToken:token,sse:{recheckMs:50}});await quiet.listen(0,'127.0.0.1');const quietBase=await quiet.getUrl();
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
     const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_3',text:'안녕'});
@@ -195,7 +218,7 @@ test('SSE: a client gone during the ownership check leaves no subscription behin
   let active=0,subscribes=0;let failSubscribe=false;
   const counting={subscribe:async(turnId:string,listener:(e:TurnEvent)=>void)=>{
     subscribes++;if(failSubscribe)throw new Error('redis down');active++;const off=await chat.events.subscribe(turnId,listener);return ()=>{active--;off();};}};
-  const app2=await createApiApplication({...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:counting},token,{sse:{recheckMs:40}});
+  const app2=await createApiApplication({...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:counting},productionToken,{syntheticToken:token,sse:{recheckMs:40}});
   await app2.listen(0,'127.0.0.1');const base2=await app2.getUrl();
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
@@ -224,7 +247,7 @@ test('draft briefs pass the input safety filter when it is on: refuse/support wi
   const calls:unknown[]=[];const provider={generate:async(messages:unknown)=>{calls.push(messages);return '합성 초안';}};
   const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200},onSafetyFallback});
   runtime={...runtime,chat,personas,provider};
-  app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
   const refused=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'REFUSE_ME 초안'}});
   expect(refused.status).toBe(201);expect(refused.body).toMatchObject({notice:{status:'out_of_scope',content:safetyReply('sexual','ko'),limitations:[]},image:{code:'IMAGE_RUNNER_ONLY'}});
@@ -245,7 +268,7 @@ test('draft briefs pass the input safety filter when it is on: refuse/support wi
 
 test('draft cap applies only with the safety filter on; filter-off drafting is unchanged',async()=>{
   await app.close();
-  app=await createApiApplication(runtime,token,{draftsPerOwnerPerMinute:1});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:1});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const off=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
   for(let i=0;i<3;i++) expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
 });
@@ -255,7 +278,7 @@ test('with the safety filter on, draft requests are capped per owner per minute 
   const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();
   const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200}});
   runtime={...runtime,chat,personas,provider};
-  app=await createApiApplication(runtime,token,{draftsPerOwnerPerMinute:2});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:2});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
   for(let i=0;i<2;i++) expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
   const calls=(runtime.provider as FakeTextProvider).calls;
@@ -263,7 +286,7 @@ test('with the safety filter on, draft requests are capped per owner per minute 
   expect(limited.status).toBe(503);expect(limited.body).toEqual({error:{code:'QUEUE_FULL'}});expect((runtime.provider as FakeTextProvider).calls).toBe(calls);expect(assess).toHaveBeenCalledTimes(2);
   const other=(await call('sessions',{method:'POST',owner:'owner_synthetic_b',body:{personId:persona.personId}})).body.session.id;
   expect((await call(`sessions/${other}/drafts`,{method:'POST',owner:'owner_synthetic_b',body:{brief:'합성 초안'}})).status).toBe(201);
-  await expect(createApiApplication(runtime,token,{draftsPerOwnerPerMinute:0})).rejects.toThrow();
+  await expect(createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:0})).rejects.toThrow();
 });
 test(': the fictional draft path renders the same four persona fields for a persona card (no new field reaches it)',async()=>{
   await app.close();
@@ -274,7 +297,7 @@ test(': the fictional draft path renders the same four persona fields for a pers
   const generate=jest.spyOn(provider,'generate');
   const chat=createLocalChat({store,personas,provider});
   runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[card],saveArtifact:async()=>undefined};
-  app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const id=(await call('sessions',{method:'POST',body:{personId:card.personId}})).body.session.id;
   expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 전시 소개'}})).status).toBe(201);
   const messages=generate.mock.calls[0]![0];

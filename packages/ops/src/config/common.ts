@@ -54,7 +54,12 @@ const passes=(check:(value:string)=>unknown)=>(value:string)=>{try {check(value)
 /** A blank value of a required key is reported once, as `missing` (see required()), not also as a format error. */
 export const unlessBlank=(rule:string,check:(value:string)=>boolean)=>z.string().refine(value=>blank(value)||check(value),rule).optional();
 export const databaseUrl=unlessBlank('database_url_guard',passes(assertLocalDatabaseUrl));
-export const redisUrl=unlessBlank('redis_url_guard',passes(assertLocalRedisUrl));
+/** The loopback guard, then the ACL app user `ptr` (the default user is off). */
+export const redisUrl=z.string().superRefine((value,ctx)=>{
+  if(blank(value)) return;
+  const rule=!passes(assertLocalRedisUrl)(value)?'redis_url_guard':new URL(value).username!=='ptr'?'redis_username_ptr':undefined;
+  if(rule) ctx.addIssue({code:'custom',message:rule});
+}).optional();
 export const token=unlessBlank('token_length',value=>value.length>=24&&value.length<=512);
 /** Optional keys: a blank value is invalid too (the code would refuse it). */
 export const oneOf=(values:readonly string[])=>z.string().refine(value=>values.includes(value),'invalid_value').optional();

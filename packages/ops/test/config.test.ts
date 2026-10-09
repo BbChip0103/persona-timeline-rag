@@ -5,7 +5,7 @@ import { ConfigError, checkRole, loadConfig, type EnvRole } from '../src';
 
 // Synthetic values only. Loopback targets pass the storage/Redis guards; nothing connects.
 const DB='postgresql://ptr_researcher:synthetic-password@127.0.0.1:56432/ptr_research';
-const REDIS='redis://:synthetic-password@127.0.0.1:56479/0';
+const REDIS='redis://ptr:synthetic-password@127.0.0.1:56479/0';
 const TOKEN='synthetic-token-abcdefghijklmnop', GATEWAY_TOKEN='synthetic-gateway-token-abcdefghij';
 let dir:string, upstreams:string, twoPools:string, personas:string;
 beforeAll(()=>{
@@ -22,7 +22,7 @@ const base=():Record<EnvRole,NodeJS.ProcessEnv>=>({
   worker:{DATABASE_URL:DB,PTR_REDIS_URL:REDIS,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:GATEWAY_TOKEN},
   dispatcher:{DATABASE_URL:DB,PTR_REDIS_URL:REDIS},
   gateway:{PTR_GATEWAY_TOKEN:GATEWAY_TOKEN,PTR_GATEWAY_UPSTREAMS_FILE:upstreams},
-  web:{PTR_API_TOKEN:TOKEN,PTR_SESSION_SECRET:'synthetic-session-secret-at-least-32-chars',PTR_UI_PASSWORD:'synthetic'},
+  web:{PTR_API_TOKEN:TOKEN,PTR_SESSION_SECRET:'synthetic-session-secret-at-least-32-chars',PTR_UI_PASSWORD:'synthetic-ui-pass'},
 });
 const live={GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true',OPENROUTER_API_KEY:'synthetic-key'};
 const check=(role:EnvRole,env:NodeJS.ProcessEnv)=>{const report=checkRole(role,env);return {errors:report.errors,warnings:report.warnings};};
@@ -57,6 +57,11 @@ describe('role schemas ()',()=>{
       ['api',{...api,PTR_GATEWAY_TOKEN:'short'},[{key:'PTR_GATEWAY_TOKEN',rule:'token_length'}]],
       ['api',{...api,DATABASE_URL:'postgresql://u:p@10.0.0.1:5432/ptr_research'},[{key:'DATABASE_URL',rule:'database_url_guard'}]],
       ['api',{...api,PTR_REDIS_URL:'redis://127.0.0.1:6379/0'},[{key:'PTR_REDIS_URL',rule:'redis_url_guard'}]],
+      // Redis ACL : the app user `ptr`; the default user is off, so a URL without it cannot log in.
+      ['api',{...api,PTR_REDIS_URL:'redis://:synthetic-password@127.0.0.1:56479/0'},[{key:'PTR_REDIS_URL',rule:'redis_username_ptr'}]],
+      ['worker',{...worker,PTR_REDIS_URL:'redis://default:synthetic-password@127.0.0.1:56479/0'},[{key:'PTR_REDIS_URL',rule:'redis_username_ptr'}]],
+      ['dispatcher',{DATABASE_URL:DB,PTR_REDIS_URL:'redis://ptrx:synthetic-password@127.0.0.1:56479/0'},[{key:'PTR_REDIS_URL',rule:'redis_username_ptr'}]],
+      ['api',{...api,PTR_REDIS_URL:'redis://ptr:synthetic-password@127.0.0.1:6379/0'},[{key:'PTR_REDIS_URL',rule:'redis_url_guard'}]],
       ['api',{...api,PTR_PERSONAS_FILE:join(dir,'missing.json')},[{key:'PTR_PERSONAS_FILE',rule:'file_missing'}]],
       ['api',{...api,PTR_AUTHORED_PERSONAS_FILE:join(dir,'missing.json')},[{key:'PTR_AUTHORED_PERSONAS_FILE',rule:'file_missing'}]],
       ['api',{...api,PTR_PERSONAS_FILE:''},[{key:'PTR_PERSONAS_FILE',rule:'file_missing'}]],
@@ -72,6 +77,8 @@ describe('role schemas ()',()=>{
       ['gateway',{...gateway,PTR_GATEWAY_UPSTREAMS_FILE:personas},[{key:'PTR_GATEWAY_UPSTREAMS_FILE',rule:'upstreams_file_invalid'}]],
       ['web',{...web,PTR_SESSION_SECRET:'x'.repeat(31)},[{key:'PTR_SESSION_SECRET',rule:'secret_length'}]],
       ['web',{...web,PTR_UI_PASSWORD:''},[{key:'PTR_UI_PASSWORD',rule:'missing'}]],
+      // The login route refuses passwords under 12 characters (apps/web/app/api/auth/route.ts); startup says so first.
+      ['web',{...web,PTR_UI_PASSWORD:'x'.repeat(11)},[{key:'PTR_UI_PASSWORD',rule:'password_length'}]],
     ];
     for(const [role,env,errors] of cases) expect([role,check(role,env).errors]).toEqual([role,errors]);
   });
@@ -110,6 +117,15 @@ describe('environment-wide rules ( steps 1, 3–5)',()=>{
     expect(checkRole('api',{PTR_DEMO_SCALING:'1',PTR_CHAT_PROVIDER:'fake'}).demo).toBe(true);
     expect(check('api',{...base().api,PTR_DEMO_SCALING:'0'})).toEqual({errors:[],warnings:[]});
     expect(check('api',{...base().api,PTR_DEMO_SCALING:'yes'}).errors).toEqual([{key:'PTR_DEMO_SCALING',rule:'invalid_value'}]);
+  });
+  test('the harness token (demo layer) must differ from the production token ',()=>{
+    const demo={PTR_DEMO_SCALING:'1',PTR_CHAT_PROVIDER:'fake',PTR_API_TOKEN:TOKEN};
+    expect(check('api',{...demo,PTR_API_SYNTHETIC_TOKEN:'synthetic-harness-token-abcdefgh'}).errors).toEqual([]);
+    expect(check('api',{...demo,PTR_API_SYNTHETIC_TOKEN:TOKEN}).errors).toEqual([{key:'PTR_API_SYNTHETIC_TOKEN',rule:'synthetic_token_reuse'}]);
+    for(const short of ['short',' ','']) expect(check('api',{...demo,PTR_API_SYNTHETIC_TOKEN:short}).errors).toEqual([{key:'PTR_API_SYNTHETIC_TOKEN',rule:'token_length'}]);
+    expect(check('api',{...base().api,PTR_API_SYNTHETIC_TOKEN:'synthetic-harness-token-abcdefgh'}).errors).toEqual([{key:'PTR_API_SYNTHETIC_TOKEN',rule:'demo_key'}]);
+    // Other roles do not read it.
+    expect(check('dispatcher',{...base().dispatcher,PTR_DEMO_SCALING:'1',PTR_API_TOKEN:TOKEN,PTR_API_SYNTHETIC_TOKEN:TOKEN}).errors).toEqual([]);
   });
   test('R rules: removed fails, PTR_API_URL warns when it is the constant, example-file keys warn',()=>{
     const {api}=base();

@@ -33,6 +33,11 @@ export function roleProblems(role:EnvRole,env:NodeJS.ProcessEnv,cwd=process.cwd(
 export function checkRole(role:EnvRole,env:NodeJS.ProcessEnv,cwd=process.cwd()):ConfigReport {
   const demo=demoScaling(env), shared=envProblems(env);
   const errors=[...shared.errors,...roleProblems(role,env,cwd)];
+  // D10: the harness token (demo layer) has the token length and never doubles as the production token; checked with
+  // the switch on as well (createApiApplication refuses both too).
+  const harness=env.PTR_API_SYNTHETIC_TOKEN;
+  if(role==='api'&&harness!==undefined&&!(harness.length>=24&&harness.length<=512)) errors.push({key:'PTR_API_SYNTHETIC_TOKEN',rule:'token_length'});
+  else if(role==='api'&&!blank(harness)&&harness===env.PTR_API_TOKEN) errors.push({key:'PTR_API_SYNTHETIC_TOKEN',rule:'synthetic_token_reuse'});
   const report:ConfigReport={role,demo,errors,warnings:shared.warnings};
   if(role==='gateway'&&!demo&&!errors.length) {
     const result=upstreamsFilePool(env.PTR_GATEWAY_UPSTREAMS_FILE!,cwd);

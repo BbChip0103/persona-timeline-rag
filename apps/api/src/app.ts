@@ -19,9 +19,17 @@ const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retriev
 const draftSchema=z.object({brief:z.string().trim().min(1).max(2000)}).strict();
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
 const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason:'이 포스트 초안 요청은 이미지를 제출하지 않습니다. 무료 이미지 생성은 자격을 검증하는 별도 private runner에서 실행하며 완료 결과와 작업 상태를 별도로 기록합니다.'};
+/**
+ * Owner spaces . The production token (the web proxy) may only name the owner the web derives
+ * (apps/web/lib/auth.ts: `local-<40 hex>`); the harness token (PTR_API_SYNTHETIC_TOKEN) only synthetic owners, so
+ * load tests and fixtures never share an owner with the web. The token middleware records which space a request has.
+ */
+const WEB_OWNER=/^local-[a-f0-9]{40}$/;
+const SYNTHETIC_OWNER=/^(?:lt-[a-z0-9-]{1,40}|owner_synthetic_[a-z0-9_]{1,40})$/;
+const ownerSpace=new WeakMap<Request,RegExp>();
 function owner(request:Request):string {
-  const value=request.header('X-PTR-Owner');
-  if(!value || !/^[a-zA-Z0-9_-]{1,128}$/.test(value)) throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
+  const value=request.header('X-PTR-Owner');const space=ownerSpace.get(request);
+  if(!value || !space?.test(value)) throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
   return value;
 }
 function safeSession(session:ChatSession) { const {ownerId:_,...safe}=session;return safe; }
@@ -125,21 +133,29 @@ class ApiController {
     finally {clearTimeout(timeout);this.drafts.delete(id);}
   }
 }
-export async function createApiApplication(runtime:ApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number}={}):Promise<INestApplication> {
+/** `syntheticToken`: the harness token (PTR_API_SYNTHETIC_TOKEN, demo layer); it must differ from the production token. */
+export async function createApiApplication(runtime:ApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string}={}):Promise<INestApplication> {
   const draftLimit=options.draftsPerOwnerPerMinute??DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE;
   if(!Number.isInteger(draftLimit)||draftLimit<1) throw new CoreError('INVALID_INPUT');
-  if(!token || token.length<24 || token.length>512) throw new CoreError('INVALID_INPUT');
+  const validToken=(value:string)=>value.length>=24 && value.length<=512;
+  if(!token || !validToken(token)) throw new CoreError('INVALID_INPUT');
+  const synthetic=options.syntheticToken;
+  if(synthetic!==undefined && (!validToken(synthetic) || synthetic===token)) throw new CoreError('INVALID_INPUT');
   @Module({controllers:[ApiController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}},{provide:DRAFT_LIMIT,useValue:draftLimit}]})
   class ApiModule {}
   const app=await NestFactory.create<NestExpressApplication>(ApiModule,{logger:false,bodyParser:false});
   // Token middleware runs before body parsing so unauthenticated input has no effect.
-  const expected=createHash('sha256').update(token).digest();
+  const digest=(value:string)=>createHash('sha256').update(value).digest();
+  const expected=digest(token), expectedSynthetic=synthetic===undefined?undefined:digest(synthetic);
   app.use((request:Request,response:Response,next:NextFunction)=>{
     response.setHeader('Cache-Control','no-store');response.setHeader('X-Content-Type-Options','nosniff');
     if(request.method==='GET' && request.path==='/api/health') return next();
     const header=request.header('Authorization')??'';
     const supplied=header.startsWith('Bearer ')?header.slice(7):'';
-    if(!supplied || supplied.length>512 || !timingSafeEqual(expected,createHash('sha256').update(supplied).digest())) return response.status(403).json({error:{code:'UNAUTHORIZED'}});
+    const hashed=supplied && supplied.length<=512?digest(supplied):undefined;
+    if(hashed && timingSafeEqual(expected,hashed)) ownerSpace.set(request,WEB_OWNER);
+    else if(hashed && expectedSynthetic && timingSafeEqual(expectedSynthetic,hashed)) ownerSpace.set(request,SYNTHETIC_OWNER);
+    else return response.status(403).json({error:{code:'UNAUTHORIZED'}});
     return next();
   });
   app.useBodyParser('json',{limit:'16kb'});

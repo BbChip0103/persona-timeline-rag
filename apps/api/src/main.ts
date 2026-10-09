@@ -4,7 +4,7 @@ import { createRuntime } from './runtime';
 async function main() {
   loadConfig('api',process.env);
   const runtime=createRuntime();
-  const app=await createApiApplication(runtime,process.env.PTR_API_TOKEN??'');
+  const app=await createApiApplication(runtime,process.env.PTR_API_TOKEN??'',{syntheticToken:process.env.PTR_API_SYNTHETIC_TOKEN||undefined});
   const port=Number(process.env.PTR_API_PORT??56441);
   if(!Number.isInteger(port) || port<1024 || port>65535) throw new Error('INVALID_PORT');
   await app.listen(port,'127.0.0.1');

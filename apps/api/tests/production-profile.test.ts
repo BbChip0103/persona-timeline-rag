@@ -4,7 +4,7 @@ import { createRecoveryRuntime, createRuntime } from '../src/runtime';
 
 // : the production profile's code changes. Synthetic loopback targets; nothing connects.
 const databaseUrl='postgresql://ptr_loadtester:synthetic-password@127.0.0.1:56432/ptr_loadtest';
-const redisUrl='redis://:synthetic-password@127.0.0.1:56479/0';
+const redisUrl='redis://ptr:synthetic-password@127.0.0.1:56479/0';
 const gateway={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'};
 const structuredOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.provider as unknown as {options:{structuredAgentReplies?:boolean}}).options.structuredAgentReplies;
 

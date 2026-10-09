@@ -17,8 +17,8 @@ if (enabled) {
       store,
       wait: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       cleanup: async () => {
-        const keys = await redis.keys(`${prefix}:*`);
-        if (keys.length) await redis.del(...keys);
+        // SCAN, not KEYS: KEYS is @dangerous and refused to the ACL user ptr .
+        for await (const keys of redis.scanStream({ match: `${prefix}:*`, count: 500 }) as AsyncIterable<string[]>) if (keys.length) await redis.del(...keys);
         redis.disconnect();
       },
     };

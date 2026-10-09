@@ -16,8 +16,8 @@ if (enabled) {
       store: new RedisGatewayRegistry(redis, prefix),
       wait: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       cleanup: async () => {
-        const keys = await redis.keys(`${prefix}:*`);
-        if (keys.length) await redis.del(...keys);
+        // SCAN, not KEYS: KEYS is @dangerous and refused to the ACL user ptr .
+        for await (const keys of redis.scanStream({ match: `${prefix}:*`, count: 500 }) as AsyncIterable<string[]>) if (keys.length) await redis.del(...keys);
         redis.disconnect();
       },
     };
@@ -35,8 +35,8 @@ if (enabled) {
       expect(await store.heartbeat({ id: 'gw-a', url: 'http://127.0.0.1:56460/v1', maxQueue: 256, state: 'active', startedAt: 1, seq: 0 }, 10000, 5000)).toBe('gw-a');
       expect((await store.list()).records.map((r) => r.id)).toEqual(['gw-a']);
     } finally {
-      const keys = await redis.keys(`${prefix}:*`);
-      if (keys.length) await redis.del(...keys);
+      // SCAN, not KEYS: KEYS is @dangerous and refused to the ACL user ptr .
+      for await (const keys of redis.scanStream({ match: `${prefix}:*`, count: 500 }) as AsyncIterable<string[]>) if (keys.length) await redis.del(...keys);
       redis.disconnect();
     }
   });

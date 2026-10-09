@@ -21,6 +21,7 @@ skipped; each setting is still checked by its own parser. The load and acceptanc
 | Env-only single-engine gateway | not used (one engine is a one-line file) | `PTR_GATEWAY_UPSTREAM=selfhosted` + `PTR_SELFHOSTED_*` (load tests, acceptance) |
 | Several workers | one | `PTR_WORKER_REPLICAS_HINT`, `PTR_METRICS_PORT` |
 | Chat providers `fake`, `selfhosted` | `gateway` or `openrouter` | allowed |
+| Harness API token (`PTR_API_SYNTHETIC_TOKEN`) | none: the API takes only the web's `local-<40 hex>` owners | a second Bearer token for synthetic owners only (`lt-*`, `owner_synthetic_*`); see [runbook.md](runbook.md#authentication-and-owner-spaces) |
 
 Numeric knobs (leases, dispatch intervals, queue limits, breaker thresholds, timeouts) are constants in production and
 can be changed only here. The sections below were moved from [goal2-serving.md](goal2-serving.md) unchanged; "above" and

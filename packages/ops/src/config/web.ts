@@ -14,7 +14,8 @@ const REQUIRED=['PTR_API_TOKEN','PTR_SESSION_SECRET','PTR_UI_PASSWORD'] as const
 const schema=z.object({
   PTR_API_TOKEN:z.string().refine(value=>blank(value)||(value.length>=24&&value.length<=512),'token_length').optional(),
   PTR_SESSION_SECRET:z.string().refine(value=>blank(value)||value.length>=32,'secret_length').optional(),
-  PTR_UI_PASSWORD:z.string().optional(),
+  // The login route answers AUTH_UNAVAILABLE below 12 characters (app/api/auth/route.ts); startup says so first.
+  PTR_UI_PASSWORD:z.string().refine(value=>blank(value)||value.length>=12,'password_length').optional(),
 }).superRefine((env,ctx)=>{for(const key of REQUIRED) if(blank(env[key])) ctx.addIssue({code:'custom',path:[key],message:'missing'});});
 /** PTR_API_TOKEN, PTR_SESSION_SECRET, PTR_UI_PASSWORD. */
 export function webSchemaProblems(env:NodeJS.ProcessEnv):ConfigProblem[] {
