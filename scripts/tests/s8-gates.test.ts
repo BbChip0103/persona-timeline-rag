@@ -1,5 +1,5 @@
 import { GEMMA4_SPECIAL_TOKENS, neutralizeControlTokens } from '@ptr/providers';
-import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, EVERYDAY_QUESTIONS, ROLEPLAY_PROBES, textLanguage, voiceFindings, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
+import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, EVERYDAY_QUESTIONS, ROLEPLAY_PROBES, koreanRegister, modelMessageFor, textLanguage, voiceFindings, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
   percentile, promValues, systemAfterAssistant, type TemplateMarkers } from '../s8-gates';
 
 /** A Gemma-like template rendering (markers are parameters of the check, so any template can be described). */
@@ -127,4 +127,23 @@ describe('gate f (persona voice) pre-screens',()=>{
     expect(EVERYDAY_QUESTIONS.map(([id])=>id)).toEqual(['f-ko-1','f-ko-2','f-ko-3','f-en-1','f-en-2','f-en-3']);
     expect(EVERYDAY_QUESTIONS.filter(([,text])=>textLanguage(text)==='ko')).toHaveLength(3);
   });
+});
+
+describe('v10 harness additions',()=>{
+  test('Korean register of a reply by its sentence endings (majority), null without Korean endings',()=>{
+    expect(koreanRegister('그냥 평소처럼 보냈어~ 너는 오늘 어땠어? 😊')).toBe('casual');
+    expect(koreanRegister('오늘도 즐겁게 보냈어요! 질문자님 하루는 어땠는지 궁금해용 ✨')).toBe('polite');
+    expect(koreanRegister('저는 연구용 AI 시뮬레이션입니다.')).toBe('polite');
+    expect(koreanRegister('It was a great day!')).toBeNull();
+  });
+  test('the pre-guard model message of a turn is matched by its request key (the turn id), never by text: same persona, same follow-up text, parallel sessions',()=>{
+    const call=(requestKey:string,message:string|null)=>({requestKey,raw:message===null?null:JSON.stringify({message,status:'answered',evidenceRefs:[],variableUpdates:{}})});
+    const calls=[call('turn-e1-2','career follow-up (tool round)'),call('turn-e2-2','origin follow-up'),call('turn-e1-2','career follow-up (final)'),call('turn-e2-2',null)];
+    expect(modelMessageFor(calls,'turn-e1-2')).toBe('career follow-up (final)');expect(modelMessageFor(calls,'turn-e2-2')).toBe('origin follow-up');
+    expect(modelMessageFor(calls,'turn-x')).toBeNull();
+  });
+  test('register endings: cute 반말 "당" and a sentence-final connective "니까" are casual; "습니까" is polite',()=>{
+    expect(koreanRegister('오늘 진짜 맛있당')).toBe('casual');expect(koreanRegister('그러니까')).toBe('casual');expect(koreanRegister('괜찮습니까?')).toBe('polite');
+  });
+
 });

@@ -27,7 +27,14 @@ import { voiceText, type SpeechLevel } from './reply-texts';
  * or "AI 툴은 안 써" is not about the speaker), or for a real person a plain "I don't have a hometown/school/career" or a
  * clause-final "고향이나 학교가 없어요" (only the listed nouns; "학교 숙제가 없어서" stays).
  */
-export const REPLY_GUARD_REVISION='reply-guard-v5';
+/**
+ * v6 : a private detail found only in the reply (the user did not ask about private life) is replaced by the
+ * neutral in-voice fallback instead of the "that's a secret" decline, which read as over-blocking on a career question
+ * (diagnostic run: the model brought up moving to its new home base from its own post). On an identity question every
+ * replacement is the identity line (keeps the AI disclosure). Past-tense origin phrasing that answers an origin question
+ * ("어릴 때 부산에서 살았어", "I grew up in …") is not residence (the v13/v10 policy asks for origin in the first person).
+ */
+export const REPLY_GUARD_REVISION='reply-guard-v6';
 export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial';
 
 const AI='(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)';
@@ -109,6 +116,9 @@ const NOT_HAVING:RegExp[]=[
   /\bI\s+(?:don['’]?t|do\s+not|can['’]?t|cannot|never)\s+(?:really\s+|actually\s+)?(?:have|eat|drink|sleep|taste|own)\b|\bno\s+(?:career|past|hometown|childhood)\b/i,
   /(?:경력|과거|고향|출신|학교|추억|입맛|직업)[^.!?\n]{0,12}없|먹(?:지|을\s?수)\s?(?:않|없|못)|(?:안|못)\s?먹/,
 ];
+/** Origin questions, and the past-tense living phrases that answer them (current residence is still private). */
+const ORIGIN_QUESTION=/출신|고향|어디서\s?(?:왔|자랐)|\bwhere\s+(?:are\s+you|do\s+you\s+come)\s+from\b|\bwhere\s+did\s+you\s+grow\s+up\b|\bhometown\b/i;
+const PAST_HOME=/(?:에|에서)\s?살았(?:었어요|었어|어요|어|던|고|는데)?|\b(?:I|we)\s+(?:lived|grew\s+up)\s+in\b/gi;
 /** Real-person personas: disowning a background item without any AI mention ("I don't actually have a school or a hometown"). */
 const BACKGROUND_DISOWNED:RegExp[]=[
   /\bI\s+(?:don['’]?t|do\s+not)\s+(?:actually\s+|really\s+)?have\s+(?:a\s+|an\s+|any\s+)?(?:career|past|hometown|school|background)\b(?!\s+(?:memory|memories|story|stories|photos?|days?|trips?|projects?|gap|break))/i,
@@ -127,8 +137,13 @@ export function guardReply(input:{utterance:string;reply:string;realPerson:boole
     return {reason:'human_impersonation',content:voiceText(identityQuestion?'identity':'fallback',input.language,level)};
   if(identityQuestion&&!AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply)))
     return {reason:'missing_ai_disclosure',content:voiceText('identity',input.language,level)};
-  if(input.realPerson&&(PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))||PRIVATE_REPLY.some(pattern=>pattern.test(input.reply))))
-    return {reason:'private_life',content:voiceText('decline_private',input.language,level)};
+  if(input.realPerson) {
+    // On an identity question the replacement keeps the AI disclosure, whatever else the reply touched.
+    if(PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))) return {reason:'private_life',content:voiceText(identityQuestion?'identity':'decline_private',input.language,level)};
+    // Past-tense origin phrasing answering an origin question ("어릴 때 부산에서 살았어", "I grew up in …") is origin, not residence.
+    const reply=ORIGIN_QUESTION.test(input.utterance)?input.reply.replace(PAST_HOME,' '):input.reply;
+    if(PRIVATE_REPLY.some(pattern=>pattern.test(reply))) return {reason:'private_life',content:voiceText(identityQuestion?'identity':'fallback',input.language,level)};
+  }
   // Disowning the persona's own background, career or everyday likes "because I'm an AI" (every persona), or, for a real
   // person, plainly ("I don't have a hometown"): the in-voice fallback (gate e).
   if(!identityQuestion&&!artTalk&&(AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply))&&NOT_HAVING.some(pattern=>pattern.test(input.reply))

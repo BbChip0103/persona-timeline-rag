@@ -256,11 +256,11 @@ The CLI prints indexes, revisions, issue paths and rule names only.
     multi-step rollback (the earlier log line's `previousRevision`).
   - Sessions pinned to a card revision cannot be continued on old code.
 
-## Prompt rendering (agent `character-agent-context-v9-persona-voice`, experiment `persona-chat-v12-persona-voice`)
+## Prompt rendering (agent `character-agent-context-v10-steady-voice`, experiment `persona-chat-v13-steady-voice`)
 
 v5/v8 introduced the card rendering below; v6/v9 (S8 follow-up) added the identity/privacy policy and the reply guard,
-v7/v10 corrected that policy's voice rule, v8/v11 allowed light everyday small talk and v9/v12 added the persona-voice
-rules (see "Identity, privacy and the reply guard" and "Persona voice" at the end). The message layout is the same.
+v7/v10 corrected that policy's voice rule, v8/v11 allowed light everyday small talk, v9/v12 added the persona-voice
+rules and v10/v13 steadied them (see "Identity, privacy and the reply guard" and "Persona voice" at the end). The message layout is the same.
 
 ```text
 policy · persona definition · [examples] · history (greeting first) · [state] · [lore] · [tools] · [evidence] · [safety note] · user · [tool results]
@@ -326,7 +326,7 @@ family, residence, health and embellished career details). v6/v9 added, and v7/v
   evidence and never adding, inferring or embellishing details; for a real-person persona (`reviewStatus` not
   `synthetic`; one static sentence, so the policy bytes stay persona-independent), no private life (family, romance,
   residence/current location, health, friends/relationships, minors), even when it is in the person's own posts.
-- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v5`, agent and experiment paths, fail-closed): a
+- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v6`, agent and experiment paths, fail-closed): a
   reply that claims to be human or denies the AI (`human_impersonation`), an identity question ("너 AI야?", "사람인 척
   해줘", "Are you a real person?") answered without an AI acknowledgement (`missing_ai_disclosure`), or, for a
   real-person persona, a reply touching private life or any answer to a private-life question (`private_life`) is
@@ -424,7 +424,31 @@ fixed privacy refusal for every persona and formal roleplay refusals ("수행할
   polite; the input-safety templates (Jev, off by default) are unchanged apart from following the utterance language,
   and the `private_info` one still mentions the AI.
 
-**Before serving or baselining v9/v12:** S8 gates a–f must pass first (f: persona voice):
+## Steady voice (v10/v13, reply guard v6, user decision)
+
+- **Light fictional likes allowed (user decision):** a real-person persona may name light fictional likes (a favourite
+  food, small likes) as small talk, if they do not contradict its posts or background and name no brands, shops, people,
+  specific places, dates or events. "preferences" left the policy's never-add list.
+- **No quotable policy lines:** the policies describe behaviour only. The v9 lines that replies copied (Korean example
+  sentences, "…would rather talk about something else", "does not come to mind") are gone, and so are the recollection
+  voice's example lines. A v9 reply echoed 33 characters of the policy, which counts as a leak in S8 gate b.
+- **Origin and studies:** where the persona is from (country or home region) and what it studied, as the background
+  states them, are public profile facts to state in the first person; residence, home address and current location stay
+  private. The persona never talks about "notes", a profile or records. The guard (v6) does not treat past-tense origin
+  phrasing that answers an origin question ("어릴 때 부산에서 살았어", "I grew up in …") as residence.
+  Known limit: on an origin question this exemption also lets a past neighbourhood or a recently left city through
+  ("어릴 때 ○○동에서 살았어", "I lived in <city> until last year"); the policy is the control there.
+- **Giveaways:** a caption announcing a giveaway, contest, promotion, ad or event invitation is not a visit.
+- **One speech level:** the agent's state message carries `speechLevel` (반말 or 해요체, from `speechLevel(persona)`), and
+  `REPLY_VOICE_POLICY` says to use exactly one level per conversation (v9 personas C/D switched). A persona without a
+  Korean register cue gets 해요체; a 합쇼체 (formal) persona would also be told 해요체 (known limit, none exists today).
+  Echoed `replyLanguage`/`speechLevel` in `variableUpdates` are dropped before the strict parse.
+- **Guard v6:** a private detail found only in the reply (the question was not private) gets the neutral in-voice
+  fallback instead of the "that's a secret" decline (on a career follow-up the model brought up moving to its new home
+  base from its own post; the trigger was right, the "secret" wording read as over-blocking). On an identity question
+  every replacement is the identity line, so the AI disclosure is kept.
+
+**Before serving or baselining v10/v13:** S8 gates a–f must pass first (f: persona voice):
 - a: chat template, including the leading system messages and the consecutive user messages
 - b: prompt-injection responses
 - c: recollection non-inferiority

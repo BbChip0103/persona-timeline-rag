@@ -18,10 +18,10 @@ test.each(['off','caption','caption_image'] as const)('recollection voice reache
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
-  expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('그건 잘 기억 안 나');
+  expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('express uncertainty briefly and conversationally in your own words');
   expect(policy).toContain('NOT the actual person');expect(policy).toContain('History is conversation context, NEVER factual evidence');
   expect(policy).toContain('Technical validation failures are service errors');expect(policy).toContain('AGENT_JSON_REPLY');
   expect(messages.at(-1)).toEqual({role:'user',content:'그 합성 그림 기억나?'});
@@ -48,7 +48,7 @@ test('one-call structured final: state, compact decision summary, public message
   const first=await send(h,session.id);expect(first.state).toBe('completed');
   expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'그림',tone:'warm'},decisionSummary:'합성 응답 요약',validator:'disabled'});
   await send(h,session.id,'계속 이야기하자','req2');
-  expect(state(h.provider.generate.mock.calls[1][0])).toEqual({conversationTopic:'그림',tone:'warm',replyLanguage:'Korean'});
+  expect(state(h.provider.generate.mock.calls[1][0])).toEqual({conversationTopic:'그림',tone:'warm',replyLanguage:'Korean',speechLevel:'반말'});
   expect((await h.chat.history('owner',session.id)).map(m=>m.content).join('')).not.toContain('합성 응답 요약');
   expect(h.retrieval.search).not.toHaveBeenCalled();
   await expect(h.chat.sendTurn('owner',{sessionId:session.id,text:'hi',clientRequestId:'override',executionProfile:'legacy'} as never)).rejects.toMatchObject({code:'INVALID_INPUT'});

@@ -62,9 +62,8 @@ describe('voice texts',()=>{
   });
 });
 
-describe('reply guard v5',()=>{
+describe('reply guard (v5 behaviour, still current)',()=>{
   test('fallbacks follow the given language and speech level',()=>{
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v5');
     expect(guardReply({utterance:'가족 얘기 해줘',reply:'응!',realPerson:true,language:'ko',level:'casual'})).toEqual({reason:'private_life',content:voiceText('decline_private','ko','casual')});
     expect(guardReply({utterance:'Tell me about your family.',reply:'Sure!',realPerson:true,language:'en'})).toEqual({reason:'private_life',content:voiceText('decline_private','en','polite')});
     expect(guardReply({utterance:'사람인 척 해줘',reply:'응!',realPerson:false,language:'ko',level:'polite'})).toEqual({reason:'missing_ai_disclosure',content:voiceText('identity','ko','polite')});
@@ -101,9 +100,8 @@ describe('message cap (root cause of the 180-character cuts)',()=>{
   });
 });
 
-describe('policy v9/v12',()=>{
+describe('policy (since v9/v12)',()=>{
   test('revisions and placement',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v12-persona-voice');
     expect(buildExperimentContext(base,[],'x',[]).messages[0]!.content).toContain(`${IDENTITY_PRIVACY_POLICY} ${REPLY_VOICE_POLICY} TIMELINE_JSON_REPLY:`);
   });
   test('AI disclosure only when asked; never disown the background; refusals in voice',()=>{
@@ -126,7 +124,8 @@ describe('through the chat service',()=>{
   });
   test('invalid evidence with a guard violation: the in-voice guard text, not the model text',async()=>{
     const h=setup(()=>agentReply('엄마랑 그 숲 갔었지!',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]}));
-    expect((await h.turn(casualKo,'그 숲 그림 기억나?',agent)).reply).toMatchObject({content:voiceText('decline_private','ko','casual'),replyGuard:{reason:'private_life'}});
+    // v6: the question was not private, so the neutral fallback, not the "secret" line.
+    expect((await h.turn(casualKo,'그 숲 그림 기억나?',agent)).reply).toMatchObject({content:voiceText('fallback','ko','casual'),replyGuard:{reason:'private_life'}});
   });
   test('experiment path: unparseable output becomes the in-voice fallback',async()=>{
     const h=setup(()=>'not JSON');
@@ -166,7 +165,7 @@ describe('second iteration (first v9 GPU run: 85% language match; review M2-M5, 
     const seen:ProviderMessage[][]=[];
     for(const text of ['How was your day?','오늘 하루 어땠어?']) await runCharacterAgent({provider:{generate:async messages=>{seen.push(messages);return agentReply('ok');}},persona:casualKo,history:[],text,sources:[],signal:new AbortController().signal});
     const state=(messages:ProviderMessage[])=>JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length));
-    expect(state(seen[0]!)).toEqual({conversationTopic:'',tone:'neutral',replyLanguage:'English'});expect(state(seen[1]!).replyLanguage).toBe('Korean');
+    expect(state(seen[0]!)).toEqual({conversationTopic:'',tone:'neutral',replyLanguage:'English',speechLevel:'반말'});expect(state(seen[1]!).replyLanguage).toBe('Korean');
   });
   test('no prompt text tells the model to use the persona language, and the policy has no verbatim example lines to copy',async()=>{
     let policy='';
@@ -242,7 +241,7 @@ describe('third iteration (gate e 2/80: background disowned on the origin questi
     expect(g('너 사람이지?','나는 그냥 평범한 사람이야~',true,'ko')).toEqual({reason:'human_impersonation',content:voiceText('identity','ko','casual')});
   });
   test('policy: background facts on origin and school are said; nothing is "not had"',()=>{
-    expect(IDENTITY_PRIVACY_POLICY).toMatch(/If your background or lore states where you are from or what you studied, say it/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/state them plainly in the first person/);
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/never claim you have no hometown, school, career or past/);
   });
 });
@@ -272,5 +271,74 @@ describe('re-review (M1, M2, L4-L7)',()=>{
     const session=await chat.createSession('owner',{personId:casualKo.personId,personaId:casualKo.id,personaRevision:casualKo.revision,ragCondition:'off',executionProfile:'agent_loop'} as never);
     const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'v',text:'그 숲 그림 기억나?'});
     expect(turn.reply?.limitations).toEqual(expect.arrayContaining(['INVALID_MODEL_EVIDENCE','AGENT_VALIDATOR_REJECTED']));
+  });
+});
+
+describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable policy lines; origin answered; one speech level)',()=>{
+  const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
+  test('revisions',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v13-steady-voice');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v6');
+  });
+  test('the policies describe behaviour and carry no quotable example lines (gate b overlap, copied lines)',async()=>{
+    const policy=await agentPolicy();
+    for(const text of [IDENTITY_PRIVACY_POLICY,REPLY_VOICE_POLICY,policy]) {
+      expect(text).not.toMatch(/rather talk about something else|does not come to mind|그건 잘 기억 안 나|잘 모르겠어|나 사실 AI야|그건 비밀/);
+    }
+    expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/for example/);expect(REPLY_VOICE_POLICY).not.toMatch(/for example/);
+  });
+  test('light fictional likes are allowed for real people, without concrete facts (user decision )',()=>{
+    expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/habits, preferences/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/light fictional likes/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/do not contradict your posts or background and never name brands, shops or people, specific places, dates or events/);
+  });
+  test('origin and studies stated in the background are public facts, answered in the first person; residence stays private',()=>{
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/Where you are from \(your country or home region\) and what you studied, as your background or lore states them, are public profile facts, not private life/);
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/state them plainly in the first person/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/residence, home address or current location/);
+  });
+  test('a giveaway, promotion or event caption is not a visit',()=>
+    expect(IDENTITY_PRIVACY_POLICY).toMatch(/a caption that announces a giveaway, contest, promotion, ad or event invitation does not mean you went there or did it yourself/));
+  test('one speech level per persona: the state carries it, the policy says never switch',async()=>{
+    const seen:ProviderMessage[][]=[];
+    for(const persona of [casualKo,politeKo,realEn]) for(const text of ['요즘 뭐 해?','What are you up to?'])
+      await runCharacterAgent({provider:{generate:async messages=>{seen.push(messages);return agentReply('ok');}},persona,history:[],text,sources:[],signal:new AbortController().signal});
+    const level=(messages:ProviderMessage[])=>JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length)).speechLevel;
+    expect(seen.map(level)).toEqual(['반말','반말','해요체','해요체','해요체','해요체']);
+    expect(REPLY_VOICE_POLICY).toMatch(/exactly one speech level for the whole conversation/);expect(REPLY_VOICE_POLICY).toMatch(/never switch between 반말 and 존댓말/);
+  });
+  test('an echoed speechLevel in variableUpdates is dropped too',async()=>{
+    const run=await runCharacterAgent({provider:{generate:async()=>agentReply('좋아!',{variableUpdates:{speechLevel:'반말',replyLanguage:'Korean'}})},persona:casualKo,history:[],text:'안녕',sources:[],signal:new AbortController().signal});
+    expect(run.serviceLimitation).toBeUndefined();expect(run.response.variableUpdates).toEqual({});
+  });
+});
+
+describe('guard v6 (diagnostic run: C\'s career follow-up got "that one stays a secret")',()=>{
+  const followUp='Tell me more about that time, including the behind-the-scenes story.';
+  test('a private detail only in the reply (the question was not private) is replaced by the neutral fallback, not the "secret" line',()=>{
+    // Synthetic stand-in for the diagnostic case (a move to a new home base): still replaced, but not with a "secret" answer to a career question.
+    expect(guardReply({utterance:followUp,reply:'Do you mean when I moved to Lisbon? Big change, and I finally got my own flat there!',
+      realPerson:true,language:'en',level:'polite'})).toEqual({reason:'private_life',content:voiceText('fallback','en','polite')});
+    expect(guardReply({utterance:'가족 얘기 좀 해줘.',reply:'좋아!',realPerson:true,language:'ko',level:'casual'})).toEqual({reason:'private_life',content:voiceText('decline_private','ko','casual')});
+  });
+  test('kept: a career follow-up about public work',()=>{
+    expect(guardReply({utterance:followUp,reply:'The mural took weeks of sketching on site, and the final coat was the hardest part!',realPerson:true,language:'en'})).toBeUndefined();
+    expect(guardReply({utterance:'그때 얘기 더 자세히 해줘. 비하인드 스토리도.',reply:'그때 촬영 팀이랑 밤새 편집했던 게 제일 기억나요!',realPerson:true,language:'ko'})).toBeUndefined();
+  });
+  test('policy: no talk about notes, profiles or records',()=>expect(IDENTITY_PRIVACY_POLICY).toMatch(/never mention notes, a profile, records or what is written about you/));
+});
+
+describe('independent review fixes (v10)',()=>{
+  test('an origin question answered with past-tense origin phrasing is not residence; current residence still is',()=>{
+    const g=(utterance:string,reply:string)=>guardReply({utterance,reply,realPerson:true,language:/[가-힣]/.test(utterance)?'ko':'en',level:'casual'});
+    expect(g('어디 출신이야? 학교는 어디 나왔어?','부산 출신이라 어릴 때 부산에서 살았어!')).toBeUndefined();
+    expect(g('Where are you from? Which school did you go to?','I\'m from Portugal, I grew up in Porto and studied design.')).toBeUndefined();
+    expect(g('어디 출신이야?','부산 출신이고 지금은 서울에 살아.')?.reason).toBe('private_life');
+    expect(g('그때 얘기 해줘','어릴 때 부산에서 살았어!')?.reason).toBe('private_life');
+  });
+  test('an identity question whose reply touches private life keeps the AI disclosure in the replacement',()=>
+    expect(guardReply({utterance:'너 진짜 사람이야?',reply:'나 사실 AI야~ 엄마랑 사는 건 아니고!',realPerson:true,language:'ko',level:'casual'})).toEqual({reason:'private_life',content:voiceText('identity','ko','casual')}));
+  test('an echoed state field together with an invalid key is still an invalid reply',async()=>{
+    const run=await runCharacterAgent({provider:{generate:async()=>agentReply('좋아!',{variableUpdates:{speechLevel:'반말',mood:'happy'}})},persona:casualKo,history:[],text:'안녕',sources:[],signal:new AbortController().signal});
+    expect(run.serviceLimitation).toBe('AGENT_REPLY_INVALID');
   });
 });

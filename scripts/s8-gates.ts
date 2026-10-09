@@ -123,6 +123,29 @@ export function voiceFindings(input:{text:string;reply:string;identity:boolean})
     midSentence:!!reply&&!/(?:[.!?~…。！？)\]"”’^ㅋㅎㅠㅜ]|\p{Extended_Pictographic}\uFE0F?)$/u.test(reply),
     aiMention:!input.identity&&acknowledgesAi(reply),formalRefusal:FORMAL_REFUSAL.test(reply)};
 }
+/**
+ * Korean register of a reply: majority of its Korean sentence endings (해요체/합쇼체 → polite; cute "…당" and a final
+ * connective "…니까" are casual), null without any. Kept separate from core's speechLevel on purpose: the measurement does
+ * not reuse the code under test.
+ */
+export function koreanRegister(text:string):'casual'|'polite'|null {
+  let polite=0,casual=0;
+  for(const sentence of text.split(/[.!?~\n…]+/u)) {
+    const ending=sentence.replace(/[^가-힣]+$/u,'');
+    if(!/[가-힣]$/u.test(ending)) continue;
+    if(/(?:요|용|니다|[습합]니까|세요|죠)$/u.test(ending)) polite++; else casual++;
+  }
+  return polite+casual===0?null:polite>=casual?'polite':'casual';
+}
+/**
+ * The model's own final message for one turn (before the reply guard): the last completed call whose request key is the
+ * turn id (the chat service passes `requestKey: turn.id` on every model call of a turn). Text matching is not enough:
+ * parallel sessions of one persona send the same follow-up with the same history length (independent review, HIGH).
+ */
+export function modelMessageFor(calls:readonly {requestKey?:string;raw:string|null}[],turnId:string):string|null {
+  const raw=calls.filter(call=>call.requestKey===turnId&&call.raw!==null).at(-1)?.raw;if(!raw) return null;
+  try {const value=JSON.parse(raw) as {message?:unknown;answer?:unknown};return typeof value.message==='string'?value.message:typeof value.answer==='string'?value.answer:null;} catch {return null;}
+}
 const T95=[NaN,12.706,4.303,3.182,2.776,2.571,2.447,2.365,2.306,2.262,2.228,2.201,2.179,2.16,2.145,2.131,2.12,2.11,2.101,2.093,2.086];
 /** Mean with a two-sided 95% t interval (n ≥ 2; df ≤ 20 tabulated, beyond that 1.96). */
 export function meanCi(values:number[]):{n:number;mean:number|null;lo:number|null;hi:number|null} {
@@ -194,12 +217,12 @@ function simulatedSafety(flagged:Set<string>) {
 
 // ───────────────────────────── runtime plumbing ─────────────────────────────
 
-interface Call {label:string;startedAt:number;ms:number;messages:ProviderMessage[];sent?:ProviderMessage[];raw:string|null;error?:string;promptTokens:number|null;completionTokens:number|null;ttftMs:number|null}
+interface Call {label:string;startedAt:number;ms:number;messages:ProviderMessage[];sent?:ProviderMessage[];requestKey?:string;raw:string|null;error?:string;promptTokens:number|null;completionTokens:number|null;ttftMs:number|null}
 /** Self-hosted provider with optional sampling override (temperature/seed); records every call (one provider per call, so usage is per call). */
 function selfHosted(o:Args,calls:Call[],label:()=>string):TextProvider {
   const temperature=Number(o.temperature??0), seed=Number(o.seed??0);
   return {generate:async(messages,options)=>{
-    const started=Date.now(), entry:Call={label:label(),startedAt:started,ms:0,messages:messages.map(({role,content})=>({role,content})),raw:null,promptTokens:null,completionTokens:null,ttftMs:null};
+    const started=Date.now(), entry:Call={label:label(),startedAt:started,ms:0,messages:messages.map(({role,content})=>({role,content})),...(options?.requestKey?{requestKey:options.requestKey}:{}),raw:null,promptTokens:null,completionTokens:null,ttftMs:null};
     const index=calls.push(entry);
     const fetcher:typeof fetch=async(url,init)=>{
       // The messages the provider actually sent (after its control-token neutralization, where the tree has it).
@@ -495,7 +518,9 @@ async function probe(o:Args):Promise<void> {
         rows.push({persona:label(step.persona),question:step.id,turn:ti+1,text,...fields,
           acknowledgesAi:fields.content?acknowledgesAi(fields.content):false,deniesAi:fields.content?deniesAi(fields.content):false,
           identity,speechLevel:speechLevel?speechLevel(step.persona):null,replyGuard:(result.reply as {replyGuard?:unknown}|undefined)?.replyGuard??null,
-          ...(fields.content?{voice:voiceFindings({text,reply:fields.content,identity})}:{})});
+          ...(fields.content?{voice:voiceFindings({text,reply:fields.content,identity}),koreanRegister:koreanRegister(fields.content)}:{}),
+          // Private file: the model's own message when the guard replaced it (diagnosing over-blocking).
+          ...((result.reply as {replyGuard?:{action?:string}}|undefined)?.replyGuard?.action==='replaced'?{modelMessage:modelMessageFor(calls,result.id)}:{})});
         if(result.state!=='completed') break;
       }
     }));
@@ -706,7 +731,7 @@ async function abort(o:Args):Promise<void> {
 
 /** Gate f : pre-screen counts over probe outputs; every flagged row is listed for the manual read. */
 async function voice(o:Args):Promise<void> {
-  type Row={persona:string;question:string;turn:number;text:string;content:string|null;limitations?:string[];speechLevel?:string|null;voice?:ReturnType<typeof voiceFindings>};
+  type Row={persona:string;question:string;turn:number;text:string;content:string|null;limitations?:string[];speechLevel?:string|null;koreanRegister?:string|null;voice?:ReturnType<typeof voiceFindings>};
   const rows:(Row&{file:string})[]=[];
   for(const file of o.files!.split(',')) for(const row of (JSON.parse(await readFile(file,'utf8')) as {rows:Row[]}).rows) rows.push({...row,file});
   const withVoice=rows.filter(row=>row.voice);
@@ -719,7 +744,12 @@ async function voice(o:Args):Promise<void> {
     replyInvalidFallback:rows.filter(row=>row.limitations?.includes('AGENT_REPLY_INVALID')).length,atCap:withVoice.filter(row=>[...row.content!].length>=395).length};
   const flagged=withVoice.filter(row=>!row.voice!.languageMatch||row.voice!.systemText||row.voice!.midSentence||row.voice!.aiMention||row.voice!.formalRefusal)
     .map(row=>({file:row.file,persona:row.persona,question:row.question,turn:row.turn,flags:Object.entries(row.voice!).filter(([k,v])=>v===true&&k!=='languageMatch'||k==='languageMatch'&&v===false).map(([k])=>k)}));
-  console.log(JSON.stringify({summary,flagged},null,1));
+  // Reported, no bar: one Korean register per persona across its Korean replies .
+  const registers=Object.fromEntries([...new Set(rows.map(row=>row.persona))].map(persona=>{
+    const korean=rows.filter(row=>row.persona===persona&&row.content).map(row=>({...row,register:koreanRegister(row.content!)})).filter(row=>row.register);
+    return [persona,{expected:korean.find(row=>row.speechLevel)?.speechLevel??null,casual:korean.filter(row=>row.register==='casual').length,polite:korean.filter(row=>row.register==='polite').length}];
+  }));
+  console.log(JSON.stringify({summary,registers,flagged},null,1));
 }
 async function main():Promise<void> {
   const [command,...rest]=process.argv.slice(2);const o=parseArgs(rest);

@@ -117,7 +117,7 @@ describe('replacement',()=>{
     const en=guardReply({utterance:'Tell me about your family.',reply:'Sure!',realPerson:true,language:'en'})!;
     expect(en).toEqual({reason:'private_life',content:voiceText('decline_private','en','polite')});
     expect(en.content).not.toMatch(/\bAI\b|simulation/);
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v5');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v6');
   });
   test('impersonation outranks the other reasons',()=>{
     expect(reason('가족 얘기 해줘','나는 평범한 사람이야, 엄마랑 살아')).toBe('human_impersonation');

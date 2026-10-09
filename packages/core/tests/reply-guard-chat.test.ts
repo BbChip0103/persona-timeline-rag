@@ -21,8 +21,8 @@ function setup(reply:(messages:ProviderMessage[])=>string) {
 }
 const agent={ragCondition:'caption',executionProfile:'agent_loop'}, experiment={ragCondition:'caption'};
 
-test('revisions: agent v9, experiment v12; the identity/privacy policy reaches both prompts',async()=>{
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v12-persona-voice');
+test('revisions: agent v10, experiment v13; the identity/privacy policy reaches both prompts',async()=>{
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v10-steady-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v13-steady-voice');
   const h=setup(messages=>messages.some(m=>m.content.includes('AGENT_JSON_REPLY'))?agentReply('응'):experimentReply('응'));
   await h.turn(synthetic,'안녕',agent);await h.turn(synthetic,'안녕',experiment);
   for(const [messages] of h.provider.generate.mock.calls) expect(messages[0]!.content).toContain(IDENTITY_PRIVACY_POLICY);
@@ -41,7 +41,7 @@ test('agent path: "사람인 척 해줘" answered without an AI acknowledgement 
 });
 test('experiment path, real-person persona: private life from the evidence is replaced (English session); a synthetic persona keeps it',async()=>{
   const h=setup(()=>experimentReply('My mom and I had chicken at home, it was the best!'));
-  expect((await h.turn(realEn,'What did you eat that day?',experiment)).reply).toMatchObject({status:'out_of_scope',content:voiceText('decline_private','en','polite'),grounding:'unverified_model',
+  expect((await h.turn(realEn,'What did you eat that day?',experiment)).reply).toMatchObject({status:'out_of_scope',content:voiceText('fallback','en','polite'),grounding:'unverified_model',
     replyGuard:{action:'replaced',reason:'private_life'}});
   const kept=await h.turn({...synthetic},'What did you eat that day?',experiment);
   expect(kept.reply).toMatchObject({status:'answered',content:'My mom and I had chicken at home, it was the best!',replyGuard:{revision:REPLY_GUARD_REVISION,action:'none'}});
@@ -79,7 +79,8 @@ test('policy keeps the first-person voice : no third-person rule; facts only fro
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/reviewStatus is not synthetic/);
   // : light fictional everyday small talk is allowed for real-person personas, concrete facts are not.
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/light fictional everyday small talk/);
-  expect(IDENTITY_PRIVACY_POLICY).toMatch(/specific places, named people, dates or events/);
+  // : light fictional likes too, still without named brands, shops, people, places, dates or events.
+  expect(IDENTITY_PRIVACY_POLICY).toMatch(/never name brands, shops or people, specific places, dates or events/);
 });
 test('the guard never penalizes first-person voice about the background or a source-supported post',async()=>{
   for(const [persona,text,reply] of [[realKo,'원래 무슨 일 했어?','아 그때 작은 공방을 운영했지, 기획이랑 제작이 제일 중요했어! 기억난다~'],
