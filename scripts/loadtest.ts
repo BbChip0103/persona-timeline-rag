@@ -120,6 +120,8 @@ class Fleet {
     const t=this.topology;
     this.launch('gateway','apps/gateway/src/main.ts',{PTR_GATEWAY_PORT:String(port),PTR_GATEWAY_TOKEN:this.gatewayToken,
       PTR_GATEWAY_UPSTREAM:t.provider,PTR_GATEWAY_MAX_CONCURRENCY:String(t.gatewayMaxConcurrency),PTR_GATEWAY_MAX_QUEUE:String(t.gatewayMaxQueue),
+      // The fake engine answers headers and body together (vLLM sends headers at once): headers timeout off, as measured before.
+      PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS:'0',
       // The gateway, not the workers, owns the model and its latency profile.
       ...(t.provider==='selfhosted'?{PTR_SELFHOSTED_BASE_URL:t.selfhostedBaseUrl,PTR_SELFHOSTED_MODEL:t.selfhostedModel}:this.latency?{PTR_FAKE_LATENCY:this.latency}:{}),
       // The per-minute ceiling protects a paid secondary; the fake one is lifted so the outage shape is measured.

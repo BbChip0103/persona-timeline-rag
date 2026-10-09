@@ -62,20 +62,29 @@ export class OpenAICompatibleUpstream implements Upstream {
   readonly model:string;
   private readonly endpoint:string;
   private readonly healthUrl:string;
-  constructor(options:{baseUrl:string;model:string}) {
+  private readonly headersTimeoutMs:number;
+  /**
+   * `headersTimeoutMs` (0 = off): response headers must arrive within it, else a TimeoutError (504). Set only for the
+   * env-only engine without failover; pools and the failover wrapper apply their own (FailoverOptions.headersTimeoutMs).
+   */
+  constructor(options:{baseUrl:string;model:string;headersTimeoutMs?:number}) {
     const url=new URL(options.baseUrl);
     if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||url.username||url.password||url.search||url.hash) throw new Error('UPSTREAM_NOT_LOOPBACK');
     this.model=options.model;this.endpoint=`${options.baseUrl.replace(/\/$/,'')}/chat/completions`;this.healthUrl=`${url.origin}/health`;
+    this.headersTimeoutMs=options.headersTimeoutMs??0;
   }
-  async complete(request:ChatCompletionRequest,signal:AbortSignal):Promise<UpstreamResult> {
+  async complete(request:ChatCompletionRequest,caller:AbortSignal):Promise<UpstreamResult> {
     let response:Response;
+    const headers=new AbortController();
+    const timer=this.headersTimeoutMs?setTimeout(()=>headers.abort(new DOMException('upstream headers timeout','TimeoutError')),this.headersTimeoutMs):undefined;
+    const signal=timer?AbortSignal.any([caller,headers.signal]):caller;
     try {response=await fetch(this.endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...request,model:this.model}),signal,redirect:'error'});}
     catch(error) {
       if(signal.aborted) throw error;
       const code=(error as {cause?:{code?:unknown}})?.cause?.code;
       if(code==='UND_ERR_HEADERS_TIMEOUT'||code==='UND_ERR_BODY_TIMEOUT') throw new DOMException('upstream response timeout','TimeoutError');
       throw classifyTransportError(error)??error;
-    }
+    } finally {clearTimeout(timer);}
     // Error bodies are never relayed; release the connection now instead of at garbage collection.
     if(!response.ok){await response.body?.cancel().catch(()=>undefined);return {status:response.status,contentType:'application/json',body:''};}
     return {status:response.status,contentType:response.headers.get('content-type')??'application/json',

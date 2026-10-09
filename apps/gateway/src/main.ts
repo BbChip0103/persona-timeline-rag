@@ -158,8 +158,10 @@ export function upstreamFromEnvironment(env:NodeJS.ProcessEnv,replicas?:()=>numb
   if(kind==='selfhosted') {
     if(pooled) return poolFromEnvironment(env,discovery,failover,replicas);
     if(!env.PTR_SELFHOSTED_BASE_URL||!env.PTR_SELFHOSTED_MODEL) throw new Error('SELFHOSTED_NOT_CONFIGURED');
+    // Without failover there is no breaker or alternative: the headers timeout only ends a hung engine's calls early.
+    if(failover==='off') return {upstream:new OpenAICompatibleUpstream({baseUrl:env.PTR_SELFHOSTED_BASE_URL,model:env.PTR_SELFHOSTED_MODEL,
+      headersTimeoutMs:integer(env,'PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS',DEFAULT_FAILOVER.headersTimeoutMs,0,600000)})};
     const primary=new OpenAICompatibleUpstream({baseUrl:env.PTR_SELFHOSTED_BASE_URL,model:env.PTR_SELFHOSTED_MODEL});
-    if(failover==='off') return {upstream:primary};
     const options=failoverOptions(env);
     if(failover==='fake') return {upstream:new FailoverUpstream(primary,fakeUpstream(env),options,replicas)};
     const secondary=openRouterUpstream(env,FAILOVER_MODEL,true);

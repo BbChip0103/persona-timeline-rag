@@ -104,6 +104,6 @@ Historical decisions/time checkpoints live beside the external issue, not duplic
 
 Turns always run queued: API (`pnpm dev:api`) + worker(s) (`pnpm dev:worker`) + dispatcher (`pnpm dev:dispatcher`),
 optionally the LLM gateway (`pnpm dev:gateway`, workers with `PTR_CHAT_PROVIDER=gateway`). All need the local Redis
-(`infra/compose.redis.yml`, `PTR_REDIS_URL`) and migrations through 0007; evaluation scripts need Redis too. The
+(`infra/compose.redis.yml`, `PTR_REDIS_URL`) and migrations through 0008 (`0008_turn_leases.sql`); evaluation scripts need Redis too. The
 synthetic load/failure harness on `ptr_loadtest`, self-hosted engines over an SSH tunnel and the GPU benchmark
 scripts are documented in [goal2-serving.md](goal2-serving.md).

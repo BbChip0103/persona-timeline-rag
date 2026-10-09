@@ -11,3 +11,11 @@ test('unknown codes are never surfaced; ordinary complete/cancel and context-lim
   expect(turnNotice({state:'completed',errorCode:'PROVIDER_REQUEST_UNRESOLVED'})).toBe('');
   expect(turnNotice({state:'cancelled'})).toContain('취소');expect(turnNotice({state:'failed',errorCode:'CONTEXT_LIMIT'})).toContain('새 대화');
 });
+test('QUEUE_TIMEOUT (no worker started the turn in time) is a friendly try-again line in the session language, never system jargon',()=>{
+  const korean=turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'},'ko');
+  expect(korean).toContain('잠시 후 다시 시도해 주세요');
+  expect(turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'})).toBe(korean); // the Korean UI default
+  const english=turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'},'en');
+  expect(english).toMatch(/try again in a moment/i);expect(english).not.toMatch(/[가-힣]/);
+  for(const value of [korean,english]) expect(value).not.toMatch(/QUEUE|TIMEOUT|queue|worker|timeout|큐|워커|타임아웃|대기열/);
+});

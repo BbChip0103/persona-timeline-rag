@@ -106,7 +106,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     provider=client;model=env.GOAL1_TEXT_MODEL??env.PTR_MODEL??env.TEXT_MODEL??DEFAULT_TEXT_MODEL;embeddingModel=embedding.model;
     embed=(text,options)=>embedding.embed([text],options).then(vectors=>vectors[0]!);
   } else if(providerName==='selfhosted') {
-    // Goal2: self-hosted vLLM/SGLang through an SSH tunnel. Chat only; embeddings stay on the fake space.
+    // Goal2: self-hosted vLLM/SGLang through an SSH tunnel. Chat only: there is no real query embedder (see semanticSearch).
     const baseUrl=env.PTR_SELFHOSTED_BASE_URL, selfModel=env.PTR_SELFHOSTED_MODEL;
     if(!baseUrl||!selfModel) throw new CoreError('INVALID_INPUT');
     provider=new OpenAICompatibleTextProvider({baseUrl,model:selfModel,maxOutputTokens:512,timeoutMs:60000,structuredAgentReplies:env.PTR_SELFHOSTED_STRUCTURED==='1'});model=`selfhosted/${selfModel}`;
@@ -178,8 +178,12 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   if(!/^[a-z0-9-]{1,40}$/.test(queueName)||!/^[a-z0-9-]{1,40}$/.test(namespace)) throw new CoreError('INVALID_INPUT');
   const delivery=new BullMqTurnDelivery(redisUrl,{queueName});
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
-  const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,
-    retrieval:new PostgresRetrieval(sources,{embed,modelRevision:embeddingModel}),
+  // R10: self-hosted and gateway chat embed queries with the fake hash model, whose space holds no licensed source
+  // vectors (those are openai/text-embedding-3-small), so semantic search would quietly find nothing. Semantic sessions
+  // are refused there instead; real query embeddings would be a new external, paid transfer (docs/data-policy.md).
+  const semanticSearch=providerName==='fake'||providerName==='openrouter';
+  const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,semanticSearch,
+    retrieval:new PostgresRetrieval(sources,semanticSearch?{embed,modelRevision:embeddingModel}:undefined),
     ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
   return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,...(gateways?{gateways}:{}),
     async listPersonas() {

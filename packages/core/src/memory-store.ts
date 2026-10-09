@@ -83,9 +83,10 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
     const turn = this.turns.get(id);
     return turn?.ownerId === owner && !terminal(turn.state) ? this.transitionTurn(id,[turn.state],'cancelled') : false;
   }
-  async claimTurn(turnId:string,workerId:string,leaseMs:number):Promise<QueuedTurn|undefined> {
+  async claimTurn(turnId:string,workerId:string,leaseMs:number,maxQueueMs?:number):Promise<QueuedTurn|undefined> {
     const now=Date.now();const turn=this.turns.get(turnId);const lease=this.leases.get(turnId);
     if(!turn||turn.state!=='pending'||!this.inputs.has(turnId)||(lease&&lease.owner&&lease.expiresAt>=now)) return undefined;
+    if(maxQueueMs!==undefined&&now-this.queuedAt(turn)>maxQueueMs) return undefined;
     const attempts=(lease?.attempts??0)+1;
     this.leases.set(turnId,{owner:workerId,expiresAt:now+leaseMs,attempts});this.outbox.delete(turnId);
     return {turn:structuredClone(turn),input:structuredClone(this.inputs.get(turnId)!),fence:{workerId,attempt:attempts}};
@@ -106,6 +107,18 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
       this.outbox.set(turn.id,{seq,createdAt:now});requeued.push(turn.id);
     }
     return {requeued,failed};
+  }
+  /** When the turn was last queued: its outbox entry (reservation or latest requeue), else its creation. */
+  private queuedAt(turn:ChatTurn):number {return this.outbox.get(turn.id)?.createdAt??Date.parse(turn.createdAt);}
+  async expireQueued(maxQueueMs:number):Promise<{turnId:string;errorCode:'QUEUE_TIMEOUT'|'WORKER_LOST'}[]> {
+    const now=Date.now();const failed:{turnId:string;errorCode:'QUEUE_TIMEOUT'|'WORKER_LOST'}[]=[];
+    for(const turn of this.turns.values()) {
+      const lease=this.leases.get(turn.id);
+      if(turn.state!=='pending'||!this.inputs.has(turn.id)||lease?.owner||now-this.queuedAt(turn)<=maxQueueMs) continue;
+      const errorCode=(lease?.attempts??0)>0?'WORKER_LOST' as const:'QUEUE_TIMEOUT' as const;
+      turn.state='failed';turn.errorCode=errorCode;turn.finishedAt=new Date().toISOString();this.outbox.delete(turn.id);failed.push({turnId:turn.id,errorCode});
+    }
+    return failed;
   }
   /** Token and expiry share one record here, so they cannot drift apart; nothing to repair. */
   async reconcileLeases():Promise<{requeued:string[];failed:string[];dropped:number}> {return {requeued:[],failed:[],dropped:0};}

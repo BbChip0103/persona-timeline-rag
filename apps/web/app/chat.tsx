@@ -6,7 +6,7 @@ import { readTurnStream } from '../lib/turn-stream';
 type Mode='off'|'lexical'|'semantic';
 type RagCondition='off'|'caption'|'caption_image';
 type Persona={id:string;personId:string;label:string;language:string;revision:string;reviewStatus:string;aiDisclosure:string};
-type Session={id:string;personId:string;personaRevision:string;retrievalMode:Mode;ragCondition?:RagCondition;createdAt:string};
+type Session={id:string;personId:string;personaRevision:string;language?:string;retrievalMode:Mode;ragCondition?:RagCondition;createdAt:string};
 type Message={id:string;turnId:string|null;role:'user'|'assistant';content:string};
 type Evidence={sourceId:string;sourceUrl:string;postedAt:string;eventDate:string|null;quote:string;origin?:'source_caption'|'ai_image_annotation';annotationId?:string;annotationRevision?:string;annotationHash?:string;imageHash?:string};
 type Reply={grounding?:'unverified_model'|'source_bound_quotes';content:string;status:string;evidence:Evidence[];limitations:string[]};
@@ -30,11 +30,11 @@ export default function Chat() {
   const [text,setText]=useState('');const [intent,setIntent]=useState<'small_talk'|'timeline'>('small_talk');const [query,setQuery]=useState('');const [basis,setBasis]=useState<'posted'|'event'>('posted');const [start,setStart]=useState('');const [end,setEnd]=useState('');
   const [busy,setBusy]=useState(false);const [active,setActive]=useState<Turn>();const [attempt,setAttempt]=useState<Attempt>();const [error,setError]=useState('');const [notice,setNotice]=useState('');
   const [brief,setBrief]=useState('');const [draft,setDraft]=useState('');const [draftBusy,setDraftBusy]=useState(false);
-  const sessionRef=useRef<string|undefined>(undefined);const bottom=useRef<HTMLDivElement>(null);
+  const sessionRef=useRef<string|undefined>(undefined);const languageRef=useRef<string|undefined>(undefined);const bottom=useRef<HTMLDivElement>(null);
   async function refreshHistory(id:string) {
     const value=await api<{session:Session;history:Message[]}>(`sessions/${id}`);
     if(sessionRef.current!==id) return;
-    setSession(value.session);setHistory(value.history);
+    setSession(value.session);languageRef.current=value.session.language;setHistory(value.history);
     const ids=[...new Set(value.history.filter(message=>message.role==='assistant'&&message.turnId).map(message=>message.turnId!))].slice(-20);
     const turns=await Promise.all(ids.map(turnId=>api<{turn:Turn}>(`turns/${turnId}`).catch(()=>undefined)));
     if(sessionRef.current!==id) return;
@@ -44,7 +44,7 @@ export default function Chat() {
     sessionRef.current=id;setActive(undefined);setAttempt(undefined);setError('');setNotice('');setDraft('');setBusy(true);
     try {await refreshHistory(id);localStorage.setItem('ptr-session-id',id);
       const activeId=localStorage.getItem(`ptr-active-turn-${id}`);
-      if(activeId){const value=await api<{turn:Turn}>(`turns/${activeId}`).catch(()=>undefined);if(value&&!terminal(value.turn.state))setActive(value.turn);else {if(value)setNotice(turnNotice(value.turn));localStorage.removeItem(`ptr-active-turn-${id}`);}}
+      if(activeId){const value=await api<{turn:Turn}>(`turns/${activeId}`).catch(()=>undefined);if(value&&!terminal(value.turn.state))setActive(value.turn);else {if(value)setNotice(turnNotice(value.turn,languageRef.current));localStorage.removeItem(`ptr-active-turn-${id}`);}}
     }catch(e){setError((e as Error).message);sessionRef.current=undefined;setSession(undefined);}finally{setBusy(false);}
   }
   useEffect(()=>{let stopped=false;void Promise.all([api<{personas:Persona[]}>('personas'),api<{sessions:Session[]}>('sessions')]).then(async([people,stored])=>{
@@ -60,7 +60,7 @@ export default function Chat() {
     const controller=new AbortController();let timer:ReturnType<typeof setTimeout>;let failures=0;
     const settle=async(turn:Turn)=>{
       if(turn.reply)setReplies(previous=>({...previous,[turn.id]:turn.reply!}));
-      setNotice(turnNotice(turn));
+      setNotice(turnNotice(turn,languageRef.current));
       await refreshHistory(turn.sessionId);if(controller.signal.aborted)return;localStorage.removeItem(`ptr-active-turn-${turn.sessionId}`);setActive(undefined);setAttempt(undefined);
     };
     const connect=async()=>{try{
@@ -84,7 +84,7 @@ export default function Chat() {
   async function submit(value:Attempt) {
     if(!session)return;setBusy(true);setError('');setNotice('');setAttempt(value);
     try {const result=await api<{turn:Turn}>(`sessions/${session.id}/turns`,value);
-      if(terminal(result.turn.state)){await refreshHistory(session.id);setAttempt(undefined);setNotice(turnNotice(result.turn));}else {localStorage.setItem(`ptr-active-turn-${result.turn.sessionId}`,result.turn.id);setActive(result.turn);}
+      if(terminal(result.turn.state)){await refreshHistory(session.id);setAttempt(undefined);setNotice(turnNotice(result.turn,languageRef.current));}else {localStorage.setItem(`ptr-active-turn-${result.turn.sessionId}`,result.turn.id);setActive(result.turn);}
       setText('');
     }catch(e){setError((e as Error).message);}finally{setBusy(false);}
   }

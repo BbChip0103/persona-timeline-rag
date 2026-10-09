@@ -4,7 +4,7 @@ import { createConnection, createServer as createTcpServer, type Server as TcpSe
 import type { AddressInfo } from 'node:net';
 import type { TextProvider } from '@ptr/core';
 import { OpenAICompatibleTextProvider, OpenRouterClient, ProviderError, type BudgetLedger, type BudgetRequest, type CallMetrics } from '@ptr/providers';
-import { classifyTransportError, createGateway, FailoverUpstream, OpenAICompatibleUpstream, TextProviderUpstream, UpstreamConnectError, type FailoverOptions, type GatewayOptions, type Upstream, type UpstreamResult } from '../src';
+import { classifyTransportError, createGateway, DEFAULT_FAILOVER, FailoverUpstream, OpenAICompatibleUpstream, StaticUpstreamSource, TextProviderUpstream, UpstreamConnectError, UpstreamPool, type FailoverOptions, type GatewayOptions, type Upstream, type UpstreamResult } from '../src';
 import { ledgerReady, secondaryReady, upstreamFromEnvironment } from '../src/main';
 import { closedPort } from './closed-port';
 
@@ -462,5 +462,83 @@ describe('failover configuration',()=>{
     const live=upstreamFromEnvironment({...selfhosted,PTR_GATEWAY_FAILOVER:'openrouter',GOAL1_DATABASE_URL:databaseUrl,GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true',OPENROUTER_API_KEY:'synthetic-key'});
     expect(typeof live.upstream.ready).toBe('function');expect(live.upstream.failoverMetrics?.().secondary).toBe(gemma);
     await live.close?.();
+  });
+});
+
+describe('hung engine: accepts the connection, never sends headers (architecture review R1)',()=>{
+  /** Raw TCP engine that reads requests and never answers anything, /health included (a frozen engine behind a live tunnel). */
+  function hungEngine() {
+    const calls={completions:0,health:0};const sockets=new Set<Socket>();
+    const server=createTcpServer(socket=>{
+      sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>undefined);
+      socket.on('data',chunk=>{const line=chunk.toString('latin1');if(line.startsWith('GET /health'))calls.health++;else if(line.startsWith('POST '))calls.completions++;});
+    });
+    return {server,calls,stop:()=>{for(const socket of sockets) socket.destroy();}};
+  }
+  test('the primary headers timeout is on by default (10 s); PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS=0 still turns it off',async()=>{
+    expect(DEFAULT_FAILOVER.headersTimeoutMs).toBe(10000);
+    const hung=hungEngine();const engineBase=await listen(hung.server);
+    const env={PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_SELFHOSTED_BASE_URL:`${engineBase}/v1`,PTR_SELFHOSTED_MODEL:'m'};
+    // Env-only without failover: no breaker and no alternative, but the call still ends at the headers timeout.
+    const early=await gateway(upstreamFromEnvironment({...env,PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS:'100'}).upstream,{upstreamTimeoutMs:1500});
+    let started=Date.now();const cut=await post(early.base);
+    expect(cut.status).toBe(504);expect(await cut.json()).toEqual({error:{code:'UPSTREAM_TIMEOUT'}});expect(Date.now()-started).toBeLessThan(1000);
+    const off=await gateway(upstreamFromEnvironment({...env,PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS:'0'}).upstream,{upstreamTimeoutMs:1500});
+    started=Date.now();const late=await post(off.base);
+    expect(late.status).toBe(504);expect(Date.now()-started).toBeGreaterThanOrEqual(1400);
+    hung.stop();
+  });
+  test('N headers timeouts run a /health probe that hangs too, the breaker opens and later turns go to the paid secondary; nothing is billed twice',async()=>{
+    const hung=hungEngine();const ledger=new MemoryLedger();const secondary=openRouter(ledger,answer);
+    const failover=new FailoverUpstream(primaryAt(await listen(hung.server)),secondary.upstream,{headersTimeoutMs:100,timeoutThreshold:3,probeTimeoutMs:100,cooldownMs:30000});
+    const {base,g}=await gateway(failover,{upstreamTimeoutMs:5000});
+    for(let i=1;i<=3;i++) {
+      const started=Date.now();const response=await post(base,{messages,stream:true},{'X-PTR-Request-Key':`turn-${i}`});
+      // Sent and unanswered: it may be in the model, so it is a 504 and never resubmitted to the secondary.
+      expect(response.status).toBe(504);expect(await response.json()).toEqual({error:{code:'UPSTREAM_TIMEOUT'}});expect(Date.now()-started).toBeLessThan(2000);
+    }
+    await until(()=>failover.failoverMetrics().breaker.state==='open');
+    expect(failover.failoverMetrics().breaker).toMatchObject({opened:1,probesFailed:1});expect(hung.calls.health).toBe(1);
+    const served=await post(base,{messages,stream:true},{'X-PTR-Request-Key':'turn-4'});
+    expect(served.status).toBe(200);expect(served.headers.get('x-ptr-upstream')).toBe('secondary');await served.text();
+    expect(hung.calls.completions).toBe(3);
+    // Zero double billing: one paid call, for the one turn that never reached the primary.
+    expect(secondary.posts).toHaveLength(1);expect(ledger.requests.size).toBe(1);
+    expect(g.metrics().failover).toMatchObject({failovers:{breaker_open:1},answered:{primary:0,secondary:1}});
+    hung.stop();
+  });
+  test('with two primaries and no secondary, the hung one is taken out after N timeouts and the other serves; a timed-out call is never resent',async()=>{
+    const hung=hungEngine();const good=engine(healthy);
+    const records=[['hung',await listen(hung.server)],['good',await listen(good.server)]].map(([id,base])=>({pool:'m',id:id!,baseUrl:`${base}/v1`,maxSeqs:4,
+      kvCapacityTokens:null,weight:1,state:'active' as const,epoch:'e1',seq:0}));
+    const pool=new UpstreamPool({model:'m',source:new StaticUpstreamSource(records),admission:true,routing:'round_robin',
+      failover:{headersTimeoutMs:100,timeoutThreshold:2,probeTimeoutMs:100,cooldownMs:30000}});
+    const {base}=await gateway(pool,{upstreamTimeoutMs:5000});
+    let ok=0, timedOut=0;
+    while(hung.calls.completions<2) {const response=await post(base);if(response.status===200){ok++;await response.text();}else {expect(response.status).toBe(504);timedOut++;await response.text();}}
+    await until(()=>pool.poolMetrics().upstreams.find(u=>u.id==='hung')!.breaker==='open');
+    for(let i=0;i<5;i++) {const response=await post(base);expect(response.status).toBe(200);await response.text();ok++;}
+    expect(timedOut).toBe(2);expect(hung.calls.completions).toBe(2);expect(good.calls.completions).toBe(ok);
+    await pool.close();hung.stop();
+  });
+  test('a caller that gives up after waiting the headers timeout without headers counts as a timeout; an earlier one does not',async()=>{
+    jest.useFakeTimers({now:0,doNotFake:['setImmediate']});
+    let health=0;
+    // Never answers and never notices the headers timer (as if the timer ran late): only the caller's abort ends the call.
+    const primary={model:'p',health:async()=>{health++;return false;},
+      complete:(_request:unknown,signal:AbortSignal)=>new Promise<UpstreamResult>((_resolve,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}))};
+    const secondary=countingSecondary();
+    const failover=new FailoverUpstream(primary,secondary.upstream,{headersTimeoutMs:1000,timeoutThreshold:1,probeTimeoutMs:100,cooldownMs:30000});
+    const leave=async(afterMs:number)=>{
+      const controller=new AbortController();const call=failover.complete({messages},controller.signal);
+      await new Promise(r=>setImmediate(r));jest.setSystemTime(Date.now()+afterMs);controller.abort();
+      await expect(call).rejects.toMatchObject({name:'AbortError'});await new Promise(r=>setImmediate(r));
+    };
+    await leave(500);
+    expect(failover.failoverMetrics().breaker).toMatchObject({state:'closed',consecutiveTimeouts:0});expect(health).toBe(0);
+    await leave(1500);
+    expect(health).toBe(1);expect(failover.failoverMetrics().breaker).toMatchObject({state:'open',opened:1});
+    expect(secondary.calls.n).toBe(0);
+    expect((await failover.complete({messages},new AbortController().signal)).upstream).toBe('secondary');
   });
 });

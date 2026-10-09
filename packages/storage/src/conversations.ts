@@ -131,20 +131,24 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
       return true;
     });
   }
-  async claimTurn(turnId: string, workerId: string, leaseMs: number): Promise<QueuedTurn | undefined> {
+  async claimTurn(turnId: string, workerId: string, leaseMs: number, maxQueueMs?: number): Promise<QueuedTurn | undefined> {
     // Only a pending turn with no token, or whose token's lease row has expired, is claimable. Concurrent claimers
     // serialize on the turns row; a loser re-checks the committed row, whose new (owner, attempts) token matches no
     // lease row in its older snapshot, so it fails. The claim upserts the lease row and retires the outbox entry.
+    // With maxQueueMs a turn that waited longer than that since it was last queued (its outbox entry: the reservation or
+    // the latest requeue) is not claimed (expireQueued fails it; both use the database clock).
     const result = await this.pool.query(`WITH claimed AS (
         UPDATE turns t SET lease_owner=$2, attempts=t.attempts+1
         WHERE t.id=$1 AND t.state='pending' AND t.request_input IS NOT NULL AND (t.lease_owner IS NULL OR EXISTS (
           SELECT 1 FROM turn_leases l WHERE l.turn_id=t.id AND l.owner=t.lease_owner AND l.attempt=t.attempts AND l.expires_at < now()))
+          AND ($4::double precision IS NULL OR COALESCE((SELECT o.created_at FROM turn_outbox o WHERE o.turn_id=t.id), t.created_at)
+            >= now()-make_interval(secs => $4::double precision/1000))
         RETURNING t.*), leased AS (
         INSERT INTO turn_leases(turn_id,owner,attempt,expires_at)
         SELECT id, lease_owner, attempts, now()+make_interval(secs => $3::double precision/1000) FROM claimed
         ON CONFLICT (turn_id) DO UPDATE SET owner=EXCLUDED.owner, attempt=EXCLUDED.attempt, expires_at=EXCLUDED.expires_at),
       retired AS (DELETE FROM turn_outbox o USING claimed c WHERE o.turn_id=c.id)
-      SELECT * FROM claimed`, [turnId, workerId, leaseMs]);
+      SELECT * FROM claimed`, [turnId, workerId, leaseMs, maxQueueMs ?? null]);
     const row = result.rows[0];
     return row ? { turn: turn(row), input: row.request_input as SendTurnInput, fence: { workerId, attempt: row.attempts } } : undefined;
   }
@@ -204,6 +208,23 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
       return { requeued: result.rows.filter(row => row.state === 'pending').map(row => row.id),
         failed: result.rows.filter(row => row.state === 'failed').map(row => row.id), dropped };
     });
+  }
+  async expireQueued(maxQueueMs: number): Promise<{ turnId: string; errorCode: 'QUEUE_TIMEOUT' | 'WORKER_LOST' }[]> {
+    // Unclaimed pending turns all have an outbox entry (written by the reservation and by every requeue with a fresh
+    // created_at, removed by the claim), so the small outbox drives the scan and dates the wait. The row lock (SKIP
+    // LOCKED, never waits) re-checks the state and the empty token on the latest row version: a claim committed first
+    // wins, and once this commits a claim finds the turn failed. A requeued turn (attempts > 0) may have reached a
+    // model before its worker was lost, so it fails as WORKER_LOST, not as a turn that never ran.
+    const result = await this.pool.query(`WITH due AS (
+        SELECT t.id FROM turn_outbox o JOIN turns t ON t.id=o.turn_id
+        WHERE t.state='pending' AND t.lease_owner IS NULL AND t.request_input IS NOT NULL
+          AND o.created_at < now()-make_interval(secs => $1::double precision/1000)
+        FOR NO KEY UPDATE OF t SKIP LOCKED), failed AS (
+        UPDATE turns t SET state='failed', error_code=CASE WHEN t.attempts > 0 THEN 'WORKER_LOST' ELSE 'QUEUE_TIMEOUT' END, finished_at=now()
+        FROM due d WHERE t.id=d.id AND t.state='pending' AND t.lease_owner IS NULL RETURNING t.id, t.error_code), retired AS (
+        DELETE FROM turn_outbox o USING failed f WHERE o.turn_id=f.id)
+      SELECT id, error_code FROM failed`, [maxQueueMs]);
+    return result.rows.map(row => ({ turnId: String(row.id), errorCode: row.error_code }));
   }
   async pendingDispatches(graceMs: number, limit: number): Promise<TurnDispatch[]> {
     // Entries of turns that ended without being claimed (e.g. cancelled while queued) are dropped on the way.

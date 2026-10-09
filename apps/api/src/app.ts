@@ -34,7 +34,7 @@ class SafeErrorFilter implements ExceptionFilter {
     if(response.headersSent){if(!response.writableEnded)response.end();return;}
     let status=500;let code='INTERNAL_ERROR';
     if(error instanceof CoreError) {
-      code=error.code;status=({NOT_FOUND:404,FORBIDDEN:403,TURN_ACTIVE:409,IDEMPOTENCY_CONFLICT:409,INVALID_INPUT:400,TURN_FAILED:502,CONTEXT_LIMIT:409,PERSONA_UNAVAILABLE:404,QUEUE_FULL:503} as const)[error.code];
+      code=error.code;status=({NOT_FOUND:404,FORBIDDEN:403,TURN_ACTIVE:409,IDEMPOTENCY_CONFLICT:409,INVALID_INPUT:400,TURN_FAILED:502,CONTEXT_LIMIT:409,PERSONA_UNAVAILABLE:404,QUEUE_FULL:503,SEMANTIC_UNAVAILABLE:400} as const)[error.code];
       if(error.code==='QUEUE_FULL') response.setHeader('Retry-After','1');
     } else if(error instanceof z.ZodError) {status=400;code='INVALID_INPUT';}
     else if(error instanceof HttpException) {

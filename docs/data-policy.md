@@ -18,11 +18,30 @@
 
 `data/`, `reports/`, `*.private.md`, 실제 매체 파일과 `.env`는 `.gitignore`로 제외합니다. 이는 실수 방지 장치이지 공개 허가나 접근 통제가 아닙니다. Git 추가·공개 전에 staged 파일과 과거 이력을 별도로 확인합니다. 이미 추적된 파일은 ignore 규칙만으로 제거되지 않습니다.
 
-원본 승인 내용과 후보 정보를 공개 README, 예제 설정, 테스트 fixture, 터미널 캡처나 CI 로그에 복사하지 않습니다. 현재 구현은 로컬 처리만 수행하며 외부 모델 호출을 하지 않습니다.
+원본 승인 내용과 후보 정보를 공개 README, 예제 설정, 테스트 fixture, 터미널 캡처나 CI 로그에 복사하지 않습니다. 서비스 실행(API·워커·게이트웨이)에서 외부 모델·호스트로 나가는 데이터는 아래 [외부 전송](#외부-전송) 표의 경로뿐이며, 연구·평가 스크립트의 외부 호출은 같은 절에 따로 적습니다.
 
 연구용 AI 페르소나는 실제 본인/공식 계정이 아닌 시뮬레이션임을 표시합니다. 실제 인물의 비공개 관계·감정·의도·사적 기억을 설계로 채워 사실처럼 말하지 않습니다. 사용자와의 채팅도 실제 인물의 현실 이력이나 관계로 기록하지 않습니다. 승인된 로컬 연구용 채팅과 공개/상업용 실존인물 챗봇 배포는 구분합니다.
 
 포스트/이미지는 AI 가상 초안으로 표시하고 실제Instagram에 업로드하지 않습니다. 생성물을 실제 게시물/사건/평가정답으로 재유입하지 않습니다. External image는 외부 API이므로 모델 선택과 별개로 개인 자격·비용·원본/사진 reference 전송 조건을 확인합니다. 다른 프로젝트 cookie/API key는 사용하지 않습니다. [창작물 계약](creative-artifacts.md).
+
+## 외부 전송
+
+연구 책임자(사용자)가 2026-10-09에 아래 세 경로를 현행대로 허용했습니다. 모두 기본값은 꺼짐이거나 운영자가 직접 켜야 하는 구성이며, 켜면 아래 데이터가 이 컴퓨터 밖으로 나갑니다. 유료 호출은 공통 예산 원장(Postgres `ptr_provider_requests`·`ptr_provider_budget`, 비용 상한 `GOAL1_BUDGET_USD`와 호출 수 상한)을 거칩니다.
+
+| 경로 | 켜는 조건 | 보내는 데이터 | 받는 곳 |
+|---|---|---|---|
+| Jev 의도 분류 | `PTR_INTENT_CLASSIFIER=jev` + `GOAL1_LIVE_ENABLED=true` + `GOAL1_ALLOW_EXTERNAL_DATA=true` + `OPENROUTER_API_KEY` | 규칙으로 의도가 정해지지 않은 턴에서만(검색 없는 대조 세션 제외): 이번 사용자 발화 앞 500자, 같은 세션의 직전 사용자 발화 최대 2개(각 300자, 자격 정보 패턴·민감 발화 제외), 고정 질문문 | OpenRouter Decisions API, 모델 `typesafe/jev-1.13`(TypeSafe) |
+| Jev 입력 안전 검사 | `PTR_SAFETY_FILTER=jev` + 위 live 조건 | 모든 턴(규칙이 이미 거절한 턴은 자해 질문만): 이번 사용자 발화 전체(첫 500자 창 + 4100자 창들), 직전 사용자 발화 최대 2개, 고정 질문문. 창작 초안 요청이면 초안 지시문(최대 2000자) | 같음 |
+| 게이트웨이 장애 전환 | 게이트웨이 `PTR_GATEWAY_UPSTREAM=selfhosted` + `PTR_GATEWAY_FAILOVER=openrouter` + 위 live 조건 + 원장 DB | 자체 엔진에서 응답을 받기 전에 연결이 실패했을 때만: 연결 거절·연결 실패(요청이 엔진에 닿지 않음), 응답 첫 바이트 전 연결 끊김(엔진에 닿았을 수 있음, `PTR_GATEWAY_FAILOVER_ON_CLOSE` 기본 true일 때만), 모든 차단기 열림·등록된 엔진 없음(엔진에 보내지 않음). 그 턴의 프롬프트 전체: 정책 문구, 페르소나 카드(실존 인물 페르소나의 배경 포함), 근거 게시물 최대 3건의 원본 캡션(이미지 조건이면 AI 이미지 설명 포함), 최근 대화, 사용자 발화. 시간 초과·HTTP 오류·중간에 끊긴 응답은 넘기지 않습니다 | OpenRouter, 모델 `google/gemma-4-26b-a4b-it` |
+| 자체 엔진(RunPod) | `PTR_CHAT_PROVIDER=selfhosted` 또는 게이트웨이 `PTR_GATEWAY_UPSTREAM=selfhosted` | 모든 채팅 턴의 프롬프트 전체(위 장애 전환과 같은 구성, 실존 인물 데이터 포함) | RunPod에서 빌린 GPU 호스트(제3자 하드웨어)의 vLLM/SGLang. 앱은 127.0.0.1로 연결된 SSH 터널로만 접속합니다 |
+
+- OpenRouter 요청(Jev·장애 전환)은 `data_collection: deny`, `zdr: true`, `allow_fallbacks: false`와 가격 상한을 붙여 보냅니다. 이것은 요청 조건이며, OpenRouter와 그 뒤 제공자가 실제로 지키는지는 이 코드가 검증하지 못합니다.
+- 장애 전환은 턴 id를 원장 멱등 키로 씁니다. 같은 턴의 재시도는 끝난 응답을 재사용하거나, 결과가 미확정이면 다시 보내지 않습니다(이중 과금 없음). 분당 호출 상한은 `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE`(기본 120)입니다.
+- Jev 호출이 실패하거나 시간을 넘기면 규칙만으로 처리합니다(fail-open). 페르소나 카드·캡션·모델 응답은 Jev로 보내지 않습니다.
+- RunPod 호스트는 이 저장소 밖의 제3자 장비입니다. 프롬프트는 그 호스트의 엔진 프로세스가 처리하며, 호스트의 디스크·로그 보존과 접근 통제는 이 코드가 관리하지 않습니다. 접속 정보와 호스트 정보는 저장소에 두지 않습니다.
+- 이 표 밖의 직접 `PTR_CHAT_PROVIDER=openrouter` 경로(Goal1 연구 실행: 채팅과 질의 임베딩)도 같은 live 조건과 원장으로 OpenRouter에 보냅니다. External image는 위 창작물 계약을 따릅니다.
+- 연구·평가 스크립트(운영자가 live 조건을 켜고 직접 실행할 때만): `scripts/live-research.ts`는 라이선스 원본 캡션을, `scripts/import-image-annotations.ts`는 AI 이미지 설명 텍스트를 임베딩용으로 OpenRouter(`openai/text-embedding-3-small`)에 보냅니다. `scripts/evaluate.ts`, `scripts/evaluate-memory-context.ts`, `scripts/provider-bench.ts`, `scripts/bench-jev-gemma.ts`, `scripts/evaluate-jev-*.ts`, `scripts/s8-gates.ts`는 평가용 대화 프롬프트나 사용자 발화를 위 표와 같은 방식(OpenRouter 채팅·Jev, 또는 RunPod 엔진)으로 보냅니다.
+- 자체 엔진·게이트웨이 경로에는 실제 질의 임베딩이 없습니다. semantic 세션은 만들 수 없고(`SEMANTIC_UNAVAILABLE`), 임베딩을 위한 새 외부 전송은 연결하지 않았습니다.
 
 ## 대상과 최소화
 
@@ -44,3 +63,13 @@
 ## 코드 라이선스
 
 현재 별도 코드 `LICENSE`는 지정하지 않았습니다. 향후 코드 라이선스를 명시하더라도 적용 대상은 자체 작성 코드이며, 승인 데이터·사진·캡션·원본 제공자 자료에 대한 재배포 권리를 부여하지 않습니다.
+
+## 출처 (외부 전송 절, 코드 기준)
+
+- Jev 요청 구성과 보내는 상태: `packages/providers/src/jev.ts` (`decisionState`, `DEFAULT_JEV_MODEL`), 직전 발화 선택: `packages/core/src/chat-service.ts` (`recentUserTurns`), 안전 검사 창: `packages/core/src/input-safety.ts` (`SAFETY_WINDOW`), 의도 분류 조건: `packages/core/src/intent-routing.ts` (`needsIntentClassifier`), 켜는 설정: `apps/api/src/runtime.ts`
+- OpenRouter 요청 조건과 live 조건: `packages/providers/src/openrouter.ts` (`provider()`, `decide()`, `liveOptionsFromEnvironment`), 원장: `packages/providers/src/budget.ts`
+- 장애 전환 조건과 모델: `apps/gateway/src/pool.ts` (`UpstreamPool.complete`), `apps/gateway/src/main.ts` (`FAILOVER_MODEL`, `failoverOptions`), 분류표: `docs/goal2-serving.md` "Primary failure classification"
+- 프롬프트 구성(근거 3건): `packages/core/src/prompts.ts` (`buildExperimentContext`, `EVIDENCE_POST_LIMIT`)
+- 자체 엔진 연결(loopback만): `apps/gateway/src/upstreams.ts` (`OpenAICompatibleUpstream`), `packages/providers/src/openai-compatible.ts`, GPU 호스트 스크립트: `infra/gpu/README.md`
+- 스크립트의 외부 호출: `scripts/live-research.ts` (`client.embed`), `scripts/import-image-annotations.ts` (`client.embed`), 그 밖에 `OpenRouterClient`를 만드는 `scripts/*.ts`
+- semantic 거절: `apps/api/src/runtime.ts` (`semanticSearch`), `packages/core/src/chat-service.ts` (`createSession`)

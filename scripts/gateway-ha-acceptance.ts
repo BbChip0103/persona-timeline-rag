@@ -51,7 +51,8 @@ async function startGateway(name:string,port:number,env:NodeJS.ProcessEnv,preloa
   const child=spawn(process.execPath,['--import','tsx',...(preload?['--import',preload]:[]),'apps/gateway/src/main.ts'],{stdio:['ignore','pipe','pipe'],
     env:{PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_GATEWAY_PORT:String(port),PTR_GATEWAY_TOKEN:TOKEN,PTR_GATEWAY_ID:name,
       PTR_GATEWAY_REGISTRY:'on',PTR_REDIS_URL:process.env.PTR_REDIS_URL,PTR_REGISTRY_PREFIX:PREFIX,PTR_GATEWAY_ALLOW:ALLOW,PTR_GATEWAY_ROUTE_LOG_SAMPLE:'0',
-      PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_GATEWAY_POOL:POOL,...env}});
+      // Fake engines send headers with the first token, not at once like vLLM: keep the headers timeout off, as before.
+      PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_GATEWAY_POOL:POOL,PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS:'0',...env}});
   const lines:string[]=[];
   for(const stream of [child.stdout!,child.stderr!]) stream.on('data',(chunk:Buffer)=>{for(const line of chunk.toString('utf8').split('\n')) if(line.trim()) lines.push(`${Date.now()} ${line}`);});
   const exit=new Promise<{code:number|null;signal:NodeJS.Signals|null;at:number}>(resolve=>child.once('exit',(code,signal)=>resolve({code,signal,at:Date.now()})));

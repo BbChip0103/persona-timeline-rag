@@ -10,7 +10,11 @@ import { EngineTelemetry, type TelemetryMetrics, type TelemetryOptions } from '.
 import { OpenAICompatibleUpstream, UpstreamConnectError, type ChatCompletionRequest, type RequestContext, type Upstream, type UpstreamResult } from './upstreams';
 
 export interface FailoverOptions extends BreakerOptions {
-  /** 0 = off. The primary must send response headers within this time; the stream after that is not limited. */
+  /**
+   * The primary must send response headers within this time (default 10000; 0 = off); the stream after that is not
+   * limited. A timeout counts toward the breaker. So does a caller that gives up after waiting at least this long
+   * without headers (the worker's own deadline), when it is on.
+   */
   headersTimeoutMs:number;
   /**
    * Treat a primary connection closed before any response byte like a connection failure (another primary, then the
@@ -22,7 +26,7 @@ export interface FailoverOptions extends BreakerOptions {
   maxPerMinute:number;
 }
 export const DEFAULT_FAILOVER:FailoverOptions={failureThreshold:3,timeoutThreshold:3,cooldownMs:30000,probeTimeoutMs:2000,
-  headersTimeoutMs:0,failOverOnClose:true,maxPerMinute:120};
+  headersTimeoutMs:10000,failOverOnClose:true,maxPerMinute:120};
 export interface FailoverMetrics {
   secondary:string;
   /** Primary breaker; with several primaries: closed if any is closed, counts summed, streaks the largest. */
@@ -523,7 +527,10 @@ export class UpstreamPool implements Upstream {
         // Sent and unanswered in time (the gateway's deadline, the headers timeout, or the HTTP client's own
         // timeout): it may be in the model, so it is never retried elsewhere.
         const timeout=isTimeout(error)?error:primarySignal.aborted&&isTimeout(primarySignal.reason)?primarySignal.reason:undefined;
-        if(timeout) member.health.timedOut();
+        // A caller that left after waiting at least the headers timeout without headers saw a hung primary too
+        // (e.g. the timer ran late); it is counted for the breaker only, and the caller's own error is kept.
+        const gaveUp=!timeout&&signal.aborted&&this.options.headersTimeoutMs>0&&Date.now()-reservation.dispatchedAt>=this.options.headersTimeoutMs;
+        if(timeout||gaveUp) member.health.timedOut();
         release();
         throw timeout??error;
       }

@@ -10,10 +10,10 @@ function setup(provider:TextProvider={generate:jest.fn(async()=> '반가워요.'
   const events=new InMemoryTurnEvents();
   const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,timeoutMs:1000,leases:store,delivery,events,maxQueueDepth});
   const session=(owner='owner_q')=>chat.createSession(owner,{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
-  const worker=(id='worker-a',leaseMs=200)=>new TurnWorker({chat,leases:store,workerId:id,leaseMs});
+  const worker=(id='worker-a',leaseMs=200,maxQueueMs?:number)=>new TurnWorker({chat,leases:store,workerId:id,leaseMs,...(maxQueueMs!==undefined?{maxQueueMs}:{})});
   /** Connects a worker to the delivery queue, like a BullMQ consumer with the given concurrency. */
   const consume=(w:TurnWorker,concurrency=4)=>delivery.consume(d=>w.handle(d).then(()=>undefined),{concurrency});
-  const dispatcher=(maxAttempts=2)=>new TurnDispatcher({leases:store,delivery,events,maxAttempts,graceMs:0,intervalMs:20});
+  const dispatcher=(maxAttempts=2,maxQueueMs?:number)=>new TurnDispatcher({leases:store,delivery,events,maxAttempts,graceMs:0,intervalMs:20,...(maxQueueMs!==undefined?{maxQueueMs}:{})});
   return {store,delivery,events,chat,session,worker,consume,dispatcher,provider};
 }
 
@@ -298,6 +298,26 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     expect(failures).toEqual([{turnId:turn.id,code:'RETRIEVAL_UNAVAILABLE'}]);
     expect(generate).not.toHaveBeenCalled();
   });
+  test('without a real query embedder (semanticSearch:false) semantic sessions are refused at creation, and turns of an older one fail as RETRIEVAL_UNAVAILABLE',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    const generate=jest.fn(async()=> '반가워요.');const search=jest.fn(async()=>[]);
+    const options={store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:1000,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate},retrieval:{search},onTurnFailure:(failure:{turnId:string;code:string})=>failures.push(failure)};
+    const base={personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,timezone:'UTC'};
+    const chat=new ChatService({...options,semanticSearch:false});
+    await expect(chat.createSession('owner_q',{...base,retrievalMode:'semantic'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+    // A RAG condition without a mode defaults to semantic: refused too, never silently switched to lexical.
+    await expect(chat.createSession('owner_q',{...base,ragCondition:'caption'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+    await expect(chat.createSession('owner_q',{...base,retrievalMode:'lexical'})).resolves.toMatchObject({retrievalMode:'lexical'});
+    // A semantic session created while semantic search was available (same store), now served by a runtime without it.
+    const old=await new ChatService(options).createSession('owner_q',{...base,retrievalMode:'semantic'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:old.id,clientRequestId:'semantic-old',text:'안녕'});
+    await new TurnWorker({chat,leases:store,workerId:'w-s',leaseMs:5000}).handle(dispatch!);
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
+    expect(failures).toEqual([{turnId:turn.id,code:'RETRIEVAL_UNAVAILABLE'}]);
+    expect(generate).not.toHaveBeenCalled();expect(search).not.toHaveBeenCalled();
+  });
   test('free text in a TURN_FAILED message never reaches the failure log (UNSPECIFIED instead)',async()=>{
     const failures:{turnId:string;code:string}[]=[];
     const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
@@ -331,5 +351,60 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     expect(reconcile.mock.calls.length).toBeLessThanOrEqual(2);
     expect(reconcile).toHaveBeenCalledWith(3,15000);
     expect(events.published).toContainEqual({turnId:'t-lost',state:'failed',errorCode:'WORKER_LOST'});
+  });
+});
+
+describe('queue wait limit (PTR_TURN_MAX_QUEUE_MS): an unclaimed turn fails with QUEUE_TIMEOUT instead of running late',()=>{
+  const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+  test('the dispatcher sweep fails a turn still unclaimed after the limit, publishes QUEUE_TIMEOUT, and a late delivery never runs it',async()=>{
+    const {chat,session,worker,dispatcher,events,provider}=setup();
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'old',text:'안녕'});
+    const d=dispatcher(2,50);
+    await d.tick();expect((await chat.getTurn('owner_q',turn.id)).state).toBe('pending'); // younger than the limit
+    await sleep(80);await d.tick();
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'QUEUE_TIMEOUT'});
+    expect(events.published).toContainEqual({turnId:turn.id,state:'failed',errorCode:'QUEUE_TIMEOUT'});
+    expect(await worker().handle(dispatch!)).toBe('skipped');
+    expect(provider.generate).not.toHaveBeenCalled();
+    await d.tick();expect(events.published.filter(e=>e.turnId===turn.id)).toHaveLength(1); // swept once
+    await expect(chat.startTurn('owner_q',{sessionId:s.id,clientRequestId:'again',text:'다시'})).resolves.toMatchObject({state:'pending'});
+  });
+  test('a worker never claims a turn older than the limit, even when no sweep has run yet',async()=>{
+    const {chat,session,worker,provider}=setup();
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'late',text:'안녕'});
+    await sleep(80);
+    expect(await worker('worker-a',200,50).handle(dispatch!)).toBe('skipped');
+    expect(provider.generate).not.toHaveBeenCalled();
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('pending');
+  });
+  test('a claimed turn is never swept, even when it runs past the limit (the 30 s turn timer owns it from the claim)',async()=>{
+    const provider:TextProvider={generate:jest.fn(async()=>{await sleep(150);return '반가워요.';})};
+    const {chat,session,worker,dispatcher}=setup(provider);
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'running',text:'안녕'});
+    const running=worker('worker-a',200,50).handle(dispatch!);
+    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
+    await sleep(80);await dispatcher(2,50).tick();
+    expect(await running).toBe('executed');
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('completed');
+  });
+  test('a requeued turn gets a fresh wait from its requeue; if no worker takes it in time it fails as WORKER_LOST (it may have reached a model), not QUEUE_TIMEOUT',async()=>{
+    const provider:TextProvider={generate:jest.fn(()=>new Promise<string>(()=>{}))};
+    const {chat,session,worker,dispatcher,store,events}=setup(provider);
+    const s=await session();
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'requeued',text:'안녕'});
+    const dead=worker('worker-dead',50);void dead.handle(dispatch!);
+    await until(async()=>(await chat.getTurn('owner_q',turn.id)).state==='generating');
+    dead.kill();await sleep(120);
+    const d=dispatcher(3,100);
+    await d.tick(); // recovery requeues it; the turn is older than the limit, but its new wait has just started
+    expect((await chat.getTurn('owner_q',turn.id)).state).toBe('pending');
+    await sleep(130);await d.tick();
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'WORKER_LOST'});
+    expect(events.published).toContainEqual({turnId:turn.id,state:'failed',errorCode:'WORKER_LOST'});
+    expect(await store.claimTurn(turn.id,'worker-b',200)).toBeUndefined();
+    expect(provider.generate).toHaveBeenCalledTimes(1);
   });
 });

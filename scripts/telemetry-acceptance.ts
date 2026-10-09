@@ -41,7 +41,9 @@ async function setup(specs:(FakeEngineConfig&{maxSeqs?:number})[],options:Partia
   for(const engine of engines) await engine.start();
   const records:UpstreamRecord[]=specs.map((spec,i)=>({pool:'fake',id:spec.name,baseUrl:engines[i]!.baseUrl,maxSeqs:spec.maxSeqs??12,kvCapacityTokens:spec.kvCapacityTokens,
     weight:1,state:'active',epoch:'file',seq:0}));
-  const pool=new UpstreamPool({model:'fake',source:new StaticUpstreamSource(records),admission:true,maxQueue:256,queueTimeoutMs:10000,slowStartMs:0,...options});
+  // The fake engines send headers with the first token (after queueing/prefill), unlike vLLM, which sends them at once: the
+  // default primary headers timeout (10 s) would count their queueing as hung-engine timeouts, so it is off here as before.
+  const pool=new UpstreamPool({model:'fake',source:new StaticUpstreamSource(records),admission:true,maxQueue:256,queueTimeoutMs:10000,slowStartMs:0,...options,failover:{headersTimeoutMs:0,...options.failover}});
   const token=randomBytes(24).toString('hex');
   const {server}=createGateway({token,upstream:pool,limits:{maxConcurrent:4096,maxQueue:4096,queueTimeoutMs:10000,upstreamTimeoutMs:60000}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',()=>resolve()));

@@ -358,6 +358,71 @@ integration('turn outbox, per-turn leases, fencing and recovery (synthetic fixtu
     });
   });
 
+  describe('queue wait limit (QUEUE_TIMEOUT): compare-and-set against the claim', () => {
+    const LIMIT = 60_000;
+    /** Moves a synthetic turn's creation and its outbox entry (when it was last queued) into the past (this file's own rows only). */
+    const age = async (turnId: string, ms: number) => {
+      await pool.query(`UPDATE turns SET created_at=now()-make_interval(secs => $2::double precision/1000) WHERE id=$1`, [turnId, ms]);
+      await pool.query(`UPDATE turn_outbox SET created_at=now()-make_interval(secs => $2::double precision/1000) WHERE turn_id=$1`, [turnId, ms]);
+    };
+    const ids = (failed: { turnId: string }[]) => failed.map(f => f.turnId);
+    it('fails a pending turn unclaimed past the limit once, retires its outbox entry and blocks later claims; a younger turn stays', async () => {
+      const old = await enqueue(await session()); const young = await enqueue(await session());
+      await age(old.id, LIMIT + 5_000);
+      const first = await store.expireQueued(LIMIT);
+      expect(first).toContainEqual({ turnId: old.id, errorCode: 'QUEUE_TIMEOUT' }); expect(ids(first)).not.toContain(young.id);
+      expect(await store.getTurn(old.id, `owner-${scope}`)).toMatchObject({ state: 'failed', errorCode: 'QUEUE_TIMEOUT' });
+      expect(await outboxOf(old.id)).toEqual([]); expect(await leaseOf(old.id)).toEqual([]);
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(old.id);
+      expect(await store.claimTurn(old.id, 'w-late', 5000)).toBeUndefined();
+      expect(await store.claimTurn(young.id, 'w-a', 5000, LIMIT)).toBeDefined();
+    });
+    it('the claim itself refuses a turn older than the limit (no sweep needed); without a limit it claims as before', async () => {
+      const turn = await enqueue(await session());
+      await age(turn.id, LIMIT + 5_000);
+      expect(await store.claimTurn(turn.id, 'w-a', 5000, LIMIT)).toBeUndefined();
+      expect(await turnRow(turn.id)).toMatchObject({ lease_owner: null, attempts: 0, state: 'pending' });
+      expect((await store.claimTurn(turn.id, 'w-b', 5000))!.fence).toEqual({ workerId: 'w-b', attempt: 1 });
+    });
+    it('a claimed turn is never expired, whatever its age; a requeued one waits afresh from its requeue, then fails as WORKER_LOST', async () => {
+      const turn = await enqueue(await session());
+      const claimed = await store.claimTurn(turn.id, 'w-a', 30);
+      await age(turn.id, LIMIT + 5_000);
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(turn.id);
+      await store.transitionTurn(turn.id, ['pending'], 'generating', undefined, claimed!.fence);
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(turn.id);
+      await sleep(50);
+      expect((await store.recoverExpired(3)).requeued).toContain(turn.id);
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(turn.id); // the requeue wrote a fresh outbox entry
+      await age(turn.id, LIMIT + 5_000);
+      expect(await store.claimTurn(turn.id, 'w-b', 5000, LIMIT)).toBeUndefined();
+      expect(await store.expireQueued(LIMIT)).toContainEqual({ turnId: turn.id, errorCode: 'WORKER_LOST' });
+      expect(await store.getTurn(turn.id, `owner-${scope}`)).toMatchObject({ state: 'failed', errorCode: 'WORKER_LOST' });
+    });
+    it('a claim holding the row lock wins: the sweep skips it without waiting and never fails it after the claim commits', async () => {
+      const turn = await enqueue(await session());
+      await age(turn.id, LIMIT + 5_000);
+      const claim = await holder();
+      expect(await storeOn(claim.client).claimTurn(turn.id, 'w-a', 5000)).toBeDefined();
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(turn.id); // SKIP LOCKED
+      await claim.end('COMMIT');
+      expect(ids(await store.expireQueued(LIMIT))).not.toContain(turn.id);
+      expect(await turnRow(turn.id)).toMatchObject({ lease_owner: 'w-a', state: 'pending' });
+    });
+    it('a sweep holding the row lock wins: a claim queued behind it finds the turn failed and runs nothing', async () => {
+      const turn = await enqueue(await session());
+      await age(turn.id, LIMIT + 5_000);
+      const sweep = await holder();
+      expect(ids(await storeOn(sweep.client).expireQueued(LIMIT))).toContain(turn.id);
+      const claim = store.claimTurn(turn.id, 'w-a', 5000); // no limit: only the compare-and-set can stop it
+      await waitingOn(sweep.pid);
+      await sweep.end('COMMIT');
+      expect(await claim).toBeUndefined();
+      expect(await turnRow(turn.id)).toMatchObject({ lease_owner: null, attempts: 0, state: 'failed' });
+      expect(await leaseOf(turn.id)).toEqual([]);
+    });
+  });
+
   it('migration 0008 carries active leases over from turns, drops the old column and index, and is idempotent', async () => {
     const client = await pool.connect();
     const schema = `ptr_migtest_${randomUUID().replace(/-/g, '').slice(0, 12)}`;

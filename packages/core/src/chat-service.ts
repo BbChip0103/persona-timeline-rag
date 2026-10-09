@@ -16,6 +16,12 @@ import { replyText, speechLevel, utteranceLanguage, voiceText, type VoiceTextKey
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
   leases:TurnLeaseStore;delivery:TurnDelivery;
+  /**
+   * False when the runtime has no real query embedder (self-hosted and gateway chat, R10): semantic sessions are then
+   * refused at creation (SEMANTIC_UNAVAILABLE) and turns of an older one fail as RETRIEVAL_UNAVAILABLE, instead of
+   * searching an embedding space no source vector is in. Default true.
+   */
+  semanticSearch?:boolean;
   /** Backlog bound for admission control (default 256). */
   maxQueueDepth?:number;
   /** State-change notices for push delivery (SSE); never carries model output. */
@@ -58,6 +64,7 @@ export class ChatService {
     const parsed=CreateSessionSchema.safeParse(input);
     if(!parsed.success) throw new CoreError('INVALID_INPUT');
     const value=parsed.data;
+    if(value.retrievalMode==='semantic'&&this.options.semanticSearch===false) throw new CoreError('SEMANTIC_UNAVAILABLE');
     const raw=await this.options.personas.get(value.personaId,value.personaRevision);
     const result=PersonaSchema.safeParse(raw);
     if(!result.success) throw new CoreError('PERSONA_UNAVAILABLE');
@@ -190,6 +197,8 @@ export class ChatService {
     } finally { if(timer) clearTimeout(timer); }
   }
   private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {
+    // Any turn of a semantic session may search (the agent's tool too): with no real embedder, fail it up front.
+    if(session.retrievalMode==='semantic'&&this.options.semanticSearch===false) throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
     const history=await store.history(session.id,session.ownerId);
     if(history.length>(this.options.maxHistoryMessages ?? 100)) {
       await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT');return;

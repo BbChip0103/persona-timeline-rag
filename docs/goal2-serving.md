@@ -12,7 +12,7 @@ client ─POST /api/sessions/:id/turns──→ API ×N ── one transaction: 
                                             ▼                                                       │ claim / lease / fenced writes
                                  Redis: BullMQ queue + pub/sub ──deliver──→ worker ×M ──────────────┘
                                             ▲   state notices ◀── publish ──┘   │
-       dispatcher ×D: requeue expired leases / WORKER_LOST, re-publish unclaimed outbox entries
+       dispatcher ×D: requeue expired leases / WORKER_LOST, QUEUE_TIMEOUT, re-publish unclaimed outbox entries
                                                                                 ▼
                        LLM gateway (fake | self-hosted vLLM: one engine or a pool from a file / the Redis registry
                                     [+ optional OpenRouter failover] | OpenRouter)
@@ -49,6 +49,18 @@ All need `PTR_REDIS_URL` (`infra/compose.redis.yml`) and migrations through `000
 - The dispatcher (`PTR_DISPATCH_INTERVAL_MS`, 1000) returns turns with an expired lease to pending with a new
   `dispatch_seq` and outbox entry, or fails them with `WORKER_LOST` after `PTR_MAX_ATTEMPTS` (3) and publishes the
   failure. It is safe to run more than one. Its outbox sweep is database-wide.
+- Queue wait limit (`PTR_TURN_MAX_QUEUE_MS`, 60000, 1000–3600000; set the same value on workers and dispatchers): a
+  pending turn no worker holds fails once it has waited longer than this since it was last queued (its outbox entry:
+  the reservation, or the latest requeue after a lost lease), and the failure is published. A turn that never ran
+  fails with `QUEUE_TIMEOUT`; a requeued one (an earlier attempt may have reached a model) fails with `WORKER_LOST`.
+  The dispatcher's sweep does it each tick after recovery; it scans the outbox (every unclaimed pending turn has an
+  entry) and locks with `SKIP LOCKED`. The claim itself also refuses a turn past the limit, so no worker starts one
+  before the sweep runs. Both use the database clock and are compare-and-set on the turns row (state `pending`, empty
+  token): a claim committed first is never failed, and a failed turn is never claimed. A claimed turn is never failed
+  by this sweep, whatever its age; from the claim the turn timeout (30 s) owns it. For `QUEUE_TIMEOUT` the web UI shows
+  a short "try again in a moment" line in the session language; nothing ran, so trying again is safe.
+  Each requeue starts a fresh wait, so across `PTR_MAX_ATTEMPTS` a turn can stay unfinished for up to about
+  attempts × (limit + turn timeout + lease), roughly 5 minutes with the defaults.
 - Cancellation: the API marks the turn cancelled and publishes it; the worker running it is subscribed to the
   turn's channel and aborts the provider call at once (the lease heartbeat stays as the backstop).
 - Re-execution after a lost worker is safe for the live OpenRouter provider: its ledger reuses a settled response
@@ -88,6 +100,14 @@ aborts the upstream call. Upstream errors become 502 without that marker. SIGTER
 workers read (same section).
 Workers use `PTR_CHAT_PROVIDER=gateway` (`PTR_GATEWAY_TOKEN`, `PTR_GATEWAY_STRUCTURED=1` for guided decoding) and the
 client below.
+
+Semantic search with `PTR_CHAT_PROVIDER=gateway` or `selfhosted` (architecture review R10): these runtimes have no real
+query embedder (queries would get the fake hash embedding, `synthetic/hash-1536-v1`, while licensed source vectors
+are `openai/text-embedding-3-small`, so the `model_revision` filter would return no evidence). Session creation with
+`retrievalMode: semantic` (also the default of a RAG condition without a mode) is refused with 400
+`SEMANTIC_UNAVAILABLE`; turns of a semantic session created earlier fail (`TURN_FAILED`, reason
+`RETRIEVAL_UNAVAILABLE`) before any model or search call. Use `lexical`. Real query embeddings there would be a new
+external, paid transfer and are not wired. `fake` and `openrouter` keep semantic search.
 
 ### Worker gateway client: retries, gateway URLs, capacity rule
 
@@ -273,7 +293,7 @@ slot, so a full gateway queue still answers 429 `GATEWAY_QUEUE_FULL` / 503 `GATE
 | `PTR_GATEWAY_BREAKER_TIMEOUTS` | 3 (1–100) | consecutive primary timeouts that trigger a `/health` probe while closed; only a failed probe opens the breaker |
 | `PTR_GATEWAY_BREAKER_COOLDOWN_MS` | 30000 (1000–3600000) | how long an open breaker sends every request straight to the secondary |
 | `PTR_GATEWAY_BREAKER_PROBE_TIMEOUT_MS` | 2000 (100–30000) | timeout of a `GET /health` probe (a hung probe counts as failed) |
-| `PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS` | 0 = off (0–600000) | the primary must send response headers within this time (504, counted as a timeout, never failed over). The stream after the headers is not limited. vLLM streams through Starlette's `StreamingResponse`, which sends headers before the first token, so e.g. 10000 catches a hung tunnel without cutting queued or slow generations. Leave it off for non-streaming callers. |
+| `PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS` | 10000 (0–600000; 0 = off) | the primary must send response headers within this time (504, counted as a timeout, never failed over). The stream after the headers is not limited. vLLM streams through Starlette's `StreamingResponse`, which sends headers before the first token, so 10000 catches a hung engine or tunnel without cutting queued or slow generations. The worker always streams; set 0 only for non-streaming callers. It applies to pools, the failover wrapper and (without a breaker) the env-only engine with failover off. The fake-engine harnesses (`loadtest`, `routing-compare`, telemetry / registry / gateway-HA acceptance) set it to 0: their fake engines send headers only with the first token. |
 | `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` | 120 (1–100000) | secondary calls started per rolling minute; above it the request fails (502, `rateLimited`). Failover shares the ledger's lifetime call cap (10000) with chat and Jev: at 120/min a whole cap lasts at least 83 min of outage. |
 
 With failover on, keep `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` below 300000. Above it, undici's own 300 s headers timeout ends
@@ -289,7 +309,8 @@ Primary failure classification (`classifyTransportError`, `FailoverUpstream`):
 | DNS failure (`getaddrinfo`, `ENOTFOUND`, `EAI_AGAIN`) / TLS | no; cannot occur today (loopback IP over plain HTTP) | secondary (`dns`) | failures +1 |
 | connection closed or reset after connecting, before any response byte (`UND_ERR_SOCKET`, `ECONNRESET` on read, `EPIPE`, a reused keep-alive socket the engine closed, or any other transport error) | maybe; nothing was returned to the caller | **secondary** (`closed_before_response`) with `PTR_GATEWAY_FAILOVER_ON_CLOSE=true`, else 502 `UPSTREAM_UNAVAILABLE` | failures +1 |
 | no response headers before the headers timeout or `PTR_GATEWAY_UPSTREAM_TIMEOUT_MS` (hang after accept), or undici's own headers/body timeout (`UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`, 300 s) | maybe | 504 `UPSTREAM_TIMEOUT` | timeouts +1 (probe at the threshold) |
-| caller cancelled | maybe | none | no change |
+| caller cancelled after waiting at least the headers timeout without headers (on only when the headers timeout is) | maybe | none | timeouts +1 (probe at the threshold) |
+| caller cancelled earlier | maybe | none | no change |
 | any HTTP status other than 2xx, including 503 | maybe (see below) | 502 `UPSTREAM_HTTP_<status>` | both streaks reset |
 | 2xx, stream cut mid-response | yes | stream ends broken (client error) | both streaks reset |
 | breaker open | not sent to the primary | **secondary** (`breaker_open`) | — |
@@ -300,6 +321,18 @@ Why a primary 503 is never failed over (vLLM main at commit 194da61, 2026-10-08)
 - **Scaling:** the elastic-EP `ScalingMiddleware` answers 503 too ([middleware.py#L22-L44](https://github.com/vllm-project/vllm/blob/194da61de1769c28bfad2b6642c60cc7eca544dd/vllm/entrypoints/serve/elastic_ep/middleware.py#L22-L44)).
 
 The status alone cannot tell these apart. A dead EngineCore raises `EngineDeadError`, a `VLLMServerError` ([v1/engine/exceptions.py#L12](https://github.com/vllm-project/vllm/blob/194da61de1769c28bfad2b6642c60cc7eca544dd/vllm/v1/engine/exceptions.py#L12)) that maps to 500 ([error_response.py#L66-L69](https://github.com/vllm-project/vllm/blob/194da61de1769c28bfad2b6642c60cc7eca544dd/vllm/entrypoints/serve/exception_handling/error_response.py#L66-L69)). The handler then stops the server ([vllm_error.py#L28-L64](https://github.com/vllm-project/vllm/blob/194da61de1769c28bfad2b6642c60cc7eca544dd/vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py#L28-L64), [launcher.py#L197-L206](https://github.com/vllm-project/vllm/blob/194da61de1769c28bfad2b6642c60cc7eca544dd/vllm/entrypoints/launchers/launcher.py#L197-L206)), so later requests are refused through a direct port. Through an SSH tunnel (`ssh -L`) a dead engine behind a live tunnel shows up as closed before any response instead; this was reproduced locally with a `socat` forwarder in front of a closed port, which gave `UND_ERR_SOCKET`. Those requests fail over by default. A remote engine that hangs keeps the tunnel connection open; that is the timeout row. Undici's fetch blocks "bad ports" (e.g. port 1) with an uncoded error, which is therefore treated as closed before response; never point the primary at such a port.
+
+Hung engine (architecture review R1): before, the headers timeout was off and the gateway's own deadline (60 s) came
+after the worker's turn deadline (30 s), whose abort was not counted, so an engine that accepts connections and never
+answers never opened the breaker and every turn spent 30 s. Now the headers timeout is on by default and late caller
+aborts count too. A hung engine costs each turn up to 10 s (504) until `PTR_GATEWAY_BREAKER_TIMEOUTS` such timeouts in
+a row run a `/health` probe; a hung engine or tunnel does not answer it either (probe timeout), so the breaker opens
+and later requests go to another primary or, when configured, the secondary. The request that timed out is not
+resent anywhere, also not to another free primary: its body was sent, so it may be in the model (the timeout row
+above), and the gateway does not resubmit such a request to the paid secondary. Every secondary call stays keyed by
+the worker's turn id in the ledger, so nothing is billed twice (`apps/gateway/tests/failover.test.ts`, "hung engine").
+An engine whose `/health` still answers 200 while completions hang is not taken out (its probe passes); each of its
+calls still ends at the headers timeout.
 
 Breaker:
 - **Opening on failures:** `PTR_GATEWAY_BREAKER_FAILURES` consecutive connection failures open it.
@@ -340,7 +373,7 @@ Observability:
   - `failovers` by reason: `connect_refused`, `connect_timeout`, `connect_error`, `dns`, `closed_before_response`, `breaker_open`
   - `closedNotFailedOver`, `rateLimited`, `secondaryErrors`
 
-  Cancelled callers are not counted.
+  Cancelled callers are not counted here (a late one counts only toward the breaker's timeout streak).
 - **Failover off:** responses and metrics are unchanged for the `selfhosted` and `fake` upstreams. Departures that apply with failover off as well:
   - A malformed `X-PTR-Request-Key` is rejected with 400 `INVALID_INPUT` (the worker never sends one).
   - The `openrouter` upstream now scopes its ledger entries per turn when the header is present, so identical prompts of different turns are both billed instead of replayed.
@@ -348,10 +381,11 @@ Observability:
   - The `openrouter` upstream honours a lower `max_tokens` from the caller.
   - The `openrouter` upstream does not run the startup check.
   - An undici headers/body timeout from a self-hosted upstream now answers 504 `UPSTREAM_TIMEOUT` instead of 502.
+  - The env-only self-hosted engine ends a call that has no response headers after `PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS` (default 10000) with 504 `UPSTREAM_TIMEOUT`; there is no breaker or alternative here.
 - **Turn trace:** the worker does not record the serving upstream in it (the provider port returns text only).
 
 Runbook:
-- **Enable:** set `PTR_GATEWAY_UPSTREAM=selfhosted PTR_GATEWAY_FAILOVER=openrouter` plus the live flags and the ledger database (`GOAL1_DATABASE_URL`/`DATABASE_URL`), e.g. `GOAL1_LIVE_ENABLED=true node --env-file=.env.local --import tsx apps/gateway/src/main.ts`. Consider `PTR_GATEWAY_PRIMARY_HEADERS_TIMEOUT_MS=10000` for streaming workers.
+- **Enable:** set `PTR_GATEWAY_UPSTREAM=selfhosted PTR_GATEWAY_FAILOVER=openrouter` plus the live flags and the ledger database (`GOAL1_DATABASE_URL`/`DATABASE_URL`), e.g. `GOAL1_LIVE_ENABLED=true node --env-file=.env.local --import tsx apps/gateway/src/main.ts`. The primary headers timeout is on (10000) by default; keep it for streaming workers.
 - **Watch:** `failover.breaker.state`, `answered.secondary` and `rateLimited` in `/metrics`. Every secondary answer is billed to the shared ledger.
 - **Breaker stuck open:** `/health` on the engine origin is failing; check the engine and the SSH tunnel (`curl http://127.0.0.1:<port>/health`).
 - **Stop paid traffic:** restart the gateway without `PTR_GATEWAY_FAILOVER`, lower `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE`, or lower the ledger caps. In-flight secondary calls finish within the shutdown drain.

@@ -7,6 +7,8 @@ export interface TurnWorkerOptions {
   leaseMs:number;
   /** Cancellation notices abort the provider call at once; the lease heartbeat stays as the backstop. */
   cancellations?:TurnEventSource;
+  /** PTR_TURN_MAX_QUEUE_MS: a turn that waited longer than this since it was last queued is not claimed (the dispatcher fails it). Unset = no limit. */
+  maxQueueMs?:number;
   onError?:(phase:'claim'|'execute',error:unknown)=>void;
 }
 
@@ -23,7 +25,7 @@ export class TurnWorker {
   async handle(dispatch:TurnDispatch):Promise<'executed'|'skipped'> {
     if(this.dead) return 'skipped';
     let queued;
-    try {queued=await this.options.leases.claimTurn(dispatch.turnId,this.options.workerId,this.options.leaseMs);}
+    try {queued=await this.options.leases.claimTurn(dispatch.turnId,this.options.workerId,this.options.leaseMs,this.options.maxQueueMs);}
     catch(error) {this.options.onError?.('claim',error);throw error;}
     if(!queued||this.dead) return 'skipped';
     const controller=new AbortController();
@@ -63,10 +65,18 @@ export interface TurnDispatcherOptions {
   intervalMs:number; batch?:number;
   /** Lease drift repair (reconcileLeases), run at most once per intervalMs; graceMs should be at least one lease. */
   reconcile?:{intervalMs:number;graceMs:number};
-  onError?:(phase:'recover'|'reconcile'|'dispatch',error:unknown)=>void;
+  /**
+   * PTR_TURN_MAX_QUEUE_MS: pending turns no worker holds fail once they waited this long since they were last queued
+   * (QUEUE_TIMEOUT, or WORKER_LOST for a requeued one). Unset = no limit.
+   */
+  maxQueueMs?:number;
+  onError?:(phase:'recover'|'reconcile'|'expire'|'dispatch',error:unknown)=>void;
 }
 
-/** Recovery loop: requeues expired leases (or fails them with WORKER_LOST) and re-publishes undelivered outbox entries. */
+/**
+ * Recovery loop: requeues expired leases (or fails them with WORKER_LOST), fails turns that waited too long for a
+ * worker (QUEUE_TIMEOUT; WORKER_LOST for a requeued one) and re-publishes undelivered outbox entries.
+ */
 export class TurnDispatcher {
   private timer?:ReturnType<typeof setInterval>;
   private running?:Promise<void>;
@@ -91,6 +101,10 @@ export class TurnDispatcher {
         for(const turnId of failed) await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
       } catch(error) {this.options.onError?.('reconcile',error);}
     }
+    if(this.options.maxQueueMs!==undefined) try {
+      for(const {turnId,errorCode} of await this.options.leases.expireQueued(this.options.maxQueueMs))
+        await this.options.events?.publish({turnId,state:'failed',errorCode}).catch(()=>undefined);
+    } catch(error) {this.options.onError?.('expire',error);}
     try {
       for(const dispatch of await this.options.leases.pendingDispatches(this.options.graceMs,this.options.batch??500))
         await this.options.delivery.publish(dispatch);

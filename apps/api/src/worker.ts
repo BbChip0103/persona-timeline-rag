@@ -15,8 +15,9 @@ async function main() {
   const runtime=createRuntime(process.env,{onTurnFailure:({code})=>process.stderr.write(`turn failed ${code}\n`)});
   const workerId=process.env.PTR_WORKER_ID??`worker-${randomUUID().slice(0,8)}`;
   // Lease must outlive several heartbeats (lease/3); the dispatcher requeues turns whose lease expired.
+  // A turn that waited longer than PTR_TURN_MAX_QUEUE_MS for a worker is not run (the dispatcher fails it with QUEUE_TIMEOUT).
   const worker=new TurnWorker({chat:runtime.chat,leases:runtime.leases,workerId,leaseMs:integer('PTR_LEASE_MS',15000,300,600000),
-    cancellations:runtime.eventSource,onError:phase=>process.stderr.write(`worker ${phase} error\n`)});
+    maxQueueMs:integer('PTR_TURN_MAX_QUEUE_MS',60000,1000,3600000),cancellations:runtime.eventSource,onError:phase=>process.stderr.write(`worker ${phase} error\n`)});
   const concurrency=integer('PTR_WORKER_CONCURRENCY',32,1,1024), replicas=integer('PTR_WORKER_REPLICAS_HINT',1,1,1024);
   const consumer=startTurnConsumer(process.env.PTR_REDIS_URL??'',dispatch=>worker.handle(dispatch),
     {concurrency,queueName:process.env.PTR_TURN_QUEUE??'turns',onError:()=>process.stderr.write('worker queue error\n')});

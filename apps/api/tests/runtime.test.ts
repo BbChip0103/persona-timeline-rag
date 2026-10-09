@@ -66,6 +66,15 @@ test('gateway URLs: PTR_GATEWAY_URLS is a priority list (PTR_GATEWAY_URL a list 
   for(const extra of [{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,https://example.com/v1'},{PTR_GATEWAY_URLS:' , '},{PTR_GATEWAY_RESET_RETRIES:'-1'},{PTR_GATEWAY_RESET_RETRIES:''},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:' '},{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,http://127.0.0.1:56460/v1'},{PTR_GATEWAY_RESET_RETRIES:'11'},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'x'}])
     expect(()=>createRuntime({...base,...extra})).toThrow();
 });
+test('selfhosted and gateway chat have no real query embedder: semantic sessions are refused before any lookup (fake and openrouter keep semantic)',async()=>{
+  const session={personId:'person_synthetic',personaId:'persona_synthetic',personaRevision:'v1',timezone:'UTC',retrievalMode:'semantic' as const};
+  for(const env of [{PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'http://127.0.0.1:18000/v1',PTR_SELFHOSTED_MODEL:'m'},
+    {PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'}]) {
+    const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,...env});
+    await expect(runtime.chat.createSession('owner_synthetic',session)).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+    await runtime.close?.();
+  }
+});
 test('PTR_GATEWAY_DISCOVERY=redis: calls follow the gateway registry (leader first), with PTR_GATEWAY_URLS as the seed; PTR_GATEWAY_ALLOW is validated',async()=>{
   const served:string[]=[];
   const server=createServer((req,res)=>{req.resume();req.on('end',()=>{served.push(String(req.url));res.writeHead(200,{'Content-Type':'text/event-stream'});

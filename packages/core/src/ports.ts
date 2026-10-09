@@ -42,8 +42,12 @@ export interface TurnDispatch { turnId:string; seq:number }
  * written only on claim and recovery; a renewal extends only the lease expiry, and a turn that ends drops its lease.
  */
 export interface TurnLeaseStore {
-  /** Leases one dispatched turn to this worker only if it is pending and not held by a live lease; otherwise undefined. */
-  claimTurn(turnId:string,workerId:string,leaseMs:number):Promise<QueuedTurn|undefined>;
+  /**
+   * Leases one dispatched turn to this worker only if it is pending and not held by a live lease; otherwise undefined.
+   * With `maxQueueMs`, a turn that has waited longer than that since it was last queued (its outbox entry: the
+   * reservation, or the latest requeue) is not claimed either (expireQueued fails it).
+   */
+  claimTurn(turnId:string,workerId:string,leaseMs:number,maxQueueMs?:number):Promise<QueuedTurn|undefined>;
   /**
    * Extends the lease while the turn is still active under this fence and the lease has not expired yet (an expired
    * lease may already be claimed by another worker); false means stop (cancelled, lost or expired).
@@ -62,6 +66,13 @@ export interface TurnLeaseStore {
    * published again; re-publishing a dispatch the queue still holds is a no-op there.
    */
   pendingDispatches(graceMs:number,limit:number):Promise<TurnDispatch[]>;
+  /**
+   * Fails every pending turn that no worker holds and that has waited longer than maxQueueMs since it was last queued:
+   * QUEUE_TIMEOUT when it never ran (attempts 0), WORKER_LOST when it was requeued after a lost worker (an earlier
+   * attempt may have reached a model). Compare-and-set on the state and the empty token, so a turn claimed at the same
+   * moment is left alone and a failed one can no longer be claimed.
+   */
+  expireQueued(maxQueueMs:number):Promise<{turnId:string;errorCode:'QUEUE_TIMEOUT'|'WORKER_LOST'}[]>;
 }
 /** Hands reserved turns to workers (BullMQ in production). Publishing the same dispatch twice must be harmless. */
 export interface TurnDelivery {
@@ -74,7 +85,7 @@ export interface TurnEvent { turnId:string; state:TurnState; errorCode?:string }
 export interface TurnEvents { publish(event:TurnEvent):Promise<void> }
 /** Listening side of turn events (SSE readers; workers watching for cancellation). Returns an unsubscribe function. */
 export interface TurnEventSource { subscribe(turnId:string,listener:(event:TurnEvent)=>void):Promise<()=>void> }
-export type CoreErrorCode='NOT_FOUND'|'FORBIDDEN'|'TURN_ACTIVE'|'IDEMPOTENCY_CONFLICT'|'INVALID_INPUT'|'TURN_FAILED'|'CONTEXT_LIMIT'|'PERSONA_UNAVAILABLE'|'QUEUE_FULL';
+export type CoreErrorCode='NOT_FOUND'|'FORBIDDEN'|'TURN_ACTIVE'|'IDEMPOTENCY_CONFLICT'|'INVALID_INPUT'|'TURN_FAILED'|'CONTEXT_LIMIT'|'PERSONA_UNAVAILABLE'|'QUEUE_FULL'|'SEMANTIC_UNAVAILABLE';
 /** Why a turn failed: a constant logged by onTurnFailure, never free text (the stored/client code stays TURN_FAILED). */
 export type TurnFailureReason='TURN_ABORTED'|'TURN_TIMEOUT'|'REPLY_REJECTED'|'TOOL_QUERY_REJECTED'|'TOOL_LIMIT'|'TOOL_REPEATED'|'RETRIEVAL_UNAVAILABLE';
 export class CoreError extends Error {
