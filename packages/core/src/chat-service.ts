@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type ProviderMessage, type SendTurnInput, type SourcePost } from '@ptr/contracts';
-import { CoreError, LEASE_LOST, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
+import { CoreError, LEASE_LOST, PROVIDER_DEADLINE, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
@@ -193,7 +193,9 @@ export class ChatService {
       // provider error code are logged only when they look like a constant, otherwise as UNSPECIFIED, so free text
       // can never reach the log.
       const constant=(value:string)=>/^[A-Z_]{1,40}$/.test(value)?value:'UNSPECIFIED';
-      const message=error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
+      // The gateway refused or cut a model call at the turn deadline: a turn timeout, reported like the timer's own (§4.7).
+      const message=providerCode===PROVIDER_DEADLINE?'TURN_TIMEOUT'
+        :error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
       this.options.onTurnFailure?.({turnId:turn.id,code:message!==undefined?constant(message):typeof providerCode==='string'?constant(providerCode)
         :error instanceof Error?error.constructor.name:'UNKNOWN'});
     } finally { if(timer) clearTimeout(timer); }

@@ -7,7 +7,7 @@ import { HASH_SALT, PrefixTable } from './prefix';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
 import { EngineTelemetry, type TelemetryMetrics, type TelemetryOptions } from './telemetry';
-import { OpenAICompatibleUpstream, UpstreamConnectError, type ChatCompletionRequest, type RequestContext, type Upstream, type UpstreamResult } from './upstreams';
+import { DEADLINE_MARGIN_MS, OpenAICompatibleUpstream, SECONDARY_MIN_REMAINING_MS, UpstreamConnectError, type ChatCompletionRequest, type RequestContext, type Upstream, type UpstreamResult } from './upstreams';
 
 export interface FailoverOptions extends BreakerOptions {
   /**
@@ -70,7 +70,8 @@ export interface PoolQueueMetrics {
   routing:RoutingPolicy; fairness:'fifo'|'drr';
   queued:Record<'1'|'0'|'-1',number>; queuedTokens:number;
   waitMs:{p50:number|null;p95:number|null};
-  rejected:{queue_full:number;saturated:number;queue_timeout:number;draining:number};
+  /** `deadline`: refused because the caller's X-PTR-Deadline left too little time to send (nothing was sent). */
+  rejected:{queue_full:number;saturated:number;queue_timeout:number;draining:number;deadline:number};
   /** G: the global prefix (policy block) learned from the first request's msg0, in tokens. */
   globalPrefixTokens:number;
   /** Recent uncached prompt tokens per second reaching a first chunk (Retry-After estimate); null before any. */
@@ -115,7 +116,10 @@ export interface PoolOptions {
   primaryAttempts?:number;
   /** Linear ramp of a newly added upstream's limit (PTR_GATEWAY_SLOW_START_MS). Default 30000; 0 = off. */
   slowStartMs?:number;
-  /** Longest wait in the pool queue before a marked 503 GATEWAY_QUEUE_TIMEOUT. Default 10000. */
+  /**
+   * Longest wait in the pool queue before a marked 503 GATEWAY_QUEUE_TIMEOUT. Default 10000. A request with a deadline
+   * (RequestContext.deadlineAt) waits at most until DEADLINE_MARGIN_MS before it, then gets GATEWAY_DEADLINE.
+   */
   queueTimeoutMs?:number;
   /**
    * The pool owns admission (S3): the gateway's own limiter is bypassed, requests wait in this pool's band queue, and
@@ -183,6 +187,8 @@ interface Pending extends QueuedRequest {
   estimate:RequestEstimate&{cachedPrefix:number}; exclude:Set<Member>;
   /** For the routing log: the caller's request key (hashed there), a retry on another primary, arrival at the pool. */
   requestKey:string|undefined; retry:boolean; arrivedAt:number;
+  /** Latest send time (X-PTR-Deadline − DEADLINE_MARGIN_MS; Infinity without a deadline). */
+  sendBy:number;
   settle:(result:{member:Member;reservation:Reservation}|{none:string|undefined})=>void; reject:(error:unknown)=>void;
 }
 /**
@@ -254,7 +260,7 @@ export class UpstreamPool implements Upstream {
   private readonly waits:number[]=[];
   private readonly processed:{at:number;tokens:number}[]=[];
   private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
-  private readonly rejected={queue_full:0,saturated:0,queue_timeout:0,draining:0};
+  private readonly rejected={queue_full:0,saturated:0,queue_timeout:0,draining:0,deadline:0};
   private draining=false;
   private readonly affinityCounts:Record<AffinityOutcome,number>={picked:0,brokenBySlack:0,none:0};
   private readonly ttfts:number[]=[];private readonly e2es:number[]=[];
@@ -290,8 +296,10 @@ export class UpstreamPool implements Upstream {
   async complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult> {
     const arrivedAt=Date.now();
     const estimate=this.learnPrefix(estimateRequest(request,this.pool.bytesPerToken??3.9));
-    const tried=new Set<Member>();let reason='breaker_open';let lastError:unknown;let waitUntil:number|undefined;
-    const deadline=()=>waitUntil??=Date.now()+(this.pool.queueTimeoutMs??10000);
+    const tried=new Set<Member>();let reason='breaker_open';let lastError:unknown;
+    // : nothing goes to a primary after sendBy, so the queue wait ends there at the latest.
+    const sendBy=context?.deadlineAt===undefined?Infinity:context.deadlineAt-DEADLINE_MARGIN_MS;
+    const waitUntil=Math.min(arrivedAt+(this.pool.queueTimeoutMs??10000),sendBy), deadline=()=>waitUntil;
     const attempts=Math.max(1,this.pool.primaryAttempts??2);
     for(let attempt=0;attempt<attempts;attempt++) {
       let routed:Awaited<ReturnType<UpstreamPool['route']>>;
@@ -301,6 +309,7 @@ export class UpstreamPool implements Upstream {
         // in time must not become a marked "nothing was sent" rejection. Fall through to the secondary or the error.
         if(attempt>0&&error instanceof GatewayRejection) break;
         if(error instanceof GatewayRejection&&error.code==='GATEWAY_QUEUE_TIMEOUT') {this.counts.queueTimeouts++;this.rejected.queue_timeout++;}
+        if(error instanceof GatewayRejection&&error.code==='GATEWAY_DEADLINE') this.rejected.deadline++;
         throw error;
       }
       if(!('member' in routed)) {if(routed.none) reason=routed.none;break;}
@@ -318,6 +327,12 @@ export class UpstreamPool implements Upstream {
     if(!secondary) throw lastError;
     // A caller that already left is neither sent nor counted.
     if(signal.aborted) throw signal.reason;
+    // D16: the secondary only with SECONDARY_MIN_REMAINING_MS of the deadline left. Too late with nothing tried is a
+    // marked refusal; after a primary attempt (which may have reached an engine) its failure stands.
+    if(context?.deadlineAt!==undefined&&context.deadlineAt-Date.now()<SECONDARY_MIN_REMAINING_MS) {
+      if(tried.size) throw lastError;
+      this.rejected.deadline++;throw new GatewayRejection('GATEWAY_DEADLINE');
+    }
     const now=Date.now();
     while(this.started.length&&now-this.started[0]!>=60000) this.started.shift();
     if(this.started.length>=this.perMinuteCap()) {this.counts.rateLimited++;throw new Error('FAILOVER_RATE_LIMITED');}
@@ -410,17 +425,20 @@ export class UpstreamPool implements Upstream {
         return Promise.reject(new GatewayRejection('GATEWAY_SATURATED',this.retryAfterSeconds(band)));
       }
     }
+    const sendBy=context?.deadlineAt===undefined?Infinity:context.deadlineAt-DEADLINE_MARGIN_MS;
     return new Promise((resolve,reject)=>{
       const remaining=deadlineAt-Date.now();
       const cleanup=()=>{clearTimeout(timer);signal.removeEventListener('abort',onAbort);};
       let settled=false;
-      const pending:Pending={id:++this.nextId,band,flow:context?.flow??'',cost,enqueuedAt:Date.now(),estimate,exclude,requestKey:context?.requestKey,retry,arrivedAt,
+      const pending:Pending={id:++this.nextId,band,flow:context?.flow??'',cost,enqueuedAt:Date.now(),estimate,exclude,requestKey:context?.requestKey,retry,arrivedAt,sendBy,
         settle:result=>{settled=true;cleanup();this.record(this.waits,Date.now()-pending.enqueuedAt);resolve(result);},
         reject:error=>{settled=true;cleanup();reject(error);}};
       // Leaving frees the head of a band: run a pass so the requests behind it do not wait for the next tick.
       const leave=(error:unknown)=>{if(this.queue.remove(pending)) {cleanup();reject(error);this.kick();}};
       const onAbort=()=>leave(signal.reason);
-      const timer=setTimeout(()=>leave(new GatewayRejection('GATEWAY_QUEUE_TIMEOUT')),Math.max(0,remaining));
+      // A wait bounded by the caller's deadline (not the queue timeout) ends as `deadline`: resending cannot help.
+      const expired=deadlineAt>=sendBy?'GATEWAY_DEADLINE':'GATEWAY_QUEUE_TIMEOUT';
+      const timer=setTimeout(()=>leave(new GatewayRejection(expired)),Math.max(0,remaining));
       if(retry) this.queue.unshift(pending);else this.queue.push(pending);
       this.kick();
       // Bound checked after a dispatch attempt (a request with credit runs even at PTR_GATEWAY_MAX_QUEUE=0). When full, a
@@ -452,6 +470,9 @@ export class UpstreamPool implements Upstream {
   private dispatch():void {
     const now=this.now();
     this.queue.plan(Date.now(),pending=>{
+      // Credit reached it too late to send before its deadline (§4 step 4): refused before any member is picked, so no
+      // counter, rotation or reservation moves. complete() marks it on a first attempt only (D17).
+      if(Date.now()>pending.sendBy) {pending.reject(new GatewayRejection('GATEWAY_DEADLINE'));return true;}
       const live=this.candidates(pending.exclude);
       if(!live.length) {
         if(this.pool.secondary||pending.exclude.size) {pending.settle({none:pending.exclude.size?undefined:'no_upstream'});return true;}

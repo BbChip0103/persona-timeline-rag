@@ -3,7 +3,7 @@ import { isAbsolute, resolve } from 'node:path';
 import { z } from 'zod';
 // The registry subpath: the gateway imports this package and must never load BullMQ (apps/gateway/tests/imports.test.ts).
 import { assertLocalRedisUrl } from '@ptr/messaging/registry';
-import { OpenRouterClient, ProviderError, type BudgetLedger } from '@ptr/providers';
+import { isAllowedTextModel } from '@ptr/providers';
 import { assertLocalDatabaseUrl } from '@ptr/storage';
 import { ENV_REGISTRY, GATED_PREFIX } from '../env-registry';
 import { apiUrlProblem, blank } from './web';
@@ -60,19 +60,8 @@ export const token=unlessBlank('token_length',value=>value.length>=24&&value.len
 export const oneOf=(values:readonly string[])=>z.string().refine(value=>values.includes(value),'invalid_value').optional();
 /** A regular file (a blank value resolves to the current directory, which is not one). */
 export const existingFile=(cwd:string)=>z.string().refine(path=>!blank(path)&&statSync(resolve(cwd,path),{throwIfNoEntry:false})?.isFile()===true,'file_missing').optional();
-/**
- * OpenRouter chat models: the client's constructor is the allowlist (its model table is private to @ptr/providers), so it
- * is asked with synthetic, never-used settings. Nothing connects: the constructor only validates.
- */
-const PROBE_LEDGER={} as BudgetLedger;
-export function allowedTextModel(model:string):boolean {
-  try {
-    new OpenRouterClient({apiKey:'probe',liveEnabled:true,allowExternalData:true,ledger:PROBE_LEDGER,textModel:model,
-      databaseUrl:'postgresql://ptr_researcher:probe@127.0.0.1:56432/ptr_research'});
-    return true;
-  } catch(error) {return !(error instanceof ProviderError&&error.code==='MODEL_NOT_ALLOWED');}
-}
-export const textModel=unlessBlank('model_allowlist',allowedTextModel);
+/** OpenRouter chat models: the providers allowlist itself (nothing is constructed or connected). */
+export const textModel=unlessBlank('model_allowlist',isAllowedTextModel);
 export type Refinement=z.RefinementCtx;
 export const report=(ctx:Refinement,key:string,rule:string)=>ctx.addIssue({code:'custom',path:[key],message:rule});
 /** OpenRouter (chat, Jev helpers, failover) needs all three live keys; the client would fail with LIVE_DISABLED. */

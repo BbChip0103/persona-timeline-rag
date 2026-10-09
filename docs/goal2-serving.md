@@ -137,6 +137,7 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
 | connection refused (`ECONNREFUSED`): nothing was sent | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_TRANSPORT` at once | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
 | 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_HTTP_429` / `PROVIDER_HTTP_503` at once | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
 | the same, reason `draining` (a gateway draining on SIGTERM, S6) | yes (same time rule) | yes | none before an untried URL, else as above |
+| 503 marked, reason `deadline`, or an unmarked 504 with `X-PTR-Gateway-Reason: deadline` (see "Turn deadline" below) | never: `PROVIDER_DEADLINE` at once | — | — |
 | reset or close before the response headers, or a failed connect: a fetch `TypeError` whose cause code is `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET` ("other side closed"), `UND_ERR_CLOSED`, `UND_ERR_CONNECT_TIMEOUT`, `EHOSTUNREACH` or `ENETUNREACH` | only with a request key, at most `PTR_GATEWAY_RESET_RETRIES` in total, only with ≥ `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` left | yes | full jitter `U(0, min(2000, 200·2^k))` ms |
 | reset while reading the SSE body after a 200 (same codes), or a stream that ends cleanly without `[DONE]` or a `finish_reason` | as above; the partial text and its usage are discarded (only a complete answer is returned) | yes | as above |
 | any other HTTP status (502/504/500/4xx, an unmarked 503), our own abort or timeout, `INVALID_PROVIDER_RESPONSE` (empty or > 65536 chars), malformed SSE JSON, any other transport error (bad port, unexpected redirect, a `TypeError` without a known code) | never | — | — |
@@ -156,6 +157,35 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
 - Several gateway URLs (`PTR_GATEWAY_URLS`, active–standby), the per-gateway failover ceiling and the capacity rule
   (Σ worker concurrency ≤ gateway caps + queue) are demo-mode topics: see [demo-mode.md](demo-mode.md#several-gateway-urls-and-the-capacity-rule).
   Production runs one gateway at the default URL.
+
+### Turn deadline (`X-PTR-Deadline`)
+
+- **Header:** the worker client sends `X-PTR-Deadline` when the call has a turn deadline: an integer epoch ms,
+  `min(deadlineAt, now + provider timeout)`, the same value on every retry. Same host only (loopback), so one clock.
+  Absent: the gateway behaves as before. Malformed (not `^\d{1,15}$`): 400 `INVALID_INPUT`.
+- **Send margin, 5000 ms:** nothing is sent to a primary later than 5 s before the deadline.
+  - With 5 s or less left on arrival: 503 `GATEWAY_DEADLINE`, marked (`X-PTR-Gateway: rejected`,
+    `X-PTR-Gateway-Reason: deadline`, no `Retry-After`), before any queueing.
+  - The queue wait (gateway limiter or pool queue) is `min(PTR_GATEWAY_QUEUE_TIMEOUT_MS, deadline − 5 s − now)`. A wait
+    ended by the deadline bound is the marked 503 `deadline`; one ended by the queue timeout stays `queue_timeout`.
+  - Credit granted after that point is handed back before a member is picked (no `dispatched` count, no round-robin
+    turn): marked `deadline` on a request's first attempt, unmarked on a second primary attempt (the first may have
+    reached an engine), which then falls through to the secondary rule or the first attempt's error.
+  - With `PTR_GATEWAY_REJECT_SATURATED=true` (demo mode) the early `saturated` check runs first and compares against
+    the deadline-bounded wait, so a request the deadline would refuse can get the 429 `saturated` instead.
+- **Secondary floor, 3500 ms:** the OpenRouter failover secondary is used only with at least 3.5 s left (OpenRouter
+  p95 3141 ms at c=8). Below it: marked 503 `deadline` if no primary was tried, otherwise the primary's error stands
+  (unmarked).
+- **After sending:** the call is aborted at the deadline with a `DeadlineExceeded` reason (not a `TimeoutError`). The
+  gateway answers an unmarked 504 `UPSTREAM_TIMEOUT` with `X-PTR-Gateway-Reason: deadline` (or cuts the stream after
+  the headers). A secondary call is cut the same way; the ledger keeps its unresolved-call rule (no resubmission).
+- **Breaker:** a deadline abort is never an engine timeout. It counts only by the existing rule for a caller that gave
+  up: no response headers and at least the 10 s headers timeout since dispatch. Aborts after headers or before 10 s
+  never move the breaker, so a healthy, loaded engine does not trip it.
+- **Client and turn:** the marked `deadline` refusal and the deadline 504 become `PROVIDER_DEADLINE` with no retry. The
+  chat service ends the turn as it does on its own timer: `failed` / `TURN_FAILED`, reason `TURN_TIMEOUT`.
+- **Metrics (`GET /metrics`):** `rejected.deadline` (marked refusals), `deadlineAborts` (sent calls cut at the
+  deadline), and per pool `queue.rejected.deadline`. A pool refusal is counted by both, like `queue_timeout`.
 
 ### Capacity controller (demo mode)
 
@@ -628,6 +658,10 @@ Uses the isolated `ptr_loadtest` database (`PTR_LOADTEST_DATABASE_URL`, see `inf
 (ports from `--port`, default 56451), worker ×`--workers`, dispatcher ×`--dispatchers`, and the gateway (port +50;
 `--gateway=0` calls the model in-process). It uses its own queue/namespace (`loadtest-turns` / `loadtest`) and wipes
 that queue at the end.
+
+Workers and the acceptance harnesses (`scripts/registry-acceptance.ts`, `scripts/gateway-ha-acceptance.ts`) send the
+turn deadline (`X-PTR-Deadline`). Under load, queued calls can therefore end as `deadline` refusals (gateway
+`rejected.deadline`, client `PROVIDER_DEADLINE`, turn reason `TURN_TIMEOUT`), which earlier versions did not show. Account for this when comparing against older results.
 
 ```sh
 pnpm exec tsx scripts/loadtest.ts ramp --levels=64,256,1024 --stage-seconds=45 --apis=2 --workers=4 --worker-concurrency=512

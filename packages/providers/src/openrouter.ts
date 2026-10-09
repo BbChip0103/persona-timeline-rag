@@ -37,6 +37,8 @@ const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json
   // Catalog price (2026-10-08); optional reasoning stays off. The `:free` variant is never allowed.
   'google/gemma-4-26b-a4b-it':{prompt:0.09,completion:0.3,reasoning:{enabled:false},agentSchema:true},
 };
+/** The chat-model allowlist (the client's constructor refuses anything else with MODEL_NOT_ALLOWED); also read by the config check. */
+export function isAllowedTextModel(model:string):boolean {return Object.hasOwn(TEXT_MODELS,model);}
 /** Decision models (Decisions API): input-only pricing ceiling in USD per million tokens; output tokens are free. Pinned ids only. */
 const DECISION_MODELS:Record<string,{prompt:number}>={'typesafe/jev-1.13':{prompt:0.05}};
 export const DECISION_MODEL_IDS=Object.keys(DECISION_MODELS);
@@ -86,7 +88,7 @@ export class OpenRouterClient {
     if (!options.liveEnabled||!options.allowExternalData||!options.apiKey.trim()) throw new ProviderError('LIVE_DISABLED');
     assertLocalDatabaseUrl(options.databaseUrl);
     this.model=options.textModel??DEFAULT_TEXT_MODEL;
-    if (!Object.hasOwn(TEXT_MODELS,this.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
+    if (!isAllowedTextModel(this.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
     this.outputTokens=options.maxOutputTokens??512;
     this.inputBytes=options.maxInputBytes??32768;
     this.timeoutMs=options.timeoutMs??30000;

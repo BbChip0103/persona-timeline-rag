@@ -5,6 +5,11 @@ import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Perso
  * `priority`: 0 = a turn's first model call, 1 = a follow-up call of the same turn (the LLM gateway serves those first so
  * running turns finish), −1 = batch; providers may ignore it.
  */
+/**
+ * Error `code` a TextProvider throws when the LLM gateway refused the call or cut it at the turn's deadline (X-PTR-Deadline,
+ * ): the turn ends as TURN_TIMEOUT, the same as when its own timer runs out.
+ */
+export const PROVIDER_DEADLINE='PROVIDER_DEADLINE';
 export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> }
 export interface Retrieval {
   search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { PROVIDER_DEADLINE } from '@ptr/core';
 import { OpenAICompatibleTextProvider, ProviderError, fetchGatewayCapacity, gatewayCapacityWarning, gatewayRejectedBackoffMs, gatewayResetBackoffMs, type CallMetrics } from '../src';
 
 const signal=()=>new AbortController().signal;
@@ -272,6 +273,42 @@ describe('gateway connection resets, retries and URL rotation',()=>{
     const back=jest.fn().mockRejectedValueOnce(refused()).mockRejectedValueOnce(refused()).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
     expect(await gatewayClient(back,{timeoutMs:60000,retryMinRemainingMs:5000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+20000})).toBe('ok');
     expect(back).toHaveBeenCalledTimes(3);
+  });
+  test('X-PTR-Deadline = min(deadlineAt, now + timeoutMs) in epoch ms, on every attempt; absent without a deadlineAt ',async()=>{
+    const deadlineOf=(fetcher:jest.Mock,index:number)=>new Headers(((fetcher.mock.calls[index] as unknown[])[1] as RequestInit).headers).get('x-ptr-deadline');
+    const turn=jest.fn().mockRejectedValueOnce(reset()).mockResolvedValueOnce(sse([delta('ok'),'[DONE]']));
+    const deadlineAt=Date.now()+20000;
+    expect(await gatewayClient(turn,{timeoutMs:60000}).generate(messages,{signal:signal(),...key,deadlineAt})).toBe('ok');
+    expect(deadlineOf(turn,0)).toBe(String(deadlineAt));expect(deadlineOf(turn,1)).toBe(String(deadlineAt));
+    // The call's own timeout ends first: its end is sent instead.
+    const short=jest.fn(async()=>sse([delta('ok'),'[DONE]']));
+    const before=Date.now();
+    await gatewayClient(short,{timeoutMs:3000}).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+20000});
+    const sent=Number(deadlineOf(short,0));
+    expect(Number.isInteger(sent)).toBe(true);expect(sent).toBeGreaterThanOrEqual(before+3000);expect(sent).toBeLessThanOrEqual(Date.now()+3000);
+    const none=jest.fn(async()=>sse([delta('ok'),'[DONE]']));
+    await gatewayClient(none).generate(messages,{signal:signal(),...key});
+    expect(deadlineOf(none,0)).toBeNull();
+    // A malformed deadline is never sent as such (the gateway would answer 400): not finite → absent, past → 0.
+    const odd=jest.fn(async()=>sse([delta('ok'),'[DONE]']));
+    await gatewayClient(odd).generate(messages,{signal:signal(),...key,deadlineAt:Number.NaN});
+    await gatewayClient(odd).generate(messages,{signal:signal(),...key,deadlineAt:-5});
+    expect(deadlineOf(odd,0)).toBeNull();expect(deadlineOf(odd,1)).toBe('0');
+  });
+  test('a marked `deadline` rejection is never retried: PROVIDER_DEADLINE at once, whatever time is left',async()=>{
+    const metrics:CallMetrics[]=[];
+    const fetcher=jest.fn().mockResolvedValueOnce(marked(503,'deadline')).mockResolvedValue(sse([delta('ok'),'[DONE]']));
+    await expect(gatewayClient(fetcher,{timeoutMs:60000,retryMinRemainingMs:0,onMetrics:(m:CallMetrics)=>metrics.push(m)})
+      .generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+60000})).rejects.toEqual(new ProviderError('PROVIDER_DEADLINE'));
+    expect(fetcher).toHaveBeenCalledTimes(1);expect(metrics).toEqual([expect.objectContaining({ok:false,error:'PROVIDER_DEADLINE',attempts:1})]);
+    // A call cut at the deadline after it was sent: an unmarked 504 that names the deadline. Other 504s keep their code.
+    const cut=jest.fn(async()=>new Response('{}',{status:504,headers:{'X-PTR-Gateway-Reason':'deadline'}}));
+    await expect(gatewayClient(cut).generate(messages,{signal:signal(),...key,deadlineAt:Date.now()+60000})).rejects.toEqual(new ProviderError('PROVIDER_DEADLINE'));
+    expect(cut).toHaveBeenCalledTimes(1);
+    const plain=jest.fn(async()=>new Response('{}',{status:504}));
+    await expect(gatewayClient(plain).generate(messages,{signal:signal(),...key})).rejects.toEqual(new ProviderError('PROVIDER_HTTP_504'));
+    // The code is the one the chat service maps to TURN_TIMEOUT.
+    expect(PROVIDER_DEADLINE).toBe('PROVIDER_DEADLINE');
   });
 });
 

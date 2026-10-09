@@ -9,7 +9,16 @@ export interface RequestContext {
   priority?:1|0|-1;
   /** X-PTR-Flow: fairness key for DRR (hex, e.g. a hash of the owner). */
   flow?:string;
+  /** X-PTR-Deadline: when the caller's turn ends, epoch ms . Absent = no deadline beyond the gateway's own. */
+  deadlineAt?:number;
 }
+/**
+ * Nothing is sent to a primary later than this before the deadline (D14: over twice the 4090 c=8 p50 of 2.40 s, the
+ * client's resend floor too): the queue wait ends there, as a marked `deadline` refusal.
+ */
+export const DEADLINE_MARGIN_MS=5000;
+/** The paid secondary is used only with at least this much of the deadline left (D16: OpenRouter p95 3141 ms at c=8, rounded up). */
+export const SECONDARY_MIN_REMAINING_MS=3500;
 /** What an upstream hands back: an HTTP-like status and a body the gateway relays as-is. `upstream`: set by failover only. */
 export interface UpstreamResult { status:number; contentType:string; body:AsyncIterable<Uint8Array>|string; upstream?:'primary'|'secondary' }
 export interface Upstream {

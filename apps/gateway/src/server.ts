@@ -7,7 +7,7 @@ import type { GatewayPublisherMetrics } from '@ptr/messaging/registry';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
 import { neutralizeControlTokens } from '@ptr/providers';
-import type { ChatCompletionRequest, RequestContext, Upstream } from './upstreams';
+import { DEADLINE_MARGIN_MS, type ChatCompletionRequest, type RequestContext, type Upstream } from './upstreams';
 
 export interface GatewayOptions {
   token:string; upstream:Upstream;
@@ -18,7 +18,10 @@ export interface GatewayOptions {
 }
 export interface GatewayMetrics {
   upstream:string; inFlight:number; queued:number; accepted:number; completed:number; upstreamErrors:number;
-  rejected:{queueFull:number;queueTimeout:number;draining:number};
+  /** `deadline`: X-PTR-Deadline left too little time to send (marked 503 `deadline`, never sent upstream). */
+  rejected:{queueFull:number;queueTimeout:number;draining:number;deadline:number};
+  /** Calls already sent upstream that were cut at their X-PTR-Deadline (DeadlineExceeded). */
+  deadlineAborts:number;
   /** Graceful drain started (SIGTERM, §6.3): queued and new requests get the marked 503 `draining`. */
   draining:boolean;
   /** Milliseconds over the most recent requests (bounded sample). */
@@ -54,6 +57,10 @@ const json=(res:ServerResponse,status:number,body:unknown,headers:Record<string,
 
 /** The marked drain rejection: nothing was sent upstream, so the client may resend it to its next gateway at once. */
 const DRAINING_HEADERS={'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'draining','Connection':'close'};
+/** The marked deadline refusal: nothing was sent, and the client does not resend it (no time left for a call, D17). */
+const DEADLINE_HEADERS={'X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'deadline'};
+/** X-PTR-Deadline: epoch ms as an integer (same host, one clock). */
+const DEADLINE=/^\d{1,15}$/;
 export interface Gateway {
   server:Server; metrics:()=>GatewayMetrics;
   /**
@@ -74,11 +81,12 @@ export function createGateway(options:GatewayOptions):Gateway {
   if(options.token.length<24||options.token.length>512) throw new Error('INVALID_GATEWAY_TOKEN');
   const expected=createHash('sha256').update(options.token).digest();
   const limiter=new AdmissionLimiter(options.limits);
-  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0,draining:0};
+  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0,draining:0,deadline:0,deadlineAborts:0};
   let draining=false, active=0;const idleWaiters:(()=>void)[]=[];
   /** Keep-alive: while draining every response closes its connection. */
   const closing=():Record<string,string>=>draining?{'Connection':'close'}:{};
   const refuseDraining=(res:ServerResponse)=>{counters.draining++;json(res,503,{error:{code:'GATEWAY_DRAINING'}},DRAINING_HEADERS);};
+  const refuseDeadline=(res:ServerResponse)=>{counters.deadline++;json(res,503,{error:{code:'GATEWAY_DEADLINE'}},DEADLINE_HEADERS);};
   const queueWaits:number[]=[],upstreamTimes:number[]=[];
   const record=(list:number[],value:number)=>{list.push(value);if(list.length>SAMPLE)list.shift();};
   let meanUpstreamMs:number|null=null; // EWMA of successful calls, for Retry-After
@@ -88,7 +96,8 @@ export function createGateway(options:GatewayOptions):Gateway {
   const capacity=()=>{if(!owned) return {maxConcurrent,maxQueue,total:maxConcurrent+maxQueue};const a=owned();return {maxConcurrent:a.maxConcurrent,maxQueue:a.maxQueue,total:a.maxConcurrent+a.maxQueue};};
   const metrics=():GatewayMetrics=>({upstream:options.upstream.model,inFlight:owned?owned().inFlight:limiter.inFlight,queued:owned?owned().queued:limiter.queued,
     accepted:counters.accepted,completed:counters.completed,upstreamErrors:counters.upstreamErrors,
-    rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout,draining:counters.draining},draining,
+    rejected:{queueFull:counters.queueFull,queueTimeout:counters.queueTimeout,draining:counters.draining,deadline:counters.deadline},
+    deadlineAborts:counters.deadlineAborts,draining,
     queueWaitMs:{p50:percentile(queueWaits,0.5),p95:percentile(queueWaits,0.95)},upstreamMs:{p50:percentile(upstreamTimes,0.5),p95:percentile(upstreamTimes,0.95)},
     ...(options.upstream.failoverMetrics?{failover:options.upstream.failoverMetrics()}:{}),
     ...(options.upstream.poolMetrics?{pool:options.upstream.poolMetrics()}:{}),
@@ -129,12 +138,18 @@ export function createGateway(options:GatewayOptions):Gateway {
     const priority=req.headers['x-ptr-priority'], flow=req.headers['x-ptr-flow'];
     if(priority!==undefined&&!['1','0','-1'].includes(String(priority))) return json(res,400,{error:{code:'INVALID_INPUT'}});
     if(flow!==undefined&&(typeof flow!=='string'||!/^[0-9a-f]{1,32}$/.test(flow))) return json(res,400,{error:{code:'INVALID_INPUT'}});
+    const deadlineHeader=req.headers['x-ptr-deadline'];
+    if(deadlineHeader!==undefined&&(typeof deadlineHeader!=='string'||!DEADLINE.test(deadlineHeader))) return json(res,400,{error:{code:'INVALID_INPUT'}});
+    const deadlineAt=deadlineHeader===undefined?undefined:Number(deadlineHeader);
     const context:RequestContext={...(requestKey!==undefined?{requestKey}:{}),...(priority!==undefined?{priority:Number(priority) as 1|0|-1}:{}),
-      ...(flow!==undefined?{flow:flow as string}:{})};
+      ...(flow!==undefined?{flow:flow as string}:{}),...(deadlineAt!==undefined?{deadlineAt}:{})};
+    // Time left to send : none is a marked refusal before any queueing; otherwise it bounds the queue wait.
+    const sendWithinMs=()=>deadlineAt===undefined?Infinity:deadlineAt-DEADLINE_MARGIN_MS-Date.now();
+    if(sendWithinMs()<=0) return refuseDeadline(res);
     // The caller's disconnect cancels waiting and the upstream call alike.
     const caller=new AbortController();res.on('close',()=>{if(!res.writableFinished)caller.abort();});
     const queuedAt=performance.now();let release:(()=>void)|undefined;
-    try {release=owned?()=>undefined:await limiter.acquire(caller.signal);}
+    try {release=owned?()=>undefined:await limiter.acquire(caller.signal,sendWithinMs());}
     catch(error) {
       const code=error instanceof GatewayRejection?error.code:'CANCELLED';
       // X-PTR-Gateway-Reason tells clients why (queue_full / queue_timeout; draining later sends them to the next URL).
@@ -142,12 +157,21 @@ export function createGateway(options:GatewayOptions):Gateway {
         {'Retry-After':String(queueFullRetryAfterSeconds(limiter.queued,maxConcurrent,meanUpstreamMs)),'X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_full'});}
       if(code==='GATEWAY_QUEUE_TIMEOUT'){counters.queueTimeout++;return json(res,503,{error:{code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
       if(code==='GATEWAY_DRAINING') return refuseDraining(res);
+      if(code==='GATEWAY_DEADLINE') return refuseDeadline(res);
       return; // caller already gone
     }
+    // A slot granted too late to send before the deadline is handed back unused (a pool checks its own credit).
+    if(!owned&&sendWithinMs()<0) {release();return refuseDeadline(res);}
     // With a pool that owns admission the wait happens inside complete(): see pool.queue.waitMs instead.
     counters.accepted++;if(!owned) record(queueWaits,performance.now()-queuedAt);
     const started=performance.now();
-    const signal=AbortSignal.any([caller.signal,AbortSignal.timeout(options.limits.upstreamTimeoutMs)]);
+    // Once sent, the call ends at the deadline with its own reason (DeadlineExceeded, not a TimeoutError), so the
+    // breaker counts it only by the caller-gave-up rule (pool.ts), never as an engine timeout (D15).
+    const expiry=new AbortController();
+    // A deadline past the gateway's own upstream timeout needs no timer (and one over 2^31−1 ms would fire at once).
+    const expiryTimer=deadlineAt===undefined||deadlineAt-Date.now()>=options.limits.upstreamTimeoutMs?undefined
+      :setTimeout(()=>expiry.abort(new DOMException('turn deadline','DeadlineExceeded')),Math.max(0,deadlineAt-Date.now()));
+    const signal=AbortSignal.any([caller.signal,AbortSignal.timeout(options.limits.upstreamTimeoutMs),expiry.signal]);
     try {
       const result=await options.upstream.complete(request,signal,Object.keys(context).length?context:undefined);
       // Which upstream answered, only when failover is configured.
@@ -169,6 +193,7 @@ export function createGateway(options:GatewayOptions):Gateway {
       // A pool refused or timed out the request in its own queue: nothing was sent, so it is a marked (retryable) rejection.
       if(error instanceof GatewayRejection&&error.code!=='CANCELLED'&&!caller.signal.aborted&&!res.headersSent) {
         if(error.code==='GATEWAY_DRAINING') return refuseDraining(res);
+        if(error.code==='GATEWAY_DEADLINE') return refuseDeadline(res);
         if(error.code==='GATEWAY_QUEUE_TIMEOUT') {counters.queueTimeout++;
           return json(res,503,{error:{code:error.code}},{'Retry-After':'1','X-PTR-Gateway':'rejected','X-PTR-Gateway-Reason':'queue_timeout'});}
         counters.queueFull++;
@@ -177,8 +202,12 @@ export function createGateway(options:GatewayOptions):Gateway {
       }
       // A timeout: the gateway's own, or a failover primary's headers deadline (a TimeoutError from the upstream).
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';
-      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}},closing());else res.destroy();}
-    } finally {record(upstreamTimes,performance.now()-started);release();}
+      // Cut at X-PTR-Deadline: still unmarked (it was sent), but the reason tells the client it was the turn deadline.
+      const cut=expiry.signal.aborted&&!caller.signal.aborted;
+      if(cut) counters.deadlineAborts++;
+      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}},
+        {...(cut?{'X-PTR-Gateway-Reason':'deadline'}:{}),...closing()});else res.destroy();}
+    } finally {clearTimeout(expiryTimer);record(upstreamTimes,performance.now()-started);release();}
   }
   const server=createServer((req,res)=>{
     const path=(req.url??'').split('?')[0];

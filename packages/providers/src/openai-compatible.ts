@@ -1,5 +1,5 @@
 import type { ProviderMessage } from '@ptr/contracts';
-import { AGENT_RESPONSE_JSON_SCHEMA, type TextProvider } from '@ptr/core';
+import { AGENT_RESPONSE_JSON_SCHEMA, PROVIDER_DEADLINE, type TextProvider } from '@ptr/core';
 import { ProviderError } from './budget';
 import { neutralizeMessages } from './control-tokens';
 
@@ -79,7 +79,9 @@ type Json=Record<string,unknown>;
  * OpenAI-compatible chat adapter for self-hosted serving engines or the LLM gateway in front of them. No billing
  * ledger here: GPU time is accounted per run, and a billable upstream behind the gateway keeps its own ledger.
  * Gateway admission rejections (429/503 marked `X-PTR-Gateway: rejected`) and refused connections are retried
- * (jittered Retry-After, or a short backoff) until the caller's signal or the timeout ends the call. Connection resets
+ * (jittered Retry-After, or a short backoff) until the caller's signal or the timeout ends the call; a `deadline`
+ * rejection (sent with too little of the turn left, see X-PTR-Deadline) or a 504 cut at that deadline is PROVIDER_DEADLINE
+ * at once (the chat service ends the turn as TURN_TIMEOUT). Connection resets
  * (before the headers or mid-stream) are retried only when `resetRetries` is set and the call has a request key, a
  * bounded number of times and only with `retryMinRemainingMs` left. Every other error (HTTP errors, our abort or
  * timeout, invalid output) surfaces at once, because the request may already have reached a model.
@@ -133,7 +135,10 @@ export class OpenAICompatibleTextProvider implements TextProvider {
         // The gateway scopes a billable secondary's ledger entry to this key (the turn id); malformed keys are not sent.
         ...(keyed?{'X-PTR-Request-Key':options.requestKey!}:{}),
         // The gateway's queue band: follow-up calls of a running turn (1) go before first calls (0).
-        ...(options.priority!==undefined?{'X-PTR-Priority':String(options.priority)}:{})};
+        ...(options.priority!==undefined?{'X-PTR-Priority':String(options.priority)}:{}),
+        // When this call ends, as epoch ms (gateway on the same host): the gateway bounds its queue wait by it and never
+        // sends a request it could not finish in time .
+        ...(Number.isFinite(options.deadlineAt)?{'X-PTR-Deadline':String(Math.max(0,Math.floor(Math.min(options.deadlineAt!,Date.now()+timeoutMs))))}:{})};
       // Calls start at the first URL; `next()` moves on and reports whether it wrapped around to the first again.
       const endpoints=this.endpoints();
       let index=0, refusedAttempt=0, resets=0;
@@ -164,6 +169,8 @@ export class OpenAICompatibleTextProvider implements TextProvider {
         }
         if((response.status===429||response.status===503)&&response.headers.get('x-ptr-gateway')===GATEWAY_REJECTED) {
           await response.body?.cancel().catch(()=>undefined);
+          // Too little of the deadline left to send it: a resend would be refused the same way (D17).
+          if(response.headers.get('x-ptr-gateway-reason')==='deadline') throw new ProviderError(PROVIDER_DEADLINE);
           // A draining gateway sends us to the next URL at once; otherwise wait (jittered) and try the same one again.
           // Either way, too little time left for the wait plus retryMinRemainingMs fails now with the rejection's code.
           const rejected=new ProviderError(`PROVIDER_HTTP_${response.status}`);
@@ -172,6 +179,10 @@ export class OpenAICompatibleTextProvider implements TextProvider {
           if(!canResend(waitMs)) throw rejected;
           await sleep(waitMs,signal);
           continue;
+        }
+        // An unmarked 504 naming the deadline: the gateway cut the sent call at X-PTR-Deadline (never resent either).
+        if(response.status===504&&response.headers.get('x-ptr-gateway-reason')==='deadline') {
+          await response.body?.cancel().catch(()=>undefined);throw new ProviderError(PROVIDER_DEADLINE);
         }
         if(!response.ok||!response.body) throw new ProviderError(`PROVIDER_HTTP_${response.status}`);
         let text='', buffer='', complete=false;

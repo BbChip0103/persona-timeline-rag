@@ -1,4 +1,4 @@
-import { FakeTextProvider, FakeEmbeddingProvider, OpenRouterEmbeddingProvider, normalizeEmbeddingModel, OpenRouterClient, ProviderError, type BudgetLedger, type BudgetRequest } from '../src';
+import { FakeTextProvider, FakeEmbeddingProvider, OpenRouterEmbeddingProvider, normalizeEmbeddingModel, isAllowedTextModel, OpenRouterClient, ProviderError, type BudgetLedger, type BudgetRequest } from '../src';
 
 const signal=()=>new AbortController().signal;
 const databaseUrl='postgresql://ptr_researcher:synthetic@127.0.0.1:56432/ptr_research';
@@ -154,6 +154,9 @@ describe('live adapter with fake network only',()=>{
     expect(body.provider).toEqual({require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,max_price:{prompt:0.09,completion:0.3,request:0}});
     // The free variant is never allowlisted.
     expect(()=>client(fakeFetch(),new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it:free'})).toThrow('MODEL_NOT_ALLOWED');
+    // The same table answers the config check  without constructing a client.
+    expect(isAllowedTextModel('google/gemma-4-26b-a4b-it')).toBe(true);expect(isAllowedTextModel('google/gemma-4-26b-a4b-it:free')).toBe(false);
+    expect(isAllowedTextModel('toString')).toBe(false);
     const raised=fakeFetch();raised.mockImplementationOnce(async()=>reply({data:[{id:'google/gemma-4-26b-a4b-it',pricing:{prompt:'0.00000015',completion:'0.0000006'}}]}));
     await expect(client(raised,new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it'}).generate(messages,{signal:signal()})).rejects.toThrow('PRICING_CHANGED_OR_UNKNOWN_FEE');
   });

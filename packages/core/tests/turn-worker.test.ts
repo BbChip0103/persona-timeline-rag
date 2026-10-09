@@ -1,5 +1,5 @@
 import type { Persona } from '@ptr/contracts';
-import { ChatService, CoreError, InMemoryConversationStore, InMemoryPersonaRepository, InMemoryTurnDelivery, InMemoryTurnEvents, TurnDispatcher, TurnWorker, createLocalChat, type TextProvider } from '../src';
+import { ChatService, CoreError, PROVIDER_DEADLINE, InMemoryConversationStore, InMemoryPersonaRepository, InMemoryTurnDelivery, InMemoryTurnEvents, TurnDispatcher, TurnWorker, createLocalChat, type TextProvider } from '../src';
 
 const persona:Persona={id:'persona_synthetic_q',personId:'person_synthetic_q',label:'Synthetic Q',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Queue test',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
 const until=async(check:()=>Promise<boolean>|boolean,ms=2000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
@@ -269,6 +269,18 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     await new TurnWorker({chat,leases:store,workerId:'w-t',leaseMs:5000}).handle(dispatch!);
     expect((await chat.getTurn('owner_q',turn.id))).toMatchObject({state:'failed',errorCode:'TURN_FAILED'});
     expect(failures).toEqual([{turnId:turn.id,code:'TURN_TIMEOUT'}]); // a reason code, not the bare TURN_FAILED
+  });
+  test('a provider call refused or cut at the turn deadline (gateway `deadline`) ends the turn as TURN_TIMEOUT, like the turn timer',async()=>{
+    const failures:{turnId:string;code:string}[]=[];
+    const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
+    // What the gateway client throws for a marked 503 `deadline` or a 504 cut at X-PTR-Deadline .
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:5000,leases:store,delivery,events,maxQueueDepth:10,
+      provider:{generate:async()=>{throw Object.assign(new Error(PROVIDER_DEADLINE),{code:PROVIDER_DEADLINE});}},onTurnFailure:failure=>failures.push(failure)});
+    const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
+    const {turn,dispatch}=await chat.submitTurn('owner_q',{sessionId:s.id,clientRequestId:'deadline',text:'안녕'});
+    await new TurnWorker({chat,leases:store,workerId:'w-d',leaseMs:5000}).handle(dispatch!);
+    expect(await chat.getTurn('owner_q',turn.id)).toMatchObject({state:'failed',errorCode:'TURN_FAILED'}); // the same notice as a timeout
+    expect(failures).toEqual([{turnId:turn.id,code:'TURN_TIMEOUT'}]);
   });
   test('a turn cancelled while it runs is reported as TURN_ABORTED, not as a bare TURN_FAILED',async()=>{
     const failures:{turnId:string;code:string}[]=[];
