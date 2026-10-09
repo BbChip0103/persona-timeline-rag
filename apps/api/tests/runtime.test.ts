@@ -2,7 +2,11 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
 import { BullMqTurnDelivery, MemoryGatewayRegistry } from '@ptr/messaging';
-import { createRuntime } from '../src/runtime';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Persona } from '@ptr/contracts';
+import { createRuntime, mergePersonaLists, readPersonaCatalogue } from '../src/runtime';
 
 // Pools are lazy: no connection is opened by composition alone.
 const databaseUrl='postgresql://ptr_loadtester:synthetic-password@127.0.0.1:56432/ptr_loadtest';
@@ -119,4 +123,34 @@ test('PTR_SAFETY_FILTER=jev is off by default, separate from the intent classifi
   expect(()=>createRuntime({...live,GOAL1_LIVE_ENABLED:'false'})).toThrow('LIVE_DISABLED');
   for(const env of [{PTR_SAFETY_FILTER:'regex'},{PTR_SAFETY_THRESHOLD_SEXUAL:'0'},{PTR_SAFETY_THRESHOLD_SEXUAL:'1.1'},{PTR_SAFETY_THRESHOLD_PRIVATE_INFO:'x'},{PTR_JEV_TIMEOUT_MS:'10'},{PTR_JEV_RESERVED_CALL_FRACTION:'1'},{PTR_JEV_RESERVED_CALL_FRACTION:''},{PTR_SAFETY_TIMEOUT_MS:'10'},{PTR_SAFETY_TIMEOUT_MS:'2500.5'},{PTR_SAFETY_TIMEOUT_MS:'20000'},{PTR_JEV_RESERVED_CALL_FRACTION:' '},{PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'}])
     expect(()=>createRuntime({...live,...env})).toThrow();
+});
+
+describe('persona catalogue: generated list + authored list ',()=>{
+  const p=(personId:string,revision:string):Persona=>({id:`persona:${personId}`,personId,label:'Synthetic',language:'ko',revision,reviewStatus:'synthetic',identity:'Fictional',concept:'test',style:[],boundaries:['AI'],sourceRefs:[],greeting:'안녕'});
+  test('the authored entry wins for its personId; other generated entries stay; personIds are unique',()=>{
+    const merged=mergePersonaLists([p('a','gen-1'),p('b','gen-1')],[p('b','auth-1'),p('c','auth-1')]);
+    expect(merged.map(x=>[x.personId,x.revision])).toEqual([['a','gen-1'],['b','auth-1'],['c','auth-1']]);
+    // A prepare-research rerun replaces only the generated list: the authored entry still wins.
+    expect(mergePersonaLists([p('a','gen-2'),p('b','gen-2')],[p('b','auth-1')]).find(x=>x.personId==='b')!.revision).toBe('auth-1');
+    expect(()=>mergePersonaLists([],[p('b','auth-1'),p('b','auth-2')])).toThrow();
+    expect(()=>mergePersonaLists([p('a','gen-1'),p('a','gen-2')],[])).toThrow();
+  });
+  test('the API reads the authored list only from PTR_AUTHORED_PERSONAS_FILE: unset is empty, set but missing does not start',async()=>{
+    const dir=await mkdtemp(join(tmpdir(),'personas-'));
+    try {
+      const generated=join(dir,'generated.json'),authored=join(dir,'authored.json');
+      await writeFile(generated,JSON.stringify([p('a','gen-1'),p('b','gen-1')]));await writeFile(authored,JSON.stringify([p('b','auth-1')]));
+      const base={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_PERSONAS_FILE:generated};
+      // File reading only (listPersonas then keeps the entries whose revision is current in the database).
+      expect((await readPersonaCatalogue(base,databaseUrl)).map(x=>x.revision)).toEqual(['gen-1','gen-1']);
+      expect((await readPersonaCatalogue({...base,PTR_AUTHORED_PERSONAS_FILE:authored},databaseUrl)).map(x=>[x.personId,x.revision])).toEqual([['a','gen-1'],['b','auth-1']]);
+      const started=createRuntime({...base,PTR_AUTHORED_PERSONAS_FILE:authored});await started.close?.();
+      expect(()=>createRuntime({...base,PTR_AUTHORED_PERSONAS_FILE:join(dir,'missing.json')})).toThrow();
+      // Published lists are bound to their database ({database, personas}); a list for another database is refused.
+      await writeFile(authored,JSON.stringify({database:'ptr_loadtest',personas:[p('b','auth-2')]}));
+      expect((await readPersonaCatalogue({...base,PTR_AUTHORED_PERSONAS_FILE:authored},databaseUrl)).map(x=>x.revision)).toEqual(['gen-1','auth-2']);
+      await writeFile(authored,JSON.stringify({database:'ptr_research',personas:[p('b','auth-2')]}));
+      await expect(readPersonaCatalogue({...base,PTR_AUTHORED_PERSONAS_FILE:authored},databaseUrl)).rejects.toThrow();
+    } finally {await rm(dir,{recursive:true,force:true});}
+  });
 });

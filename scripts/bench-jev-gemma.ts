@@ -134,7 +134,7 @@ async function capture(options:Record<string,string>):Promise<void> {
       for(const conversation of evaluator.conversations) {
         if(run.capReached) break;
         const owner=`bench-capture-${randomUUID()}`;
-        const session=await chat.createSession(owner,{personId:conversation.personId,personaId:conversation.personaId,personaRevision:conversation.personaRevision,
+        const session=await chat.createSession(owner,{greetingIndex:0,personId:conversation.personId,personaId:conversation.personaId,personaRevision:conversation.personaRevision,
           timezone:'Asia/Seoul',ragCondition:'caption_image',retrievalMode:'semantic',executionProfile:'agent_loop'});
         for(const [turnIndex,item] of conversation.turns.entries()) {
           current={conversationId:conversation.id,turnIndex,iteration:0,language:conversation.language,category:conversation.category};

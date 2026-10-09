@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { PersonaSchema, SourcePostSchema, type Persona, type SourcePost } from '@ptr/contracts';
 import { createLocalPool, PostgresPersonaRepository, PostgresSourceRepository } from '@ptr/storage';
+import { parsePersonaList } from '@ptr/core';
 interface RawPost {person_id:string;post_id:string;caption:string;posted_at:string;source_url:string;event_date:string|null}
 interface Target {username:string;display_name:string;category:string;cohort:string}
 const digest=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -42,6 +45,34 @@ export function prepare(raw:RawPost[],targets:Target[]):{sources:SourcePost[];pe
   if(sources.some(s=>!targets.some(t=>t.username===s.personId)))throw new Error('Source outside selected targets');
   return {sources,personas,split};
 }
+/**
+ *  ①: personIds with an authored persona (scripts/persona.ts publish) keep their authored current revision,
+ * so their generated persona is still written to personas.json but not imported into the database.
+ */
+export function importablePersonas(personas:Persona[],authored:Persona[]):{importable:Persona[];skipped:string[]} {
+  const owned=new Set(authored.map(persona=>persona.personId));
+  return {importable:personas.filter(persona=>!owned.has(persona.personId)),skipped:personas.filter(persona=>owned.has(persona.personId)).map(persona=>persona.personId)};
+}
+/**
+ * The authored list ( ①), fail-closed: PTR_AUTHORED_PERSONAS_FILE set but missing throws; the default
+ * (`data/research/personas.authored.json`, next to this script's other private files) may be missing, with a warning.
+ * Accepts the CLI's `{database, personas}` list (its database must be DATABASE_URL's) or a plain array.
+ */
+export async function authoredPersonas(env:NodeJS.ProcessEnv|{PTR_AUTHORED_PERSONAS_FILE?:string;DATABASE_URL?:string},warn:(message:string)=>void,cwd='.'):Promise<Persona[]> {
+  const explicit=env.PTR_AUTHORED_PERSONAS_FILE;
+  const path=explicit||join(cwd,'data/research/personas.authored.json');
+  if(!existsSync(path)) {
+    if(explicit) throw new Error('PTR_AUTHORED_PERSONAS_FILE is set but the file does not exist');
+    warn('No authored persona list at the default path: every generated persona will be imported.');
+    return [];
+  }
+  const list=parsePersonaList(JSON.parse(await readFile(path,'utf8')));
+  if(list.database!==undefined) {
+    let database='';try {database=new URL(env.DATABASE_URL??'').pathname.slice(1);} catch {database='';}
+    if(list.database!==database) throw new Error('The authored persona list belongs to another database');
+  }
+  return list.personas;
+}
 export async function privateJson(path:string,value:unknown):Promise<void>{
   await mkdir(path.slice(0,path.lastIndexOf('/')),{recursive:true,mode:0o700});
   await writeFile(path,JSON.stringify(value,null,2)+'\n',{mode:0o600});
@@ -53,11 +84,15 @@ async function main():Promise<void>{
   await privateJson('data/research/sources.json',prepared.sources);
   await privateJson('data/research/personas.json',prepared.personas);
   await privateJson('data/research/split.json',prepared.split);
+  // Read (and bind to DATABASE_URL) the authored list before anything is imported.
+  const authored=await authoredPersonas(process.env,message=>console.warn(message));
   const pool=createLocalPool(process.env.DATABASE_URL??'');
   try {
     const imported=await new PostgresSourceRepository(pool).importPosts(prepared.sources,'licensed_source');
-    for(const persona of prepared.personas)await new PostgresPersonaRepository(pool).importPersona(persona);
-    const counts={posts:prepared.sources.length,personas:prepared.personas.length,excluded:prepared.sources.filter(s=>s.unsafe).length,
+    const {importable,skipped}=importablePersonas(prepared.personas,authored);
+    if(skipped.length)console.warn(`Skipped the database import of ${skipped.length} generated persona(s) with an authored persona; their current revision stays authored.`);
+    for(const persona of importable)await new PostgresPersonaRepository(pool).importPersona(persona);
+    const counts={posts:prepared.sources.length,personas:prepared.personas.length,authoredSkipped:skipped.length,excluded:prepared.sources.filter(s=>s.unsafe).length,
       dev:prepared.sources.filter(s=>prepared.split[s.id]==='dev').length,test:prepared.sources.filter(s=>prepared.split[s.id]==='test').length,...imported,
       reviewStatus:'silver',splitMethod:'per-person UTC calendar-day 70/30 chronological proxy; not verified same-event grouping',
       styleMethod:'Development-only length/emoji/hashtag rates and manifest category, no test captions in personas',

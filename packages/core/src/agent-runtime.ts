@@ -5,8 +5,12 @@ import { buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT } from './prompts'
 import { containsCredentialPattern, containsInternalPathPattern } from './safety';
 
 export const AGENT_RUNTIME_REVISION='agent-loop-json-action-v1';
-/** v4 (S7): agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout). */
-export const AGENT_PROMPT_REVISION='character-agent-context-v4-prefix-stable';
+/**
+ * v4 (S7): agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout).
+ * v5 : persona card (examples before the history, matched lore between state and tools) and the
+ * PERSONA_CARD_POLICY sentence, which the policy split below carries over from the experiment policy.
+ */
+export const AGENT_PROMPT_REVISION='character-agent-context-v5-persona-card';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
@@ -17,6 +21,8 @@ export interface AgentRunInput {
   search?:(query:string)=>Promise<SourcePost[]>;
   /** Per-turn safety note (input safety deflection): a system message right before the user utterance. */
   policyNote?:string;
+  /** Matched persona lore for this turn (renderLoreMessage), placed after the state and before the tools. */
+  lore?:ProviderMessage;
   /** Passed to every model call of the turn (see TextProvider). */
   requestKey?:string;deadlineAt?:number;
 }
@@ -44,7 +50,8 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     const context=buildExperimentContext(input.persona,input.history,input.text,sources,{
       policy:`${safety}${recollectionVoice}${protocol}`,...(input.policyNote?{policyNote:input.policyNote}:{}),
       // Per-turn state/tools after the history keep policy → persona → history a growing shared prefix .
-      afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify(variables)}`},
+      // Lore is fixed within the turn, the tools change on the last iteration: state · lore · tools keeps the most reuse.
+      afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify(variables)}`},...(input.lore?[input.lore]:[]),
         {role:'system',content:`AGENT_TOOLS_JSON_DATA ${JSON.stringify(input.search&&iteration<max?['timeline_search']:[])}`}],
       afterUser:transcript,
     });

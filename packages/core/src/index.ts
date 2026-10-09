@@ -13,3 +13,5 @@ export * from './memory-queue';
 export * from './local-execution';
 export * from './intent-routing';
 export * from './input-safety';
+export * from './persona-card';
+export * from './persona-publish';

@@ -13,7 +13,7 @@
 ## Execution
 
 1. Reserve an owner-bound, immutable persona/person/revision turn. Duplicate requests replay the same turn without provider calls; active turns serialize the session.
-2. Assemble persona definition, completed visible history, conversational variables, permitted tools and untrusted source/annotation data. Existing recent-user-context search and pinned evidence reuse run before generation when relevant.
+2. Assemble persona definition (with personality/background and style examples when the persona card has them), completed visible history, conversational variables, permitted tools and untrusted source/annotation data. Existing recent-user-context search and pinned evidence reuse run before generation when relevant.
 3. Parse strict `message/status/evidenceRefs/variableUpdates` plus optional `reasoning` or `function`. `reasoning` is an optional **short decision summary**, not hidden thinking, source proof or a request for detailed deliberation. It is stored privately, never shown as chat text.
 4. Optional `timeline_search` → authorized read-only retrieval → tool-result context → another model call. The tool accepts only a bounded query, never person, owner, URL, SQL, date override, credentials or write operations. Server binds person/date/mode/scope. Off and creative routes expose no tool. Unknown/repeated actions and exhausted limits fail without automatic repair/retry.
 5. Exact quote/source scope validation → optional configured validator → atomic completed reply, visible messages and private variables/trace. Failed/cancelled turns cannot commit state. The next turn reads only the latest completed, owner/person/revision-bound state.
@@ -69,8 +69,13 @@ newly billed and cannot be compared naively to uncached latency/cost.
 
 ## Current conversational/service contract
 
-The prompt is `character-agent-context-v4-prefix-stable` (the v3 bounded-roleplay wording in the S7 layout: agent
-state/tools after the history, a safety note right before the user utterance; see docs/goal2-serving.md): light roleplay
+The prompt is `character-agent-context-v5-persona-card`: the v3 bounded-roleplay wording in the S7 layout (agent
+state/tools after the history, a safety note right before the user utterance; see docs/goal2-serving.md), plus the
+persona card (docs/persona-authoring.md). It adds one policy sentence: background, example dialogues and
+lore are author-set notes, never evidence, never real memories, never citable. Example dialogues are a system message
+before the history. Matched lore is an untrusted user-role message between the state and the tools. Lore and examples
+have no source ID, so an answer built on them stays `unverified_model`. v4 and v5 numbers are not compared, because the
+policy sentence changes every persona's prompt. Light roleplay
 embellishment is allowed without promoting it to source facts or contradicting
 established core events/actors. This is not a semantic guarantee or measured
 quality improvement. Existing completed turn reports keep their recorded prompt

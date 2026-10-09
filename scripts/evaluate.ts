@@ -278,7 +278,7 @@ export async function runEvaluation(assets:Assets,runtime:HarnessRuntime,options
   if(!options.live&&options.modes.includes('semantic')) fakeIndexingCalls=await runtime.indexFake(assets.sources);
   const semanticReady=!options.live||Number(counts.rows[0]?.count)===assets.sources.filter(source=>!source.unsafe).length;
   async function session(binding:EvaluationBinding,mode:RetrievalMode):Promise<ChatSession> {
-    return runtime.chat.createSession(ownerId,{personId:binding.personId,personaId:binding.personaId,personaRevision:binding.personaRevision,timezone:binding.timezone,retrievalMode:mode});
+    return runtime.chat.createSession(ownerId,{greetingIndex:0,personId:binding.personId,personaId:binding.personaId,personaRevision:binding.personaRevision,timezone:binding.timezone,retrievalMode:mode});
   }
   function blocked(mode:RetrievalMode):string|undefined {
     if(mode==='semantic'&&!semanticReady) return 'SEMANTIC_INDEX_INCOMPLETE';

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type SendTurnInput, type SourcePost } from '@ptr/contracts';
+import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type ProviderMessage, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, LEASE_LOST, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
@@ -10,6 +10,7 @@ import { RULE_PATH_CATEGORIES, RULE_REFUSAL_REPLY, SAFETY_CATEGORIES, SAFETY_DEF
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
+import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
   leases:TurnLeaseStore;delivery:TurnDelivery;
@@ -60,8 +61,15 @@ export class ChatService {
     if(!result.success) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=result.data;
     if(persona.id !== value.personaId || persona.revision !== value.personaRevision || persona.personId !== value.personId) throw new CoreError('FORBIDDEN');
-    const session:ChatSession={id:randomUUID(),ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString()};
-    await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:`AI 연구용 시뮬레이션입니다. ${persona.greeting}`,createdAt:session.createdAt});
+    // Greeting : an explicit index (evaluations pin 0) or one derived from the session id. The index is
+    // stored only when it was given or there is a choice, so v1 personas keep their session shape.
+    const greetings=greetingsOf(persona);
+    if(value.greetingIndex!==undefined&&value.greetingIndex>=greetings.length) throw new CoreError('INVALID_INPUT');
+    const id=randomUUID();
+    const greetingIndex=value.greetingIndex??greetingIndexFor(id,greetings.length);
+    const session:ChatSession={id,ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString(),
+      ...(value.greetingIndex!==undefined||greetings.length>1?{greetingIndex}:{})};
+    await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:`${aiDisclosurePrefix(persona.language)}${greetings[greetingIndex]}`,createdAt:session.createdAt});
     return session;
   }
   async getSession(ownerId:string,sessionId:string):Promise<ChatSession> {
@@ -232,6 +240,7 @@ export class ChatService {
       || /photo|picture|사진/i.test(value.text)&&new Set((boundPrevious?.evidence??[]).flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
     let promptEvidence:ChatReply['promptEvidence'];
     let agent:ChatReply['agent'];
+    let personaContext:ChatReply['personaContext'];let lore:ProviderMessage|undefined;
     if(intent==='clarification' || intent==='unsupported') {
       output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':safetyCategory?safetyReply(safetyCategory,session.language):RULE_REFUSAL_REPLY,claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
     } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
@@ -266,13 +275,27 @@ export class ChatService {
       }
       if(!await store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
       const policyNote=deflect?SAFETY_DEFLECTION_NOTE:undefined;
-      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,sources,policyNote?{policyNote}:undefined):undefined;
+      // Persona lore , experiment and agent paths only: never on a deflected turn; the last two user
+      // messages count unless the input-safety filter acted on their turn (deflected injections stay in the history).
+      const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
+      if(cardPath&&persona.lore?.length) {
+        const previous:string[]=[];
+        if(!deflect) for(const message of promptHistory.filter(message=>message.role==='user'&&message.turnId).slice(-2)) {
+          // Fail closed: a turn whose record cannot be read counts as flagged.
+          const record=await store.getTurn(message.turnId!,session.ownerId);
+          if(record&&(record.reply?.inputSafety?.action??'none')==='none') previous.push(message.content);
+        }
+        const matched=deflect?{entries:[],omitted:0}:matchLore(persona,{current:value.text,previous});
+        personaContext={loreIds:matched.entries.map(entry=>entry.id),loreOmitted:matched.omitted};
+        if(matched.entries.length) lore=renderLoreMessage(matched.entries);
+      }
+      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,sources,policyNote||lore?{...(policyNote?{policyNote}:{}),...(lore?{afterHistory:[lore]}:{})}:undefined):undefined;
       memorySources=experiment?.sources??sources;
       if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8')};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
         provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
-        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),
+        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           if(controller.signal.aborted)throw new CoreError('TURN_FAILED');
           const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
@@ -321,7 +344,7 @@ export class ChatService {
     if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
   }
 }

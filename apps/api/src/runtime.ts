@@ -1,7 +1,8 @@
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
-import { ChatService, CoreError, DEFAULT_SAFETY_THRESHOLDS, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
+import { ChatService, CoreError, DEFAULT_SAFETY_THRESHOLDS, parsePersonaList, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
 import { BullMqTurnDelivery, GatewayDirectory, RedisGatewayRegistry, RedisTurnEventSource, RedisTurnEvents, createRedisConnection, parseGatewayAllow,
   registryPrefixFromEnv, type GatewayRegistryReader } from '@ptr/messaging';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
@@ -35,6 +36,35 @@ export function gatewayBaseUrls(env:NodeJS.ProcessEnv):string[] {
   if(!urls.length||urls.length>8) throw new CoreError('INVALID_INPUT');
   return urls;
 }
+/**
+ * UI catalogue: the generated list (prepare-research) with each authored persona replacing the entry of its personId.
+ * Session creation needs exactly one candidate per personId, so duplicates within either list fail.
+ */
+export function mergePersonaLists(generated:Persona[],authored:Persona[]):Persona[] {
+  for(const list of [generated,authored]) if(new Set(list.map(persona=>persona.personId)).size!==list.length) throw new CoreError('PERSONA_UNAVAILABLE');
+  const byPerson=new Map(authored.map(persona=>[persona.personId,persona]));
+  const merged=generated.map(persona=>byPerson.get(persona.personId)??persona);
+  return [...merged,...authored.filter(persona=>!generated.some(entry=>entry.personId===persona.personId))];
+}
+const readPersonaList=(path:string)=>readFile(path,'utf8').then(text=>{
+  const raw:unknown=JSON.parse(text);if(!Array.isArray(raw))throw new CoreError('PERSONA_UNAVAILABLE');
+  return raw.map(value=>PersonaSchema.parse(value));
+});
+/**
+ * Generated list (`PTR_PERSONAS_FILE`) merged with the authored list (`PTR_AUTHORED_PERSONAS_FILE`, empty when unset).
+ * An authored list bound to a database (`{database, personas}`) must name this runtime's database; plain arrays are
+ * still read.
+ */
+export async function readPersonaCatalogue(env:NodeJS.ProcessEnv,databaseUrl:string):Promise<Persona[]> {
+  const authoredFile=env.PTR_AUTHORED_PERSONAS_FILE;
+  const [generated,authored]=await Promise.all([readPersonaList(env.PTR_PERSONAS_FILE??'data/research/personas.json'),
+    authoredFile?readFile(authoredFile,'utf8').then(text=>parsePersonaList(JSON.parse(text))):{personas:[]}]);
+  if('database' in authored&&authored.database!==undefined) {
+    let database='';try {database=new URL(databaseUrl).pathname.slice(1);} catch {database='';}
+    if(authored.database!==database) throw new CoreError('PERSONA_UNAVAILABLE','The authored persona list belongs to another database');
+  }
+  return mergePersonaLists(generated,authored.personas);
+}
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
 export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
   /** Tests: read the gateway registry from this store instead of Redis. */
@@ -50,11 +80,12 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const personas=new PostgresPersonaRepository(pool);
   const sources=new PostgresSourceRepository(pool);
   // SQL tests may retain immutable synthetic rows: only the private approved registry is a UI catalogue.
+  // Authored personas (scripts/persona.ts publish) live in their own list so prepare-research cannot overwrite them;
+  // read once per process, so a publish needs an API restart .
+  const authoredFile=env.PTR_AUTHORED_PERSONAS_FILE;
+  if(authoredFile&&!existsSync(authoredFile)) throw new CoreError('INVALID_INPUT','PTR_AUTHORED_PERSONAS_FILE is set but the file does not exist');
   let approved:Promise<Persona[]>|undefined;
-  const approvedPersonas=()=>approved??=readFile(env.PTR_PERSONAS_FILE??'data/research/personas.json','utf8').then(text=>{
-    const raw:unknown=JSON.parse(text);if(!Array.isArray(raw))throw new CoreError('PERSONA_UNAVAILABLE');
-    return raw.map(value=>PersonaSchema.parse(value));
-  });
+  const approvedPersonas=()=>approved??=readPersonaCatalogue(env,databaseUrl);
   const fakeText=new FakeTextProvider();const fakeEmbedding=new FakeEmbeddingProvider();
   let provider:TextProvider=fakeText;
   let embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);

@@ -20,7 +20,7 @@ export async function runSmoke(env:NodeJS.ProcessEnv):Promise<{executionMode:'fa
   try {
     await runtime.personas.importPersona(persona);await runtime.sources.importPosts([post],'synthetic_fixture');await runtime.indexFake([post]);
     for(const mode of ['off','lexical','semantic'] as const) {
-      const session=await runtime.chat.createSession(owner,{personId,personaId:persona.id,personaRevision:persona.revision,timezone:'UTC',retrievalMode:mode});
+      const session=await runtime.chat.createSession(owner,{greetingIndex:0,personId,personaId:persona.id,personaRevision:persona.revision,timezone:'UTC',retrievalMode:mode});
       const factual=trace(`factual-${mode}`,mode);runtime.setTrace(factual);
       const input={sessionId:session.id,clientRequestId:`factual-${mode}`,text:'2024년 게시 캡션을 보여 주세요.',intent:'timeline' as const,
         timeline:{query:'파란 책',start:'2024-01-01',end:'2024-01-02',dateBasis:'posted' as const,limit:5}};

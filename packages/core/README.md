@@ -39,13 +39,25 @@ they used it. `PROMPT_REVISION` currently denotes the timeline revision.
 so policy → persona → history is a prefix that only grows from turn to turn. The input-safety deflection note is
 its own system message right before the user utterance (it was appended to the policy message). Revisions:
 `persona-chat-v2-turn-note-last` (small talk), `persona-chat-v4-turn-note-last` (timeline),
-`persona-chat-v7-turn-note-last` (experiment) and `character-agent-context-v4-prefix-stable` (agent). Without a
+`persona-chat-v7-turn-note-last` (experiment) and `character-agent-context-v4-prefix-stable` (agent; superseded, see
+the persona card paragraph below). Without a
 safety note the first three render the same bytes as v1 / v3 / v6; the agent prompt changes on every turn (state and
 tools moved after the history). `tests/prompt-layout.test.ts` pins the byte stability.
 
+**Persona card .** The agent prompt is `character-agent-context-v5-persona-card` and the experiment
+prompt `persona-chat-v8-persona-card`. Their layout is
+`policy · persona definition · [examples] · history · [state] · [lore] · [tools] · [evidence] · [note] · user`.
+- `PERSONA_CARD_POLICY` sits right before `TIMELINE_JSON_REPLY:`, so the agent's policy split keeps it.
+- `renderPersonaBlock` renders the definition (the v4 bytes when the new fields are absent) and the style examples.
+- `matchLore` and `renderLoreMessage` select and render lore. Selection is deterministic: user utterances only, turns
+  the input-safety filter acted on are skipped, nothing on deflected turns, at most 3 entries within 2,048 B.
+- `validatePersonaForPublish` and `personaRevision` back the authoring CLI.
+- The legacy `buildPrompt` revisions above are unchanged.
+- Contract, checks and CLI: `docs/persona-authoring.md`.
+
 ## agent-loop conversational voice and service boundaries
 
-`character-agent-context-v4-prefix-stable` (v3 wording, S7 layout) uses first-person author-role
+`character-agent-context-v5-persona-card` (v3 wording, S7 layout, persona card) uses first-person author-role
 narration in the disclosed research simulation. Light reactions, humour,
 atmosphere and minor scene embellishment are allowed, but are not verified
 source facts. Established core events/actors, exact quotations and important

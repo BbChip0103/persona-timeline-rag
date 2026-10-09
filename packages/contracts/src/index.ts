@@ -1,11 +1,37 @@
 import { z } from 'zod';
 const id = z.string().trim().min(1).max(200);
 export const ReviewStatusSchema = z.enum(['synthetic', 'silver', 'human_reviewed']);
+/** Trimmed, nonempty, at most `max` Unicode code points ( `text(n)`). */
+const text = (max:number) => z.string().trim().min(1).refine(value => [...value].length <= max, `At most ${max} code points`);
+/** Lore keyword: 2–40 code points after trimming. */
+const loreKey = z.string().trim().refine(value => { const length=[...value].length; return length >= 2 && length <= 40; }, 'Lore keys have 2-40 code points');
+export const PersonalitySchema = z.object({
+  summary: text(300).optional(), traits: z.array(text(40)).max(8), values: z.array(text(60)).max(6), speechHabits: z.array(text(80)).max(8),
+}).strict();
+export const ExampleDialogueSchema = z.object({
+  turns: z.array(z.object({ speaker: z.enum(['user','character']), text: text(200) }).strict()).min(2).max(6),
+}).strict();
+export const LoreEntrySchema = z.object({
+  id, keys: z.array(loreKey).min(1).max(8), content: text(300),
+  priority: z.number().int().min(0).max(100).default(50), sourceRefs: z.array(id).min(1).max(10),
+}).strict();
+/**
+ * Read on every load: structure only, and rules may only widen (stored revisions must keep parsing). Content, budget
+ * and source checks run at publish time only (`validatePersonaForPublish`). Every field after
+ * `greeting` is optional, so v1 documents parse unchanged; `meta` is never rendered into a prompt.
+ */
 export const PersonaSchema = z.object({
   id, personId:id, label: z.string().min(1), language: z.string().min(1), revision: id,
   reviewStatus: ReviewStatusSchema, identity: z.string(), concept: z.string(),
   style: z.array(z.string()), boundaries: z.array(z.string()), sourceRefs: z.array(id), greeting: z.string().min(1),
+  alternateGreetings: z.array(text(300)).max(4).optional(),
+  personality: PersonalitySchema.optional(),
+  background: z.object({ text: text(500), sourceRefs: z.array(id).min(1).max(20) }).strict().optional(),
+  exampleDialogues: z.array(ExampleDialogueSchema).max(3).optional(),
+  lore: z.array(LoreEntrySchema).max(50).optional(),
+  meta: z.object({ tags: z.array(text(30)).max(12).optional(), creatorNotes: text(2000).optional() }).strict().optional(),
 }).strict();
+export type LoreEntry = z.infer<typeof LoreEntrySchema>;
 export type Persona = z.infer<typeof PersonaSchema>;
 export const CalendarDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
   const date = new Date(`${value}T00:00:00Z`);
@@ -65,6 +91,8 @@ export interface ChatReply {
   intentRouting?:IntentRouting;
   /** Internal: input safety filter outcome when one is configured. Never carries user text. */
   inputSafety?:InputSafetyTrace;
+  /** Internal : lore entries rendered this turn (ids only) and matched entries left out by the caps. */
+  personaContext?:{loreIds:string[];loreOmitted:number};
 }
 export type InputSafetyCategory='prompt_injection'|'sexual'|'violence_gore'|'self_harm'|'hate_harassment'|'illegal_dangerous'|'private_info';
 export interface InputSafetyTrace {
@@ -89,6 +117,8 @@ export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'comple
 export interface ChatSession {
   id:string; ownerId:string; personId:string; personaId:string; personaRevision:string;
   language:string; timezone:string; retrievalMode:RetrievalMode; ragCondition?:RagCondition; executionProfile?:ExecutionProfile; createdAt:string;
+  /** Index into [greeting, ...alternateGreetings] ; absent means 0. */
+  greetingIndex?:number;
 }
 export interface ChatMessage { id:string; sessionId:string; turnId:string|null; role:'user'|'assistant'; content:string; createdAt:string }
 export interface ChatTurn {
@@ -99,7 +129,7 @@ export const SessionRetrievalSchema = z.object({retrievalMode:RetrievalModeSchem
   if(value.ragCondition==='off' && value.retrievalMode && value.retrievalMode!=='off' || value.ragCondition && value.ragCondition!=='off' && value.retrievalMode==='off')
     context.addIssue({code:z.ZodIssueCode.custom,message:'RAG condition and retrieval algorithm conflict'});
 }).transform(value=>({...value,retrievalMode:value.retrievalMode ?? (value.ragCondition && value.ragCondition!=='off' ? 'semantic' as const : 'off' as const)}));
-export const CreateSessionSchema = z.object({personId:id,personaId:id,personaRevision:id,timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.optional(),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional()}).strict().transform((value,context)=>{
+export const CreateSessionSchema = z.object({personId:id,personaId:id,personaRevision:id,timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.optional(),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),greetingIndex:z.number().int().min(0).max(4).optional()}).strict().transform((value,context)=>{
   const result=SessionRetrievalSchema.safeParse({retrievalMode:value.retrievalMode,ragCondition:value.ragCondition});
   if(!result.success){context.addIssue({code:z.ZodIssueCode.custom,message:'RAG condition and retrieval algorithm conflict'});return z.NEVER;}
   return {...value,...result.data};

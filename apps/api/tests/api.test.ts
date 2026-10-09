@@ -265,3 +265,19 @@ test('with the safety filter on, draft requests are capped per owner per minute 
   expect((await call(`sessions/${other}/drafts`,{method:'POST',owner:'owner_synthetic_b',body:{brief:'합성 초안'}})).status).toBe(201);
   await expect(createApiApplication(runtime,token,{draftsPerOwnerPerMinute:0})).rejects.toThrow();
 });
+test(': the fictional draft path renders the same four persona fields for a persona card (no new field reaches it)',async()=>{
+  await app.close();
+  const card:Persona={...persona,alternateGreetings:['다른 인사'],personality:{summary:'UNIQUE-PERSONALITY',traits:[],values:[],speechHabits:[]},
+    background:{text:'UNIQUE-BACKGROUND',sourceRefs:['web:1']},exampleDialogues:[{turns:[{speaker:'user',text:'UNIQUE-EXAMPLE'},{speaker:'character',text:'b'}]}],
+    lore:[{id:'UNIQUE-LORE',keys:['그림'],content:'UNIQUE-LORE-CONTENT',priority:50,sourceRefs:['web:1']}],meta:{creatorNotes:'UNIQUE-META'}};
+  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([card]);const provider=new FakeTextProvider();
+  const generate=jest.spyOn(provider,'generate');
+  const chat=createLocalChat({store,personas,provider});
+  runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[card],saveArtifact:async()=>undefined};
+  app=await createApiApplication(runtime,token);await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const id=(await call('sessions',{method:'POST',body:{personId:card.personId}})).body.session.id;
+  expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 전시 소개'}})).status).toBe(201);
+  const messages=generate.mock.calls[0]![0];
+  expect(messages[1]).toEqual({role:'system',content:JSON.stringify({language:persona.language,concept:persona.concept,style:persona.style,boundaries:persona.boundaries})});
+  expect(JSON.stringify(messages)).not.toMatch(/UNIQUE-|다른 인사/);
+});

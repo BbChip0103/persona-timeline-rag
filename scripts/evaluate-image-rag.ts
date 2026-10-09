@@ -202,7 +202,7 @@ export async function runExperiment(args: string[]): Promise<void> {
   try {
     const corpusBefore=await corpusSnapshot(runtime.pool,sources,plan);await privateJson(`${directory}/corpus-before.json`,corpusBefore);
     const create = async (item: ImageExperiment['cases'][number], condition: RagCondition) => runtime.chat.createSession(owner, {
-      personId: item.personId, personaId: item.personaId, personaRevision: item.personaRevision, timezone: 'UTC', ragCondition: condition,
+      greetingIndex: 0, personId: item.personId, personaId: item.personaId, personaRevision: item.personaRevision, timezone: 'UTC', ragCondition: condition,
       retrievalMode: condition === 'off' ? 'off' : 'semantic' });
     const execute = async (item: ImageExperiment['cases'][number], condition: RagCondition, history: 'single' | 'evolving', sessionId: string): Promise<void> => {
       const trace: TurnTrace = { id: `${item.id}-${condition}-${history}`, stage: 'image-rag-ablation', mode: condition === 'off' ? 'off' : 'semantic', historyKind: history,

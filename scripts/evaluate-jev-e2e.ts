@@ -104,7 +104,7 @@ async function main():Promise<void> {
         for(const conversation of evaluator.conversations) {
           if(run.capReached) break;
           const owner=`jev-e2e-${randomUUID()}`;
-          const session=await chat.createSession(owner,{personId:conversation.personId,personaId:conversation.personaId,personaRevision:conversation.personaRevision,
+          const session=await chat.createSession(owner,{greetingIndex:0,personId:conversation.personId,personaId:conversation.personaId,personaRevision:conversation.personaRevision,
             timezone:'Asia/Seoul',ragCondition:'caption_image',retrievalMode:'semantic',executionProfile:'agent_loop'});
           for(const [turnIndex,item] of conversation.turns.entries()) {
             turn=bucket();searchCalls=0;const began=performance.now();

@@ -1044,6 +1044,11 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   persona message is identical across a persona's turns; the first model call of turn N up to the end of its history
   is a byte prefix of turn N+1's first call (and of the next agent iteration's); state, tools, evidence, the note and
   tool results appear only after the history. Mutating either change back makes the suite fail.
+- **Superseded by the persona card :** agent `character-agent-context-v5-persona-card` and experiment
+  `persona-chat-v8-persona-card`. The S7 layout is kept. Style examples are added before the history, and matched lore
+  is placed between the state and the tools. One persona-independent policy sentence is added, and English sessions
+  get an English disclosure prefix. v5/v8 need S8 gates a–e before serving or baselining. See
+  docs/persona-authoring.md (persona authoring, CLI, deploy order).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
   `persona-chat-v2-turn-note-last` (small talk). Without a safety note these three render the same bytes as v6 / v3 / v1,

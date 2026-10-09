@@ -29,7 +29,7 @@ export function validateUserExport(testset: ChatTestset, value: unknown): UserCo
 export async function executeNaturalConversation(runtime: Pick<HarnessRuntime, 'chat' | 'setTrace'>, owner: string,
   conversation: UserConversation, condition: RagCondition, onRow: (row: NaturalChatRow) => Promise<void>, cooldownMs = 0, executionProfile:ExecutionProfile = 'agent_loop',
   resume?: { sessionId: string; completedTurns: number }): Promise<void> {
-  const session = resume ? await runtime.chat.getSession(owner, resume.sessionId) : await runtime.chat.createSession(owner, { personId: conversation.personId, personaId: conversation.personaId,
+  const session = resume ? await runtime.chat.getSession(owner, resume.sessionId) : await runtime.chat.createSession(owner, { greetingIndex: 0, personId: conversation.personId, personaId: conversation.personaId,
     personaRevision: conversation.personaRevision, timezone: 'Asia/Seoul', ragCondition: condition, retrievalMode: condition === 'off' ? 'off' : 'semantic',executionProfile });
   if (resume) {
     if (!Number.isSafeInteger(resume.completedTurns) || resume.completedTurns < 0 || resume.completedTurns > conversation.turns.length ||
