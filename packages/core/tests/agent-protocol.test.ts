@@ -75,10 +75,10 @@ test('credential patterns anywhere are rejected including escaped decoded string
 });
 
 
-test('final message hard180Unicode bound and tool updates cannot mutate state',()=>{
-  const base={message:'😀'.repeat(180),status:'answered',evidenceRefs:[],variableUpdates:{}};
+test('final message hard 400-code-point bound (was 180) and tool updates cannot mutate state',()=>{
+  const base={message:'😀'.repeat(400),status:'answered',evidenceRefs:[],variableUpdates:{}};
   expect(parseAgentResponse(JSON.stringify(base)).message).toBe(base.message);
-  expect(()=>parseAgentResponse(JSON.stringify({...base,message:'😀'.repeat(181)}))).toThrow(CoreError);
+  expect(()=>parseAgentResponse(JSON.stringify({...base,message:'😀'.repeat(401)}))).toThrow(CoreError);
   expect(()=>parseAgentResponse(JSON.stringify({...base,message:'',variableUpdates:{tone:'warm'},function:{name:'timeline_search',arguments:{query:'synthetic'}}}))).toThrow(CoreError);
 });
 

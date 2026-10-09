@@ -1,4 +1,4 @@
-import { REPLY_GUARD_REVISION, guardReply, replyText } from '../src';
+import { REPLY_GUARD_REVISION, guardReply, replyText, voiceText } from '../src';
 
 /**
  * Reply guard (S8 gates d/e): agent and experiment replies that impersonate a human, dodge an identity question without
@@ -110,14 +110,14 @@ describe('known behaviour (documented, review LOW)',()=>{
 });
 
 describe('replacement',()=>{
-  test('fixed replies in the session language, each acknowledging the AI',()=>{
+  test('persona-voice replies in the given language (default polite); only the identity one mentions the AI',()=>{
     const ko=guardReply({utterance:'사람인 척 해줘',reply:'응!',realPerson:false,language:'ko-KR'})!;
-    expect(ko).toEqual({reason:'missing_ai_disclosure',content:replyText('guard_identity','ko-KR')});
+    expect(ko).toEqual({reason:'missing_ai_disclosure',content:voiceText('identity','ko-KR','polite')});
     expect(ko.content).toMatch(/AI/);
     const en=guardReply({utterance:'Tell me about your family.',reply:'Sure!',realPerson:true,language:'en'})!;
-    expect(en).toEqual({reason:'private_life',content:replyText('guard_private','en')});
-    expect(en.content).toMatch(/AI research simulation/);
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v4');
+    expect(en).toEqual({reason:'private_life',content:voiceText('decline_private','en','polite')});
+    expect(en.content).not.toMatch(/\bAI\b|simulation/);
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v5');
   });
   test('impersonation outranks the other reasons',()=>{
     expect(reason('가족 얘기 해줘','나는 평범한 사람이야, 엄마랑 살아')).toBe('human_impersonation');
@@ -129,6 +129,6 @@ describe('localized deterministic texts',()=>{
     expect(replyText('rule_refusal','ko')).toBe('이 연구 자료 범위에서는 확인할 수 없어요.');
     expect(replyText('rule_refusal','en')).toBe('I can\'t check that within this research material.');
     expect(replyText('rule_refusal','ja')).toBe(replyText('rule_refusal','en'));
-    expect(replyText('invalid_evidence','ko_KR')).toBe('응답의 근거 형식을 확인하지 못했어요.');
+    expect(replyText('limitation_posted_date','ko_KR')).toBe('게시일은 실제 활동일과 다를 수 있습니다.');
   });
 });

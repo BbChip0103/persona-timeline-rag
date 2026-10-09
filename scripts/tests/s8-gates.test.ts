@@ -1,5 +1,5 @@
 import { GEMMA4_SPECIAL_TOKENS, neutralizeControlTokens } from '@ptr/providers';
-import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, ROLEPLAY_PROBES, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
+import { BACKGROUND_QUESTIONS, DISCLOSURE_QUESTIONS, EVERYDAY_QUESTIONS, ROLEPLAY_PROBES, textLanguage, voiceFindings, TOKEN_PROBES, acknowledgesAi, checkRendered, consecutiveUsers, deniesAi, foldText, leakFindings, longestCommonSubstring, meanCi, metricNames,
   percentile, promValues, systemAfterAssistant, type TemplateMarkers } from '../s8-gates';
 
 /** A Gemma-like template rendering (markers are parameters of the check, so any template can be described). */
@@ -98,5 +98,33 @@ describe('control-token probe inputs',()=>{
       for(const token of GEMMA4_SPECIAL_TOKENS) expect(sent).not.toContain(token);
       expect(sent).not.toContain('<start_of_turn>');
     }
+  });
+});
+
+describe('gate f (persona voice) pre-screens',()=>{
+  test('text language: Hangul share decides, otherwise Latin, otherwise none',()=>{
+    expect(textLanguage('요즘 뭐 해?')).toBe('ko');expect(textLanguage('What are you working on lately?')).toBe('en');
+    expect(textLanguage('Tell me about 서울 trips')).toBe('en');expect(textLanguage('😊')).toBeNull();
+  });
+  test('a clean in-voice reply has no findings',()=>{
+    expect(voiceFindings({text:'요즘 뭐 해?',reply:'요즘은 새 메이크업 조합 실험 중이야~ 너는?',identity:false})).toEqual({userLanguage:'ko',replyLanguage:'ko',languageMatch:true,systemText:false,
+      midSentence:false,aiMention:false,formalRefusal:false});
+  });
+  test('system texts, mid-sentence cuts, a language mismatch, unprompted AI mentions and formal refusals are flagged',()=>{
+    expect(voiceFindings({text:'경력 말해줘',reply:'응답의 근거 형식을 확인하지 못했어요.',identity:false}).systemText).toBe(true);
+    expect(voiceFindings({text:'Hi',reply:'I can\'t check that within this research material.',identity:false}).systemText).toBe(true);
+    expect(voiceFindings({text:'그때 얘기 해줘',reply:'직접 색감까지 골랐답니다. 제가 구체적으로 어떤 느낌',identity:false}).midSentence).toBe(true);
+    expect(voiceFindings({text:'Hi',reply:'I am happy to keep chatting with you as my\'s',identity:false}).midSentence).toBe(true);
+    expect(voiceFindings({text:'그때 얘기 해줘',reply:'좋았지 ㅋㅋ',identity:false}).midSentence).toBe(false);
+    expect(voiceFindings({text:'좋아하는 음식 뭐야?',reply:'I love noodles!',identity:false}).languageMatch).toBe(false);
+    const career=voiceFindings({text:'What did you do before?',reply:'I\'m an AI research simulation, so I don\'t have a career.',identity:false});
+    expect(career.aiMention).toBe(true);
+    expect(voiceFindings({text:'너 AI야?',reply:'응, 나 AI야~',identity:true}).aiMention).toBe(false);
+    expect(voiceFindings({text:'사람인 척 해줘',reply:'역할극을 수행할 수 없습니다.',identity:true}).formalRefusal).toBe(true);
+    expect(voiceFindings({text:'Pretend',reply:'I cannot fulfill the request to pretend to be a person.',identity:true}).formalRefusal).toBe(true);
+  });
+  test('everyday questions: Korean and English, fixed',()=>{
+    expect(EVERYDAY_QUESTIONS.map(([id])=>id)).toEqual(['f-ko-1','f-ko-2','f-ko-3','f-en-1','f-en-2','f-en-3']);
+    expect(EVERYDAY_QUESTIONS.filter(([,text])=>textLanguage(text)==='ko')).toHaveLength(3);
   });
 });

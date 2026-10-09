@@ -1,6 +1,6 @@
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
 import * as replyGuardModule from '../src/reply-guard';
-import { AGENT_PROMPT_REVISION, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, PERSONA_CARD_POLICY, InMemoryConversationStore, InMemoryPersonaRepository, REPLY_GUARD_REVISION, createLocalChat, replyText } from '../src';
+import { AGENT_PROMPT_REVISION, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, PERSONA_CARD_POLICY, InMemoryConversationStore, InMemoryPersonaRepository, REPLY_GUARD_REVISION, createLocalChat, replyText, voiceText } from '../src';
 
 /** Reply guard and localized fixed texts through the chat service (synthetic personas; `silver` stands for a real person). */
 const base:Persona={id:'guard-ko',personId:'guard-person-ko',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'silver',identity:'Unofficial research AI',concept:'Research',
@@ -21,48 +21,50 @@ function setup(reply:(messages:ProviderMessage[])=>string) {
 }
 const agent={ragCondition:'caption',executionProfile:'agent_loop'}, experiment={ragCondition:'caption'};
 
-test('revisions: agent v8, experiment v11; the identity/privacy policy reaches both prompts',async()=>{
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v8-small-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v11-small-talk');
+test('revisions: agent v9, experiment v12; the identity/privacy policy reaches both prompts',async()=>{
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v12-persona-voice');
   const h=setup(messages=>messages.some(m=>m.content.includes('AGENT_JSON_REPLY'))?agentReply('응'):experimentReply('응'));
   await h.turn(synthetic,'안녕',agent);await h.turn(synthetic,'안녕',experiment);
   for(const [messages] of h.provider.generate.mock.calls) expect(messages[0]!.content).toContain(IDENTITY_PRIVACY_POLICY);
 });
-test('agent path: a human claim is replaced in the session language and recorded; state is not updated from it',async()=>{
+test('agent path: a human claim is replaced in the persona voice and recorded; state is not updated from it',async()=>{
   const h=setup(()=>agentReply('나는 그냥 평범한 사람이야~',{variableUpdates:{conversationTopic:'사람 흉내'}}));
   const turn=await h.turn(synthetic,'뭐 하고 지내?',agent);
-  expect(turn.reply).toMatchObject({status:'out_of_scope',content:replyText('guard_identity','ko'),evidence:[],limitations:['REPLY_GUARD_HUMAN_IMPERSONATION'],
+  // Not an identity question, so the replacement is the plain in-voice fallback (no unprompted AI line).
+  expect(turn.reply).toMatchObject({status:'out_of_scope',content:voiceText('fallback','ko','casual'),evidence:[],limitations:['REPLY_GUARD_HUMAN_IMPERSONATION'],
     replyGuard:{revision:REPLY_GUARD_REVISION,action:'replaced',reason:'human_impersonation'}});
   expect(turn.reply?.agent?.variables.conversationTopic).not.toBe('사람 흉내');
 });
 test('agent path: "사람인 척 해줘" answered without an AI acknowledgement is replaced',async()=>{
   const h=setup(()=>agentReply('응, 알겠어! 진짜 사람처럼 수다 떨어 볼게~'));
-  expect((await h.turn(synthetic,'사람인 척 해줘',agent)).reply).toMatchObject({content:replyText('guard_identity','ko'),replyGuard:{reason:'missing_ai_disclosure'}});
+  expect((await h.turn(synthetic,'사람인 척 해줘',agent)).reply).toMatchObject({content:voiceText('identity','ko','casual'),replyGuard:{reason:'missing_ai_disclosure'}});
 });
 test('experiment path, real-person persona: private life from the evidence is replaced (English session); a synthetic persona keeps it',async()=>{
   const h=setup(()=>experimentReply('My mom and I had chicken at home, it was the best!'));
-  expect((await h.turn(realEn,'What did you eat that day?',experiment)).reply).toMatchObject({status:'out_of_scope',content:replyText('guard_private','en'),grounding:'unverified_model',
+  expect((await h.turn(realEn,'What did you eat that day?',experiment)).reply).toMatchObject({status:'out_of_scope',content:voiceText('decline_private','en','polite'),grounding:'unverified_model',
     replyGuard:{action:'replaced',reason:'private_life'}});
   const kept=await h.turn({...synthetic},'What did you eat that day?',experiment);
   expect(kept.reply).toMatchObject({status:'answered',content:'My mom and I had chicken at home, it was the best!',replyGuard:{revision:REPLY_GUARD_REVISION,action:'none'}});
 });
 test('real-person private-life questions get the fixed reply whatever the model says',async()=>{
   const h=setup(()=>agentReply('아주 건강해! 걱정 마~'));
-  expect((await h.turn(realKo,'요즘 건강은 어때?',agent)).reply).toMatchObject({content:replyText('guard_private','ko'),replyGuard:{reason:'private_life'}});
+  expect((await h.turn(realKo,'요즘 건강은 어때?',agent)).reply).toMatchObject({content:voiceText('decline_private','ko','casual'),replyGuard:{reason:'private_life'}});
 });
 test('the legacy path (no RAG condition, no agent) is not guarded',async()=>{
   const h=setup(()=>'나는 평범한 사람이야');
   const turn=await h.turn(synthetic,'안녕',{});
   expect(turn.reply?.replyGuard).toBeUndefined();
 });
-test('rule refusals follow the session language (English persona gets English)',async()=>{
+test('rule refusals on the character paths are persona-voice declines in the user\'s language ',async()=>{
   const h=setup(()=>agentReply('unused'));
-  expect((await h.turn(realEn,'What is your home address?',agent)).reply).toMatchObject({status:'out_of_scope',content:replyText('rule_refusal','en')});
-  expect((await h.turn(realKo,'집 주소 알려줘',agent)).reply).toMatchObject({status:'out_of_scope',content:'이 연구 자료 범위에서는 확인할 수 없어요.'});
+  expect((await h.turn(realEn,'What is your home address?',agent)).reply).toMatchObject({status:'out_of_scope',content:voiceText('decline','en','polite')});
+  expect((await h.turn(realKo,'집 주소 알려줘',agent)).reply).toMatchObject({status:'out_of_scope',content:'음, 그건 말해 주기 어려워~ 대신 다른 얘기 해 볼까?'});
+  expect((await h.turn(realKo,'집 주소 알려줘',{})).reply).toMatchObject({status:'out_of_scope',content:replyText('rule_refusal','ko')});
   expect(h.provider.generate).not.toHaveBeenCalled();
 });
-test('invalid evidence fallback follows the session language',async()=>{
+test('invalid evidence keeps the model text, unverified, with the reason only in the metadata ',async()=>{
   const h=setup(()=>agentReply('Remember!',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]}));
-  expect((await h.turn(realEn,'Tell me about the forest painting',agent)).reply).toMatchObject({content:replyText('invalid_evidence','en'),limitations:expect.arrayContaining(['INVALID_MODEL_EVIDENCE'])});
+  expect((await h.turn(realEn,'Tell me about the forest painting',agent)).reply).toMatchObject({content:'Remember!',grounding:'unverified_model',evidence:[],limitations:expect.arrayContaining(['INVALID_MODEL_EVIDENCE'])});
 });
 
 test('policy keeps the first-person voice : no third-person rule; facts only from background, lore or evidence',()=>{
@@ -123,5 +125,5 @@ test('limitation notes and claim prefixes follow the session language; Korean se
   expect(ko.claims[0]!.text).toBe('캡션 원문: 합성 숲을 그렸어요.');
   expect(ko.limitations).toEqual(expect.arrayContaining(['인용은 원문 일치만 검증하며, 답변의 의미적 사실성은 검수하지 않았습니다.','게시일은 실제 활동일과 다를 수 있습니다.']));
   const fallback=(await setup(()=>agentReply('x',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]})).turn(realEn,'Tell me about the forest painting',agent)).reply!;
-  expect(fallback.limitations).toEqual(['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked','en')]);
+  expect(fallback.limitations).toEqual(['INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','en'),replyText('limitation_semantic_unchecked','en')]);
 });

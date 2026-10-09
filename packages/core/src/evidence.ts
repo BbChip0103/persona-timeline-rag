@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { EvidenceRefSchema, SourcePostSchema, TimelineQuerySchema, type ChatReply, type EvidenceRef, type SourcePost, type TimelineQuery } from '@ptr/contracts';
 import { CoreError } from './ports';
 import { containsCredentialPattern, containsInternalPathPattern } from './safety';
-import { replyText } from './reply-texts';
+import { replyText, voiceText, type SpeechLevel } from './reply-texts';
 // Legacy offsetless quotes are exact-only; experimental formatting recovery never repairs supplied selectors.
 const LegacyEvidenceRefSchema=EvidenceRefSchema.omit({annotationId:true});
 const ModelSelectionSchema=z.union([LegacyEvidenceRefSchema,LegacyEvidenceRefSchema.omit({start:true,end:true})]);
@@ -92,29 +92,39 @@ function formattedQuote(text:string,quote:string):{start:number;end:number;quote
   return {start,end,quote:original,canonicalized:true};
 }
 
-/** Experimental natural prose is explicitly unverified; quotes are validated independently. */
-export function validateExperimentReply(raw:string,sources:SourcePost[],personId:string,condition:'off'|'caption'|'caption_image',language='ko'):Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'> {
-  const fallback={status:'insufficient_evidence' as const,content:replyText('invalid_evidence',language),claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked',language)]};
+/**
+ * Experimental natural prose is explicitly unverified; quotes are validated independently. `language` is the reply
+ * language and `level` the persona's speech level for the persona-voice fallback.
+ * : a validation failure never shows a system text. Invalid evidence keeps the model's own answer, unverified
+ * and without citations (the reply guard still runs on it in the chat service); an unparseable reply or an empty answer
+ * gets the persona-voice fallback, also when its citations are valid (they stay in `evidence`/`claims`). INVALID_MODEL_EVIDENCE
+ * stays in the limitations (metadata).
+ */
+export function validateExperimentReply(raw:string,sources:SourcePost[],personId:string,condition:'off'|'caption'|'caption_image',language='ko',level:SpeechLevel='polite'):Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'> {
+  const fallbackText=voiceText('fallback',language,level);
+  const fallback={status:'insufficient_evidence' as const,content:fallbackText,claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked',language)]};
   let result:z.infer<typeof ExperimentModelReplySchema>;
   try { result=ExperimentModelReplySchema.parse(JSON.parse(raw)); } catch { return fallback; }
   if(containsCredentialPattern(result.answer) || containsInternalPathPattern(result.answer) || result.answer.length>8000) throw new CoreError('TURN_FAILED','REPLY_REJECTED');
-  if(condition==='off' && result.evidenceRefs.length) return fallback;
+  const answer=result.answer.trim();
+  const unverified={...fallback,content:answer||fallbackText,limitations:[...(condition==='off'?['RETRIEVAL_OFF']:[]),'INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language),replyText('limitation_semantic_unchecked',language)]};
+  if(condition==='off' && result.evidenceRefs.length) return unverified;
   const evidence:ChatReply['evidence']=[];
   const refs:EvidenceRef[]=[];
   let canonicalized=false;
   for(const selection of result.evidenceRefs) {
     const source=sources.find(item=>item.id===selection.sourceId && item.personId===personId && !item.unsafe);
-    if(!source || containsCredentialPattern(selection.quote) || containsInternalPathPattern(selection.quote)) return fallback;
+    if(!source || containsCredentialPattern(selection.quote) || containsInternalPathPattern(selection.quote)) return unverified;
     const annotation=selection.annotationId ? source.imageAnnotations?.find(item=>item.id===selection.annotationId) : undefined;
-    if(selection.annotationId && (condition!=='caption_image' || !annotation || annotation.humanReviewed!==false)) return fallback;
+    if(selection.annotationId && (condition!=='caption_image' || !annotation || annotation.humanReviewed!==false)) return unverified;
     const text=annotation?.text ?? source.caption;
     let ref:EvidenceRef;
     if('start' in selection) {
-      if(selection.start>=selection.end || selection.end>text.length || text.slice(selection.start,selection.end)!==selection.quote) return fallback;
+      if(selection.start>=selection.end || selection.end>text.length || text.slice(selection.start,selection.end)!==selection.quote) return unverified;
       ref=selection;
     } else {
       const match=formattedQuote(text,selection.quote);
-      if(!match)return fallback;
+      if(!match)return unverified;
       ref={...selection,quote:match.quote,start:match.start,end:match.end};
       canonicalized ||= match.canonicalized;
     }
@@ -124,8 +134,9 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
   }
   // Verified claims refer only to exact source text, never to the generated answer's entailment.
   const claims=refs.map(ref=>({text:`${replyText(ref.annotationId?'claim_image_annotation':'claim_caption',language)}: ${ref.quote}`,evidenceRefs:[ref]}));
-  const content=result.answer.trim() || (claims.length ? claims.map(claim=>claim.text).join('\n') : replyText('no_material',language));
-  return {status:result.status,content,claims,evidence,grounding:evidence.length?'source_bound_quotes':'unverified_model',limitations:[
+  // An empty answer never shows the claim lines ("캡션 원문: …"): they stay metadata (review M2).
+  const content=answer || fallbackText;
+  return {status:answer?result.status:'insufficient_evidence',content,claims,evidence,grounding:evidence.length?'source_bound_quotes':'unverified_model',limitations:[
     ...(condition==='off'?['RETRIEVAL_OFF']:[]),
     ...(canonicalized?['QUOTE_WHITESPACE_CANONICALIZED']:[]),
     ...(evidence.length?[replyText('limitation_quote_binding',language)]:['UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language)]),

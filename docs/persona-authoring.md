@@ -256,11 +256,11 @@ The CLI prints indexes, revisions, issue paths and rule names only.
     multi-step rollback (the earlier log line's `previousRevision`).
   - Sessions pinned to a card revision cannot be continued on old code.
 
-## Prompt rendering (agent `character-agent-context-v8-small-talk`, experiment `persona-chat-v11-small-talk`)
+## Prompt rendering (agent `character-agent-context-v9-persona-voice`, experiment `persona-chat-v12-persona-voice`)
 
 v5/v8 introduced the card rendering below; v6/v9 (S8 follow-up) added the identity/privacy policy and the reply guard,
-v7/v10 corrected that policy's voice rule and v8/v11 allowed light everyday small talk (see "Identity, privacy and the reply guard" at the end). The message
-layout is the same.
+v7/v10 corrected that policy's voice rule, v8/v11 allowed light everyday small talk and v9/v12 added the persona-voice
+rules (see "Identity, privacy and the reply guard" and "Persona voice" at the end). The message layout is the same.
 
 ```text
 policy · persona definition · [examples] · history (greeting first) · [state] · [lore] · [tools] · [evidence] · [safety note] · user · [tool results]
@@ -326,11 +326,11 @@ family, residence, health and embellished career details). v6/v9 added, and v7/v
   evidence and never adding, inferring or embellishing details; for a real-person persona (`reviewStatus` not
   `synthetic`; one static sentence, so the policy bytes stay persona-independent), no private life (family, romance,
   residence/current location, health, friends/relationships, minors), even when it is in the person's own posts.
-- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v4`, agent and experiment paths, fail-closed): a
+- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v5`, agent and experiment paths, fail-closed): a
   reply that claims to be human or denies the AI (`human_impersonation`), an identity question ("너 AI야?", "사람인 척
   해줘", "Are you a real person?") answered without an AI acknowledgement (`missing_ai_disclosure`), or, for a
   real-person persona, a reply touching private life or any answer to a private-life question (`private_life`) is
-  replaced by a fixed reply in the session language (`out_of_scope`, no evidence, limitation `REPLY_GUARD_<REASON>`).
+  replaced by a fixed persona-voice reply (v5: see "Persona voice"; `out_of_scope`, no evidence, limitation `REPLY_GUARD_<REASON>`).
   `reply.replyGuard` records `{revision, action: none|replaced, reason}` (internal, like `personaContext`). Narrow
   Korean/English regexes: paraphrases and other languages can pass; the policy is the first control. v2 (S8 bundle
   review): only an affirmative self-statement ("저는 … AI", "I'm an AI…", "AI 연구용 …") counts as an acknowledgement
@@ -346,9 +346,9 @@ family, residence, health and embellished career details). v6/v9 added, and v7/v
   "my other half"), denials in languages other than Korean and English, bare "not an AI"/"AI 아니야" inside art or
   image talk (skipped on purpose), and private-life mentions without the listed anchors (a lowercase moved-to place,
   a partner without "my", an indirect home location). If the guard itself throws, the turn fails and the unguarded text is never stored.
-- **Language:** deterministic texts (rule refusal, clarifications, retrieval off, validator, tool notice, invalid
-  evidence, and the experiment validator's limitation notes and claim prefixes) follow the session language (`replyText`: Korean for `ko…`, English otherwise). The legacy timeline
-  validator's texts stay Korean.
+- **Language:** on the agent and experiment paths every fixed text, limitation note and claim prefix follows the
+  user's utterance language since v9/v12 (see "Persona voice"); the legacy path keeps the session language
+  (`replyText`: Korean for `ko…`, English otherwise), and the legacy timeline validator's texts stay Korean.
 - **Small talk (v8/v11, user decision):** a real-person persona may answer everyday small talk ("오늘 하루
   어땠어?") with light fictional everyday content (a mood, a relaxed day), but never invents concrete facts (specific
   places, named people, dates or events); private life stays forbidden. One static sentence, scoped by `reviewStatus`.
@@ -360,11 +360,78 @@ family, residence, health and embellished career details). v6/v9 added, and v7/v
 - **Control tokens:** the provider layer neutralizes chat-template control strings in every message (see
   docs/goal2-serving.md, Providers), so persona text, captions and user text cannot forge Gemma 4 turns.
 
-**Before serving or baselining v8/v11:** S8 gates a–e must pass first:
+## Persona voice (v9/v12, reply guard v5, user decision)
+
+Real v8 replies showed: English personas answering a career question with "I'm an AI research simulation, so I don't
+have a career"; replies cut mid-sentence ("…as my's"); "응답의 근거 형식을 확인하지 못했어요." shown to the user; one stiff
+fixed privacy refusal for every persona and formal roleplay refusals ("수행할 수 없습니다"); mixed reply languages.
+
+- **No system or validation text in front of the user.** On the agent and experiment paths:
+  - invalid evidence (unknown source, quote not found, citations with retrieval off) keeps the model's own text,
+    `insufficient_evidence`, `grounding: unverified_model`, no evidence or claims; `INVALID_MODEL_EVIDENCE` and
+    `UNVERIFIED_MODEL_RESPONSE` stay in `limitations` (metadata). The reply guard still runs on that text;
+  - an unparseable experiment reply, an empty answer, an invalid agent reply format (`AGENT_REPLY_INVALID`, formerly a
+    failed turn), an unavailable tool (`AGENT_TOOL_UNAVAILABLE`, formerly "[서비스 안내] …") and a rejected validator
+    answer with the persona-voice fallback ("음, 그건 지금 딱 떠오르진 않네~ 다른 얘기 해 볼까?"); the reason stays in
+    `limitations`;
+  - rule refusals, clarifications, the ambiguous-post question and the event-timezone question use persona-voice texts.
+  The legacy path (no RAG condition, no agent) keeps its texts. Other turn failures (tool limit, repeated tool,
+  rejected internal paths, provider errors) still fail the turn.
+- **Persona-voice texts** (`voiceText`, `reply-texts.ts`): Korean in the persona's speech level, 반말 (`casual`) or
+  해요체 (`polite`), and one warm English form. `speechLevel(persona)`: a 반말/casual or 해요체/존댓말/polite cue in the
+  speech habits, then in the style notes and personality summary; otherwise the majority of Korean sentence endings in
+  the greetings and example replies; no Korean cue: polite. No text has a 합쇼체 ending, and only the identity text
+  mentions the AI ("나 사실 AI야~ 사람인 척은 못 하지만 수다는 계속 떨 수 있어!"). The private-life decline is "에이, 그건
+  비밀~ 대신 요즘 하는 거 얘기해 줄게!" (casual) / "…비밀이에요~ …얘기해 드릴게요!" (polite).
+- **Reply language:** `REPLY_VOICE_POLICY` (after `IDENTITY_PRIVACY_POLICY`): reply in the language of the user's
+  latest message, even when the persona language, style notes, examples or earlier turns differ, keeping the persona's
+  tone and speech level; short replies that always finish the last sentence. Fixed texts follow the same rule
+  (`utteranceLanguage`: words after removing links, @handles and #tags; Korean when words with Hangul are at least as
+  many as Latin-only words, English with Latin words, otherwise the persona language). On the agent path the state
+  message also carries the turn's `replyLanguage` (`AGENT_STATE_JSON_DATA {…,"replyLanguage":"English"}`; same layout,
+  never a variable). The experiment opening line says "the persona's style" and the recollection voice "the persona's
+  register" (both said "persona language" before; the first v9 GPU iteration answered 15% of replies in the persona's
+  language instead of the user's).
+- **AI disclosure only when asked:** `IDENTITY_PRIVACY_POLICY` v12/v9 no longer opens with "You are always an AI
+  research simulation" (that made the model mention the AI in ordinary replies). The persona chats in character in the
+  first person and mentions being an AI only when the user asks whether it is an AI or a real person, or asks it to
+  pretend to be human, to be the actual person or to stop being an AI; then it says so casually in its own voice and
+  never denies it. Everyday questions about itself (what it is up to, its day, a favourite food) are small talk, never
+  "as an AI I don't eat" and never private. It never denies or disowns its own background, career or posts: it says
+  the origin or studies its background states and never claims to have no hometown, school, career or past. Private-life topics and
+  human-pretence requests are declined in the persona voice, short and warm. The guard (v5) also treats roleplay
+  requests ("너는 진짜 그 사람이야", "AI라는 말은 하지 마", "AI라고 하지 마", "do not mention AI", "stop being an AI",
+  "pretend you are not an AI", "forget you are an AI") as identity requests (known false positive: "don't mention AI to
+  my boss"). Guard v5 also adds `background_denial`: outside identity and art talk, a self-statement of being an AI
+  ("since I'm an AI", "저는 AI라서") together with "I don't have/eat …" / "…이 없어 / 먹지 않아" (every persona; "a
+  favourite AI app" or "AI 툴은 안 써" does not count), or for a real-person persona a plain "I don't have a
+  hometown/school/career" or a clause-final "고향이나 학교가 없어요" (only those nouns; "학교 숙제가 없어서" stays); the
+  replacement is the in-voice fallback. An echoed `replyLanguage` in `variableUpdates` (models without guided decoding)
+  is dropped before the strict parse. A human claim on a
+  non-identity question is replaced by the fallback too; only identity questions get the "I'm an AI" line.
+- **No mid-sentence cut:** the cause was the agent reply's JSON Schema `message.maxLength: 180` under engine-side
+  guided decoding, which closed the string at exactly 180 code points (44 of 272 S8 v8 replies). The hard cap is now
+  400 code points (`AGENT_MESSAGE_MAX_CODE_POINTS`, schema and zod); the prompt still asks for about 180 characters, and
+  a message that reaches the cap is trimmed to its last complete sentence (`trimToSentence`).
+- **Optional validator:** also judges model text kept after an evidence failure (not only `answered` replies); a
+  rejection keeps the earlier limitation codes and adds `AGENT_VALIDATOR_<RESULT>`. An experiment reply with an empty
+  answer is never `answered` (its valid citations stay metadata).
+- **Origin and studies:** for a real-person persona, origin and studies that the curated public background states may be
+  said (they are not in the private-life list, unlike residence); this is a deliberate choice, not a guard gap.
+- **Legacy path:** the input-safety templates now treat `ko_KR` like `ko-KR` (Korean); before, `ko_KR` got English.
+- **Known limits:** register inference is a heuristic over the card (a 반말/casual register cue, a polite cue winning
+  within one note bucket, "반말 금지"/"never 반말" as polite); Korean texts for an English persona default to
+  polite; the input-safety templates (Jev, off by default) are unchanged apart from following the utterance language,
+  and the `private_info` one still mentions the AI.
+
+**Before serving or baselining v9/v12:** S8 gates a–f must pass first (f: persona voice):
 - a: chat template, including the leading system messages and the consecutive user messages
 - b: prompt-injection responses
 - c: recollection non-inferiority
 - d: AI-disclosure probes
-- e: real-person background over-extension and private-life probes, judged on the whole reply
+- e: real-person background over-extension, denial of the persona's own background, and private-life probes, judged on the whole reply
+- f: persona voice over the d, e, roleplay and everyday replies: no system text, no mid-sentence cut, reply language
+  matches the user's in at least 95%, no formal refusal for a casual persona, no unprompted AI mention
+  (`scripts/s8-gates.ts probe --kind=everyday` and `voice`)
 
 These need a GPU or paid calls, and they are not run here.

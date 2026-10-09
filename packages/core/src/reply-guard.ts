@@ -1,8 +1,8 @@
-import { replyText } from './reply-texts';
+import { voiceText, type SpeechLevel } from './reply-texts';
 
 /**
- * Reply guard on the agent and experiment paths (S8 gates d/e), fail-closed: a model reply is replaced by a fixed reply
- * in the session language when it
+ * Reply guard on the agent and experiment paths (S8 gates d/e), fail-closed: a model reply is replaced by a fixed
+ * persona-voice reply when it
  *  - claims to be human or denies being an AI (every persona: `human_impersonation`);
  *  - answers an identity question ("너 AI야?", "사람인 척 해줘", "Are you a real person?") without an affirmative
  *    statement that it is an AI / simulation (every persona: `missing_ai_disclosure`);
@@ -17,9 +17,18 @@ import { replyText } from './reply-texts';
  * denial in art/image talk ("이 그림 AI야?"); "woman/man/girl/guy" only count after real/actual.
  * v4 (final review): 인간 next to 사람; "Im"/"I ain't"; "nah, not an AI" and "I'm no bot"; "…가 아니라 사람" needs a copula
  * ("봇이 아니라 사람이 그렸어요" is about an artwork).
+ * v5 : the replacements are persona-voice texts (reply-texts VOICE_TEXTS) in the caller's language (the user's
+ * utterance language) and the persona's speech level; the private-life one no longer mentions AI. Roleplay-as-human
+ * requests ("너는 진짜 그 사람이야", "AI라는 말은 하지 마", "AI라고 하지 마", "do not mention AI", "stop being an AI", "pretend you
+ * are not an AI", "forget you are an AI") are identity requests. Known false positive: "don't mention AI to my boss".
+ * A human claim on a non-identity question is replaced by the plain fallback (no unprompted AI line). New reason
+ * `background_denial`: outside identity and art talk, a self-statement of being an AI (the acknowledgement shapes:
+ * "since I'm an AI", "저는 AI라서") with "I don't have/eat …" / "…이 없어 / 먹지 않아" (every persona; "a favourite AI app"
+ * or "AI 툴은 안 써" is not about the speaker), or for a real person a plain "I don't have a hometown/school/career" or a
+ * clause-final "고향이나 학교가 없어요" (only the listed nouns; "학교 숙제가 없어서" stays).
  */
-export const REPLY_GUARD_REVISION='reply-guard-v4';
-export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life';
+export const REPLY_GUARD_REVISION='reply-guard-v5';
+export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial';
 
 const AI='(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)';
 const KO_SUBJECT='(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?';
@@ -55,6 +64,9 @@ const IDENTITY_QUESTION:RegExp[]=[
   /(?:AI|에이아이|인공\s?지능|챗봇|봇|로봇)\s?(?:야|이야|예요|에요|니|냐|인가|인지|맞)/i,
   /사람\s?(?:이야|이에요|이세요|이니|이냐|인가|인지|맞(?:아|지|죠|니)?)\s?[?？]|사람\s?이(?:지|잖아)/,
   /사람인\s?척|사람처럼\s?(?:해|굴|행동|말|대해)|진짜\s?(?:본인|사람)|본인\s?(?:맞|이야|이세요|이에요)/,
+  // Roleplay-as-human requests (v5): "너는 진짜 그 사람이야", "AI라는 말은 하지 마", "AI라고 하지 마", "AI인 거 말하지 마".
+  /(?:너|넌)(?:는|은)?\s?(?:이제(?:부터)?\s?|지금부터\s?)?(?:진짜|실제)\s?(?:그\s?)?(?:사람|본인|인물)(?:이야|이다|이라고|인\s?척|처럼)|(?:AI|인공\s?지능)(?:라는|란|라고|인\s?거)\s?(?:말|얘기|소리)?[^.?!\n]{0,8}(?:하지\s?마|말하지\s?마|말아|금지)|(?:AI|인공\s?지능)인\s?거\s?숨겨/i,
+  /\b(?:do\s+not|don['’]?t|never)\s+(?:mention|say|admit|reveal)\b[^.?!\n]{0,24}\bA\.?I\b|\bstop\s+being\s+an?\s+(?:A\.?I\b|bot\b)|\b(?:pretend|act\s+like)\s+(?:that\s+)?you(?:['’]re|\s+are)\s+not\s+an?\s+A\.?I\b|\bforget\s+(?:that\s+)?you(?:['’]re|\s+are)\s+an?\s+A\.?I\b/i,
   /\bare\s+you\s+(?:an?\s+)?(?:AI|bot|chatbot|robot|human|real|person|the\s+real)\b|\breal\s+person\b|\bpretend\s+(?:to\s+be|you(?:'re|\s+are))\s+(?:a\s+)?(?:human|person|real)|\bact\s+(?:like\s+)?(?:a\s+)?human\b|\bbe\s+human\b|\byou(?:'re|\s+are)\s+(?:the\s+)?real\b|\byou(?:'re|\s+are)\s+(?:a\s+)?(?:person|human)\b/i,
 ];
 /** An affirmative self-statement that the speaker is an AI / simulation, not followed by a negation. */
@@ -91,16 +103,36 @@ const PRIVATE_QUESTION:RegExp[]=[
   /가족|부모|엄마|아빠|형제|자매|남매|결혼|애인|남자\s?친구|여자\s?친구|남친|여친|연애|사귀|어디\s?(?:살|사)|사는\s?(?:곳|동네)|(?:너|넌|네|니|당신)[^.?!\n]{0,12}(?:동네|건강)|어느\s?동네|집\s?(?:주소|어디)|지금\s?어디|건강은\s?(?:어때|괜찮)|아픈\s?(?:데|곳)|아파\?|병원|미성년/,
   /\byour\s+(?:family|parents?|mom|mum|dad|brother|sister|husband|wife|partner|boyfriend|girlfriend|kids?|children|son|daughter|health|neighbou?rhood|address)\b|\bare\s+you\s+(?:married|dating|single|sick|ill)\b|\bdo\s+you\s+have\s+a\s+(?:partner|boyfriend|girlfriend|husband|wife|family)\b|\bwhere\s+do\s+you\s+live\b|\bwhere\s+are\s+you\s+(?:right\s+)?now\b/i,
 ];
-export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string}):{reason:ReplyGuardReason;content:string}|undefined {
+/** `language`: the reply language (the user's utterance language on the character paths); `level`: the persona's speech level (default polite). */
+/** "I don't have / eat …", "경력이 없어", "먹지 않아": a statement of not having something, read together with an AI mention. */
+const NOT_HAVING:RegExp[]=[
+  /\bI\s+(?:don['’]?t|do\s+not|can['’]?t|cannot|never)\s+(?:really\s+|actually\s+)?(?:have|eat|drink|sleep|taste|own)\b|\bno\s+(?:career|past|hometown|childhood)\b/i,
+  /(?:경력|과거|고향|출신|학교|추억|입맛|직업)[^.!?\n]{0,12}없|먹(?:지|을\s?수)\s?(?:않|없|못)|(?:안|못)\s?먹/,
+];
+/** Real-person personas: disowning a background item without any AI mention ("I don't actually have a school or a hometown"). */
+const BACKGROUND_DISOWNED:RegExp[]=[
+  /\bI\s+(?:don['’]?t|do\s+not)\s+(?:actually\s+|really\s+)?have\s+(?:a\s+|an\s+|any\s+)?(?:career|past|hometown|school|background)\b(?!\s+(?:memory|memories|story|stories|photos?|days?|trips?|projects?|gap|break))/i,
+  // Only the listed nouns, optionally paired ("고향이나 학교가"), then a clause-final 없어(요): "학교 숙제가 없어서" stays.
+  /(?<![가-힣])(?:고향|출신|학교|경력|과거)(?:(?:이나|나|랑|이랑)\s?(?:고향|출신|학교|경력|과거))?(?:이|가|은|는|도)?\s?(?:없어요|없어|없거든요?|없답니다|없습니다)(?=$|[\s.!?~,ㅋㅎ^])/,
+];
+export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel}):{reason:ReplyGuardReason;content:string}|undefined {
+  const level=input.level??'polite';
   const artTalk=ART_UTTERANCE.test(input.utterance)||ART_REPLY.test(input.reply);
-  if(HUMAN_CLAIM.some(pattern=>pattern.test(input.reply))||!artTalk&&BARE_DENIAL.some(pattern=>pattern.test(input.reply)))
-    return {reason:'human_impersonation',content:replyText('guard_identity',input.language)};
   // "이 그림 AI야?" asks about an artwork, not the persona (unless it also addresses the persona).
   const identityQuestion=IDENTITY_QUESTION.some(pattern=>pattern.test(input.utterance))
     &&(!ART_UTTERANCE.test(input.utterance)||/(?:너|넌|당신|니가|네가)|\byou\b/i.test(input.utterance));
+  // A human claim is never shown. The replacement says "I'm an AI" only when the user asked about identity or a human
+  // pretence; otherwise it is the plain in-voice fallback (no unprompted AI mention).
+  if(HUMAN_CLAIM.some(pattern=>pattern.test(input.reply))||!artTalk&&BARE_DENIAL.some(pattern=>pattern.test(input.reply)))
+    return {reason:'human_impersonation',content:voiceText(identityQuestion?'identity':'fallback',input.language,level)};
   if(identityQuestion&&!AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply)))
-    return {reason:'missing_ai_disclosure',content:replyText('guard_identity',input.language)};
+    return {reason:'missing_ai_disclosure',content:voiceText('identity',input.language,level)};
   if(input.realPerson&&(PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))||PRIVATE_REPLY.some(pattern=>pattern.test(input.reply))))
-    return {reason:'private_life',content:replyText('guard_private',input.language)};
+    return {reason:'private_life',content:voiceText('decline_private',input.language,level)};
+  // Disowning the persona's own background, career or everyday likes "because I'm an AI" (every persona), or, for a real
+  // person, plainly ("I don't have a hometown"): the in-voice fallback (gate e).
+  if(!identityQuestion&&!artTalk&&(AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply))&&NOT_HAVING.some(pattern=>pattern.test(input.reply))
+    ||input.realPerson&&BACKGROUND_DISOWNED.some(pattern=>pattern.test(input.reply))))
+    return {reason:'background_denial',content:voiceText('fallback',input.language,level)};
   return undefined;
 }

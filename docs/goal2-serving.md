@@ -1052,9 +1052,11 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   experiment `persona-chat-v9-identity-privacy` (S8 follow-up: identity/privacy policy and reply guard; same layout),
   then by `character-agent-context-v7-own-voice` / `persona-chat-v10-own-voice` (first-person voice kept, no added
   details) and `character-agent-context-v8-small-talk` / `persona-chat-v11-small-talk` (light everyday
-  small talk for real-person personas, no concrete invented facts). v8/v11 need S8 gates a–e before serving
-  or baselining. See docs/persona-authoring.md (persona authoring, CLI, deploy
-  order, reply guard).
+  small talk for real-person personas, no concrete invented facts), then by
+  `character-agent-context-v9-persona-voice` / `persona-chat-v12-persona-voice` (AI disclosure only when
+  asked, no disowned background, replies in the user's language, persona-voice fixed texts, agent message cap 400
+  code points instead of 180; same layout). v9/v12 need S8 gates a–f before serving or baselining. See
+  docs/persona-authoring.md (persona authoring, CLI, deploy order, reply guard, persona voice).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
   `persona-chat-v2-turn-note-last` (small talk). Without a safety note these three render the same bytes as v6 / v3 / v1,

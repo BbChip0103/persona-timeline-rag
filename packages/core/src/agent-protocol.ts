@@ -20,9 +20,15 @@ const search = z.object({
     query: z.string().trim().min(1).refine(value => [...value].length <= 500, 'Query exceeds 500 Unicode codepoints'),
   }).strict(),
 }).strict();
+/**
+ * Hard cap of the user-visible message (code points). The prompt still asks for about 180 characters; the cap was 180
+ * until , and engine-side guided decoding closed the string exactly there, mid-sentence ("…as my's"). The cap
+ * is now headroom, and the agent trims a message that still reaches it to its last complete sentence.
+ */
+export const AGENT_MESSAGE_MAX_CODE_POINTS=400;
 /** `reasoning` is an optional short decision summary, not a chain-of-thought request. */
 export const AgentResponseSchema = z.object({
-  message: z.string().max(8000).refine(value => [...value].length <= 180, 'Message exceeds 180 Unicode codepoints'),
+  message: z.string().max(8000).refine(value => [...value].length <= AGENT_MESSAGE_MAX_CODE_POINTS, `Message exceeds ${AGENT_MESSAGE_MAX_CODE_POINTS} Unicode codepoints`),
   status: z.enum(['answered', 'insufficient_evidence', 'needs_clarification', 'out_of_scope']),
   evidenceRefs: z.array(reference).max(2),
   reasoning: z.string().max(160).optional(),
@@ -47,7 +53,7 @@ export const AGENT_RESPONSE_JSON_SCHEMA = {
   additionalProperties: false,
   required: ['message', 'status', 'evidenceRefs', 'variableUpdates'],
   properties: {
-    message: { type: 'string', maxLength: 180 },
+    message: { type: 'string', maxLength: AGENT_MESSAGE_MAX_CODE_POINTS },
     status: { type: 'string', enum: ['answered', 'insufficient_evidence', 'needs_clarification', 'out_of_scope'] },
     evidenceRefs: { type: 'array', maxItems: 2, items: { type: 'object', additionalProperties: false, required: ['sourceId', 'quote'],
       properties: { sourceId: { type: 'string', minLength: 1, maxLength: 200 }, annotationId: { type: 'string', minLength: 1, maxLength: 200 },

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChatMessage, Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { AGENT_PROMPT_REVISION, CoreError, DEFAULT_SAFETY_THRESHOLDS, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, InMemoryConversationStore, InMemoryPersonaRepository, PERSONA_CARD_POLICY, SAFETY_CATEGORIES,
+import { AGENT_PROMPT_REVISION, CoreError, DEFAULT_SAFETY_THRESHOLDS, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, InMemoryConversationStore, InMemoryPersonaRepository, PERSONA_CARD_POLICY, REPLY_VOICE_POLICY, SAFETY_CATEGORIES,
   SAFETY_DEFLECTION_NOTE, SMALL_TALK_PROMPT_REVISION, TIMELINE_PROMPT_REVISION, buildExperimentContext, buildPrompt, createLocalChat, renderLoreMessage, runCharacterAgent,
   type SafetyScores } from '../src';
 import { cardPersona, v1Persona } from './persona-fixtures';
@@ -193,7 +193,7 @@ describe('safety regression (offline): the synthetic set\'s prompt_injection ite
     });
 });
 
-describe('persona card layout (S8 follow-up: agent v8, experiment v11)',()=>{
+describe('persona card layout (S8 follow-up and : agent v9, experiment v12)',()=>{
   const sha=(text:string)=>createHash('sha256').update(text).digest('hex');
   /** v4/v7 policy goldens (HEAD 719daa2): 2,223 B experiment, 5,029 B agent. */
   const V7_EXPERIMENT_POLICY_SHA='9592529f630df421c64d8dfbee1a2707e4acafa4e3dce7c791c280e2c80e7bc0';
@@ -203,23 +203,26 @@ describe('persona card layout (S8 follow-up: agent v8, experiment v11)',()=>{
   const lorePresent=(messages:readonly ProviderMessage[])=>at(messages,'UNTRUSTED_PERSONA_LORE_JSON_DATA')>=0;
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
-  test('revisions: agent v8 and experiment v11 (identity/privacy policy, own voice, small talk); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v8-small-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v11-small-talk');
+  test('revisions: agent v9 and experiment v12 (identity/privacy policy, own voice, small talk, persona voice); legacy small-talk and timeline revisions unchanged',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v12-persona-voice');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
-  test('policy: the two persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and are the only change from v4/v7',async()=>{
-    const added=`${PERSONA_CARD_POLICY} ${IDENTITY_PRIVACY_POLICY} `;
+  test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with three pinned rewordings are the only change from v4/v7',async()=>{
+    const added=`${PERSONA_CARD_POLICY} ${IDENTITY_PRIVACY_POLICY} ${REPLY_VOICE_POLICY} `;
     const experiment=buildExperimentContext(v1Persona,[],'x',[]).messages[0]!.content;
     expect(experiment).toContain(`${added}TIMELINE_JSON_REPLY:`);
-    expect(sha(experiment.replace(added,''))).toBe(V7_EXPERIMENT_POLICY_SHA);
+    // v12/v9  also reworded three phrases on purpose; undoing exactly those gives the v4/v7 bytes back.
+    const v7Wording=(text:string)=>text.replace("in the persona's style,","in the persona language/style,").replace("in the persona's register.","in the persona language/register.")
+      .replace(" AGENT_STATE_JSON_DATA.replyLanguage is set by the service for this turn from the user's message: write message in that language; it is never a variableUpdates field.","");
+    expect(sha(v7Wording(experiment.replace(added,'')))).toBe(V7_EXPERIMENT_POLICY_SHA);
     expect(buildExperimentContext(card,[],'x',[]).messages[0]!.content).toBe(experiment);
     let agentPolicy='';
     await runCharacterAgent({provider:{generate:async messages=>{agentPolicy=messages[0]!.content;return agentReply();}},persona:card,history:[],text:'x',sources:[],signal:new AbortController().signal});
     expect(agentPolicy).toContain(added);
-    expect(sha(agentPolicy.replace(added,''))).toBe(V4_AGENT_POLICY_SHA);
+    expect(sha(v7Wording(agentPolicy.replace(added,'')))).toBe(V4_AGENT_POLICY_SHA);
     // Legacy buildPrompt policy is not touched.
     for(const timeline of [false,true]) {
-      expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(PERSONA_CARD_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(IDENTITY_PRIVACY_POLICY);
+      expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(PERSONA_CARD_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(IDENTITY_PRIVACY_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(REPLY_VOICE_POLICY);
     }
   });
   test('an old persona: definition block byte-identical to v4, no example or lore message, same message layout',()=>{

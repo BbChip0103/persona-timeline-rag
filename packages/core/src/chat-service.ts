@@ -12,7 +12,7 @@ import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type 
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
 import { REPLY_GUARD_REVISION, guardReply } from './reply-guard';
-import { replyText } from './reply-texts';
+import { replyText, speechLevel, utteranceLanguage, voiceText, type VoiceTextKey } from './reply-texts';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
   leases:TurnLeaseStore;delivery:TurnDelivery;
@@ -252,19 +252,26 @@ export class ChatService {
     let agent:ChatReply['agent'];
     let personaContext:ChatReply['personaContext'];let lore:ProviderMessage|undefined;
     let replyGuard:ChatReply['replyGuard'];
-    // Reply guard (agent and experiment paths, S8 follow-up): fail-closed fixed reply in the session language.
+    // Character paths (experiment and agent): fixed texts are persona-voice texts in the user's utterance
+    // language and the persona's speech level; the legacy path keeps its texts in the session language.
+    const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
+    const replyLanguage=cardPath?utteranceLanguage(value.text,session.language):session.language, level=speechLevel(persona);
+    const fixed=(key:'rule_refusal'|'clarification'|'ambiguous_reference'|'event_timezone')=>cardPath
+      ?voiceText(({rule_refusal:'decline',clarification:'clarification',ambiguous_reference:'ambiguous_reference',event_timezone:'event_timezone'} as const satisfies Record<string,VoiceTextKey>)[key],replyLanguage,level)
+      :replyText(key,session.language);
+    // Reply guard (agent and experiment paths, S8 follow-up): fail-closed persona-voice reply.
     const guard=(candidate:typeof output):typeof output=>{
-      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:persona.reviewStatus!=='synthetic',language:session.language});
+      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:persona.reviewStatus!=='synthetic',language:replyLanguage,level});
       replyGuard=guarded?{revision:REPLY_GUARD_REVISION,action:'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
       return guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate;
     };
     if(intent==='clarification' || intent==='unsupported') {
-      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?replyText('clarification',session.language):safetyCategory?safetyReply(safetyCategory,session.language):replyText('rule_refusal',session.language),claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
+      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?fixed('clarification'):safetyCategory?safetyReply(safetyCategory,replyLanguage):fixed('rule_refusal'),claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
     } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
       memoryTrace={...memoryTrace,action:'clarify'};
-      output={status:'needs_clarification',content:replyText('ambiguous_reference',session.language),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
+      output={status:'needs_clarification',content:fixed('ambiguous_reference'),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
     } else if(intent==='timeline' && session.retrievalMode !== 'off' && query.dateBasis==='event' && query.start && query.timezone !== 'UTC') {
-      output={status:'needs_clarification',content:replyText('event_timezone',session.language),claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
+      output={status:'needs_clarification',content:fixed('event_timezone'),claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
     } else if(intent==='timeline' && session.retrievalMode==='off' && session.ragCondition===undefined) {
       output={status:'insufficient_evidence',content:replyText('retrieval_off',session.language),claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
     } else {
@@ -294,7 +301,6 @@ export class ChatService {
       const policyNote=deflect?SAFETY_DEFLECTION_NOTE:undefined;
       // Persona lore , experiment and agent paths only: never on a deflected turn; the last two user
       // messages count unless the input-safety filter acted on their turn (deflected injections stay in the history).
-      const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
       if(cardPath&&persona.lore?.length) {
         const previous:string[]=[];
         if(!deflect) for(const message of promptHistory.filter(message=>message.role==='user'&&message.turnId).slice(-2)) {
@@ -328,16 +334,18 @@ export class ChatService {
         agent=agentRun.agent;memorySources=agentRun.context.sources;
         promptEvidence={sourceIds:memorySources.map(source=>source.id),annotationIds:memorySources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
           omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8')};
-        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),session.language);
+        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),replyLanguage,level);
         if(!session.ragCondition&&intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
         if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
         agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
-        if(this.options.agentValidator&&output.status==='answered') {
+        // The optional judge also sees model text kept after an evidence failure , not only answered replies.
+        if(this.options.agentValidator&&(output.status==='answered'||output.limitations.includes('INVALID_MODEL_EVIDENCE')&&output.content!==voiceText('fallback',replyLanguage,level))) {
           if(agent.toolCalls)agent.validator='skipped_tool_followup';
           else {
             try {agent.validator=await this.options.agentValidator.validate({question:value.text,answer:output.content,sources:memorySources,personId:session.personId,signal:controller.signal})==='accept'?'accepted':'rejected';}
             catch {agent.validator='error';}
-            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:replyText('validator_rejected',session.language),claims:[],evidence:[],limitations:[`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
+            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:voiceText('fallback',replyLanguage,level),claims:[],evidence:[],grounding:'unverified_model',
+              limitations:[...output.limitations.filter(code=>/^[A-Z_]+$/.test(code)),`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
           }
         }
         output=guard(output);
@@ -347,7 +355,7 @@ export class ChatService {
         if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
       }
       else if(session.ragCondition) {
-        output=guard(validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition,session.language));
+        output=guard(validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition,replyLanguage,level));
         if(experiment!.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${experiment!.omittedAnnotations}`);
       }
       else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);

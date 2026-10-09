@@ -1,5 +1,5 @@
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat, voiceText } from '../src';
 const persona:Persona={id:'agent-synthetic',personId:'agent-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
 const source:SourcePost={id:'agent-post',personId:persona.personId,caption:'합성 숲을 그렸어요.',postedAt:'2024-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/synthetic',hash:'synthetic-hash',snapshot:'v1',unsafe:false,imageAnnotations:[{id:'agent-photo',imageHash:'ih',annotationHash:'ah',revision:'v1',text:'짙은 초록의 숲.',model:'synthetic',humanReviewed:false}]};
 const final=(patch:object={})=>JSON.stringify({status:'answered',message:'편하게 이야기해요.',evidenceRefs:[],variableUpdates:{},...patch});
@@ -18,7 +18,7 @@ test.each(['off','caption','caption_image'] as const)('recollection voice reache
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v8-small-talk');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v9-persona-voice');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
   expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('그건 잘 기억 안 나');
@@ -33,12 +33,12 @@ test('supported first-person message is preserved with exact refs, without a pro
   expect(turn.reply?.content).toBe(message);expect(turn.reply?.evidence[0].sourceId).toBe(source.id);
   expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(turn.reply?.agent?.promptRevision).toBe(AGENT_PROMPT_REVISION);
 });
-test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs retain technical fallback',async()=>{
+test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs keep the model text unverified, without citations ',async()=>{
   const h=setup([final({status:'insufficient_evidence',message:'그건 잘 기억 안 나. 어느 그림 말하는 거야?'}),final({message:'아 기억나!',evidenceRefs:[{sourceId:'invented',quote:'invented'}]})]);
   const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const first=await send(h,session.id);expect(first.reply?.content).toBe('그건 잘 기억 안 나. 어느 그림 말하는 거야?');expect(first.reply?.evidence).toEqual([]);
-  const second=await send(h,session.id,'계속','req2');expect(second.reply?.content).toBe('응답의 근거 형식을 확인하지 못했어요.');
-  expect(second.reply?.limitations).toContain('INVALID_MODEL_EVIDENCE');expect(second.reply?.content).not.toContain('기억');
+  const second=await send(h,session.id,'계속','req2');expect(second.reply?.content).toBe('아 기억나!');
+  expect(second.reply?.limitations).toContain('INVALID_MODEL_EVIDENCE');expect(second.reply).toMatchObject({grounding:'unverified_model',evidence:[],claims:[]});
 });
 
 test('one-call structured final: state, compact decision summary, public message-only history and immutable profile',async()=>{
@@ -48,7 +48,7 @@ test('one-call structured final: state, compact decision summary, public message
   const first=await send(h,session.id);expect(first.state).toBe('completed');
   expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'그림',tone:'warm'},decisionSummary:'합성 응답 요약',validator:'disabled'});
   await send(h,session.id,'계속 이야기하자','req2');
-  expect(state(h.provider.generate.mock.calls[1][0])).toEqual({conversationTopic:'그림',tone:'warm'});
+  expect(state(h.provider.generate.mock.calls[1][0])).toEqual({conversationTopic:'그림',tone:'warm',replyLanguage:'Korean'});
   expect((await h.chat.history('owner',session.id)).map(m=>m.content).join('')).not.toContain('합성 응답 요약');
   expect(h.retrieval.search).not.toHaveBeenCalled();
   await expect(h.chat.sendTurn('owner',{sessionId:session.id,text:'hi',clientRequestId:'override',executionProfile:'legacy'} as never)).rejects.toMatchObject({code:'INVALID_INPUT'});
@@ -85,10 +85,12 @@ test('scoped tool cannot select different person, date or algorithm; bad sources
   const data=h.provider.generate.mock.calls[1][0].find(m=>m.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!.content;
   expect(data).not.toContain('wrong-date');expect(data).not.toContain('unsafe');expect(data).not.toContain('"sourceId":"other"');
 });
-test.each([tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('malformed actions fail once with no retrieval, history or state writes',async raw=>{
+test.each([tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('malformed actions answer once with the persona-voice fallback : no retrieval, no state writes',async raw=>{
   const h=setup([raw]);const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
-  const turn=await send(h,session.id);expect(turn.state).toBe('failed');expect(turn.errorCode).toBe('TURN_FAILED');
-  expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(h.retrieval.search).not.toHaveBeenCalled();expect(await h.chat.history('owner',session.id)).toHaveLength(1);
+  const turn=await send(h,session.id);expect(turn.state).toBe('completed');
+  expect(turn.reply).toMatchObject({status:'insufficient_evidence',content:voiceText('fallback','ko','casual'),evidence:[],agent:{variables:{conversationTopic:'',tone:'neutral'}}});
+  expect(turn.reply?.limitations).toContain('AGENT_REPLY_INVALID');
+  expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(h.retrieval.search).not.toHaveBeenCalled();
 });
 test('duplicate tool query and max loop exhaustion stop without extra calls',async()=>{
   for(const outputs of [[tool(),tool()],[tool('one'),tool('two'),tool('three')]]) {
@@ -99,7 +101,6 @@ test('duplicate tool query and max loop exhaustion stop without extra calls',asy
   }
 });
 test.each([
-  {reason:'AGENT_REPLY_INVALID',outputs:['not JSON']},
   {reason:'REPLY_REJECTED',outputs:[final({message:'see /home/agent/notes'})]},
   {reason:'TOOL_QUERY_REJECTED',outputs:[tool('file:///etc/passwd')]},
   {reason:'TOOL_LIMIT',outputs:[tool('one'),tool('two'),tool('three')]},
@@ -190,12 +191,12 @@ test('configured validator accept permits only final state patch, with no model 
 });
 
 
-test('off unavailable tool returns service notice once and permits a later normal turn without new state',async()=>{
+test('off unavailable tool answers once with the persona-voice fallback (no service notice) and permits a later normal turn without new state',async()=>{
   const h=setup([tool(),final({message:'그래, 다른 얘기 하자ㅋㅋ'})]);
   const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const first=await send(h,session.id);expect(first.state).toBe('completed');
   expect(first.reply?.status).toBe('insufficient_evidence');expect(first.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE');
-  expect(first.reply?.content).toContain('[서비스 안내]');expect(first.reply?.content).not.toContain('기억');
+  expect(first.reply?.content).toBe(voiceText('fallback','ko','casual'));expect(first.reply?.content).not.toContain('서비스');
   expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'',tone:'neutral'}});
   expect(first.reply?.evidence).toEqual([]);expect(h.provider.generate).toHaveBeenCalledTimes(1);
   const next=await send(h,session.id,'다른 얘기 하자','next');expect(next.reply?.content).toBe('그래, 다른 얘기 하자ㅋㅋ');
