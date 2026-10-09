@@ -23,7 +23,9 @@ unused and the `ptr_goal1` resource names are not owned by another project. Then
 docker compose --env-file .env.local -f infra/compose.db.yml up -d db
 # With DATABASE_URL already loaded from private configuration:
 pnpm db:migrate
-RUN_STORAGE_DB_TESTS=1 pnpm exec jest packages/storage/test --runInBand
+# Storage integration tests run on the synthetic ptr_loadtest database (see below), never on ptr_research;
+# their cleanup refuses any other database.
+RUN_STORAGE_DB_TESTS=1 DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm exec jest packages/storage/test --runInBand
 ```
 
 Migrations run only after URL and connected database/user identity checks. They

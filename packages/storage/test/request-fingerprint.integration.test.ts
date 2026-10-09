@@ -3,6 +3,7 @@ import type { Pool } from 'pg';
 import type { Persona } from '@ptr/contracts';
 import { type LocalChat, requestFingerprint, createLocalChat } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository } from '../src';
+import { removeSyntheticConversations } from './synthetic-cleanup';
 const enabled=process.env.RUN_STORAGE_DB_TESTS==='1'&&Boolean(process.env.DATABASE_URL);
 (enabled?describe:describe.skip)('dedicated local SQL structured request fingerprint (synthetic only)',()=>{
   const scope=`synthetic-request-hash-${randomUUID()}`;let pool:Pool;let store:PostgresConversationStore;let service:LocalChat;
@@ -10,7 +11,7 @@ const enabled=process.env.RUN_STORAGE_DB_TESTS==='1'&&Boolean(process.env.DATABA
   const provider={generate:jest.fn(async()=>JSON.stringify({status:'insufficient_evidence',answer:'',evidenceRefs:[]}))};
   const retrieval={search:jest.fn(async()=>[])};
   beforeAll(async()=>{pool=createLocalPool(process.env.DATABASE_URL!);store=new PostgresConversationStore(pool);const personas=new PostgresPersonaRepository(pool);await personas.importPersona(persona);service=createLocalChat({store,personas,provider,retrieval});});
-  afterAll(async()=>{await pool?.end();});
+  afterAll(async()=>{try{await removeSyntheticConversations(pool,[scope]);}finally{await pool?.end();}});
   async function create(){return service.createSession(scope,{personId:scope,personaId:persona.id,personaRevision:persona.revision,retrievalMode:'lexical',timezone:'UTC'});}
   test('canonical retry does not call provider/retrieval again; changed structured fields conflict',async()=>{
     const session=await create();

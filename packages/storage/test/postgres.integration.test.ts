@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type { ChatReply, ChatSession, Persona, SourcePost, TimelineQuery } from '@ptr/contracts';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresSourceRepository } from '../src/index';
+import { removeSyntheticConversations } from './synthetic-cleanup';
 
 const enabled = process.env.RUN_STORAGE_DB_TESTS === '1' && !!process.env.DATABASE_URL;
 const integration = enabled ? describe : describe.skip;
@@ -34,7 +35,7 @@ integration('dedicated loopback Postgres storage (synthetic fixtures only)', () 
     await conversations.create(session, { id: `greeting-${scope}`, sessionId: session.id, turnId: null, role: 'assistant', content: persona.greeting, createdAt: session.createdAt });
     await sources.importPosts(posts, 'synthetic_fixture');
   });
-  afterAll(async () => { await pool?.end(); });
+  afterAll(async () => { try { await removeSyntheticConversations(pool, [scope]); } finally { await pool?.end(); } });
   it('keeps persona revisions immutable and pinned', async () => {
     await personas.importPersona(persona);
     await expect(personas.importPersona({ ...persona, greeting: 'mutated' })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });

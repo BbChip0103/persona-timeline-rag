@@ -61,7 +61,9 @@ export class ChatService {
   constructor(private readonly options:ChatServiceOptions) {}
   async createSession(ownerId:string,input:CreateSessionInput):Promise<ChatSession> {
     if(!ownerId.trim()) throw new CoreError('FORBIDDEN');
-    const parsed=CreateSessionSchema.safeParse(input);
+    // A RAG condition without a mode defaults to semantic, or to lexical where semantic search is unavailable.
+    const defaulted=input.retrievalMode===undefined&&input.ragCondition&&input.ragCondition!=='off'&&this.options.semanticSearch===false?{...input,retrievalMode:'lexical' as const}:input;
+    const parsed=CreateSessionSchema.safeParse(defaulted);
     if(!parsed.success) throw new CoreError('INVALID_INPUT');
     const value=parsed.data;
     if(value.retrievalMode==='semantic'&&this.options.semanticSearch===false) throw new CoreError('SEMANTIC_UNAVAILABLE');

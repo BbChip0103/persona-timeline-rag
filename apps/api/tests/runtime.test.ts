@@ -72,6 +72,11 @@ test('selfhosted and gateway chat have no real query embedder: semantic sessions
     {PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'}]) {
     const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,...env});
     await expect(runtime.chat.createSession('owner_synthetic',session)).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+    // Wiring check only: a RAG condition alone must not default to the unavailable semantic mode. It then fails later on
+    // the persona lookup (PERSONA_UNAVAILABLE on a migrated database, a connection error on the dummy one); the exact
+    // lexical default is asserted in packages/core/tests/turn-worker.test.ts.
+    const {retrievalMode:_ignored,...noMode}=session;
+    await expect(runtime.chat.createSession('owner_synthetic',{...noMode,ragCondition:'caption'})).rejects.not.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
     await runtime.close?.();
   }
 });

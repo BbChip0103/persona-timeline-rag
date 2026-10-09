@@ -307,8 +307,10 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
     const base={personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,timezone:'UTC'};
     const chat=new ChatService({...options,semanticSearch:false});
     await expect(chat.createSession('owner_q',{...base,retrievalMode:'semantic'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
-    // A RAG condition without a mode defaults to semantic: refused too, never silently switched to lexical.
-    await expect(chat.createSession('owner_q',{...base,ragCondition:'caption'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+    // A RAG condition without a mode defaults to semantic where it works, and to lexical where it does not.
+    await expect(chat.createSession('owner_q',{...base,ragCondition:'caption'})).resolves.toMatchObject({retrievalMode:'lexical',ragCondition:'caption'});
+    await expect(chat.createSession('owner_q',{...base,ragCondition:'off'})).resolves.toMatchObject({retrievalMode:'off'});
+    await expect(new ChatService(options).createSession('owner_q',{...base,ragCondition:'caption'})).resolves.toMatchObject({retrievalMode:'semantic'});
     await expect(chat.createSession('owner_q',{...base,retrievalMode:'lexical'})).resolves.toMatchObject({retrievalMode:'lexical'});
     // A semantic session created while semantic search was available (same store), now served by a runtime without it.
     const old=await new ChatService(options).createSession('owner_q',{...base,retrievalMode:'semantic'});

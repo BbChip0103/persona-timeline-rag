@@ -19,3 +19,11 @@ test('QUEUE_TIMEOUT (no worker started the turn in time) is a friendly try-again
   expect(english).toMatch(/try again in a moment/i);expect(english).not.toMatch(/[가-힣]/);
   for(const value of [korean,english]) expect(value).not.toMatch(/QUEUE|TIMEOUT|queue|worker|timeout|큐|워커|타임아웃|대기열/);
 });
+test('WORKER_LOST (the worker died mid-turn) is a friendly temporary-problem line in the session language, never system jargon',()=>{
+  const korean=turnNotice({state:'failed',errorCode:'WORKER_LOST'},'ko');
+  expect(korean).toContain('잠시 후 다시 시도해 주세요');expect(korean).toContain('일시적');
+  expect(turnNotice({state:'failed',errorCode:'WORKER_LOST'})).toBe(korean);
+  const english=turnNotice({state:'failed',errorCode:'WORKER_LOST'},'en');
+  expect(english).toMatch(/temporary problem/i);expect(english).toMatch(/try again/i);expect(english).not.toMatch(/[가-힣]/);
+  for(const value of [korean,english]) expect(value).not.toMatch(/WORKER|LOST|\bworker|\blease\b|\blost\b|워커|리스|유실/);
+});

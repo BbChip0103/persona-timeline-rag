@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 import type { ChatReply, ChatSession, Persona } from '@ptr/contracts';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository } from '../src/index';
+import { removeSyntheticConversations } from './synthetic-cleanup';
 
 // Recovery, reconciliation and dispatch sweeps are database-wide. Run these tests on a database no dispatcher or load
 // test is using at the same time (e.g. ptr_loadtest while idle); assertions only look at this file's own turns.
@@ -65,7 +66,7 @@ integration('turn outbox, per-turn leases, fencing and recovery (synthetic fixtu
     store = new PostgresConversationStore(pool);
     await new PostgresPersonaRepository(pool).importPersona(persona);
   });
-  afterAll(async () => { await pool?.end(); });
+  afterAll(async () => { try { await removeSyntheticConversations(pool, [scope]); } finally { await pool?.end(); } });
 
   it('the reservation writes its outbox entry atomically; concurrent claims lease the turn once and retire the entry', async () => {
     const s = await session(); const turn = await enqueue(s, '큐 입력');
