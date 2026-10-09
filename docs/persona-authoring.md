@@ -105,11 +105,13 @@ order. A `meta`-only change gives a new revision, but the prompt bytes stay the 
 
 ```bash
 # checks only: no database, nothing written
-pnpm exec tsx scripts/persona.ts validate drafts.json --sources-doc … --split-file … --captions-file … [--generated-list …]
+pnpm exec tsx scripts/persona.ts validate drafts.json --sources-doc … --split-file … --captions-file … [--generated-list …] [--baseline …]
 # dry run: prints the target database and the computed revisions; writes nothing
 pnpm exec tsx scripts/persona.ts publish drafts.json --target research_db|loadtest_db <paths…>
 # publish: import (and make current) → authored list → publish log
 pnpm exec tsx scripts/persona.ts publish drafts.json --target research_db <paths…> --confirm
+# rollback: make stored revisions current again, verbatim (dry run without --confirm; the dry run does not check the database)
+pnpm exec tsx scripts/persona.ts restore previous.json --target research_db --authored-list … --publish-log … [--add] --confirm
 ```
 
 `<file>` holds one persona or an array (one per `personId`). Private paths have **no defaults**. A flag wins over its
@@ -121,8 +123,28 @@ env var. A missing value, or a missing input file, fails.
 | split (`id → dev\|test`) | `--split-file` | `PTR_RESEARCH_SPLIT_FILE` |
 | captions (`sources.json`) | `--captions-file` | `PTR_RESEARCH_SOURCES_FILE` |
 | generated personas (optional, leak-check exemption) | `--generated-list` | `PTR_PERSONAS_FILE` |
-| authored list (publish; created on first publish) | `--authored-list` | `PTR_AUTHORED_PERSONAS_FILE` |
-| publish log (publish; JSONL, created on first publish) | `--publish-log` | `PTR_PERSONA_PUBLISH_LOG` |
+| baseline: the revisions current before this publish (optional, see below) | `--baseline` | `PTR_PERSONA_BASELINE_FILE` |
+| authored list (publish and restore; created on first publish) | `--authored-list` | `PTR_AUTHORED_PERSONAS_FILE` |
+| publish log (publish and restore; JSONL, created on first publish) | `--publish-log` | `PTR_PERSONA_PUBLISH_LOG` |
+
+`restore` needs only `--target`, `--authored-list` and `--publish-log` (no research inputs); `--add` lets it add an
+authored-list entry that does not exist yet.
+
+**`--baseline`** (a JSON array of the persona documents that are current in the target database before this publish,
+exported verbatim from `persona_versions`):
+- A baseline applies to the draft with the same persona id, else the same `personId`; a different id or person is an
+  error (`baseline_mismatch`) and grants nothing.
+- Style lines identical to a baseline **style** line, and boundaries lines identical to a baseline **boundaries** line,
+  skip the test-split leak check and the per-line length limit (each field against the same field).
+- The style **count** limit (8) is skipped only while every style line comes from the baseline and there are no more
+  lines than in it. This is intended and style-only: goal1's refined revisions have 9 style lines, boundaries keep
+  their 1–10 count limit.
+- Every other rule still applies to baseline text.
+- `validate` and dry runs warn `baseline_unverified`. A confirmed publish first checks every baseline against the
+  target database: it must be that persona's **current** revision (same `personas.id`, `person_id`, `revision`, and
+  the stored `document` equal as jsonb). If any check fails, the whole publish is refused and nothing is written. The
+  log line records `baselineRevision`. On a rerun after the import committed (the list/log step failed), the draft's
+  computed revision is current: that also passes, as long as the baseline is still stored exactly as given.
 
 **Source document entries:**
 - Required: `id` (`web:<n>`), `personId`, `url` (http/https), `title`, `publisher`, `retrievedAt` (`YYYY-MM-DD…`) and
@@ -155,7 +177,11 @@ env var. A missing value, or a missing input file, fails.
 - **The publish log holds real handles** (publisher user names, personIds). It stays private (mode 0600, under the
   ignored `data/`) and is never committed or pasted into reports.
 - One log line is written per persona: `personaId, personId, revision, previousRevision, inserted, currentRevisionSet,
-  publisher (OS/git user), publishedAt, lintRevision, sourceDocSha256, target, database`.
+  [alreadyCurrent: true when previousRevision equals revision (a rerun)], [baselineRevision], publisher (OS/git user),
+  publishedAt, lintRevision, sourceDocSha256, target, database`.
+- A `restore` writes `action: "restore", personaId, personId, revision, previousRevision, currentRevisionSet,
+  [alreadyCurrent], [notLatestPreviousRevision], publisher, publishedAt, target, database` (no lint fields: nothing is
+  linted).
 - Republishing the same file is idempotent for the database and the list, and it adds a log line.
 
 The CLI prints indexes, revisions, issue paths and rule names only.
@@ -189,13 +215,45 @@ The CLI prints indexes, revisions, issue paths and rule names only.
   1. Deploy every API and worker process with this contract.
   2. Publish the first card persona.
   3. Restart the API.
-- **Rollback:**
-  1. Restore the generated revision as current by republishing the generated document. That is the entry for this
-     `personId` in `personas.json`, run through `publish … --confirm` to the same target. The revision rule is the same,
-     so it republishes as its own `silver-…` revision with `setCurrent`. The authored list entry becomes that v1-shaped
-     document, which old code can read. This is tested in `persona-cli.test.ts`.
-  2. Restart the API.
-  3. Then roll back the code.
+- **Rollback** restores the revision that was current **before** the publish, not necessarily the generated one. For
+  the 4 research personas that is goal1's refined `dialogue-*` revision (made by
+  `scripts/refine-personas.ts`). Verified from the source: the first card publish recorded
+  `previousRevision: dialogue-…` for all 4 personas in the publish log. The generated `personas.json` document lacks
+  those refinements.
+  1. Take the `previousRevision` of the publish being undone from the publish log, and export that document verbatim
+     (revision included) from `persona_versions` (read-only `SELECT document … WHERE persona_id=… AND revision=…`).
+  2. Run `restore <file> --target … --authored-list … --publish-log … --confirm`. It re-points `current_revision` to
+     those stored revisions in one transaction, verbatim: no lint (a stored revision may never have been linted, e.g.
+     a `dialogue-*` revision; intentional), no new revision, and it refuses a revision that is not stored or is stored
+     with other content (jsonb equality, so a key-reordered export is fine). The authored list must already hold an
+     entry for that `personId` with the same persona id (`--add` for a missing entry). The authored list entry becomes
+     that document (v1-shaped for a `dialogue-*` revision, so old code can read it) and the log gets an
+     `action: "restore"` line with the `previousRevision` it replaced.
+     - **Target check (decision: warn, not refuse):** when the target is not the newest log line's `previousRevision`
+       for that persona (a multi-step rollback), the output warns `not_latest_previous_revision` and the log line
+       records `notLatestPreviousRevision: true`. Lines with `alreadyCurrent: true` (reruns) are skipped when finding
+       the newest one. Example: after a rebase done as below (restore `dialogue-*`, then publish the card), the newest
+       `previousRevision` is `dialogue-*`, so a one-step rollback returns to it; rolling back further, past an earlier
+       card revision, is multi-step and warns. Refusing would block those legitimate rollbacks; the stored-revision
+       check still guards the content.
+     - A dry run prints that the database was not checked.
+     - Tested in `persona-cli.test.ts`, `packages/storage/test/personas.test.ts` and the opt-in SQL suite
+       (`postgres.integration.test.ts`: restore from a key-reordered export, no new `persona_versions` row, a mismatch
+       leaves the pointer).
+  3. Restart the API.
+  4. Then roll back the code.
+  - If no earlier revision exists (a persona first created by a publish), republish the generated document instead
+    (`publish … --confirm`; it gets its own `silver-…` revision).
+- **Rebasing on a refined revision** (e.g. goal1's `dialogue-*` revisions for the 4 research personas):
+  1. `restore` the refined revision, so it is current again (export it verbatim from `persona_versions`).
+  2. Build the drafts on its concept and style, and `publish … --baseline <that same document> --confirm`. The
+     baseline check requires it to be current (or, on a rerun after the import committed, the draft's revision to be
+     current) and stored exactly as given; its approved style/boundaries lines then skip the leak check and the line
+     limits.
+  - The recorded rebase (S8 report) was done before this strict rule existed: it published with the
+    `dialogue-*` documents as an unverified baseline while the earlier card revision was current, so its log line has no
+    `baselineRevision` and its `previousRevision` is the earlier card revision; `dialogue-*` stays reachable as a
+    multi-step rollback (the earlier log line's `previousRevision`).
   - Sessions pinned to a card revision cannot be continued on old code.
 
 ## Prompt rendering (agent `character-agent-context-v8-small-talk`, experiment `persona-chat-v11-small-talk`)

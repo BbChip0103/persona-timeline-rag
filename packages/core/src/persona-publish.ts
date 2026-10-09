@@ -25,6 +25,17 @@ export interface PersonaPublishContext {
    * common phrases such as "conversational responses" otherwise collide with captions .
    */
   generated?:Persona;
+  /**
+   * The same persona's revision that was current before this publish (pre-existing approved text, e.g. goal1's refined
+   * `dialogue-*` revisions). Style and boundaries lines identical to it skip the leak check and the per-line length
+   * limit, and the style count limit while every style line comes from it (style only, intended: the refined
+   * revisions have more and longer style lines than the publish limits; boundaries keep their 1–10 count limit). Style
+   * lines are compared with the baseline style, boundaries with the baseline boundaries. It must be the same persona id
+   * and person (else `baseline_mismatch`, no exemption). Every other rule still applies.
+   */
+  baseline?:Persona;
+  /** The baseline was verified against the target database (a confirmed publish); otherwise a `baseline_unverified` warning. */
+  baselineVerified?:boolean;
 }
 export const EXAMPLE_DIALOGUE_CODE_POINT_LIMIT=800;
 export const TEST_CAPTION_OVERLAP_CODE_POINTS=12;
@@ -175,8 +186,14 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
   // Publish limits of the v1 fields (the read schema stays wide for stored revisions).
   const limit=(path:string,count:number,max:number,min=0)=>{if(count>max||count<min)report(path,'limit');};
   limit('label',codePoints(p.label),60);limit('identity',codePoints(p.identity),300);limit('concept',codePoints(p.concept),300);
-  limit('style',p.style.length,8);p.style.forEach((text,i)=>limit(`style[${i}]`,codePoints(text),120));
-  limit('boundaries',p.boundaries.length,10,1);p.boundaries.forEach((text,i)=>limit(`boundaries[${i}]`,codePoints(text),160));
+  const baseline=context.baseline&&context.baseline.id===p.id&&context.baseline.personId===p.personId?context.baseline:undefined;
+  if(context.baseline&&!baseline) report('','baseline_mismatch');
+  if(baseline&&!context.baselineVerified) report('','baseline_unverified','warn');
+  const baselineStyle=new Set(baseline?.style??[]),baselineBoundaries=new Set(baseline?.boundaries??[]);
+  const styleFromBaseline=p.style.length>0&&p.style.length<=(baseline?.style.length??0)&&p.style.every(text=>baselineStyle.has(text));
+  if(!styleFromBaseline) limit('style',p.style.length,8);
+  p.style.forEach((text,i)=>{if(!baselineStyle.has(text)) limit(`style[${i}]`,codePoints(text),120);});
+  limit('boundaries',p.boundaries.length,10,1);p.boundaries.forEach((text,i)=>{if(!baselineBoundaries.has(text)) limit(`boundaries[${i}]`,codePoints(text),160);});
   limit('sourceRefs',p.sourceRefs.length,50);limit('greeting',codePoints(p.greeting),300);
   const exampleTotal=(p.exampleDialogues??[]).reduce((sum,dialogue)=>sum+dialogue.turns.reduce((inner,turn)=>inner+codePoints(turn.text),0),0);
   if(exampleTotal>EXAMPLE_DIALOGUE_CODE_POINT_LIMIT) report('exampleDialogues','example_total');
@@ -188,8 +205,10 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
     if(loreBytes([entry])>LORE_BYTE_LIMIT) report(`lore[${i}]`,'budget_lore_entry');
   });
   if(personaBlockBytes(p)>PERSONA_BLOCK_BYTE_LIMIT) report('','budget_persona_block');
-  // Only the generated style and boundaries sentences are exempt from the leak check (review fix).
-  const generatedTexts=new Set(context.generated?[...context.generated.style,...context.generated.boundaries]:[]);
+  // Only the generated (or baseline) style and boundaries sentences are exempt from the leak check (review fix), each
+  // against the same field: a style sentence never exempts the same text in boundaries, nor the other way round.
+  const exemptStyle=new Set([...(context.generated?.style??[]),...baselineStyle]);
+  const exemptBoundaries=new Set([...(context.generated?.boundaries??[]),...baselineBoundaries]);
   if(realPerson&&!context.testCaptions.length) report('','leak_check_unavailable');
   const leaks=new Set(context.testCaptions.flatMap(caption=>windows(caption,TEST_CAPTION_OVERLAP_CODE_POINTS)));
   for(const {path,text,group} of authorFields(p)) {
@@ -199,7 +218,7 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
     for(const [rule,patterns] of FORBIDDEN) if(patterns.some(matches)) report(path,rule);
     if(containsCredentialPattern(text)||containsCredentialPattern(folded)) report(path,'credential');
     if(containsInternalPathPattern(text)||containsInternalPathPattern(folded)) report(path,'internal_path');
-    const exempt=/^(?:style|boundaries)\[/.test(path)&&generatedTexts.has(text);
+    const exempt=/^style\[/.test(path)&&exemptStyle.has(text)||/^boundaries\[/.test(path)&&exemptBoundaries.has(text);
     if(group!=='label'&&group!=='meta'&&leaks.size&&!exempt&&windows(text,TEST_CAPTION_OVERLAP_CODE_POINTS).some(window=>leaks.has(window))) report(path,'test_caption_overlap');
     if(realPerson&&['greeting','personality','background','example','lore'].includes(group)&&PRIVATE_LIFE.some(matches)) report(path,'private_life');
     // Background text is stored as a third-person character sheet (a storage format; the model speaks about it in the

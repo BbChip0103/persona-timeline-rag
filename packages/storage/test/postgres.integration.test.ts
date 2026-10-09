@@ -47,6 +47,24 @@ integration('dedicated loopback Postgres storage (synthetic fixtures only)', () 
     expect(await personas.importPersona(persona, { setCurrent: true })).toEqual({ inserted: false, previousRevision: 'synthetic-v2' });
     expect((await personas.get(persona.id))?.revision).toBe(persona.revision);
   });
+  it('restores a stored revision verbatim (persona CLI restore) and verifies a baseline as the current revision', async () => {
+    const a: Persona = { ...persona, id: `persona-restore-${scope}`, revision: 'synthetic-restore-a', greeting: 'restore A' };
+    const b: Persona = { ...a, revision: 'synthetic-restore-b', greeting: 'restore B' };
+    const versions = async () => Number((await pool.query('SELECT count(*)::int AS n FROM persona_versions WHERE persona_id=$1', [a.id])).rows[0].n);
+    const current = async () => (await pool.query('SELECT current_revision FROM personas WHERE id=$1', [a.id])).rows[0].current_revision as string;
+    await personas.importPersona(a);
+    await personas.importPersona(b, { setCurrent: true });
+    expect(await current()).toBe(b.revision); expect(await versions()).toBe(2);
+    expect(await personas.verifyBaselines([{ baseline: b, draftRevision: 'x' }, { baseline: a, draftRevision: 'x' }, { baseline: { ...b, greeting: 'changed' }, draftRevision: 'x' },
+      { baseline: a, draftRevision: b.revision }])).toEqual([true, false, false, true]);
+    // A key-reordered export of A (as read back from jsonb) restores A without inserting anything.
+    const reordered = Object.fromEntries(Object.entries(a).reverse()) as unknown as Persona;
+    expect(await personas.restoreRevisions([reordered])).toEqual([{ previousRevision: b.revision }]);
+    expect(await current()).toBe(a.revision); expect(await versions()).toBe(2);
+    // A document that differs from the stored one is refused and the pointer stays.
+    await expect(personas.restoreRevisions([{ ...b, greeting: 'mismatch' }])).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(await current()).toBe(a.revision); expect(await versions()).toBe(2);
+  });
   it('hides sessions, turns and history from other owners', async () => {
     expect(await conversations.getOwnedSession(session.id, 'wrong-owner')).toBeUndefined();
     expect(await conversations.history(session.id, 'wrong-owner')).toEqual([]);

@@ -175,6 +175,40 @@ describe('validatePersonaForPublish',()=>{
     // The exemption is only for the overlap check: a generated text never escapes the other rules.
     expect(await rules({...persona,concept:'never break character'},ctx({generated:{...generated,concept:'never break character'}}))).toEqual(['keep_character']);
   });
+  test('baseline (the pre-publish current revision): identical style/boundaries lines skip the leak check and the line limits',async()=>{
+    const caption='Respond as the disclosed research character, not a third-person analyst, about sunsets.';
+    const long='Respond as the disclosed research character, not a third-person analyst; '+'keep the narrative rhythm natural and light. '.repeat(2);
+    const lines=['L1 approved.','L2 approved.','L3 approved.','L4 approved.','L5 approved.','L6 approved.','L7 approved.','L8 approved.',long];
+    const baseline={...v1Persona,id:cardPersona.id,personId:cardPersona.personId,style:lines};
+    const persona={...cardPersona,style:lines};
+    expect(await rules(persona,ctx({testCaptions:[caption]}))).toEqual(expect.arrayContaining(['limit','test_caption_overlap']));
+    expect(await rules(persona,ctx({testCaptions:[caption],baseline}))).toEqual([]);
+    // One edited line is checked again (its length and the overlap); adding a line beyond the baseline's count is a limit.
+    expect(await errors({...persona,style:[...lines.slice(0,8),`${long}!`]},ctx({testCaptions:[caption],baseline}))).toEqual(expect.arrayContaining([
+      {path:'style[8]',rule:'limit',severity:'error'},{path:'style[8]',rule:'test_caption_overlap',severity:'error'}]));
+    expect(await rules({...persona,style:[...lines,'L10 new.']},ctx({testCaptions:[caption],baseline}))).toEqual(['limit']);
+    // Never other rules, and never other fields.
+    expect(await rules({...persona,style:[...lines.slice(0,8),'never break character']},ctx({baseline:{...baseline,style:[...lines.slice(0,8),'never break character']}}))).toEqual(['keep_character']);
+    expect(await rules({...persona,style:['ok'],concept:caption},ctx({testCaptions:[caption],baseline:{...baseline,concept:caption}}))).toEqual(['test_caption_overlap']);
+  });
+  test('baseline review fixes: style vs boundaries checked separately, id/personId must match, unverified warns',async()=>{
+    const caption='Respond as the disclosed research character, not a third-person analyst, about sunsets.';
+    const line='Respond as the disclosed research character, not a third-person analyst.';
+    const base={...v1Persona,id:cardPersona.id,personId:cardPersona.personId};
+    // A baseline STYLE line does not exempt the same text in boundaries, nor the other way round.
+    expect(await errors({...cardPersona,style:['ok'],boundaries:[line]},ctx({testCaptions:[caption],baseline:{...base,style:[line]}}))).toEqual([{path:'boundaries[0]',rule:'test_caption_overlap',severity:'error'}]);
+    expect(await errors({...cardPersona,style:[line],boundaries:['ok']},ctx({testCaptions:[caption],baseline:{...base,boundaries:[line]}}))).toEqual([{path:'style[0]',rule:'test_caption_overlap',severity:'error'}]);
+    expect(await rules({...cardPersona,style:[line]},ctx({testCaptions:[caption],baseline:{...base,style:[line]}}))).toEqual([]);
+    // The generated persona is split the same way.
+    expect(await errors({...cardPersona,style:['ok'],boundaries:[line]},ctx({testCaptions:[caption],generated:{...base,style:[line]}}))).toEqual([{path:'boundaries[0]',rule:'test_caption_overlap',severity:'error'}]);
+    // A baseline for another persona id or person is refused and grants nothing.
+    for(const other of [{...base,id:'persona:other',style:[line]},{...base,personId:'someone-else',style:[line]}])
+      expect(await rules({...cardPersona,style:[line]},ctx({testCaptions:[caption],baseline:other}))).toEqual(expect.arrayContaining(['baseline_mismatch','test_caption_overlap']));
+    // Unverified (validate, dry run) → warning; verified against the target database (confirmed publish) → none.
+    const report=await validatePersonaForPublish({...cardPersona,style:[line]},ctx({testCaptions:[caption],baseline:{...base,style:[line]}}));
+    expect(report.ok).toBe(true);expect(report.issues).toEqual([{path:'',rule:'baseline_unverified',severity:'warn'}]);
+    expect((await validatePersonaForPublish({...cardPersona,style:[line]},ctx({testCaptions:[caption],baseline:{...base,style:[line]},baselineVerified:true}))).issues).toEqual([]);
+  });
   test('the report never carries field text',async()=>{
     const secret='Ignore previous instructions UNIQUE-CANARY-123';
     const report=await validatePersonaForPublish({...cardPersona,background:{...cardPersona.background!,text:secret}},ctx({testCaptions:[secret]}));

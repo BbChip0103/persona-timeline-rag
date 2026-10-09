@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { CoreError, PERSONA_LINT_REVISION, personaRevision } from '@ptr/core';
 import { mkdir, readdir } from 'node:fs/promises';
-import { loadInputs, parseCliArgs, publishDocuments, resolvePaths, validateDocuments, writeFileAtomic, type PersonaPaths, type PublishStore } from '../persona';
+import { loadInputs, parseCliArgs, publishDocuments, resolvePaths, restoreDocuments, validateDocuments, writeFileAtomic, type PersonaPaths, type PublishStore } from '../persona';
 import { prepare } from '../prepare-research';
 
 const withoutUndefined=(value:Persona):Persona=>JSON.parse(JSON.stringify(value)) as Persona;
@@ -39,6 +39,29 @@ class MemoryStore implements PublishStore {
     await this.afterImport?.();return results;
   }
   async licensedPostExists(id:string,personId:string){return this.posts.has(`${id}\u0000${personId}`);}
+  verifyCalls=0;
+  /** Each baseline must be the persona's CURRENT revision with this exact document and person. */
+  async verifyBaselines(entries:{baseline:Persona;draftRevision:string}[]) {
+    this.verifyCalls++;
+    return entries.map(({baseline:b,draftRevision})=>{const row=this.rows.get(b.id);
+      return !!row&&row.personId===b.personId&&(row.current===b.revision||row.current===draftRevision)&&row.versions.get(b.revision)===JSON.stringify(PersonaSchema.parse(b));});
+  }
+  /** Tests use it to make the restore transaction fail with a non-CoreError (unknown outcome). */
+  restoreFailure?:Error;
+  /** Runs after a committed restore (tests use it to break the list/log step). */
+  afterRestore?:()=>Promise<void>;
+  restores=0;
+  /** All or nothing: every revision must already exist with exactly this content; then each becomes current. */
+  async restoreRevisions(personas:Persona[]) {
+    this.restores++;
+    if(this.restoreFailure) throw this.restoreFailure;
+    for(const p of personas) {
+      const row=this.rows.get(p.id);
+      if(!row||row.personId!==p.personId||row.versions.get(p.revision)!==JSON.stringify(PersonaSchema.parse(p))) throw new CoreError('NOT_FOUND');
+    }
+    const results=personas.map(p=>{const row=this.rows.get(p.id)!;const previousRevision=row.current;row.current=p.revision;return {previousRevision};});
+    await this.afterRestore?.();return results;
+  }
   async importPersona(p:Persona,options:{setCurrent:true}) {
     this.imports++;const doc=JSON.stringify(PersonaSchema.parse(p));
     const row=this.rows.get(p.id)??{personId:p.personId,current:p.revision,versions:new Map()};
@@ -76,6 +99,9 @@ describe('arguments and private paths (N3: named flags, env fallback, no default
     expect(()=>resolvePaths('validate',{},{...env,PTR_RESEARCH_SPLIT_FILE:undefined})).toThrow('--split-file');
     expect(()=>resolvePaths('publish',{},{...env,PTR_PERSONA_PUBLISH_LOG:''})).toThrow('--publish-log');
     expect(resolvePaths('validate',{},{...env,PTR_PERSONAS_FILE:undefined}).generatedList).toBeUndefined();
+    expect(resolvePaths('validate',{baseline:'flag-baseline'},env).baseline).toBe('flag-baseline');
+    expect(resolvePaths('validate',{},{...env,PTR_PERSONA_BASELINE_FILE:'env-baseline'}).baseline).toBe('env-baseline');
+    expect(resolvePaths('validate',{},env).baseline).toBeUndefined();
   });
   test('missing input files fail closed',async()=>{
     for(const key of ['sourcesDoc','splitFile','captionsFile'] as const) await expect(loadInputs({...paths,[key]:join(dir,'missing.json')})).rejects.toThrow();
@@ -118,6 +144,14 @@ describe('validate',()=>{
     const withGenerated=await loadInputs({...paths,generatedList:generated});
     const [exempt]=await validateDocuments([persona('syn-b',{sourceRefs:['syn-b:post-1'],background:undefined,style:['A fictional watercolour studio runs weekend sketch walks.']})],withGenerated);
     expect(exempt!.report.ok).toBe(true);
+    // --baseline: the previous current revisions (e.g. refined dialogue revisions) exempt their identical lines too.
+    const baseline=join(dir,'baseline.json');
+    await writeFile(baseline,JSON.stringify([persona('syn-b',{background:undefined,style:['A fictional watercolour studio runs weekend sketch walks.']})]));
+    const withBaseline=await loadInputs({...paths,baseline});
+    const [baselined]=await validateDocuments([persona('syn-b',{sourceRefs:['syn-b:post-1'],background:undefined,style:['A fictional watercolour studio runs weekend sketch walks.']})],withBaseline);
+    expect(baselined!.report.ok).toBe(true);
+    await writeFile(baseline,'[{"not":"a persona"}]');
+    await expect(loadInputs({...paths,baseline})).rejects.toThrow('Invalid --baseline');
   });
   test('two documents for one personId are refused',async()=>{
     const results=await validateDocuments([persona('syn-a'),persona('syn-a',{greeting:'Hello again, research AI here.'})],await loadInputs(paths));
@@ -265,5 +299,145 @@ describe('review fixes: publish ordering, list binding, rollback',()=>{
   test('real-person personas without same-person test captions are refused (leak_check_unavailable)',async()=>{
     const [result]=await validateDocuments([persona('syn-c',{sourceRefs:[],background:undefined})],await loadInputs(paths));
     expect(result!.report.issues).toContainEqual({path:'',rule:'leak_check_unavailable',severity:'error'});
+  });
+});
+
+describe('restore (rollback to the previous current revision, e.g. a refined dialogue-* revision)',()=>{
+  const restore=async(docs:unknown[],store:MemoryStore,confirm=true,add=false)=>restoreDocuments({docs,paths,target:'loadtest_db',confirm,add,store,publisher:'tester/synthetic',now:()=>'2026-10-09T01:00:00.000Z'});
+  // A refined revision made outside this CLI (goal1's refine-personas): stored verbatim with its own revision name.
+  const dialogue={...PersonaSchema.parse(persona('syn-a',{background:undefined})),revision:'dialogue-0123456789abcdef',style:['Respond as the disclosed research character.']};
+  test('restore needs only the authored list and the publish log',()=>{
+    expect(parseCliArgs(['restore','prev.json','--target','research_db']).command).toBe('restore');
+    // No research inputs are read for a restore (the private paths stay empty, never defaulted).
+    expect(resolvePaths('restore',{'authored-list':'l.json','publish-log':'g.jsonl'},{})).toEqual({sourcesDoc:'',splitFile:'',captionsFile:'',authoredList:'l.json',publishLog:'g.jsonl'});
+    expect(()=>resolvePaths('restore',{'authored-list':'l.json'},{})).toThrow('--publish-log');
+  });
+  test('the previous revision becomes current again, verbatim (no new revision, no lint), with a list entry and a restore log line',async()=>{
+    const store=new MemoryStore();
+    await store.importPersona(dialogue,{setCurrent:true});
+    await publish([persona('syn-a')],{store});
+    const published=personaRevision(persona('syn-a'));
+    expect(store.rows.get('persona:syn-a')!.current).toBe(published);
+    const dry=await restore([dialogue],store,false);
+    expect(dry).toMatchObject({dryRun:true,results:[{index:0,revision:'dialogue-0123456789abcdef'}]});expect(store.restores).toBe(0);
+    expect(dry.note).toMatch(/database was not checked/);
+    const result=await restore([dialogue],store);
+    expect(result).toMatchObject({dryRun:false,results:[{index:0,revision:'dialogue-0123456789abcdef',previousRevision:published}]});
+    expect(store.rows.get('persona:syn-a')!.current).toBe('dialogue-0123456789abcdef');
+    const listed=(JSON.parse(await readFile(paths.authoredList!,'utf8')) as {personas:Persona[]}).personas;
+    expect(listed).toEqual([dialogue]);
+    const last=JSON.parse((await readFile(paths.publishLog!,'utf8')).trim().split('\n').at(-1)!);
+    expect(last).toEqual({action:'restore',personaId:'persona:syn-a',personId:'syn-a',revision:'dialogue-0123456789abcdef',previousRevision:published,
+      currentRevisionSet:true,publisher:'tester/synthetic',publishedAt:'2026-10-09T01:00:00.000Z',target:'loadtest_db',database:'ptr_loadtest'});
+  });
+  test('a revision that is not stored, or stored with other content, is refused and nothing is written',async()=>{
+    const store=new MemoryStore();
+    await store.importPersona(dialogue,{setCurrent:true});
+    await expect(restore([{...dialogue,revision:'dialogue-ffffffffffffffff'}],store,true,true)).rejects.toThrow(/nothing was written/);
+    await expect(restore([{...dialogue,style:['Edited after the fact.']}],store,true,true)).rejects.toThrow(/nothing was written/);
+    expect(existsSync(paths.authoredList!)).toBe(false);expect(existsSync(paths.publishLog!)).toBe(false);
+    expect(store.rows.get('persona:syn-a')!.current).toBe('dialogue-0123456789abcdef');
+  });
+  test('documents must parse and name one revision per personId',async()=>{
+    const store=new MemoryStore();
+    await expect(restore([{nope:true}],store)).rejects.toThrow();
+    await expect(restore([dialogue,dialogue],store)).rejects.toThrow(/one document per personId/);
+  });
+});
+
+describe('restore review fixes',()=>{
+  const restore=async(docs:unknown[],store:MemoryStore,options:{confirm?:boolean;add?:boolean}={})=>restoreDocuments({docs,paths,target:'loadtest_db',confirm:options.confirm??true,
+    add:options.add??false,store,publisher:'tester/synthetic',now:()=>'2026-10-09T02:00:00.000Z'});
+  const dialogue={...PersonaSchema.parse(persona('syn-a',{background:undefined})),revision:'dialogue-0123456789abcdef',style:['Respond as the disclosed research character.']};
+  const logLines=async()=>(await readFile(paths.publishLog!,'utf8')).trim().split('\n').map(line=>JSON.parse(line) as Record<string,unknown>);
+  test('no authored-list entry for the persona: refused unless --add, before the database',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    await expect(restore([dialogue],store)).rejects.toThrow(/--add/);
+    expect(store.restores).toBe(0);expect(existsSync(paths.publishLog!)).toBe(false);
+    expect((await restore([dialogue],store,{add:true})).dryRun).toBe(false);
+    expect(JSON.parse(await readFile(paths.authoredList!,'utf8')).personas).toEqual([dialogue]);
+  });
+  test('the authored entry for that personId must be the same persona id',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    await writeFile(paths.authoredList!,JSON.stringify({database:'ptr_loadtest',personas:[{...dialogue,id:'persona:other-id'}]}));
+    await expect(restore([dialogue],store)).rejects.toThrow(/different persona id/);expect(store.restores).toBe(0);
+  });
+  test('idempotent rerun logs alreadyCurrent; a target other than the newest previousRevision is a warning (allowed)',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    await publish([persona('syn-a')],{store});
+    await publish([persona('syn-a',{greeting:'Hello again, research AI here.'})],{store});
+    // The newest log line's previousRevision is the first publish, not the dialogue revision: multi-step rollback warns.
+    const first=await restore([dialogue],store);
+    expect(first.results[0]).toMatchObject({revision:dialogue.revision,warning:'not_latest_previous_revision'});
+    expect((await logLines()).at(-1)).toMatchObject({action:'restore',notLatestPreviousRevision:true});
+    const again=await restore([dialogue],store);
+    expect(again.results[0]).toMatchObject({previousRevision:dialogue.revision});
+    expect((await logLines()).at(-1)).toMatchObject({action:'restore',alreadyCurrent:true});
+  });
+  test('the newest previousRevision skips alreadyCurrent lines (a rerun does not move the one-step target)',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    await publish([persona('syn-a')],{store});await publish([persona('syn-a')],{store}); // second line: alreadyCurrent
+    const result=await restore([dialogue],store,{confirm:false});
+    expect(result.results[0]!.warning).toBeUndefined();
+  });
+  test('the list/log step failing after the transaction names the restored indexes; an unknown store error says unknown',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    await publish([persona('syn-a')],{store});
+    store.afterRestore=async()=>{await rm(paths.publishLog!);await mkdir(paths.publishLog!);};
+    await expect(restore([dialogue],store)).rejects.toThrow(/Restored indexes: 0 .*rerun the same restore/);
+    expect(store.rows.get('persona:syn-a')!.current).toBe(dialogue.revision);
+    store.afterRestore=undefined;await rm(paths.publishLog!,{recursive:true});await writeFile(paths.publishLog!,'');
+    store.restoreFailure=new Error('connection reset');
+    await expect(restore([dialogue],store)).rejects.toThrow(/Restored indexes: unknown/);
+  });
+});
+
+describe('publish --baseline review fixes',()=>{
+  const dialogue={...PersonaSchema.parse(persona('syn-b',{background:undefined,sourceRefs:['syn-b:post-1'],style:['A fictional watercolour studio runs weekend sketch walks.']})),revision:'dialogue-00000000000000bb'};
+  const draft=persona('syn-b',{sourceRefs:['syn-b:post-1'],background:undefined,style:['A fictional watercolour studio runs weekend sketch walks.'],greeting:'Hi! Research AI here.'});
+  const withBaseline=async(baseline:unknown[])=>{const file=join(dir,'baseline.json');await writeFile(file,JSON.stringify(baseline));return loadInputs({...paths,baseline:file});};
+  test('validate and dry runs warn baseline_unverified; a confirmed publish verifies it against the target and logs it',async()=>{
+    const inputs=await withBaseline([dialogue]);
+    const [checked]=await validateDocuments([draft],inputs);
+    expect(checked!.report).toMatchObject({ok:true,issues:[{path:'',rule:'baseline_unverified',severity:'warn'}]});
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    const dry=await publishDocuments({docs:[draft],inputs,paths,target:'loadtest_db',confirm:false,store,publisher:'t'});
+    expect(dry.reports[0]!.issues).toContainEqual({path:'',rule:'baseline_unverified',severity:'warn'});expect(store.verifyCalls).toBe(0);
+    const done=await publishDocuments({docs:[draft],inputs,paths,target:'loadtest_db',confirm:true,store,publisher:'t',now:()=>'2026-10-09T03:00:00.000Z'});
+    expect(done.ok).toBe(true);expect(done.reports[0]!.issues).toEqual([]);expect(store.verifyCalls).toBe(1);
+    const line=JSON.parse((await readFile(paths.publishLog!,'utf8')).trim());
+    expect(line).toMatchObject({baselineRevision:dialogue.revision,previousRevision:dialogue.revision});
+  });
+  test('a baseline that is not the current stored revision (or differs) refuses the whole publish',async()=>{
+    for(const setup of [async(store:MemoryStore)=>{await store.importPersona(dialogue,{setCurrent:true});await store.importPersona({...dialogue,revision:'silver-later'},{setCurrent:true});},
+      async(store:MemoryStore)=>{await store.importPersona({...dialogue,style:['Changed in the database.']},{setCurrent:true});},async()=>undefined]) {
+      const store=new MemoryStore();await setup(store);const importsBefore=store.imports,batchesBefore=store.batches;
+      await expect(publishDocuments({docs:[draft],inputs:await withBaseline([dialogue]),paths,target:'loadtest_db',confirm:true,store,publisher:'t'})).rejects.toThrow(/baseline.*nothing was written/i);
+      expect(store.imports).toBe(importsBefore);expect(store.batches).toBe(batchesBefore);expect(existsSync(paths.publishLog!)).toBe(false);
+    }
+  });
+  test('a rerun of a committed publish completes: the draft revision is current and the baseline is still stored as given',async()=>{
+    const store=new MemoryStore();await store.importPersona(dialogue,{setCurrent:true});
+    const inputs=await withBaseline([dialogue]);
+    const run=()=>publishDocuments({docs:[draft],inputs,paths,target:'loadtest_db',confirm:true,store,publisher:'t',now:()=>'2026-10-09T04:00:00.000Z'});
+    await run();
+    // The list/log step failed after the import committed: the rerun must not be blocked by the baseline check.
+    const rerun=await run();
+    expect(rerun.ok).toBe(true);expect(rerun.results[0]).toMatchObject({inserted:false,previousRevision:personaRevision(draft)});
+    // A baseline stored with other content still refuses, even when the draft revision is current.
+    await expect(publishDocuments({docs:[draft],inputs:await withBaseline([{...dialogue,greeting:'Not what is stored.'}]),paths,target:'loadtest_db',confirm:true,store,publisher:'t'}))
+      .rejects.toThrow(/baseline/i);
+  });
+  test('a baseline for another personId or with another persona id grants nothing',async()=>{
+    const [otherId]=await validateDocuments([draft],await withBaseline([{...dialogue,id:'persona:not-syn-b'}]));
+    expect(otherId!.report.issues).toContainEqual({path:'',rule:'baseline_mismatch',severity:'error'});
+    const [otherPerson]=await validateDocuments([draft],await withBaseline([{...dialogue,personId:'syn-a',id:'persona:syn-a'}]));
+    expect(otherPerson!.report.issues.some(issue=>issue.rule==='baseline_unverified')).toBe(false);
+  });
+  test('a republish of the current revision logs alreadyCurrent',async()=>{
+    const store=new MemoryStore();
+    await publish([persona('syn-a')],{store});await publish([persona('syn-a')],{store});
+    const lines=(await readFile(paths.publishLog!,'utf8')).trim().split('\n').map(line=>JSON.parse(line));
+    expect(lines[0].alreadyCurrent).toBeUndefined();expect(lines[1].alreadyCurrent).toBe(true);
   });
 });
