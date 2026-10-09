@@ -72,7 +72,8 @@ newly billed and cannot be compared naively to uncached latency/cost.
 The prompt is `character-agent-context-v5-persona-card`: the v3 bounded-roleplay wording in the S7 layout (agent
 state/tools after the history, a safety note right before the user utterance; see docs/goal2-serving.md), plus the
 persona card (docs/persona-authoring.md). It adds one policy sentence: background, example dialogues and
-lore are author-set notes, never evidence, never real memories, never citable. Example dialogues are a system message
+lore are author-set notes, never evidence, never citable (v5 also said "never real memories"; v7 replaces that with "you
+may speak about them as yourself" and adds the identity/privacy policy, see docs/persona-authoring.md). Example dialogues are a system message
 before the history. Matched lore is an untrusted user-role message between the state and the tools. Lore and examples
 have no source ID, so an answer built on them stays `unverified_model`. v4 and v5 numbers are not compared, because the
 policy sentence changes every persona's prompt. Light roleplay

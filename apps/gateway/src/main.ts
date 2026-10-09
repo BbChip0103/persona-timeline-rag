@@ -76,11 +76,15 @@ type Configured={upstream:Upstream;close?:()=>Promise<void>;reload?:()=>void};
  * Engine telemetry filter  for pools: off by default (PTR_GATEWAY_METRICS_INTERVAL_MS=0) until the metric
  * names and meanings are verified on the real engines (S8); e.g. 1000 turns it on.
  */
-function engineTelemetry(env:NodeJS.ProcessEnv):{telemetry?:{intervalMs:number;kvHigh:number;waitingMax:number}} {
+function engineTelemetry(env:NodeJS.ProcessEnv):{telemetry?:{intervalMs:number;kvHigh:number;waitingMax:number;timeoutMs:number}} {
   const intervalMs=integer(env,'PTR_GATEWAY_METRICS_INTERVAL_MS',0,0,60000);
   if(intervalMs!==0&&intervalMs<100) throw new Error('INVALID_PTR_GATEWAY_METRICS_INTERVAL_MS');
   const kvHigh=decimal(env,'PTR_GATEWAY_ENGINE_KV_HIGH',0.95,0.1,1), waitingMax=integer(env,'PTR_GATEWAY_ENGINE_WAITING_MAX',2,0,100000);
-  return intervalMs?{telemetry:{intervalMs,kvHigh,waitingMax}}:{};
+  // One poll's timeout: 500 ms (the interval when shorter) by default; engines behind an SSH tunnel need ~2000 (S8).
+  const timeoutMs=integer(env,'PTR_GATEWAY_METRICS_TIMEOUT_MS',Math.min(500,intervalMs||500),50,60000);
+  // Data older than 3 × the interval counts as stale; a poll allowed to run longer would defeat that.
+  if(intervalMs&&timeoutMs>3*intervalMs) throw new Error('INVALID_PTR_GATEWAY_METRICS_TIMEOUT_MS');
+  return intervalMs?{telemetry:{intervalMs,kvHigh,waitingMax,timeoutMs}}:{};
 }
 /**
  * Pool of self-hosted engines : static discovery reads PTR_GATEWAY_UPSTREAMS_FILE (mtime + SIGHUP);

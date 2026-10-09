@@ -188,7 +188,7 @@ describe('OpenAICompatibleUpstream /metrics and the gateway environment',()=>{
     status=503;expect(await upstream.metrics(signal())).toBeNull();
     status=200;body='# '+'x'.repeat(1024*1024+10)+'\n';expect(await upstream.metrics(signal())).toBeNull();
   });
-  test('PTR_GATEWAY_METRICS_INTERVAL_MS (default 0 = off until verified on real engines; e.g. 1000), PTR_GATEWAY_ENGINE_KV_HIGH (0.95), PTR_GATEWAY_ENGINE_WAITING_MAX (2)',async()=>{
+  test('PTR_GATEWAY_METRICS_INTERVAL_MS (default 0 = off until verified on real engines; e.g. 1000), PTR_GATEWAY_METRICS_TIMEOUT_MS (500, capped by the interval when unset), PTR_GATEWAY_ENGINE_KV_HIGH (0.95), PTR_GATEWAY_ENGINE_WAITING_MAX (2)',async()=>{
     const port=await listen(createServer((req,res)=>{res.writeHead(req.url==='/metrics'?200:404);res.end(req.url==='/metrics'?metricsText({kv:0.97,start:1}):'');}));
     const dir=mkdtempSync(join(tmpdir(),'ptr-upstreams-'));const file=join(dir,'upstreams.json');
     writeFileSync(file,JSON.stringify({pools:{m:{upstreams:[{id:'a',baseUrl:`http://127.0.0.1:${port}/v1`}]}}}));
@@ -198,12 +198,21 @@ describe('OpenAICompatibleUpstream /metrics and the gateway environment',()=>{
     const on=upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'1000'});
     try {
       await until(()=>on.upstream.poolMetrics!().upstreams[0]!.telemetry?.ageMs!==null);
-      expect(on.upstream.poolMetrics!()).toMatchObject({telemetry:{intervalMs:1000,kvHigh:0.95,waitingMax:2},upstreams:[{telemetry:{kvUsage:0.97,blocked:true}}]});
+      expect(on.upstream.poolMetrics!()).toMatchObject({telemetry:{intervalMs:1000,kvHigh:0.95,waitingMax:2,timeoutMs:500},upstreams:[{telemetry:{kvUsage:0.97,blocked:true}}]});
     } finally {await on.close?.();}
+    // Over an SSH tunnel /metrics took 0.6-1.2 s on a new connection (S8): the poll timeout is configurable.
+    const slow=upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'1000',PTR_GATEWAY_METRICS_TIMEOUT_MS:'2000'});
+    try {expect(slow.upstream.poolMetrics!()).toMatchObject({telemetry:{intervalMs:1000,timeoutMs:2000}});} finally {await slow.close?.();}
+    // A timeout above 3 × the interval would keep the member fresh-looking on stale data: rejected when telemetry is on.
+    expect(()=>upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'500',PTR_GATEWAY_METRICS_TIMEOUT_MS:'1501'})).toThrow('INVALID_PTR_GATEWAY_METRICS_TIMEOUT_MS');
+    const edge=upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'500',PTR_GATEWAY_METRICS_TIMEOUT_MS:'1500'});
+    try {expect(edge.upstream.poolMetrics!()).toMatchObject({telemetry:{timeoutMs:1500}});} finally {await edge.close?.();}
+    const fast=upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'200'});
+    try {expect(fast.upstream.poolMetrics!()).toMatchObject({telemetry:{intervalMs:200,timeoutMs:200}});} finally {await fast.close?.();}
     const off=upstreamFromEnvironment({...env,PTR_GATEWAY_METRICS_INTERVAL_MS:'0',PTR_GATEWAY_ENGINE_KV_HIGH:'0.9',PTR_GATEWAY_ENGINE_WAITING_MAX:'0'});
     try {expect(off.upstream.poolMetrics!()).toMatchObject({telemetry:null,upstreams:[{telemetry:null}]});} finally {await off.close?.();}
     expect(()=>upstreamFromEnvironment({...env,PTR_GATEWAY_DISCOVERY:'redis',PTR_REGISTRY_PREFIX:'ptr:turns'})).toThrow('INVALID_PTR_REGISTRY_PREFIX');
-    for(const [name,value] of [['PTR_GATEWAY_METRICS_INTERVAL_MS','50'],['PTR_GATEWAY_ENGINE_KV_HIGH','1.5'],['PTR_GATEWAY_ENGINE_WAITING_MAX','-1']] as const)
+    for(const [name,value] of [['PTR_GATEWAY_METRICS_INTERVAL_MS','50'],['PTR_GATEWAY_METRICS_TIMEOUT_MS','10'],['PTR_GATEWAY_METRICS_TIMEOUT_MS','60001'],['PTR_GATEWAY_ENGINE_KV_HIGH','1.5'],['PTR_GATEWAY_ENGINE_WAITING_MAX','-1']] as const)
       expect(()=>upstreamFromEnvironment({...env,[name]:value})).toThrow(`INVALID_${name}`);
   });
 });

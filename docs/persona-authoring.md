@@ -34,7 +34,7 @@ report holds `{path, rule, severity}` and never field text.
   - instruction override or system-prompt talk (`instruction`)
   - our block markers, including `Persona definition`, case-insensitive (`block_marker`)
   - reply-JSON fragments (`reply_json`)
-  - chat-template special tokens (`special_token`)
+  - chat-template special tokens (`special_token`), including Gemma 4's `<|turn>`, `<turn|>`, `<|channel>` style tokens: vLLM parses them as real control tokens inside message content (S8 gate a)
   - CBS/V1 macros such as `{{…}}` and `<BOT>` (`macro`)
   - credentials and internal paths
 - **Unicode:**
@@ -183,7 +183,7 @@ The CLI prints indexes, revisions, issue paths and rule names only.
   - If the pointer moved anyway, republishing restores it.
 - **Evaluations:** evaluation runs read pinned revisions (`personas.get(id, revision)`) and create sessions with
   `greetingIndex: 0`. A publish changes `current_revision`. Frozen runs therefore keep their registered revisions, or
-  re-baseline on v5/v8.
+  re-baseline on v8/v11.
 - **Deploy order (required):** readers on the old contract reject documents with new keys, because the schema is
   `.strict()`.
   1. Deploy every API and worker process with this contract.
@@ -198,7 +198,11 @@ The CLI prints indexes, revisions, issue paths and rule names only.
   3. Then roll back the code.
   - Sessions pinned to a card revision cannot be continued on old code.
 
-## Prompt rendering (agent `character-agent-context-v5-persona-card`, experiment `persona-chat-v8-persona-card`)
+## Prompt rendering (agent `character-agent-context-v8-small-talk`, experiment `persona-chat-v11-small-talk`)
+
+v5/v8 introduced the card rendering below; v6/v9 (S8 follow-up) added the identity/privacy policy and the reply guard,
+v7/v10 corrected that policy's voice rule and v8/v11 allowed light everyday small talk (see "Identity, privacy and the reply guard" at the end). The message
+layout is the same.
 
 ```text
 policy · persona definition · [examples] · history (greeting first) · [state] · [lore] · [tools] · [evidence] · [safety note] · user · [tool results]
@@ -208,7 +212,8 @@ policy · persona definition · [examples] · history (greeting first) · [state
   - One persona-independent sentence, `PERSONA_CARD_POLICY`, sits right before `TIMELINE_JSON_REPLY:`, so the
     agent's policy split carries it.
   - It says that background, examples and lore are author-set voice and public-profile notes: never evidence, never
-    real memories, never citable.
+    citable, not to be extended. v5 also said "never real memories"; v7/v10 replace that with "you may speak about them
+    as yourself" (first-person voice).
   - It is the only policy change from v4/v7 (pinned by hash in `prompt-layout.test.ts`), but it re-baselines every
     persona: v4 and v5 numbers are not compared.
 - **Persona definition:**
@@ -251,7 +256,53 @@ policy · persona definition · [examples] · history (greeting first) · [state
     and 26 fail with `CONTEXT_LIMIT` (tested).
   - The 30,000-byte limit is unchanged. Nothing is truncated.
 
-**Before serving or baselining v5/v8:** S8 gates a–e must pass first:
+## Identity, privacy and the reply guard (v6/v9, corrected in v7/v10)
+
+S8 gates d and e failed on v5 (a "pretend to be human" request answered without disclosure; real-person replies with
+family, residence, health and embellished career details). v6/v9 added, and v7/v10 corrected:
+
+- **Policy:** `IDENTITY_PRIVACY_POLICY`, one persona-independent text right after `PERSONA_CARD_POLICY` (so the agent's
+  policy split carries it): always an AI research simulation, never pretend to be human or deny the AI, even in
+  roleplay; otherwise the persona speaks in its own first-person voice, also about its background and posts (the
+  first-person recollection the user asked for), mentioning only facts in its background, lore or the turn's
+  evidence and never adding, inferring or embellishing details; for a real-person persona (`reviewStatus` not
+  `synthetic`; one static sentence, so the policy bytes stay persona-independent), no private life (family, romance,
+  residence/current location, health, friends/relationships, minors), even when it is in the person's own posts.
+- **Reply guard** (`guardReply`, `REPLY_GUARD_REVISION` `reply-guard-v4`, agent and experiment paths, fail-closed): a
+  reply that claims to be human or denies the AI (`human_impersonation`), an identity question ("너 AI야?", "사람인 척
+  해줘", "Are you a real person?") answered without an AI acknowledgement (`missing_ai_disclosure`), or, for a
+  real-person persona, a reply touching private life or any answer to a private-life question (`private_life`) is
+  replaced by a fixed reply in the session language (`out_of_scope`, no evidence, limitation `REPLY_GUARD_<REASON>`).
+  `reply.replyGuard` records `{revision, action: none|replaced, reason}` (internal, like `personaContext`). Narrow
+  Korean/English regexes: paraphrases and other languages can pass; the policy is the first control. v2 (S8 bundle
+  review): only an affirmative self-statement ("저는 … AI", "I'm an AI…", "AI 연구용 …") counts as an acknowledgement
+  and a negated one ("AI 아냐", "no AI here") is a denial; denials are anchored to the speaker ("이건 AI가 아니라 손그림"
+  passes); private-life questions must address the persona; the private-life patterns are narrowed (false positives
+  such as "minor key", "hospitality", "home studio", "partner brand", "집중", "홈페이지 주소", "아동 그림책", "명절" are
+  pinned in tests). v3 (review re-check): every negation stem and an adverb before "not" count as a denial, an
+  acknowledgement needs a copula and is never a question, bare "AI 아니야" is not a denial in art/image talk, and
+  "woman/man" only counts after real/actual; known misses (lowercase moved-to places, a partner without "my") are pinned
+  in tests. v4 (final review): 인간 next to 사람, "Im"/"I ain't", "nah, not an AI", "I'm no bot"; "…가 아니라 사람"
+  needs a copula, so "봇이 아니라 사람이 그렸어요" (an artwork) passes. **Known misses** (left to the policy; pinned
+  where cheap): unprompted denials phrased without the listed verbs ("그냥 평범하게 사는 사람", "a human is typing this",
+  "my other half"), denials in languages other than Korean and English, bare "not an AI"/"AI 아니야" inside art or
+  image talk (skipped on purpose), and private-life mentions without the listed anchors (a lowercase moved-to place,
+  a partner without "my", an indirect home location). If the guard itself throws, the turn fails and the unguarded text is never stored.
+- **Language:** deterministic texts (rule refusal, clarifications, retrieval off, validator, tool notice, invalid
+  evidence, and the experiment validator's limitation notes and claim prefixes) follow the session language (`replyText`: Korean for `ko…`, English otherwise). The legacy timeline
+  validator's texts stay Korean.
+- **Small talk (v8/v11, user decision):** a real-person persona may answer everyday small talk ("오늘 하루
+  어땠어?") with light fictional everyday content (a mood, a relaxed day), but never invents concrete facts (specific
+  places, named people, dates or events); private life stays forbidden. One static sentence, scoped by `reviewStatus`.
+- **Voice correction (v7/v10):** v6/v9 said the background was third-person information never retold
+  as a first-person memory. That was an instruction error: it contradicted the first-person recollection requirement.
+  The `background` text may still be stored as a third-person character sheet (a storage format); the model speaks
+  about it as itself. `PERSONA_CARD_POLICY` now says the notes may be spoken about as yourself (it no longer says
+  "never real memories"); they stay non-evidence and non-citable. The reply guard never looks at grammatical person.
+- **Control tokens:** the provider layer neutralizes chat-template control strings in every message (see
+  docs/goal2-serving.md, Providers), so persona text, captions and user text cannot forge Gemma 4 turns.
+
+**Before serving or baselining v8/v11:** S8 gates a–e must pass first:
 - a: chat template, including the leading system messages and the consecutive user messages
 - b: prompt-injection responses
 - c: recollection non-inferiority

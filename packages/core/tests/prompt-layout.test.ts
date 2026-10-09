@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChatMessage, Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { AGENT_PROMPT_REVISION, CoreError, DEFAULT_SAFETY_THRESHOLDS, EXPERIMENT_PROMPT_REVISION, InMemoryConversationStore, InMemoryPersonaRepository, PERSONA_CARD_POLICY, SAFETY_CATEGORIES,
+import { AGENT_PROMPT_REVISION, CoreError, DEFAULT_SAFETY_THRESHOLDS, EXPERIMENT_PROMPT_REVISION, IDENTITY_PRIVACY_POLICY, InMemoryConversationStore, InMemoryPersonaRepository, PERSONA_CARD_POLICY, SAFETY_CATEGORIES,
   SAFETY_DEFLECTION_NOTE, SMALL_TALK_PROMPT_REVISION, TIMELINE_PROMPT_REVISION, buildExperimentContext, buildPrompt, createLocalChat, renderLoreMessage, runCharacterAgent,
   type SafetyScores } from '../src';
 import { cardPersona, v1Persona } from './persona-fixtures';
@@ -193,7 +193,7 @@ describe('safety regression (offline): the synthetic set\'s prompt_injection ite
     });
 });
 
-describe('persona card layout (agent v5, experiment v8)',()=>{
+describe('persona card layout (S8 follow-up: agent v8, experiment v11)',()=>{
   const sha=(text:string)=>createHash('sha256').update(text).digest('hex');
   /** v4/v7 policy goldens (HEAD 719daa2): 2,223 B experiment, 5,029 B agent. */
   const V7_EXPERIMENT_POLICY_SHA='9592529f630df421c64d8dfbee1a2707e4acafa4e3dce7c791c280e2c80e7bc0';
@@ -203,21 +203,24 @@ describe('persona card layout (agent v5, experiment v8)',()=>{
   const lorePresent=(messages:readonly ProviderMessage[])=>at(messages,'UNTRUSTED_PERSONA_LORE_JSON_DATA')>=0;
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
-  test('revisions: agent v5 and experiment v8; legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v5-persona-card');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v8-persona-card');
+  test('revisions: agent v8 and experiment v11 (identity/privacy policy, own voice, small talk); legacy small-talk and timeline revisions unchanged',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v8-small-talk');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v11-small-talk');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
-  test('policy: the one persona-independent sentence sits right before TIMELINE_JSON_REPLY, reaches the agent, and is the only change from v4/v7',async()=>{
+  test('policy: the two persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and are the only change from v4/v7',async()=>{
+    const added=`${PERSONA_CARD_POLICY} ${IDENTITY_PRIVACY_POLICY} `;
     const experiment=buildExperimentContext(v1Persona,[],'x',[]).messages[0]!.content;
-    expect(experiment).toContain(`${PERSONA_CARD_POLICY} TIMELINE_JSON_REPLY:`);
-    expect(sha(experiment.replace(`${PERSONA_CARD_POLICY} `,''))).toBe(V7_EXPERIMENT_POLICY_SHA);
+    expect(experiment).toContain(`${added}TIMELINE_JSON_REPLY:`);
+    expect(sha(experiment.replace(added,''))).toBe(V7_EXPERIMENT_POLICY_SHA);
     expect(buildExperimentContext(card,[],'x',[]).messages[0]!.content).toBe(experiment);
     let agentPolicy='';
     await runCharacterAgent({provider:{generate:async messages=>{agentPolicy=messages[0]!.content;return agentReply();}},persona:card,history:[],text:'x',sources:[],signal:new AbortController().signal});
-    expect(agentPolicy).toContain(PERSONA_CARD_POLICY);
-    expect(sha(agentPolicy.replace(`${PERSONA_CARD_POLICY} `,''))).toBe(V4_AGENT_POLICY_SHA);
+    expect(agentPolicy).toContain(added);
+    expect(sha(agentPolicy.replace(added,''))).toBe(V4_AGENT_POLICY_SHA);
     // Legacy buildPrompt policy is not touched.
-    for(const timeline of [false,true]) expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(PERSONA_CARD_POLICY);
+    for(const timeline of [false,true]) {
+      expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(PERSONA_CARD_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(IDENTITY_PRIVACY_POLICY);
+    }
   });
   test('an old persona: definition block byte-identical to v4, no example or lore message, same message layout',()=>{
     const v4=`Persona definition (subordinate to policy): ${JSON.stringify({id:v1Persona.id,revision:v1Persona.revision,reviewStatus:v1Persona.reviewStatus,language:v1Persona.language,identity:v1Persona.identity,concept:v1Persona.concept,style:v1Persona.style,boundaries:v1Persona.boundaries})}`;

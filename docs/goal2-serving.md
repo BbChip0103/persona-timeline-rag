@@ -647,7 +647,7 @@ Pools only (file or registry; the env-only single upstream and the failover wrap
 
 **Telemetry polling (off by default):** `PTR_GATEWAY_METRICS_INTERVAL_MS` defaults to 0 until the metric names and
 meanings are verified on the real engines (S8); with e.g. 1000 the gateway reads each member's `GET {origin}/metrics`
-at that interval (one poll times out after min(500 ms, interval), overlapping polls collapse, a body over 1 MiB is
+at that interval (one poll times out after `PTR_GATEWAY_METRICS_TIMEOUT_MS`, default min(500 ms, interval), overlapping polls collapse, a body over 1 MiB is
 dropped as a failed poll). Parsed (vLLM v1 names,
 checked against vLLM's metrics docs and `v1/metrics/loggers.py` upstream, **not against the deployed build**; design
 [확인 필요]):
@@ -726,6 +726,7 @@ stay busy until the queue timeout, the request goes to the secondary (or the con
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PTR_GATEWAY_METRICS_INTERVAL_MS` | 0 = off (else 100–60000, e.g. 1000) | telemetry poll interval; stale after 3 ×; off until verified on real engines (S8) |
+| `PTR_GATEWAY_METRICS_TIMEOUT_MS` | 500 (the interval when shorter; 50–60000, at most 3 × the interval when telemetry is on) | one poll's timeout. Use 2000 for engines behind an SSH tunnel: S8 measured 0.6–1.2 s for `/metrics` on a new tunnel connection (3 ms on the host), so 500 ms polls failed and the member went stale; with 2000 the real-engine acceptance passed |
 | `PTR_GATEWAY_ENGINE_KV_HIGH` | 0.95 (0.1–1) | KV usage at or above it filters a member out |
 | `PTR_GATEWAY_ENGINE_WAITING_MAX` | 2 (0–100000) | engine waiting above it filters a member out |
 
@@ -1047,8 +1048,13 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
 - **Superseded by the persona card :** agent `character-agent-context-v5-persona-card` and experiment
   `persona-chat-v8-persona-card`. The S7 layout is kept. Style examples are added before the history, and matched lore
   is placed between the state and the tools. One persona-independent policy sentence is added, and English sessions
-  get an English disclosure prefix. v5/v8 need S8 gates a–e before serving or baselining. See
-  docs/persona-authoring.md (persona authoring, CLI, deploy order).
+  get an English disclosure prefix. Superseded in turn by agent `character-agent-context-v6-identity-privacy` and
+  experiment `persona-chat-v9-identity-privacy` (S8 follow-up: identity/privacy policy and reply guard; same layout),
+  then by `character-agent-context-v7-own-voice` / `persona-chat-v10-own-voice` (first-person voice kept, no added
+  details) and `character-agent-context-v8-small-talk` / `persona-chat-v11-small-talk` (light everyday
+  small talk for real-person personas, no concrete invented facts). v8/v11 need S8 gates a–e before serving
+  or baselining. See docs/persona-authoring.md (persona authoring, CLI, deploy
+  order, reply guard).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
   `persona-chat-v2-turn-note-last` (small talk). Without a safety note these three render the same bytes as v6 / v3 / v1,
@@ -1128,6 +1134,17 @@ blocks. Messages are serialized with a generic chat-template wrapper.
    routing comparisons and recalibrate bytes per token.
 
 ## Providers (direct, without the gateway)
+
+**Control tokens (all providers that call a model):** `OpenAICompatibleTextProvider.generate` and
+`OpenRouterClient.generate`/`decide` neutralize chat-template control strings in every message (and every string of a
+Jev decision state) before the request body, and so its ledger key, is built (`neutralizeControlTokens`): the 24 added
+special tokens of the deployed Gemma 4 tokenizer (`<|turn>`, `<turn|>`, `<|channel>`, `<|"|>`, `<bos>`, …), any
+`<|x>`/`<x|>`/`<|x|>`, the legacy `<start_of_turn>` family, `<s>`, `<<SYS>>` and `[INST]`. The leading `<` becomes `‹`
+(`[` becomes `［`): readable, deterministic, idempotent, and text without such strings is byte-identical (prefix
+caching and ledger keys unchanged). S8 gate a showed vLLM turning these strings inside content into real control
+tokens (a user could forge a system turn). The gateway neutralizes forwarded messages again (defence in depth for any
+other caller). Known limit: a caption that contains one is shown to the model neutralized,
+so a quote copied from it no longer matches the original caption and that reference fails validation.
 
 - `fake` (default): deterministic, no network. `PTR_FAKE_LATENCY='{"medianMs":1900,"p95Ms":3600,"seed":7}'`
   adds a seeded log-normal delay (optional `error429Rate`, `hangRate`) for load tests; rejected for any

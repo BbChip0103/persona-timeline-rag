@@ -11,7 +11,7 @@ import { containsCredentialPattern, containsInternalPathPattern, containsUngroun
  * patterns are broad on purpose (N5): a harmless phrase that matches must be reworded, there is no exception list.
  * Bump the revision whenever a pattern or limit changes.
  */
-export const PERSONA_LINT_REVISION='persona-lint-v4';
+export const PERSONA_LINT_REVISION='persona-lint-v5';
 export interface PersonaPublishIssue { path:string; rule:string; severity:'error'|'warn' }
 export interface PersonaPublishReport { ok:boolean; issues:PersonaPublishIssue[]; lintRevision:string }
 export interface PersonaPublishContext {
@@ -64,7 +64,9 @@ const FORBIDDEN:[string,RegExp[]][]=[
   ]],
   ['block_marker',[new RegExp(BLOCK_MARKERS.join('|'),'i')]],
   ['reply_json',[/"(?:evidenceRefs|variableUpdates)"|"(?:status|function)"\s*:/i]],
-  ['special_token',[/<\/?(?:start_of_turn|end_of_turn|bos|eos|pad|start_of_image|end_of_image)>|<\|[^|<>\s]{1,40}\|>|\[\/?INST\]|<<\/?SYS>>|<\/?s>/i]],
+  // `<|x>` / `<x|>`: Gemma 4's asymmetric control tokens (<|turn>, <turn|>, <|channel>, <tool_call|>, …), parsed as real
+  // control tokens when they appear in message content (S8 gate a, vLLM /tokenize).
+  ['special_token',[/<\/?(?:start_of_turn|end_of_turn|bos|eos|pad|start_of_image|end_of_image)>|<\|[^|<>\s]{1,40}\|>|<\|[^|<>\s]{1,40}>|<[^|<>\s]{1,40}\|>|\[\/?INST\]|<<\/?SYS>>|<\/?s>/i]],
   // CBS / V1 macros are nondeterministic or substituted ; any double brace is refused.
   ['macro',[/\{\{|\}\}|<\s*\/?\s*(?:BOT|USER|CHAR)\s*>/i]],
 ];
@@ -200,7 +202,8 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
     const exempt=/^(?:style|boundaries)\[/.test(path)&&generatedTexts.has(text);
     if(group!=='label'&&group!=='meta'&&leaks.size&&!exempt&&windows(text,TEST_CAPTION_OVERLAP_CODE_POINTS).some(window=>leaks.has(window))) report(path,'test_caption_overlap');
     if(realPerson&&['greeting','personality','background','example','lore'].includes(group)&&PRIVATE_LIFE.some(matches)) report(path,'private_life');
-    // Background is a third-person profile summary: it gets the private-life check instead .
+    // Background text is stored as a third-person character sheet (a storage format; the model speaks about it in the
+    // first person): it gets the private-life check instead of the biography check .
     if(['greeting','personality','example'].includes(group)&&(containsUngroundedBiography(text)||containsUngroundedBiography(folded))) report(path,'biography',realPerson?'error':'warn');
     if(group!=='label'&&group!=='meta'&&DATE_PLACE.some(pattern=>pattern.test(text))) report(path,'date_place','warn');
   }

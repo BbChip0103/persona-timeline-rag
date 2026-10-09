@@ -3,14 +3,18 @@ import { CoreError, type TextProvider } from './ports';
 import { AgentVariablesSchema, parseAgentResponse, type AgentResponse, type AgentVariables } from './agent-protocol';
 import { buildExperimentContext, EXPERIMENT_PROMPT_BYTE_LIMIT } from './prompts';
 import { containsCredentialPattern, containsInternalPathPattern } from './safety';
+import { replyText } from './reply-texts';
 
 export const AGENT_RUNTIME_REVISION='agent-loop-json-action-v1';
 /**
  * v4 (S7): agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout).
  * v5 : persona card (examples before the history, matched lore between state and tools) and the
  * PERSONA_CARD_POLICY sentence, which the policy split below carries over from the experiment policy.
+ * v6 (S8 follow-up): IDENTITY_PRIVACY_POLICY, carried the same way; the service notice follows the persona language.
+ * v7 : that policy keeps the first-person voice (no third-person rule) and forbids added details.
+ * v8 : light fictional everyday small talk allowed for real-person personas, no concrete invented facts.
  */
-export const AGENT_PROMPT_REVISION='character-agent-context-v5-persona-card';
+export const AGENT_PROMPT_REVISION='character-agent-context-v8-small-talk';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
@@ -74,7 +78,7 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<{
     if(containsCredentialPattern(query)||containsInternalPathPattern(query))throw new CoreError('TURN_FAILED');
     if(!input.search) {
       // A valid but unavailable action is a service notice, never an invented memory or retry.
-      const notice:AgentResponse={status:'insufficient_evidence',message:'[서비스 안내] 이 대화에서는 검색 도구를 사용할 수 없어요. 대화는 계속할 수 있어요.',evidenceRefs:[],variableUpdates:{}};
+      const notice:AgentResponse={status:'insufficient_evidence',message:replyText('tool_unavailable',input.persona.language),evidenceRefs:[],variableUpdates:{}};
       return {response:notice,rawReply:JSON.stringify({status:notice.status,answer:notice.message,evidenceRefs:[]}),context,
         serviceLimitation:'AGENT_TOOL_UNAVAILABLE',
         agent:{revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls,toolCalls,variables,steps,validator:'disabled'}};

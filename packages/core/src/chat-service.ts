@@ -6,11 +6,13 @@ import { requestFingerprint } from './request-fingerprint';
 import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
 import { containsCredentialPattern, containsUngroundedBiography } from './safety';
 import { intentSignals, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, type IntentClassifierOptions } from './intent-routing';
-import { RULE_PATH_CATEGORIES, RULE_REFUSAL_REPLY, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
+import { RULE_PATH_CATEGORIES, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
+import { REPLY_GUARD_REVISION, guardReply } from './reply-guard';
+import { replyText } from './reply-texts';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
   leases:TurnLeaseStore;delivery:TurnDelivery;
@@ -241,15 +243,22 @@ export class ChatService {
     let promptEvidence:ChatReply['promptEvidence'];
     let agent:ChatReply['agent'];
     let personaContext:ChatReply['personaContext'];let lore:ProviderMessage|undefined;
+    let replyGuard:ChatReply['replyGuard'];
+    // Reply guard (agent and experiment paths, S8 follow-up): fail-closed fixed reply in the session language.
+    const guard=(candidate:typeof output):typeof output=>{
+      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:persona.reviewStatus!=='synthetic',language:session.language});
+      replyGuard=guarded?{revision:REPLY_GUARD_REVISION,action:'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
+      return guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate;
+    };
     if(intent==='clarification' || intent==='unsupported') {
-      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?'어떤 날짜와 주제를 기준으로 볼까요?':safetyCategory?safetyReply(safetyCategory,session.language):RULE_REFUSAL_REPLY,claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
+      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?replyText('clarification',session.language):safetyCategory?safetyReply(safetyCategory,session.language):replyText('rule_refusal',session.language),claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
     } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
       memoryTrace={...memoryTrace,action:'clarify'};
-      output={status:'needs_clarification',content:'앞에서 여러 게시물을 봤어요. 어느 글이나 사진을 말하는 건가요?',claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
+      output={status:'needs_clarification',content:replyText('ambiguous_reference',session.language),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
     } else if(intent==='timeline' && session.retrievalMode !== 'off' && query.dateBasis==='event' && query.start && query.timezone !== 'UTC') {
-      output={status:'needs_clarification',content:'사건 날짜의 현지 시간대가 확인되지 않았어요. 게시일 기준으로 확인할까요?',claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
+      output={status:'needs_clarification',content:replyText('event_timezone',session.language),claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
     } else if(intent==='timeline' && session.retrievalMode==='off' && session.ragCondition===undefined) {
-      output={status:'insufficient_evidence',content:'검색을 끈 상태에서는 실제 활동 근거를 확인할 수 없어요.',claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
+      output={status:'insufficient_evidence',content:replyText('retrieval_off',session.language),claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
     } else {
       if(intent==='timeline' && session.retrievalMode!=='off') {
         if(!this.options.retrieval) throw new CoreError('TURN_FAILED');
@@ -311,25 +320,26 @@ export class ChatService {
         agent=agentRun.agent;memorySources=agentRun.context.sources;
         promptEvidence={sourceIds:memorySources.map(source=>source.id),annotationIds:memorySources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
           omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8')};
-        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'));
+        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),session.language);
         if(!session.ragCondition&&intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
-        if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:'실제 생애나 과거 활동에 대한 근거 없이 이야기할 수 없어요.',claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
+        if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
         agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
         if(this.options.agentValidator&&output.status==='answered') {
           if(agent.toolCalls)agent.validator='skipped_tool_followup';
           else {
             try {agent.validator=await this.options.agentValidator.validate({question:value.text,answer:output.content,sources:memorySources,personId:session.personId,signal:controller.signal})==='accept'?'accepted':'rejected';}
             catch {agent.validator='error';}
-            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:'지금 자료만으로는 확실하게 이야기하기 어려워요.',claims:[],evidence:[],limitations:[`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
+            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:replyText('validator_rejected',session.language),claims:[],evidence:[],limitations:[`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
           }
         }
+        output=guard(output);
         // A deflected turn never updates the conversational state the injection attempt may have targeted.
         if(output.status==='answered'&&!deflect)agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
         if(agentRun.serviceLimitation)output.limitations.push(agentRun.serviceLimitation);
         if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
       }
       else if(session.ragCondition) {
-        output=validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition);
+        output=guard(validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition,session.language));
         if(experiment!.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${experiment!.omittedAnnotations}`);
       }
       else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
@@ -337,14 +347,14 @@ export class ChatService {
         const safe=result.trim();
         if(!safe || safe.length>8000 || containsCredentialPattern(safe)) throw new CoreError('TURN_FAILED');
         output=containsUngroundedBiography(safe)
-          ? {status:'insufficient_evidence',content:'실제 생애나 과거 활동에 대한 근거 없이 이야기할 수 없어요.',claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']}
+          ? {status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']}
           : {status:'answered',content:safe,claims:[],evidence:[],limitations:[]};
       }
     }
     if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),...(replyGuard?{replyGuard}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
     if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
   }
 }

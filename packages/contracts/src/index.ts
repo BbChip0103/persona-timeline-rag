@@ -93,6 +93,8 @@ export interface ChatReply {
   inputSafety?:InputSafetyTrace;
   /** Internal : lore entries rendered this turn (ids only) and matched entries left out by the caps. */
   personaContext?:{loreIds:string[];loreOmitted:number};
+  /** Internal (S8 follow-up): reply guard outcome on the agent and experiment paths; a replaced reply carries the reason. */
+  replyGuard?:{revision:string;action:'none'|'replaced';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'};
 }
 export type InputSafetyCategory='prompt_injection'|'sexual'|'violence_gore'|'self_harm'|'hate_harassment'|'illegal_dangerous'|'private_info';
 export interface InputSafetyTrace {

@@ -6,6 +6,7 @@ import { REQUEST_KEY } from '@ptr/providers';
 import type { GatewayPublisherMetrics } from '@ptr/messaging/registry';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
+import { neutralizeControlTokens } from '@ptr/providers';
 import type { ChatCompletionRequest, RequestContext, Upstream } from './upstreams';
 
 export interface GatewayOptions {
@@ -119,6 +120,8 @@ export function createGateway(options:GatewayOptions):Gateway {
     try {request=JSON.parse(raw);} catch {return json(res,400,{error:{code:'INVALID_INPUT'}});}
     if(!Array.isArray(request?.messages)||!request.messages.length||!request.messages.every(m=>typeof m?.role==='string'&&typeof m?.content==='string'))
       return json(res,400,{error:{code:'INVALID_INPUT'}});
+    // Defence in depth: workers' providers already neutralize chat-template control tokens; any other caller is covered here.
+    request={...request,messages:request.messages.map(message=>({...message,content:neutralizeControlTokens(message.content)}))};
     // Optional per-turn key (the worker's turn id): scopes a billable upstream's ledger entry; never sent upstream.
     const requestKey=req.headers['x-ptr-request-key'];
     if(requestKey!==undefined&&(typeof requestKey!=='string'||!REQUEST_KEY.test(requestKey))) return json(res,400,{error:{code:'INVALID_INPUT'}});

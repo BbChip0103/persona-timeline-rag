@@ -1,6 +1,7 @@
 import type { ProviderMessage } from '@ptr/contracts';
 import { AGENT_RESPONSE_JSON_SCHEMA, type TextProvider } from '@ptr/core';
 import { ProviderError } from './budget';
+import { neutralizeMessages } from './control-tokens';
 
 /** Per-call serving metrics; TTFT comes from the first streamed content delta. */
 export interface CallMetrics {
@@ -118,7 +119,8 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     const responseFormat=agent&&this.options.structuredAgentReplies
       ?{type:'json_schema',json_schema:{name:'agent_reply',schema:AGENT_RESPONSE_JSON_SCHEMA}}
       :json?{type:'json_object'}:undefined;
-    const body={model:this.options.model,messages:messages.map(({role,content})=>({role,content})),
+    // The one choke point for every self-hosted path (agent, experiment, legacy, draft): control tokens never reach the model.
+    const body={model:this.options.model,messages:neutralizeMessages(messages),
       max_tokens:this.options.maxOutputTokens??512,temperature:0,stream:true,stream_options:{include_usage:true},
       chat_template_kwargs:{enable_thinking:false},...(responseFormat?{response_format:responseFormat}:{})};
     const timeoutMs=this.options.timeoutMs??30000, deadline=started+timeoutMs;

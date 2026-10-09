@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { AGENT_RESPONSE_JSON_SCHEMA, type TextProvider } from '@ptr/core';
 import type { ProviderMessage } from '@ptr/contracts';
 import { assertLocalDatabaseUrl } from '@ptr/storage';
+import { neutralizeJsonStrings, neutralizeMessages } from './control-tokens';
 import { ProviderError, type BudgetLedger } from './budget';
 
 const API='https://openrouter.ai/api/v1';
@@ -27,6 +28,8 @@ function reportedCostMicrousd(result:Json):number|null {
  * catalog advertises structured outputs. Opt-in per model: strict modes differ by vendor (OpenAI strict rejects
  * optional properties), so models that were not verified keep json_object.
  */
+// Control-token neutralization (control-tokens.ts) covers the Gemma 4 tokenizer's special tokens plus generic and legacy
+// chat-template shapes. If a non-Gemma model is added here, revisit that token set against its tokenizer.
 const TEXT_MODELS:Record<string,{prompt:number;completion:number;reasoning?:Json;agentSchema?:boolean}>={
   [DEFAULT_TEXT_MODEL]:{prompt:0.5,completion:3,reasoning:{effort:'minimal'}},
   'google/gemini-2.5-flash-lite':{prompt:0.1,completion:0.4,reasoning:{enabled:false}},
@@ -233,7 +236,8 @@ export class OpenRouterClient {
       ?{type:'json_schema',json_schema:{name:'agent_reply',strict:true,schema:AGENT_RESPONSE_JSON_SCHEMA}}
       :timeline?{type:'json_object'}:undefined;
     const outputTokens=Number.isInteger(options.maxOutputTokens)&&options.maxOutputTokens!>=1?Math.min(options.maxOutputTokens!,this.outputTokens):this.outputTokens;
-    const body:Json={model:this.model,messages:messages.map(({role,content})=>({role,content})),max_tokens:outputTokens,temperature:0,stream:false,provider:this.provider(false),
+    // Choke point: chat-template control tokens are neutralized before the body (and its ledger key) is built.
+    const body:Json={model:this.model,messages:neutralizeMessages(messages),max_tokens:outputTokens,temperature:0,stream:false,provider:this.provider(false),
       ...(TEXT_MODELS[this.model]!.reasoning?{reasoning:TEXT_MODELS[this.model]!.reasoning}:{}),
       ...(responseFormat?{response_format:responseFormat}:{})};
     // UTF8 bytes upper-bound content tokenization; generous per-message + fixed envelope overhead.
@@ -256,7 +260,7 @@ export class OpenRouterClient {
   async decide(request:{model:string;state:Json;questions:Json},options:{signal:AbortSignal;idempotencyKey?:string}):Promise<Json> {
     aborted(options.signal);
     if (!Object.hasOwn(DECISION_MODELS,request.model)) throw new ProviderError('MODEL_NOT_ALLOWED');
-    const body:Json={model:request.model,state:request.state,questions:request.questions,provider:{data_collection:'deny',zdr:true,allow_fallbacks:false,
+    const body:Json={model:request.model,state:neutralizeJsonStrings(request.state),questions:request.questions,provider:{data_collection:'deny',zdr:true,allow_fallbacks:false,
       // Decisions API ProviderPreferences.max_price (string USD per million tokens); output tokens are free.
       max_price:{prompt:String(DECISION_MODELS[request.model]!.prompt),completion:'0',request:'0'}}};
     const bytes=Buffer.byteLength(JSON.stringify(body),'utf8');

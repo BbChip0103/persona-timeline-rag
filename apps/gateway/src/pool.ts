@@ -87,7 +87,7 @@ export interface PoolMetrics {
   /** `restarted`: an engine restart seen in telemetry (process_start_time_seconds) cleared a member's state. */
   events:{added:number;removed:number;replaced:number;invalid:number;restarted:number};
   /** The telemetry filter settings (null = off). */
-  telemetry:{intervalMs:number;kvHigh:number;waitingMax:number}|null;
+  telemetry:{intervalMs:number;kvHigh:number;waitingMax:number;timeoutMs:number}|null;
   queue:PoolQueueMetrics;
   /** 2xx calls: arrival at the pool (queue wait included) → first body chunk / → end, ms. */
   latency:{ttftMs:Quantiles;e2eMs:Quantiles};
@@ -672,7 +672,8 @@ export class UpstreamPool implements Upstream {
       queue:{routing:this.routing,fairness:this.pool.fairness??'fifo',queued:this.queue.counts(),queuedTokens:this.queue.queuedTokens,
         waitMs:{p50:percentile(this.waits,0.5),p95:percentile(this.waits,0.95)},rejected:{...this.rejected},globalPrefixTokens:this.globalPrefix,
         prefillTokensPerSec:rate===null?null:Math.round(rate)},
-      telemetry:this.pool.telemetry?{intervalMs:this.pool.telemetry.intervalMs,kvHigh:this.pool.telemetry.kvHigh,waitingMax:this.pool.telemetry.waitingMax}:null,
+      telemetry:this.pool.telemetry?{intervalMs:this.pool.telemetry.intervalMs,kvHigh:this.pool.telemetry.kvHigh,waitingMax:this.pool.telemetry.waitingMax,
+        timeoutMs:this.pool.telemetry.timeoutMs??Math.min(500,this.pool.telemetry.intervalMs)}:null,
       latency:{ttftMs:quantiles(this.ttfts),e2eMs:quantiles(this.e2es)},
       affinity:{mode:this.pool.affinity?'on':'off',...(this.pool.affinity??DEFAULT_AFFINITY),...this.affinityCounts},prefixTtlMs:this.pool.prefixTtlMs??120000,
       upstreams,...(this.pool.source.metrics?{registry:this.pool.source.metrics()}:{})};
