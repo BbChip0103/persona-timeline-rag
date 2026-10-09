@@ -39,7 +39,7 @@ code that call `createRuntime(env)` directly are not gated. The order of the che
 | `PTR_SESSION_SECRET` | web | required; at least 32 characters (`secret_length`) |
 | `PTR_UI_PASSWORD` | web | required; at least 12 characters, the login route's own minimum (`password_length`) |
 | `PTR_GATEWAY_TOKEN` | gateway; api and worker with the `gateway` provider | required there; 24–512 characters |
-| `PTR_GATEWAY_UPSTREAMS_FILE` | gateway | required; the file exists (`file_missing`), parses (`upstreams_file_invalid`) and holds exactly one pool (`upstreams_pool_count`), whose name is the served model |
+| `PTR_GATEWAY_UPSTREAMS_FILE` | gateway | required; the file exists (`file_missing`), parses (`upstreams_file_invalid`) and holds exactly one pool (`upstreams_pool_count`), whose name is the served model; repo-relative for Compose |
 | `PTR_GATEWAY_FAILOVER` | gateway | `off` (default) or `openrouter` (`invalid_value`) |
 | `PTR_WORKER_CONCURRENCY` | worker | 1–1024, default 32 (`invalid_value`) |
 | `PTR_PERSONAS_FILE`, `PTR_AUTHORED_PERSONAS_FILE` | api, worker | optional; a regular file when set (`file_missing`) |
@@ -60,10 +60,11 @@ pnpm ops:check-env --file <path> --roles gateway
 
 The file is parsed like `node --env-file`. Output: one line per problem, `warning|error <role|all> <rule> <KEY>`, then
 `errors N warnings M`; exit 0 without errors, 1 with errors, 2 for a usage error. Problems that do not depend on the
-role (steps 1, 3–5) are printed once as `all`; role problems once per role. It also flags persona paths that are absolute
-(`path_not_repo_relative`, a warning): Compose runs the roles from the repo root inside the container, so only
-repo-relative paths reach the same file there. Run it from the checkout that holds `data/`, since relative persona
-paths are resolved against the current directory.
+role (steps 1, 3–5) are printed once as `all`; role problems once per role. It also flags persona and upstreams file
+paths that are absolute (`path_not_repo_relative`, a warning): Compose runs the roles from the repo root inside the
+container and mounts the upstreams file at the same relative path, so only repo-relative paths reach the same file there
+([Deploy with Compose](runbook.md#deploy-with-compose-production-profile)). Run it from the checkout that holds `data/`,
+since relative paths are resolved against the current directory.
 
 ## Migration from the earlier `.env.local`
 

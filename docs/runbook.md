@@ -111,6 +111,113 @@ synthetic load/failure harness on `ptr_loadtest`, self-hosted engines over an SS
 scripts are documented in [goal2-serving.md](goal2-serving.md). Metrics (`/metrics/prom` on every role), JSON log
 lines and `pnpm ops:status` are described in [observability.md](observability.md).
 
+## Deploy with Compose (production profile)
+
+ (D22–D24). `infra/compose.app.yml` (project `ptr_app`) runs the roles from one image (`Dockerfile`,
+`ptr_app:local`): api, worker, dispatcher, web, and the gateway behind the `gateway` profile (only for
+`PTR_CHAT_PROVIDER=gateway`; with `openrouter` it is not started). Postgres and Redis stay in `compose.db.yml` and
+`compose.redis.yml`, both `restart: unless-stopped`. Every app service has the same settings:
+
+- `network_mode: host`, so every role keeps its loopback guard and fixed 127.0.0.1 port (56440 web, 56441 api, 56442
+  worker metrics, 56443 dispatcher metrics, 56460 gateway). Linux only. Never run the `pnpm dev:*` processes, the native
+  commands above or a load test on the default ports at the same time. The api, web and gateway exit on a taken port, but
+  the worker and dispatcher only log `metrics_listener_failed` and keep running, so their healthcheck could reach the
+  other process: check `ss -ltnp | grep -E ':564(4[0-3]|60)'` is empty before `up`.
+- `user: "${PTR_UID:-900}:${PTR_GID:-2000}"` (`init: true`, so SIGTERM reaches the role). On another host, set
+  `PTR_UID`/`PTR_GID` in `.env.local` to the account that owns `data/generated` and can read `data/`.
+- `env_file: ../.env.local` (`required: false`; a missing file shows up as `config_invalid` at startup), `restart:
+  unless-stopped`, json-file logs rotated at 10 MB × 5 files per container. Every role receives the whole file (one env
+  file, D22), including infra keys such as `PTR_DB_PASSWORD`, visible in `docker inspect`. Keep infra-only passwords in
+  `infra/.env.db` ([DB setup](../infra/README.md)) when that matters.
+- Mounts: `data/` read-only and `data/generated` read-write on api and worker; the upstreams file read-only on the gateway.
+  Nothing else from the host. The image contains no `.env*`, `data/`, `reports/` or `accounts/` (`.dockerignore`).
+- Healthchecks (`node -e fetch`, no curl): api `/api/health` (database `SELECT 1` and Redis `PING`, D23), worker
+  `:56442/healthz`, dispatcher `:56443/healthz`, gateway `/healthz`, web `/login`.
+- `stop_grace_period: 35s` on worker and gateway: a turn has a 30 s deadline; SIGTERM lets the worker finish its turns
+  and the gateway drain (`gateway_draining` / `gateway_drained` log lines). Both exit 0 after a clean stop.
+
+Requirements: Docker Engine with Compose v2.24 or later (`env_file` `required`). Run every command from the repo root,
+always with `--env-file .env.local`: it gives Compose `PTR_UID`/`PTR_GID` and the upstreams path for the mounts. A
+variable exported in the shell wins over `--env-file` for these, so do not export them.
+
+```sh
+C="docker compose --env-file .env.local -f infra/compose.app.yml"   # add --profile gateway with the gateway provider
+```
+
+### Environment checklist
+
+1. `pnpm ops:check-env` prints `errors 0` (key names and rule ids only, never values; see [configuration](configuration.md)).
+   With `PTR_CHAT_PROVIDER=gateway` it also checks the gateway role.
+2. `PTR_PERSONAS_FILE`, `PTR_AUTHORED_PERSONAS_FILE` and `PTR_GATEWAY_UPSTREAMS_FILE` are **repo-relative** (for example
+   `data/research/personas.json`): the container's working directory is the image's repo root `/app`, where `data/` is
+   mounted. Absolute paths are flagged `path_not_repo_relative`.
+3. `PTR_REDIS_URL` uses the ACL user `ptr` (`redis_username_ptr`); `DATABASE_URL` names the isolated database.
+4. `mkdir -p data/generated && chmod 700 data/generated`, owned by `PTR_UID`. Compose does not create the bind-mount
+   sources (`create_host_path: false`), so a missing `data/` or `data/generated` stops `up` instead of appearing
+   root-owned.
+5. Postgres and Redis are up (`docker compose --env-file .env.local -f infra/compose.db.yml up -d db`, the same for
+   `compose.redis.yml`) and migrated (next section). A role started before them keeps reconnecting; the api stays
+   unhealthy (`/api/health` 503) until both answer.
+6. Values with `$` must be single-quoted in `.env.local`: Compose interpolates `env_file` values, `node --env-file` does not.
+
+### First deploy, stop and logs
+
+```sh
+$C build
+$C run --rm --no-deps api node --import tsx scripts/db-migrate.ts   # migrations, through the same image and env
+$C up -d --wait          # returns when every role is healthy; fails when one turns unhealthy
+pnpm ops:status          # role up/down, breakers, ALERTs (observability.md); the host network makes the ports local
+$C ps
+$C logs -f worker        # JSON lines; correlate by turnId across roles
+$C stop                  # worker and gateway get 35 s to finish and drain
+$C down                  # removes the containers; data stays on the host
+```
+
+The upstreams file is mounted as a single file. Edit it in place: the gateway re-reads it on an mtime change, or on
+`$C kill -s SIGHUP gateway`. An editor that replaces the file (new inode) leaves the container on the old copy until
+`$C restart gateway`. After a change in `.env.local`, recreate the roles: `$C up -d --force-recreate`.
+
+### Upgrade order
+
+1. Wait until the service is idle (no turn in flight; `pnpm ops:status`, worker `ptr_turns_inflight`).
+2. `git pull` (or check out the release commit), then `pnpm install --frozen-lockfile` and `pnpm ops:check-env` on the
+   host: a release can add or rename keys.
+3. Keep the running image for rollback: `docker tag ptr_app:local ptr_app:previous`.
+4. Back up the database when the release adds a migration (`supabase/migrations`), with the bootstrap password from the
+   environment, never in the command text:
+   `mkdir -p data/backups; (umask 077; PGPASSWORD="$PTR_DB_PASSWORD" docker exec -e PGPASSWORD ptr_goal1_db pg_dump -U supabase_admin -d ptr_research -Fc > data/backups/ptr_research-<stamp>.dump)`
+   (the subshell keeps the file at 0600 and the password out of the shell's exports).
+5. `$C build`.
+6. With a new migration: `$C stop` first (the worker and gateway finish in-flight work and drain), because the old roles
+   must not run on the new schema (`0008` dropped a column). Then migrate:
+   `$C run --rm --no-deps api node --import tsx scripts/db-migrate.ts`. Migrations are forward-only and applied once
+   each (`ptr_schema_migrations`).
+7. `$C up -d --wait` recreates the changed roles. Without a migration the old worker and gateway get SIGTERM here and
+   finish in-flight work first.
+8. `pnpm ops:status` and one turn through the web.
+
+### Rollback
+
+1. `git checkout <previous commit>` (the compose file, configs and docs must match the image).
+2. `docker tag ptr_app:previous ptr_app:local && $C up -d --wait --force-recreate` (or `$C build` on the old commit).
+3. Database: there are no down migrations, and some migrations drop objects (for example `0007` drops an index and
+   `0008` a column). An image rollback is safe when both commits have the same `supabase/migrations`. Across a
+   migration, stop the roles and restore the dump from upgrade step 4 (`pg_restore --clean` into `ptr_research`)
+   before starting the old image.
+4. Redis is not a source of truth: queued turns are re-published from the Postgres outbox by the dispatcher.
+
+## CI (`.github/workflows/ci.yml`)
+
+- **check** (every push and pull request): `pnpm install --frozen-lockfile && pnpm check`, `docker compose -f
+  infra/compose.app.yml --profile gateway config -q` and actionlint. It uses no secrets, and the checkout has no `data/`
+  and no `.env*`, so a test that needs a private local file fails here. Reproduce locally:
+  `git clone --branch <branch> <repo> /tmp/ptr-clean && cd /tmp/ptr-clean && pnpm install --frozen-lockfile && pnpm check`.
+- **integration** (pushes to `main` and manual runs): a `pgvector/pgvector` PostgreSQL 15 service container with the
+  synthetic `ptr_loadtest` database (`infra/init-loadtest-db.sh`), Redis from `infra/compose.redis.yml` (the same ACL),
+  credentials generated per run, then `pnpm db:migrate` and `RUN_STORAGE_DB_TESTS=1 RUN_REDIS_TESTS=1
+  GOAL1_TEST_BUDGET_DB=true pnpm test`. Redis runs from the compose file because a GitHub service container cannot set
+  the server command that writes the ACL.
+
 ## Authentication and owner spaces
 
 Threat model : single-user research serving; every process binds 127.0.0.1 only (code guards). The

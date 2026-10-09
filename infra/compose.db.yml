@@ -4,7 +4,7 @@ services:
   db:
     image: public.ecr.aws/supabase/postgres:15.8.1.085
     container_name: ptr_goal1_db
-    restart: "no"
+    restart: unless-stopped
     environment:
       # Keep the distribution's bootstrap role; its peer-map/extensions require it.
       POSTGRES_DB: postgres

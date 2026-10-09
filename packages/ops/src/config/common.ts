@@ -82,9 +82,10 @@ export function issues(result:z.SafeParseReturnType<unknown,unknown>):Problem[] 
   return result.success?[]:result.error.issues.map(issue=>({key:String(issue.path[0]),rule:issue.message}));
 }
 /**
- * Compose runs the roles from the repo root inside the container : only repo-relative persona paths resolve
- * to the same file there. Reported by `ops:check-env` only.
+ * Compose runs the roles from the repo root inside the container : only repo-relative persona and upstreams
+ * file paths resolve to the same file there (infra/compose.app.yml mounts the upstreams file at the same relative path).
+ * Reported by `ops:check-env` only.
  */
 export function composeProblems(env:NodeJS.ProcessEnv):Problem[] {
-  return ['PTR_PERSONAS_FILE','PTR_AUTHORED_PERSONAS_FILE'].filter(key=>env[key]&&isAbsolute(env[key]!)).map(key=>({key,rule:'path_not_repo_relative'}));
+  return ['PTR_PERSONAS_FILE','PTR_AUTHORED_PERSONAS_FILE','PTR_GATEWAY_UPSTREAMS_FILE'].filter(key=>env[key]&&isAbsolute(env[key]!)).map(key=>({key,rule:'path_not_repo_relative'}));
 }

@@ -1,0 +1,39 @@
+# : the image holds code and dependencies only. Private configuration, licensed research data, reports
+# and author material are bind-mounted or stay on the host (packages/ops/test/packaging.test.ts checks this list).
+.env*
+**/.env*
+data
+reports
+accounts
+**/*.private.md
+# Data shapes .gitignore treats as licensed research data or identifiable outputs, wherever they are.
+**/*.jsonl
+**/*.sqlite*
+**/*.db
+**/*.zip
+**/*.z[0-9][0-9]
+**/*.docx
+**/*.jpg
+**/*.jpeg
+**/*.png
+**/*.mp4
+**/*.parquet
+**/*.info
+**/*.key
+**/*.pem
+output
+state
+.omc
+.claude
+build
+dist
+.git
+**/node_modules
+**/.next
+**/.next-synthetic
+**/*.tsbuildinfo
+test-results
+playwright-report
+.venv
+**/__pycache__
+.omx

@@ -52,6 +52,13 @@ test('value rules print rule ids only; absolute persona paths are flagged for Co
     'error api production_provider PTR_CHAT_PROVIDER','error worker production_provider PTR_CHAT_PROVIDER','errors 3 warnings 4']);
   expect(code).toBe(1);
 });
+test('an absolute upstreams file path is flagged for Compose too (its bind mount is repo-relative)',()=>{
+  writeFileSync(join(dir,'upstreams.json'),JSON.stringify({pools:{m:{upstreams:[{id:'a',baseUrl:'http://127.0.0.1:18000/v1'}]}}}));
+  const gateway=(file:string)=>run(userKeys({PTR_GATEWAY_TOKEN:`${SENTINEL}-gateway`,PTR_GATEWAY_UPSTREAMS_FILE:file}),['--roles','gateway']);
+  expect(gateway(join(dir,'upstreams.json')).lines).toEqual(['roles gateway (demo off)',...WARNINGS,
+    'warning all path_not_repo_relative PTR_GATEWAY_UPSTREAMS_FILE','errors 0 warnings 5']);
+  expect(gateway('upstreams.json').lines).toEqual(['roles gateway (demo off)',...WARNINGS,'errors 0 warnings 4']);
+});
 test('a Redis URL without the ACL user ptr is flagged for every role that reads it ',()=>{
   const {code,lines}=run(userKeys({PTR_REDIS_URL:`redis://:${SENTINEL}@127.0.0.1:56479/0`}));
   expect(lines.filter(line=>line.startsWith('error '))).toEqual(['error api redis_username_ptr PTR_REDIS_URL','error worker redis_username_ptr PTR_REDIS_URL',

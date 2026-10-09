@@ -1,0 +1,103 @@
+#  (D24).
+# - check: every push and pull request. No secrets, and the checkout has no data/ and no .env* (the clean-clone
+#   acceptance), so a test that depends on a private local file fails here.
+# - integration: the Postgres and Redis suites, on pushes to main and on manual runs, against throwaway containers on the
+#   runner (synthetic ptr_loadtest database, Redis with the repo's ACL config). Credentials are generated per run.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push cancels an older run, except on main, where the integration job must finish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - name: Enable pnpm (packageManager in package.json)
+        run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - name: Compose file renders
+        run: docker compose -f infra/compose.app.yml --profile gateway config -q
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  integration:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        # pgvector on PostgreSQL 15 (the local Supabase distribution is 15 as well); migrations need only `vector`.
+        image: pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6
+        env:
+          # Bootstrap superuser named like the Supabase distribution's, so infra/init-loadtest-db.sh runs unchanged.
+          POSTGRES_USER: supabase_admin
+          POSTGRES_DB: postgres
+          # Service containers start before any step, so no generated password exists yet: the bootstrap uses trust on
+          # this throwaway, loopback-published database. The application role still gets a generated password.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:56432:5432
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin -d postgres"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - name: Enable pnpm (packageManager in package.json)
+        run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generate throwaway credentials
+        run: |
+          for name in PTR_LOADTEST_DB_PASSWORD PTR_REDIS_PASSWORD; do
+            value="$(openssl rand -hex 24)"
+            echo "::add-mask::${value}"
+            echo "${name}=${value}" >> "$GITHUB_ENV"
+          done
+      - name: Create the synthetic ptr_loadtest database and role
+        run: docker exec -i -e PTR_LOADTEST_DB_PASSWORD "${{ job.services.postgres.id }}" bash -s < infra/init-loadtest-db.sh
+      # GitHub service containers cannot set a command, so Redis runs from the repo's compose file: the same ACL
+      # (user ptr, default off), noeviction and AOF as production.
+      - name: Start Redis with the ACL config
+        run: docker compose -f infra/compose.redis.yml up -d --wait redis
+      - name: Connection URLs
+        run: |
+          echo "DATABASE_URL=postgresql://ptr_loadtester:${PTR_LOADTEST_DB_PASSWORD}@127.0.0.1:56432/ptr_loadtest" >> "$GITHUB_ENV"
+          echo "PTR_REDIS_URL=redis://ptr:${PTR_REDIS_PASSWORD}@127.0.0.1:56479/0" >> "$GITHUB_ENV"
+      - run: pnpm db:migrate
+      - name: Unit, Postgres and Redis suites
+        run: GOAL1_TEST_DATABASE_URL="$DATABASE_URL" pnpm test
+        env:
+          RUN_STORAGE_DB_TESTS: "1"
+          RUN_REDIS_TESTS: "1"
+          GOAL1_TEST_BUDGET_DB: "true"
+      - name: Remove Redis
+        if: always()
+        run: docker compose -f infra/compose.redis.yml down --volumes
