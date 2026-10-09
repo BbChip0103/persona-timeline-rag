@@ -94,7 +94,18 @@ const kstDay = (value: unknown): string => {
   return Number.isNaN(date.getTime()) ? '-' : new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 };
 const text = (value: unknown) => (typeof value === 'string' ? value : '');
-const fakeServing = (serving: unknown) => serving !== undefined && serving !== null && /fake|synthetic/i.test(JSON.stringify(serving));
+/** Upstreams that serve real model replies (docs/observability.md); `fake` and `unknown` are not among them. */
+const REAL_UPSTREAMS = new Set(['primary', 'secondary', 'openrouter', 'direct']);
+/**
+ * reply.serving : `{calls, upstreams[], secondaryCalls}`, one upstream name per model call. Fail-closed: a
+ * turn any call of which was not answered by a known real upstream (the fake model, `unknown`), or a record without that
+ * shape, is left out. Turns stored before O4 have no record and stay eligible.
+ */
+function fakeServing(serving: unknown): boolean {
+  if (serving === undefined || serving === null) return false;
+  const upstreams = (serving as { upstreams?: unknown }).upstreams;
+  return typeof serving !== 'object' || !Array.isArray(upstreams) || !upstreams.every(name => typeof name === 'string' && REAL_UPSTREAMS.has(name));
+}
 
 /** Population : local owners, real-person personas, a real reply, not served by a fake or synthetic engine. */
 function eligible(row: Record<string, unknown>): boolean {

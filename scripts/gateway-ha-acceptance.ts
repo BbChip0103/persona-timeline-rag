@@ -163,7 +163,7 @@ async function killScenario(name:'C'|'E'|'T6',redis:ReturnType<typeof createRedi
     return {scenario:name,users,seconds:SECONDS,killAtMs:killedAt-t0,signal:name==='E'?'SIGTERM':'SIGKILL',
       leaderBeforeKill:{inFlight:(before as {inFlight?:number}|null)?.inFlight??null,queued:(before as {queued?:number}|null)?.queued??null},
       killedExit:{code:exit.code,signal:exit.signal,afterKillMs:exit.at-killedAt},
-      drainLog:gws[0]!.lines.filter(line=>/gateway drain/.test(line)).map(line=>line.replace(/^\d+ /,'')),
+      drainLog:gws[0]!.lines.filter(line=>/"event":"gateway_drain/.test(line)).map(line=>line.replace(/^\d+ /,'')),
       total:summarize(samples,0,Infinity),beforeKill:summarize(samples,t0,killedAt),killWindow:summarize(samples,killedAt,killedAt+10_000),afterWindow:summarize(samples,killedAt+10_000,Infinity),
       engines:{requests:engineRequests,cancelled,duplicateGenerations:engineRequests-ok},survivors:accepted,
       listTimeline:sampler.events,listDropsKilledAfterMs:firstListWithout?firstListWithout.t-(killedAt-t0):null,

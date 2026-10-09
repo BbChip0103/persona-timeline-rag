@@ -24,6 +24,14 @@ test('PTR_FAKE_LATENCY wraps only the fake provider with the seeded delay profil
   expect(runtime.model).toBe('synthetic/fake-text-v1+latency');
   await runtime.close?.();
 });
+test('the worker\'s observability hooks reach the chat service (completion, failure, safety fallback)',async()=>{
+  const hooks={onTurnFailure:()=>undefined,onTurnCompleted:()=>undefined,onSafetyFallback:()=>undefined};
+  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl},hooks);
+  const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
+  expect(options.onTurnCompleted).toBe(hooks.onTurnCompleted);expect(options.onTurnFailure).toBe(hooks.onTurnFailure);
+  expect(typeof runtime.health).toBe('function');
+  await runtime.close?.();
+});
 test('invalid latency profiles fail at startup, and are rejected for live providers',()=>{
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_FAKE_LATENCY:'{"medianMs":0}'})).toThrow();
   expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'openrouter',PTR_FAKE_LATENCY:'{"medianMs":10,"p95Ms":20}'})).toThrow();
@@ -130,7 +138,9 @@ test('PTR_SAFETY_FILTER=jev is off by default, separate from the intent classifi
   const write=jest.spyOn(process.stderr,'write').mockImplementation(()=>true);
   const log=(safety.chat as unknown as {options:{onSafetyFallback:(event:{scope:string;reason:string})=>void}}).options.onSafetyFallback;
   log({scope:'turn',reason:'budget'});log({scope:'turn',reason:'budget'});
-  expect(write.mock.calls.map(([line])=>String(line))).toEqual(['input_safety_fallback scope=turn reason=budget count=1\n','input_safety_fallback scope=turn reason=budget count=2\n']);
+  // One JSON event per fallback , with the running count.
+  expect(write.mock.calls.map(([line])=>JSON.parse(String(line))).map(({role,event,scope,reason,count})=>({role,event,scope,reason,count}))).toEqual([
+    {role:'api',event:'input_safety_fallback',scope:'turn',reason:'budget',count:1},{role:'api',event:'input_safety_fallback',scope:'turn',reason:'budget',count:2}]);
   write.mockRestore();await safety.close?.();
   const both=createRuntime({...live,PTR_INTENT_CLASSIFIER:'jev'});
   expect(optionsOf(both).intentClassifier).toBeDefined();expect(optionsOf(both).inputSafety).toBeDefined();await both.close?.();

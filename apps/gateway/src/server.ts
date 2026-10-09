@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { REQUEST_KEY } from '@ptr/providers';
+import { createLog, servePrometheus } from '@ptr/ops';
+import { gatewayFamilies } from './prom';
 import type { GatewayPublisherMetrics } from '@ptr/messaging/registry';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 import { AdmissionLimiter, GatewayRejection } from './limiter';
@@ -15,6 +17,8 @@ export interface GatewayOptions {
   maxBodyBytes?:number;
   /** Gateway registry publisher (S6), when registered: reported as `registry` in /metrics. */
   registry?:()=>GatewayPublisherMetrics;
+  /** JSON log line writer (default stderr); events carry the request key (the worker's turn id) and codes only. */
+  log?:(line:string)=>void;
 }
 export interface GatewayMetrics {
   upstream:string; inFlight:number; queued:number; accepted:number; completed:number; upstreamErrors:number;
@@ -81,7 +85,10 @@ export function createGateway(options:GatewayOptions):Gateway {
   if(options.token.length<24||options.token.length>512) throw new Error('INVALID_GATEWAY_TOKEN');
   const expected=createHash('sha256').update(options.token).digest();
   const limiter=new AdmissionLimiter(options.limits);
-  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0,draining:0,deadline:0,deadlineAborts:0};
+  const counters={accepted:0,completed:0,upstreamErrors:0,queueFull:0,queueTimeout:0,draining:0,deadline:0,deadlineAborts:0,timeouts:0};
+  /** 2xx answers by X-PTR-Upstream (D21), for /metrics/prom. */
+  const served:Record<string,number>={};
+  const log=createLog('gateway',options.log);
   let draining=false, active=0;const idleWaiters:(()=>void)[]=[];
   /** Keep-alive: while draining every response closes its connection. */
   const closing=():Record<string,string>=>draining?{'Connection':'close'}:{};
@@ -174,14 +181,16 @@ export function createGateway(options:GatewayOptions):Gateway {
     const signal=AbortSignal.any([caller.signal,AbortSignal.timeout(options.limits.upstreamTimeoutMs),expiry.signal]);
     try {
       const result=await options.upstream.complete(request,signal,Object.keys(context).length?context:undefined);
-      // Which upstream answered, only when failover is configured.
-      const served:Record<string,string>=result.upstream?{'X-PTR-Upstream':result.upstream}:{};
+      // Which upstream answered (D21): always sent; the worker records it in the turn's reply.serving.
+      const upstream=result.upstream??'primary', named={'X-PTR-Upstream':upstream};
       if(result.status<200||result.status>=300) {
         counters.upstreamErrors++;
+        log('gateway_upstream_error',{turnId:context.requestKey??null,code:'UPSTREAM_HTTP',upstreamStatus:result.status,upstream});
         // Upstream bodies are never forwarded; this is not a gateway rejection, so clients do not auto-retry.
-        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}},{...served,...closing()});
+        return json(res,502,{error:{code:`UPSTREAM_HTTP_${result.status}`}},{...named,...closing()});
       }
-      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store',...served,...closing()});
+      served[upstream]=(served[upstream]??0)+1;
+      res.writeHead(200,{'Content-Type':result.contentType,'Cache-Control':'no-store',...named,...closing()});
       if(typeof result.body==='string') res.end(result.body);
       // pipeline handles backpressure and settles when either side closes, so a client that stops reading and
       // disconnects cannot pin this slot on a 'drain' that never comes.
@@ -204,14 +213,19 @@ export function createGateway(options:GatewayOptions):Gateway {
       const timedOut=signal.aborted||(error as {name?:unknown})?.name==='TimeoutError';
       // Cut at X-PTR-Deadline: still unmarked (it was sent), but the reason tells the client it was the turn deadline.
       const cut=expiry.signal.aborted&&!caller.signal.aborted;
-      if(cut) counters.deadlineAborts++;
-      if(!caller.signal.aborted){counters.upstreamErrors++;if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}},
+      if(cut) counters.deadlineAborts++;else if(timedOut&&!caller.signal.aborted) counters.timeouts++;
+      if(!caller.signal.aborted){counters.upstreamErrors++;
+        log('gateway_upstream_error',{turnId:context.requestKey??null,code:cut?'DEADLINE_EXCEEDED':timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE',midStream:res.headersSent});
+        if(!res.headersSent)json(res,timedOut?504:502,{error:{code:timedOut?'UPSTREAM_TIMEOUT':'UPSTREAM_UNAVAILABLE'}},
         {...(cut?{'X-PTR-Gateway-Reason':'deadline'}:{}),...closing()});else res.destroy();}
     } finally {clearTimeout(expiryTimer);record(upstreamTimes,performance.now()-started);release();}
   }
   const server=createServer((req,res)=>{
     const path=(req.url??'').split('?')[0];
     if(req.method==='GET'&&path==='/healthz') return draining?json(res,503,{ok:false,draining:true},{'Connection':'close'}):json(res,200,{ok:true});
+    // Prometheus text : no token, like /healthz; loopback only and aggregates only.
+    if(path==='/metrics/prom') return void servePrometheus(req.method,()=>gatewayFamilies(metrics(),{served,timeouts:counters.timeouts,ttft:options.upstream.ttftSeconds?.samples()??[]}))
+      .then(({status,headers,body})=>{res.writeHead(status,headers);res.end(body);});
     if(!authorized(req)) return json(res,403,{error:{code:'UNAUTHORIZED'}});
     if(req.method==='GET'&&path==='/metrics') return json(res,200,metrics());
     if(req.method==='POST'&&path==='/v1/chat/completions') return void complete(req,res).catch(()=>{if(!res.headersSent)json(res,500,{error:{code:'INTERNAL_ERROR'}});});

@@ -7,12 +7,15 @@ import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { ExecutionProfileSchema, RagConditionSchema, RetrievalModeSchema, SendTurnSchema, TimezoneSchema, type ChatSession } from '@ptr/contracts';
 import { CoreError } from '@ptr/core';
+import { createLog, servePrometheus } from '@ptr/ops';
+import { ApiMetrics, routeLabel } from './observability';
 import { publicTurn } from './public-turn';
 import { DEFAULT_SSE, streamTurn, type SseOptions } from './turn-sse';
 import type { ApiRuntime, CreativeArtifact } from './runtime';
 const RUNTIME=Symbol('API_RUNTIME');
 const SSE=Symbol('SSE_OPTIONS');
 const DRAFT_LIMIT=Symbol('DRAFT_LIMIT');
+const METRICS=Symbol('API_METRICS');
 /** Per-owner draft requests per minute (in-process, safety filter on only): each draft costs up to two safety requests and one model call. */
 export const DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE=10;
 const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
@@ -27,9 +30,16 @@ const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason
 const WEB_OWNER=/^local-[a-f0-9]{40}$/;
 const SYNTHETIC_OWNER=/^(?:lt-[a-z0-9-]{1,40}|owner_synthetic_[a-z0-9_]{1,40})$/;
 const ownerSpace=new WeakMap<Request,RegExp>();
+/** Metrics of the app that received the request (set by the token middleware). */
+const requestMetrics=new WeakMap<Request,ApiMetrics>();
 function owner(request:Request):string {
   const value=request.header('X-PTR-Owner');const space=ownerSpace.get(request);
-  if(!value || !space?.test(value)) throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
+  if(!value || !space?.test(value)) {
+    // `space`: a valid owner of the other token's space ; `format`: no valid owner at all.
+    const reason=!value?'missing':WEB_OWNER.test(value)||SYNTHETIC_OWNER.test(value)?'space':'format';
+    requestMetrics.get(request)?.ownerRejected.inc({reason});
+    throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
+  }
   return value;
 }
 function safeSession(session:ChatSession) { const {ownerId:_,...safe}=session;return safe; }
@@ -55,7 +65,9 @@ class SafeErrorFilter implements ExceptionFilter {
 class ApiController {
   private readonly drafts=new Set<string>();
   private readonly draftWindows=new Map<string,{start:number;count:number}>();
-  constructor(@Inject(RUNTIME) private readonly runtime:ApiRuntime,@Inject(SSE) private readonly sse:SseOptions,@Inject(DRAFT_LIMIT) private readonly draftLimit:number) {}
+  private readonly log=createLog('api');
+  constructor(@Inject(RUNTIME) private readonly runtime:ApiRuntime,@Inject(SSE) private readonly sse:SseOptions,@Inject(DRAFT_LIMIT) private readonly draftLimit:number,
+    @Inject(METRICS) private readonly metrics:ApiMetrics) {}
   /** Fixed one-minute window per owner; counted before any safety check or model call. */
   private admitDraft(owner:string):void {
     const now=Date.now();let window=this.draftWindows.get(owner);
@@ -66,7 +78,14 @@ class ApiController {
     if(window.count>=this.draftLimit) throw new CoreError('QUEUE_FULL');
     window.count++;
   }
-  @Get('health') health() {return {ok:true,service:'persona-timeline-rag',liveEnabled:this.runtime.providerName==='openrouter'};}
+  /** D23: with a runtime that checks its dependencies, a failed database `SELECT 1` or Redis `PING` (1 s each) answers 503. */
+  @Get('health') async health(@Res({passthrough:true}) response:Response) {
+    const body={ok:true,service:'persona-timeline-rag',liveEnabled:this.runtime.providerName==='openrouter'};
+    if(!this.runtime.health) return body;
+    const {database,redis}=await this.runtime.health();
+    if(!database||!redis) response.status(503);
+    return {...body,ok:database&&redis,checks:{database:database?'ok':'down',redis:redis?'ok':'down'}};
+  }
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
     return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'연구용 AI 시뮬레이션 · 비공식'}))};
@@ -88,12 +107,14 @@ class ApiController {
     if(!body || typeof body!=='object' || Array.isArray(body) || 'sessionId' in body) throw new CoreError('INVALID_INPUT');
     const input=SendTurnSchema.parse({...body,sessionId:id});
     if(forbiddenSecret.test(input.text)) throw new CoreError('INVALID_INPUT');
-    const turn=await this.runtime.chat.startTurn(caller,input);
+    const {turn,created}=await this.runtime.chat.submitTurn(caller,input);
+    if(created) {this.metrics.turnsCreated++;this.log('turn_created',{turnId:turn.id});}
     return {turn:safeTurn(turn)};
   }
   @Get('turns/:id') async turn(@Req() request:Request,@Param('id') id:string) {return {turn:safeTurn(await this.runtime.chat.getTurn(owner(request),id))};}
   /** Server-sent events instead of client polling: state notices plus the final public turn. */
   @Get('turns/:id/events') async turnEvents(@Req() request:Request,@Res() response:Response,@Param('id') id:string) {
+    this.metrics.sseOpen++;response.once('close',()=>{this.metrics.sseOpen--;});
     await streamTurn(this.runtime.chat,this.runtime.eventSource,owner(request),id,request,response,this.sse);
   }
   @Post('turns/:id/cancel') async cancel(@Req() request:Request,@Param('id') id:string,@Body() body:unknown) {
@@ -141,7 +162,9 @@ export async function createApiApplication(runtime:ApiRuntime,token:string,optio
   if(!token || !validToken(token)) throw new CoreError('INVALID_INPUT');
   const synthetic=options.syntheticToken;
   if(synthetic!==undefined && (!validToken(synthetic) || synthetic===token)) throw new CoreError('INVALID_INPUT');
-  @Module({controllers:[ApiController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}},{provide:DRAFT_LIMIT,useValue:draftLimit}]})
+  const metrics=new ApiMetrics();
+  @Module({controllers:[ApiController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}},{provide:DRAFT_LIMIT,useValue:draftLimit},
+    {provide:METRICS,useValue:metrics}]})
   class ApiModule {}
   const app=await NestFactory.create<NestExpressApplication>(ApiModule,{logger:false,bodyParser:false});
   // Token middleware runs before body parsing so unauthenticated input has no effect.
@@ -149,6 +172,13 @@ export async function createApiApplication(runtime:ApiRuntime,token:string,optio
   const expected=digest(token), expectedSynthetic=synthetic===undefined?undefined:digest(synthetic);
   app.use((request:Request,response:Response,next:NextFunction)=>{
     response.setHeader('Cache-Control','no-store');response.setHeader('X-Content-Type-Options','nosniff');
+    // Requests by route label and status class ; counted when the response ends, any outcome.
+    requestMetrics.set(request,metrics);
+    const route=routeLabel(request.path);
+    response.once('finish',()=>metrics.requests.inc({route,status_class:`${Math.floor(response.statusCode/100)}xx`}));
+    // Prometheus text (D18): no token, like /api/health (loopback bind, aggregates only).
+    if(request.path==='/metrics/prom') return void servePrometheus(request.method,()=>metrics.render())
+      .then(({status,headers,body})=>{response.writeHead(status,headers);response.end(body);});
     if(request.method==='GET' && request.path==='/api/health') return next();
     const header=request.header('Authorization')??'';
     const supplied=header.startsWith('Bearer ')?header.slice(7):'';

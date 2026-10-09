@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -99,7 +98,7 @@ describe('prefix table and cache affinity in the pool (S5, §4.2–4.3)',()=>{
     a.setHoldFirst(true);
     const pending=await pool.complete(turn(3),signal());
     expect(member(pool,'a')).toMatchObject({reservedKvTokens:1812,prefillTokens:1300,prefix:{entries:4,extraHits:0}});
-    expect(lines.at(-1)).toMatch(/h=\{a:0\.435\} cost=\{a:0\.213\}/); // h = G / T̂ = 1000 / 2300; cost 1300 / 10000 + 1 / 12
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({h:'{a:0.435}',cost:'{a:0.213}'}); // h = G / T̂ = 1000 / 2300; cost 1300 / 10000 + 1 / 12
     a.release();await readAll(pending);
   });
   test('only answered calls are recorded (at the first chunk): a refused connection leaves the table as it was',async()=>{
@@ -162,16 +161,16 @@ describe('latency samples',()=>{
 });
 
 describe('sampled routing decision log (§8, no text)',()=>{
-  test('PTR_GATEWAY_ROUTE_LOG_SAMPLE 1: one line per decision with the hashed request key, est, h and cost per candidate, pick, reason, wait',async()=>{
+  test('PTR_GATEWAY_ROUTE_LOG_SAMPLE 1: one JSON line per decision with the raw turn id (D20), est, h and cost per candidate, pick, reason, wait',async()=>{
     const {pool,lines}=setup({routeLogSample:1},[rec('a'),rec('b')]);
     await readAll(await pool.complete(turn(2),signal(),{requestKey:'turn-0001'}));
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/^route rk=[0-9a-f]{12} pool=m band=0 est=1900 h=\{a:0\.526,b:0\.526\} cost=\{a:0\.173,b:0\.173\} pick=a reason=tie wait=\d+ms$/);
-    expect(lines[0]).not.toContain('turn-0001');expect(lines[0]).not.toMatch(/PPP|xxx/);
-    // Salted per process: not the plain sha256 of the key (a guessable key cannot be confirmed from the log).
-    expect(lines[0]).not.toContain(`rk=${createHash('sha256').update('turn-0001').digest('hex').slice(0,12)}`);
+    // : the request key (the worker's turn id) as is, so the line joins the worker's; no text.
+    expect(JSON.parse(lines[0]!)).toEqual({ts:expect.any(String),role:'gateway',event:'gateway_route',turnId:'turn-0001',pool:'m',band:0,est:1900,
+      h:'{a:0.526,b:0.526}',cost:'{a:0.173,b:0.173}',pick:'a',reason:'tie',waitMs:expect.any(Number)});
+    expect(lines[0]).not.toMatch(/PPP|xxx/);
     await readAll(await pool.complete(turn(2),signal()));
-    expect(lines[1]).toMatch(/^route rk=- /);
+    expect(JSON.parse(lines[1]!).turnId).toBeNull();
   });
   test('sampling 0 logs nothing; a fraction samples by the random source',async()=>{
     const none=setup({routeLogSample:0});
@@ -185,15 +184,15 @@ describe('sampled routing decision log (§8, no text)',()=>{
     const {pool,a,lines}=setup({routeLogSample:1},[rec('a'),rec('b')]);
     a.refuse(1);
     await readAll(await pool.complete(turn(2),signal()));
-    expect(lines.map(line=>/pick=(\S+) reason=(\S+)/.exec(line)!.slice(1).join(' '))).toEqual(['a tie','b retry']);
+    expect(lines.map(line=>{const {pick,reason}=JSON.parse(line);return `${pick} ${reason}`;})).toEqual(['a tie','b retry']);
     const secondary:Upstream={model:'s',complete:async()=>({status:200,contentType:'application/json',body:'{}'})};
     const withSecondary=setup({routeLogSample:1,secondary});
     withSecondary.a.refuse(1);
     await readAll(await withSecondary.pool.complete(turn(2),signal()));
-    expect(withSecondary.lines.at(-1)).toMatch(/^route rk=- pool=m band=0 est=1900 h=\{\} cost=\{\} pick=secondary reason=failover wait=\d+ms$/);
+    expect(JSON.parse(withSecondary.lines.at(-1)!)).toMatchObject({turnId:null,pool:'m',band:0,est:1900,h:'{}',cost:'{}',pick:'secondary',reason:'failover'});
     const sticky=setup({routeLogSample:1,affinity:{minTokens:256,slack:0.5}});
     for(const k of [2,3]) await readAll(await sticky.pool.complete(turn(k),signal()));
-    expect(sticky.lines.map(line=>/reason=(\S+)(?: affinity=(\S+))?/.exec(line)!.slice(1).join(' '))).toEqual(['load none','affinity picked']);
+    expect(sticky.lines.map(line=>{const {reason,affinity}=JSON.parse(line);return `${reason} ${affinity}`;})).toEqual(['load none','affinity picked']);
   });
 });
 

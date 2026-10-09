@@ -10,6 +10,8 @@ export interface TurnWorkerOptions {
   /** PTR_TURN_MAX_QUEUE_MS: a turn that waited longer than this since it was last queued is not claimed (the dispatcher fails it). Unset = no limit. */
   maxQueueMs?:number;
   onError?:(phase:'claim'|'execute',error:unknown)=>void;
+  /** Observability: a claimed turn ended here; queue wait = claim − creation (a requeued turn counts from creation). */
+  onFinished?:(event:{turnId:string;queueWaitMs:number;durationMs:number})=>void;
 }
 
 /**
@@ -28,6 +30,7 @@ export class TurnWorker {
     try {queued=await this.options.leases.claimTurn(dispatch.turnId,this.options.workerId,this.options.leaseMs,this.options.maxQueueMs);}
     catch(error) {this.options.onError?.('claim',error);throw error;}
     if(!queued||this.dead) return 'skipped';
+    const claimedAt=Date.now();
     const controller=new AbortController();
     // Heartbeat first, so nothing else (e.g. a slow Redis subscribe) can let the lease lapse. A single failed renewal
     // is tolerated (transient DB trouble); a lost lease or two failures in a row abort the provider call with
@@ -43,7 +46,10 @@ export class TurnWorker {
       .then(off=>{if(finished) off();else unsubscribe=off;},()=>undefined);
     const done=this.options.chat.executeQueued(queued,controller)
       .catch(error=>this.options.onError?.('execute',error))
-      .finally(()=>{finished=true;clearInterval(heartbeat);unsubscribe?.();this.inFlight.delete(queued.turn.id);});
+      .finally(()=>{
+        finished=true;clearInterval(heartbeat);unsubscribe?.();this.inFlight.delete(queued.turn.id);
+        this.options.onFinished?.({turnId:queued.turn.id,queueWaitMs:Math.max(0,claimedAt-Date.parse(queued.turn.createdAt)),durationMs:Date.now()-claimedAt});
+      });
     this.inFlight.set(queued.turn.id,{controller,heartbeat,done});
     await done;
     return 'executed';
@@ -71,7 +77,10 @@ export interface TurnDispatcherOptions {
    */
   maxQueueMs?:number;
   onError?:(phase:'recover'|'reconcile'|'expire'|'dispatch',error:unknown)=>void;
+  /** Observability: each requeue, failure (with its code) and outbox re-publish, by turn id. */
+  onEvent?:(event:TurnDispatcherEvent)=>void;
 }
+export type TurnDispatcherEvent={type:'requeued';turnId:string}|{type:'failed';turnId:string;errorCode:'WORKER_LOST'|'QUEUE_TIMEOUT'}|{type:'republished';turnId:string};
 
 /**
  * Recovery loop: requeues expired leases (or fails them with WORKER_LOST), fails turns that waited too long for a
@@ -89,25 +98,32 @@ export class TurnDispatcher {
   }
   async stop():Promise<void> { if(this.timer) clearInterval(this.timer);this.timer=undefined;await this.running; }
   async tick():Promise<void> {
-    try {
-      const {failed}=await this.options.leases.recoverExpired(this.options.maxAttempts);
-      for(const turnId of failed) await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
-    } catch(error) {this.options.onError?.('recover',error);}
+    const report=this.options.onEvent??(()=>undefined);
+    const recovered=async({requeued,failed}:{requeued:string[];failed:string[]})=>{
+      for(const turnId of requeued) report({type:'requeued',turnId});
+      for(const turnId of failed) {
+        report({type:'failed',turnId,errorCode:'WORKER_LOST'});
+        await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
+      }
+    };
+    try {await recovered(await this.options.leases.recoverExpired(this.options.maxAttempts));}
+    catch(error) {this.options.onError?.('recover',error);}
     const reconcile=this.options.reconcile;
     if(reconcile&&Date.now()-this.reconciledAt>=reconcile.intervalMs) {
       this.reconciledAt=Date.now();
-      try {
-        const {failed}=await this.options.leases.reconcileLeases(this.options.maxAttempts,reconcile.graceMs);
-        for(const turnId of failed) await this.options.events?.publish({turnId,state:'failed',errorCode:'WORKER_LOST'}).catch(()=>undefined);
-      } catch(error) {this.options.onError?.('reconcile',error);}
+      try {await recovered(await this.options.leases.reconcileLeases(this.options.maxAttempts,reconcile.graceMs));}
+      catch(error) {this.options.onError?.('reconcile',error);}
     }
     if(this.options.maxQueueMs!==undefined) try {
-      for(const {turnId,errorCode} of await this.options.leases.expireQueued(this.options.maxQueueMs))
+      for(const {turnId,errorCode} of await this.options.leases.expireQueued(this.options.maxQueueMs)) {
+        report({type:'failed',turnId,errorCode});
         await this.options.events?.publish({turnId,state:'failed',errorCode}).catch(()=>undefined);
+      }
     } catch(error) {this.options.onError?.('expire',error);}
     try {
-      for(const dispatch of await this.options.leases.pendingDispatches(this.options.graceMs,this.options.batch??500))
-        await this.options.delivery.publish(dispatch);
+      for(const dispatch of await this.options.leases.pendingDispatches(this.options.graceMs,this.options.batch??500)) {
+        await this.options.delivery.publish(dispatch);report({type:'republished',turnId:dispatch.turnId});
+      }
     } catch(error) {this.options.onError?.('dispatch',error);}
   }
 }

@@ -1,5 +1,5 @@
 import { DEFAULT_TEXT_MODEL, FakeTextProvider, ProviderError, LatencyInjectedTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
-import { loadConfig } from '@ptr/ops';
+import { createLog, loadConfig } from '@ptr/ops';
 import { createLocalPool } from '@ptr/storage';
 import { randomUUID } from 'node:crypto';
 import { GATEWAY_ID, GatewayPublisher, POOL_NAME, RedisGatewayRegistry, RedisUpstreamRegistry, checkGatewayUrl, createRedisConnection, parseGatewayAllow,
@@ -224,12 +224,12 @@ async function main() {
   // sent upstream: workers resend them to their next gateway), /healthz 503, the registry record says draining; calls
   // already sent finish for up to PTR_GATEWAY_SHUTDOWN_MS (paid calls are not cut off), then the listener and every
   // connection close, the record is deleted and the ledger pool released.
-  let stopping=false;
+  let stopping=false;const log=createLog('gateway');
   const shutdown=()=>{
     if(stopping) return;stopping=true;
     const before=gateway.metrics();
     gateway.drain();
-    process.stderr.write(`gateway draining: ${before.inFlight} in flight, ${before.queued} queued (refused now)\n`);
+    log('gateway_draining',{inFlight:before.inFlight,queued:before.queued});
     const deadline=new Promise<'deadline'>(resolve=>setTimeout(()=>resolve('deadline'),shutdownMs).unref());
     // Exit 0 only for a clean drain: no call cut by the deadline and every cleanup step done (a supervisor can tell).
     void (async():Promise<number>=>{
@@ -237,13 +237,14 @@ async function main() {
       const ended=await Promise.race([gateway.idle().then(()=>'idle' as const),deadline]);
       await marking;
       const after=gateway.metrics();
-      process.stderr.write(`gateway drained (${ended}): ${after.rejected.draining} request(s) refused while draining, ${after.inFlight} still in flight\n`);
+      log('gateway_drained',{ended,refusedWhileDraining:after.rejected.draining,inFlight:after.inFlight});
       server.close();server.closeAllConnections();
       let clean=ended==='idle'||after.inFlight===0;
       if(publisher&&!await publisher.stop()) clean=false;
       registryRedis?.disconnect();
       try {await close?.();} catch {clean=false;}
-      if(!clean) process.stderr.write('gateway stopped uncleanly: calls cut at PTR_GATEWAY_SHUTDOWN_MS or a cleanup step failed\n');
+      // Unclean: calls cut at PTR_GATEWAY_SHUTDOWN_MS or a cleanup step failed.
+      log('gateway_stopped',{clean});
       return clean?0:1;
     })().then(code=>process.exit(code),()=>process.exit(1));
   };

@@ -74,7 +74,8 @@ describe('N=1: env-only PTR_SELFHOSTED_* behaves as a one-entry upstreams file',
   test('a healthy engine: same status, headers and bytes',async()=>{
     const up=instantEngine('주 엔진');const engineBase=await listen(up.server);
     const {same,other}=await compare({},engineBase);
-    expect(other).toEqual(same);expect(same.upstream).toBeNull();
+    // X-PTR-Upstream is always sent : `primary` from both.
+    expect(other).toEqual(same);expect(same.upstream).toBe('primary');
   });
   test('a refused engine: the same 502 UPSTREAM_UNAVAILABLE',async()=>{
     const {same,other}=await compare({},await closedPort());
@@ -82,7 +83,8 @@ describe('N=1: env-only PTR_SELFHOSTED_* behaves as a one-entry upstreams file',
   });
   test('with the fake failover secondary: the same secondary answer and X-PTR-Upstream marker',async()=>{
     const {same,other}=await compare({PTR_GATEWAY_FAILOVER:'fake'},await closedPort());
-    expect(other).toEqual(same);expect(same.upstream).toBe('secondary');
+    // The fake secondary names itself `fake`, not `secondary` (fake answers are never recorded as real).
+    expect(other).toEqual(same);expect(same.upstream).toBe('fake');
   });
   test('without a breaker alternative a single upstream is still tried (recovers at once, like the plain upstream)',async()=>{
     // A freed ephemeral port, not closedPort(): the engine comes back on this same port below, and port 2 cannot be bound.
@@ -305,9 +307,9 @@ describe('upstream pool: per-upstream breaker and retry on another primary',()=>
     const result=await pool.complete({messages},signal());
     expect(String(result.body)).toContain('"b"');expect(Date.now()-started).toBeLessThan(1000);
   });
-  test('a pool without a secondary has no failover metrics and never marks the answering upstream',async()=>{
+  test('a pool without a secondary has no failover metrics; the answering upstream is still marked primary (D21)',async()=>{
     const {pool}=twoMembers();
     expect(pool.failoverMetrics).toBeUndefined();
-    expect((await pool.complete({messages},signal())).upstream).toBeUndefined();
+    expect((await pool.complete({messages},signal())).upstream).toBe('primary');
   });
 });

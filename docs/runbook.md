@@ -108,7 +108,8 @@ Turns always run queued: API (`pnpm dev:api`) + worker(s) (`pnpm dev:worker`) + 
 optionally the LLM gateway (`pnpm dev:gateway`, workers with `PTR_CHAT_PROVIDER=gateway`). All need the local Redis
 (`infra/compose.redis.yml`, `PTR_REDIS_URL`) and migrations through 0008 (`0008_turn_leases.sql`); evaluation scripts need Redis too. The
 synthetic load/failure harness on `ptr_loadtest`, self-hosted engines over an SSH tunnel and the GPU benchmark
-scripts are documented in [goal2-serving.md](goal2-serving.md).
+scripts are documented in [goal2-serving.md](goal2-serving.md). Metrics (`/metrics/prom` on every role), JSON log
+lines and `pnpm ops:status` are described in [observability.md](observability.md).
 
 ## Authentication and owner spaces
 

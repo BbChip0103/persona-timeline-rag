@@ -1,3 +1,4 @@
+import type { Histogram } from '@ptr/ops';
 import { UpstreamPool, type FailoverMetrics, type FailoverOptions, type Primary } from './pool';
 import { StaticUpstreamSource } from './sources';
 import type { ChatCompletionRequest, RequestContext, Upstream, UpstreamResult } from './upstreams';
@@ -21,4 +22,5 @@ export class FailoverUpstream implements Upstream {
   async ready(signal:AbortSignal):Promise<void> {await this.secondary.ready?.(signal);}
   complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult> {return this.pool.complete(request,signal,context);}
   failoverMetrics():FailoverMetrics {return this.pool.failoverMetrics!();}
+  get ttftSeconds():Histogram {return this.pool.ttftSeconds;}
 }

@@ -1,6 +1,7 @@
 import { TurnDispatcher } from '@ptr/core';
-import { loadConfig } from '@ptr/ops';
+import { DISPATCHER_METRICS_PORT, loadConfig, metricsPort, startMetricsListener } from '@ptr/ops';
 import { startCapacityControllerSafely } from './capacity';
+import { dispatcherObservability } from './observability';
 import { createRecoveryRuntime } from './runtime';
 
 /**
@@ -16,19 +17,23 @@ function integer(name:string,fallback:number,min:number,max:number):number {
 }
 async function main() {
   loadConfig('dispatcher',process.env);
+  const port=metricsPort(process.env,DISPATCHER_METRICS_PORT);
   const runtime=createRecoveryRuntime(process.env);
+  const observed=dispatcherObservability({queueWaiting:()=>runtime.delivery.backlog(),oldestPendingAgeSeconds:()=>runtime.oldestPendingAgeSeconds()});
   const dispatcher=new TurnDispatcher({leases:runtime.leases,delivery:runtime.delivery,events:runtime.events,
     maxAttempts:integer('PTR_MAX_ATTEMPTS',3,1,10),graceMs:integer('PTR_DISPATCH_GRACE_MS',2000,0,600000),
     intervalMs:integer('PTR_DISPATCH_INTERVAL_MS',1000,50,60000),
     // Turns no worker claimed within PTR_TURN_MAX_QUEUE_MS of their creation fail with QUEUE_TIMEOUT .
     maxQueueMs:integer('PTR_TURN_MAX_QUEUE_MS',60000,1000,3600000),
     // Lease drift repair; the grace is one worker lease (same PTR_LEASE_MS default as the worker).
-    reconcile:{intervalMs:integer('PTR_LEASE_RECONCILE_INTERVAL_MS',60000,1000,3600000),graceMs:integer('PTR_LEASE_MS',15000,300,600000)},onError:phase=>process.stderr.write(`dispatcher ${phase} error\n`)});
+    reconcile:{intervalMs:integer('PTR_LEASE_RECONCILE_INTERVAL_MS',60000,1000,3600000),graceMs:integer('PTR_LEASE_MS',15000,300,600000)},onError:phase=>observed.log('dispatcher_error',{phase}),
+    onEvent:observed.onEvent});
   // A controller configuration error is logged and the dispatcher runs without it (lease recovery must not stop).
   const capacity=await startCapacityControllerSafely(process.env,line=>process.stderr.write(`${line}\n`));
   dispatcher.start();
+  const listener=await startMetricsListener({port,render:observed.render,onEvent:observed.log});
   process.stdout.write('Turn dispatcher started\n');
-  const shutdown=()=>{void dispatcher.stop().then(()=>capacity.stop()).then(()=>runtime.close()).finally(()=>process.exit(0));};
+  const shutdown=()=>{void dispatcher.stop().then(()=>capacity.stop()).then(()=>listener?.close()).then(()=>runtime.close()).finally(()=>process.exit(0));};
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
 }
 void main().catch(()=>{process.stderr.write('DISPATCHER_STARTUP_FAILED\n');process.exitCode=1;});

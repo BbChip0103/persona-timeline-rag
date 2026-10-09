@@ -34,6 +34,8 @@ export interface OpenAICompatibleOptions {
   /** Uniform [0,1) source for retry jitter (tests inject a seeded one). */
   random?:()=>number;
 }
+/** Upstream names the gateway sends in X-PTR-Upstream ; another value is reported as `unknown`. */
+const SERVED=new Set(['primary','secondary','fake']);
 /** Per-turn request key accepted by the gateway (`X-PTR-Request-Key`). */
 export const REQUEST_KEY=/^[A-Za-z0-9._:-]{1,128}$/;
 /** The gateway marks requests it refused before contacting any upstream; those are safe to resend. */
@@ -110,7 +112,7 @@ export class OpenAICompatibleTextProvider implements TextProvider {
     if(!options.model.trim()) throw new ProviderError('MODEL_NOT_ALLOWED');
     this.fetcher=options.fetch??fetch;
   }
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> {
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1;onServed?:(upstream:string)=>void}):Promise<string> {
     if(options.signal.aborted) throw new ProviderError('CANCELLED');
     const started=performance.now();let ttftMs:number|null=null;
     let promptTokens:number|null=null, completionTokens:number|null=null, attempts=0;
@@ -216,6 +218,9 @@ export class OpenAICompatibleTextProvider implements TextProvider {
           ttftMs=null;promptTokens=null;completionTokens=null;continue;
         }
         if(!text.trim()) throw new ProviderError('INVALID_PROVIDER_RESPONSE');
+        // Which upstream answered: the gateway names it; an engine reached directly sends no header.
+        const upstream=response.headers.get('x-ptr-upstream');
+        options.onServed?.(upstream===null?'direct':SERVED.has(upstream)?upstream:'unknown');
         report(true);return text;
       }
     } catch(error) {

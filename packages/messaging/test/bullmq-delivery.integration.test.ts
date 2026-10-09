@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { TurnDispatch, TurnEvent } from '@ptr/core';
-import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents, startTurnConsumer } from '../src';
+import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents, createRedisConnection, startTurnConsumer } from '../src';
 
 const url = process.env.PTR_REDIS_URL ?? '';
 const run = process.env.RUN_REDIS_TESTS === '1' ? describe : describe.skip;
@@ -42,6 +42,21 @@ run('BullMQ delivery and Redis turn events (opt-in RUN_REDIS_TESTS=1)', () => {
       await delivery.publish(dispatch); await delivery.publish(dispatch);
       expect(await delivery.backlog()).toBe(1);
     } finally { await delivery.close(true); }
+  });
+  it('close(true) from a fresh instance wipes a queue another instance filled (the load test cleanup)', async () => {
+    const queueName = `test-turns-${randomUUID()}`;
+    const filler = new BullMqTurnDelivery(url, { queueName });
+    for (let i = 0; i < 3; i++) await filler.publish({ turnId: randomUUID(), seq: 0 });
+    await filler.close();
+    const redis = createRedisConnection(url);
+    const keys = async () => { const found: string[] = []; let cursor = '0';
+      do { const [next, batch] = await redis.scan(cursor, 'MATCH', `ptr:${queueName}:*`, 'COUNT', 500); cursor = next; found.push(...batch); } while (cursor !== '0');
+      return found; };
+    try {
+      expect((await keys()).length).toBeGreaterThan(0);
+      await new BullMqTurnDelivery(url, { queueName }).close(true);
+      expect(await keys()).toEqual([]);
+    } finally { await redis.quit(); }
   });
   it('consumer concurrency bounds jobs in flight; close waits for them', async () => {
     const queueName = `test-turns-${randomUUID()}`;

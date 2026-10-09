@@ -49,7 +49,7 @@ export class LatencyInjectedTextProvider implements TextProvider {
     const normal=Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
     return Math.round(Math.exp(this.mu+this.sigma*normal));
   }
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> {
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;onServed?:(upstream:string)=>void}):Promise<string> {
     const failure=this.random(), delay=this.sampleDelayMs();
     if(failure<this.profile.hangRate) {
       // Never resolves on its own: exercises the caller's timeout/cancel path.

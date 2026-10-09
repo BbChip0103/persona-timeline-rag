@@ -44,6 +44,11 @@ describe('disabled and deterministic adapters',()=>{
     expect(()=>client(fetcher,new MemoryLedger(),{databaseUrl:'postgresql://x:y@remote:5432/x'})).toThrow();
     expect(fetcher).not.toHaveBeenCalled();
   });
+  test('the fake model reports `fake` as the serving upstream, so fake turns can be told apart ',async()=>{
+    const names:string[]=[];
+    await new FakeTextProvider().generate([{role:'user',content:'synthetic'}],{signal:signal(),onServed:name=>names.push(name)});
+    expect(names).toEqual(['fake']);
+  });
   test('fake text is deterministic and structured quotes are offsetless',async()=>{
     const fake=new FakeTextProvider();
     expect(await fake.generate(messages,{signal:signal()})).toBe(await fake.generate(messages,{signal:signal()}));
@@ -189,6 +194,11 @@ describe('live adapter with fake network only',()=>{
     await provider.generate([{role:'user',content:'Synthetic short'}],{signal:signal(),maxOutputTokens:100});
     await provider.generate([{role:'user',content:'Synthetic long'}],{signal:signal(),maxOutputTokens:4096});
     expect(posts(fetcher).slice(2).map(([,init])=>JSON.parse(String(init?.body)).max_tokens)).toEqual([100,512]);
+  });
+  test('a direct OpenRouter call reports `openrouter` as the serving upstream ',async()=>{
+    const names:string[]=[];
+    await client(fakeFetch()).generate(messages,{signal:signal(),onServed:name=>names.push(name)});
+    expect(names).toEqual(['openrouter']);
   });
   test('control tokens are neutralized in the chat body; clean bodies (and their ledger keys) are unchanged',async()=>{
     const ledger=new MemoryLedger();const fetcher=fakeFetch();const provider=client(fetcher,ledger);

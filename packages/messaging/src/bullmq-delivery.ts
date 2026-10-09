@@ -41,11 +41,15 @@ export class BullMqTurnDelivery implements TurnDelivery {
     });
   }
   async backlog(): Promise<number> { return (await this.queue.getJobCounts('wait')).wait ?? 0; }
-  /** `obliterate` is for throwaway test queues only. */
+  /**
+   * `obliterate` is for throwaway test queues only. It opens the queue when this instance has not (a fresh instance
+   * that only wipes a queue others filled, as the load test does at its end); a plain close of an unopened one connects nothing.
+   */
   async close(obliterate = false): Promise<void> {
-    if (!this.opened) return;
-    if (obliterate) await this.opened.obliterate({ force: true });
-    await this.opened.close(); await this.connection?.quit();
+    if (!this.opened && !obliterate) return;
+    // Closed even when obliterate fails (Redis down at the end of a run), so the process never hangs on a reconnecting client.
+    try { if (obliterate) await this.queue.obliterate({ force: true }); }
+    finally { await this.opened!.close(); await this.connection?.quit(); }
   }
 }
 

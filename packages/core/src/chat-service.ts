@@ -36,9 +36,13 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
    */
   inputSafety?:InputSafetyOptions;
   /** Observability: the safety filter fell back to rules only (fail-open). Reason class only, never text. */
-  onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void}
+  onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
+  /** Observability: a turn completed with this stored reply (metrics read its internal trace, never its text). */
+  onTurnCompleted?:(event:{turnId:string;reply:ChatReply})=>void}
 /** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
 const DEPTH_READING_TTL_MS=200;
+/** Upstream names a provider may report for reply.serving; anything else is recorded as `unknown`. */
+const UPSTREAM_LABEL=/^[a-z0-9_-]{1,40}$/;
 const activeStates=['pending','retrieving','generating','validating'] as const;
 /** Store view whose writes are fenced by the worker's lease and announced as events once they apply; reads pass through. */
 function fencedStore(store:ConversationStore,fence:LeaseFence,events?:TurnEvents):ConversationStore {
@@ -205,7 +209,8 @@ export class ChatService {
     if(session.retrievalMode==='semantic'&&this.options.semanticSearch===false) throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
     const history=await store.history(session.id,session.ownerId);
     if(history.length>(this.options.maxHistoryMessages ?? 100)) {
-      await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT');return;
+      if(await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT')) this.options.onTurnFailure?.({turnId:turn.id,code:'CONTEXT_LIMIT'});
+      return;
     }
     const raw=await this.options.personas.get(session.personaId,session.personaRevision);
     const persona=PersonaSchema.parse(raw);
@@ -222,6 +227,14 @@ export class ChatService {
       &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
       &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
     const boundPrevious=context.followUp?ownedPrevious:undefined;
+    // Per-turn view of the provider that records which upstream answered each call (reply.serving, D21).
+    const served:string[]=[];
+    const provider:TextProvider={generate:async(messages,options)=>{
+      let upstream:string|undefined;
+      const text=await this.options.provider.generate(messages,{...options,onServed:name=>{upstream=name;}});
+      served.push(upstream!==undefined&&UPSTREAM_LABEL.test(upstream)?upstream:'unknown');
+      return text;
+    }};
     const signals=intentSignals({text:value.text,context,...(value.intent?{explicitIntent:value.intent}:{}),explicitTimeline:!!value.timeline,
       ...(session.ragCondition?{ragCondition:session.ragCondition}:{}),previousTimeline:boundPrevious?.responseKind==='timeline'});
     // Only the current text and the last two non-sensitive user turns may reach a classifier: no persona, posts, replies or IDs.
@@ -333,7 +346,7 @@ export class ChatService {
         omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8'),
         ...(experiment.omittedSourceIds.length?{omittedSourceIds:experiment.omittedSourceIds}:{})};
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
-        provider:this.options.provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
+        provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
         variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           if(controller.signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');
@@ -344,7 +357,7 @@ export class ChatService {
           return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
         }}:{}),
       }):undefined;
-      const result=agentRun?.rawReply??await this.options.provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
+      const result=agentRun?.rawReply??await provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
       if(controller.signal.aborted) return;
       if(agentRun) {
         agent=agentRun.agent;memorySources=agentRun.context.sources;
@@ -387,7 +400,8 @@ export class ChatService {
     if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
     if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
     const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),...(replyGuard?{replyGuard}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
-    if(!controller.signal.aborted) await store.completeTurn(turn.id,reply);
+    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),...(replyGuard?{replyGuard}:{}),
+      ...(served.length?{serving:{calls:served.length,upstreams:served,secondaryCalls:served.filter(name=>name==='secondary').length}}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
+    if(!controller.signal.aborted&&await store.completeTurn(turn.id,reply)) this.options.onTurnCompleted?.({turnId:turn.id,reply});
   }
 }

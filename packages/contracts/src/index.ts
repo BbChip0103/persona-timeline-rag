@@ -95,6 +95,11 @@ export interface ChatReply {
   personaContext?:{loreIds:string[];loreOmitted:number};
   /** Internal (S8 follow-up): reply guard outcome on the agent and experiment paths; a replaced reply carries the reason. */
   replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'};
+  /**
+   * Internal : which upstream answered each model call of the turn, in call order (`primary`, `secondary`,
+   * `fake`, `openrouter`, `direct`, else `unknown`); `calls` = upstreams.length. Absent when no model was called.
+   */
+  serving?:{calls:number;upstreams:string[];secondaryCalls:number};
 }
 export type InputSafetyCategory='prompt_injection'|'sexual'|'violence_gore'|'self_harm'|'hate_harassment'|'illegal_dangerous'|'private_info';
 export interface InputSafetyTrace {

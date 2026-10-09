@@ -1,4 +1,5 @@
 import type { ProviderMessage } from '@ptr/contracts';
+import type { Histogram } from '@ptr/ops';
 import type { FailoverMetrics, PoolMetrics } from './pool';
 
 export interface ChatCompletionRequest { messages:{role:string;content:string}[]; stream?:boolean; [key:string]:unknown }
@@ -19,8 +20,11 @@ export interface RequestContext {
 export const DEADLINE_MARGIN_MS=5000;
 /** The paid secondary is used only with at least this much of the deadline left (D16: OpenRouter p95 3141 ms at c=8, rounded up). */
 export const SECONDARY_MIN_REMAINING_MS=3500;
-/** What an upstream hands back: an HTTP-like status and a body the gateway relays as-is. `upstream`: set by failover only. */
-export interface UpstreamResult { status:number; contentType:string; body:AsyncIterable<Uint8Array>|string; upstream?:'primary'|'secondary' }
+/**
+ * What an upstream hands back: an HTTP-like status and a body the gateway relays as-is. `upstream` (X-PTR-Upstream, D21):
+ * which one answered, set by pools and failover (`primary`/`secondary`) and by the fake model (`fake`); unset = `primary`.
+ */
+export interface UpstreamResult { status:number; contentType:string; body:AsyncIterable<Uint8Array>|string; upstream?:'primary'|'secondary'|'fake' }
 export interface Upstream {
   readonly model:string; complete(request:ChatCompletionRequest,signal:AbortSignal,context?:RequestContext):Promise<UpstreamResult>;
   failoverMetrics?():FailoverMetrics;
@@ -34,6 +38,8 @@ export interface Upstream {
   close?():Promise<void>;
   /** Graceful drain (S6): refuse queued and new requests with GatewayRejection('GATEWAY_DRAINING'); dispatched calls finish. */
   drain?():void;
+  /** Pools and failover: time to first token of 2xx calls (`ptr_gateway_ttft_seconds`). */
+  readonly ttftSeconds?:Histogram;
 }
 
 /**
@@ -134,11 +140,13 @@ export class TextProviderUpstream implements Upstream {
       ...(typeof request.max_tokens==='number'?{maxOutputTokens:request.max_tokens}:{}),
       onUsage:reported=>{usage={prompt_tokens:reported.promptTokens,completion_tokens:reported.completionTokens};}});
     const created=Math.floor(Date.now()/1000);
-    if(!request.stream) return {status:200,contentType:'application/json',body:JSON.stringify({object:'chat.completion',created,model:this.model,
+    // The synthetic fake model (load tests) names itself, so its answers are never taken for real ones (D21).
+    const served=this.model.startsWith('synthetic/')?{upstream:'fake' as const}:{};
+    if(!request.stream) return {status:200,contentType:'application/json',...served,body:JSON.stringify({object:'chat.completion',created,model:this.model,
       choices:[{index:0,message:{role:'assistant',content},finish_reason:'stop'}],...(usage?{usage}:{})})};
     const chunk=(data:unknown)=>`data: ${JSON.stringify(data)}\n\n`;
     // One chunk: the whole reply (time to first token equals the total for this upstream), with usage when reported.
-    return {status:200,contentType:'text/event-stream',body:
+    return {status:200,contentType:'text/event-stream',...served,body:
       chunk({object:'chat.completion.chunk',created,model:this.model,choices:[{index:0,delta:{role:'assistant',content},finish_reason:'stop'}],...(usage?{usage}:{})})+'data: [DONE]\n\n'};
   }
 }

@@ -10,7 +10,9 @@ import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Perso
  * ): the turn ends as TURN_TIMEOUT, the same as when its own timer runs out.
  */
 export const PROVIDER_DEADLINE='PROVIDER_DEADLINE';
-export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1}):Promise<string> }
+export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1;
+  /** Called once before a successful call returns, with the upstream that answered (e.g. the gateway's X-PTR-Upstream). */
+  onServed?:(upstream:string)=>void}):Promise<string> }
 export interface Retrieval {
   search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
   resolve?(references:EvidenceCard[],trusted:{personId:string},options:{signal:AbortSignal;evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;

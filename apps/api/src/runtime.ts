@@ -2,9 +2,10 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, type Persona } from '@ptr/contracts';
-import { ChatService, CoreError, DEFAULT_SAFETY_THRESHOLDS, parsePersonaList, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
+import { ChatService, CoreError, type ChatServiceOptions, DEFAULT_SAFETY_THRESHOLDS, parsePersonaList, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore } from '@ptr/core';
 import { BullMqTurnDelivery, GatewayDirectory, RedisGatewayRegistry, RedisTurnEventSource, RedisTurnEvents, createRedisConnection, parseGatewayAllow,
   registryPrefixFromEnv, type GatewayRegistryReader } from '@ptr/messaging';
+import { createLog } from '@ptr/ops';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, DEFAULT_TEXT_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, OpenRouterEmbeddingProvider, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
@@ -19,16 +20,25 @@ export interface ApiRuntime {
   listPersonas():Promise<Persona[]>;
   saveArtifact(artifact:CreativeArtifact):Promise<void>;
   providerName:string;model:string;close?():Promise<void>;
+  /** Dependency checks for /api/health (D23): database `SELECT 1` and Redis `PING`, 1 s each. */
+  health?():Promise<{database:boolean;redis:boolean}>;
   /** PTR_CHAT_PROVIDER=gateway with PTR_GATEWAY_DISCOVERY=redis: the gateway list read from the gateway registry (S6). */
   gateways?:GatewayDirectory;
 }
-/** Fail-open stays visible: one sanitized stderr line per safety fallback (scope, reason class, running count), never text. */
+/** Fail-open stays visible: one JSON log event per safety fallback (scope, reason class, running count), never text. */
 function logSafetyFallback():(event:{scope:'turn'|'draft';reason:string})=>void {
-  const counts=new Map<string,number>();
+  const counts=new Map<string,number>();const log=createLog('api');
   return ({scope,reason})=>{
     const key=`${scope}:${reason}`;const count=(counts.get(key)??0)+1;counts.set(key,count);
-    process.stderr.write(`input_safety_fallback scope=${scope} reason=${reason} count=${count}\n`);
+    log('input_safety_fallback',{scope,reason,count});
   };
+}
+/** Resolves false when `check` fails or takes longer than `ms`. */
+async function within(check:()=>Promise<unknown>,ms:number):Promise<boolean> {
+  let timer:ReturnType<typeof setTimeout>|undefined;
+  try {return await Promise.race([check().then(()=>true),new Promise<boolean>(resolve=>{timer=setTimeout(()=>resolve(false),ms);})]);}
+  catch {return false;}
+  finally {clearTimeout(timer);}
 }
 /** Gateway base URLs in priority order: `PTR_GATEWAY_URLS` (comma list), else `PTR_GATEWAY_URL` as a list of one. */
 export function gatewayBaseUrls(env:NodeJS.ProcessEnv):string[] {
@@ -79,14 +89,21 @@ function messagingSettings(env:NodeJS.ProcessEnv) {
  * Dispatcher runtime : lease recovery, outbox republish and queue timeouts need the turn store, delivery
  * and events only, so no chat provider, persona list or classifier is configured (no provider keys are read).
  */
-export function createRecoveryRuntime(env:NodeJS.ProcessEnv=process.env):{leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;close():Promise<void>} {
+export function createRecoveryRuntime(env:NodeJS.ProcessEnv=process.env):{leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;
+  /** Metrics : age of the oldest outbox entry, i.e. the oldest turn no worker has claimed (0 when none). */
+  oldestPendingAgeSeconds():Promise<number>;close():Promise<void>} {
   const {pool,redisUrl,queueName,namespace}=messagingSettings(env);
   const delivery=new BullMqTurnDelivery(redisUrl,{queueName}), events=new RedisTurnEvents(redisUrl,{namespace});
   return {leases:new PostgresConversationStore(pool),delivery,events,
+    async oldestPendingAgeSeconds() {
+      const result=await pool.query('SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0)::float8 AS age FROM turn_outbox');
+      return Math.max(0,Number(result.rows[0]?.age??0));
+    },
     async close() {await Promise.allSettled([delivery.close(),events.close()]);await pool.end();}};
 }
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
 export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
+  onTurnCompleted?:ChatServiceOptions['onTurnCompleted'];
   /** Tests: read the gateway registry from this store instead of Redis. */
   gatewayRegistry?:GatewayRegistryReader}={}):ApiRuntime {
   const {databaseUrl,pool,redisUrl,queueName,namespace}=messagingSettings(env);
@@ -191,6 +208,9 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     }
   }
   const store=new PostgresConversationStore(pool);
+  // Health (D23): its own Redis connection, opened on the first check (composing a runtime opens none).
+  let pingConnection:ReturnType<typeof createRedisConnection>|undefined;
+  const ping=()=>{if(!pingConnection) {pingConnection=createRedisConnection(redisUrl);pingConnection.on('error',()=>undefined);}return pingConnection.ping();};
   const delivery=new BullMqTurnDelivery(redisUrl,{queueName});
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   // R10: self-hosted and gateway chat embed queries with the fake hash model, whose space holds no licensed source
@@ -199,8 +219,13 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const semanticSearch=providerName==='fake'||providerName==='openrouter';
   const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,semanticSearch,
     retrieval:new PostgresRetrieval(sources,semanticSearch?{embed,modelRevision:embeddingModel}:undefined),
-    ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{})});
+    ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{}),
+    ...(hooks.onTurnCompleted?{onTurnCompleted:hooks.onTurnCompleted}:{})});
   return {chat,personas,provider,providerName,model,leases:store,delivery,events,eventSource,...(gateways?{gateways}:{}),
+    async health() {
+      const [database,redis]=await Promise.all([within(()=>pool.query('SELECT 1'),1000),within(ping,1000)]);
+      return {database,redis};
+    },
     async listPersonas() {
       const result=await pool.query('SELECT v.document FROM personas p JOIN persona_versions v ON v.persona_id=p.id AND v.revision=p.current_revision ORDER BY p.id');
       const registry=await approvedPersonas();
@@ -210,6 +235,6 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
       const directory=join(process.cwd(),'data','generated');await mkdir(directory,{recursive:true,mode:0o700});
       await writeFile(join(directory,`${artifact.id}.json`),JSON.stringify(artifact,null,2),{flag:'wx',mode:0o600});
     },
-    async close() {await Promise.allSettled([delivery.close(),events.close(),eventSource.close(),stopGateways?.()]);await pool.end();},
+    async close() {pingConnection?.disconnect();await Promise.allSettled([delivery.close(),events.close(),eventSource.close(),stopGateways?.()]);await pool.end();},
   };
 }

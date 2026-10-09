@@ -6,3 +6,4 @@ export * from './health';
 export * from './pool';
 export * from './sources';
 export * from './telemetry';
+export * from './prom';

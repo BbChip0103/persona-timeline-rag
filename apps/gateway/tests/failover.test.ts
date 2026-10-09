@@ -430,13 +430,13 @@ describe('secondary through the OpenRouter client and budget ledger',()=>{
 });
 
 describe('failover off (default)',()=>{
-  test('responses are byte-identical to the single-upstream gateway: no upstream header, no failover metrics',async()=>{
+  test('responses are byte-identical to the single-upstream gateway: X-PTR-Upstream primary (D21), no failover metrics',async()=>{
     const up=engine(healthy);const engineBase=await listen(up.server);
     const configured=upstreamFromEnvironment({PTR_GATEWAY_UPSTREAM:'selfhosted',PTR_SELFHOSTED_BASE_URL:`${engineBase}/v1`,PTR_SELFHOSTED_MODEL:'m'});
     expect(configured.upstream).toBeInstanceOf(OpenAICompatibleUpstream);
     const {base,g}=await gateway(configured.upstream);
     const response=await post(base);
-    expect(response.headers.get('x-ptr-upstream')).toBeNull();expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.from(sse('주 엔진')));
+    expect(response.headers.get('x-ptr-upstream')).toBe('primary');expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.from(sse('주 엔진')));
     expect(Object.keys(g.metrics()).sort()).toEqual(['accepted','capacity','completed','deadlineAborts','draining','inFlight','queueWaitMs','queued','rejected','upstream','upstreamErrors','upstreamMs']);
     const refused=await gateway(primaryAt(await closedPort()));
     const failed=await post(refused.base);

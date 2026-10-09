@@ -225,7 +225,7 @@ export class OpenRouterClient {
    * the configured output cap; `onUsage` receives the reported token counts.
    */
   async generate(messages:ProviderMessage[],options:{signal:AbortSignal;idempotencyKey?:string;maxOutputTokens?:number;
-    onUsage?:(usage:{promptTokens:number|null;completionTokens:number|null})=>void}):Promise<string> {
+    onUsage?:(usage:{promptTokens:number|null;completionTokens:number|null})=>void;onServed?:(upstream:string)=>void}):Promise<string> {
     aborted(options.signal);
     if (!Array.isArray(messages)||!messages.length||messages.length>64||messages.some(message=>!message||!['system','user','assistant'].includes(message.role)||typeof message.content!=='string'||Object.keys(message).some(key=>!['role','content'].includes(key)))) throw new ProviderError('INVALID_INPUT');
     const bytes=Buffer.byteLength(JSON.stringify(messages),'utf8');
@@ -256,6 +256,7 @@ export class OpenRouterClient {
       const usage=result.usage as Json;const count=(value:unknown)=>typeof value==='number'&&Number.isInteger(value)&&value>=0?value:null;
       options.onUsage({promptTokens:count(usage.prompt_tokens),completionTokens:count(usage.completion_tokens)});
     }
+    options.onServed?.('openrouter');
     return content;
   }
   /** Decisions API (System One models such as Jev): same ledger, caps and no-resubmission rule as text/embeddings. */

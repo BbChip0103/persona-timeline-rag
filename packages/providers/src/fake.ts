@@ -7,9 +7,11 @@ import { EMBEDDING_DIMENSIONS } from './openrouter';
 /** Synthetic deterministic behavior only; never asserts actual biography or activities. */
 export class FakeTextProvider implements TextProvider {
   calls=0;
-  async generate(messages:ProviderMessage[],options:{signal:AbortSignal}):Promise<string> {
+  async generate(messages:ProviderMessage[],options:{signal:AbortSignal;onServed?:(upstream:string)=>void}):Promise<string> {
     if(options.signal.aborted) throw new ProviderError('CANCELLED');
     this.calls++;
+    // Recorded in reply.serving, so turns answered by the fake model are never mistaken for real ones .
+    options.onServed?.('fake');
     if(messages.some(message=>message.role==='system'&&message.content.includes('AGENT_JSON_REPLY'))) {
       const input=messages.find(message=>message.role==='user'&&message.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '));
       let data:unknown=[];try{data=input?JSON.parse(input.content.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length)):[];}catch{/* No synthetic evidence on malformed context. */}

@@ -14,6 +14,8 @@
  *
  * Requires PTR_LOADTEST_DATABASE_URL (guarded: ptr_loadtest/ptr_loadtester only) and PTR_REDIS_URL. The run uses
  * its own BullMQ queue and event namespace and wipes that queue when it ends.
+ * Every worker and dispatcher serves /metrics/prom on its own port (base +100…, +200…; `--metrics=0`: PTR_METRICS_PORT=0);
+ * the report records which /metrics/prom endpoints answered at the start and at the end.
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { openSync } from 'node:fs';
@@ -75,14 +77,21 @@ export interface Topology {
   failover?:{breakerCooldownMs:number};
   /** A second, identical gateway listed after the primary in PTR_GATEWAY_URLS (active–standby). */
   standbyGateway?:boolean;
+  /** Worker and dispatcher metrics listeners on their own ports (default on); off sets PTR_METRICS_PORT=0. */
+  metrics:boolean;
 }
 type Role='api'|'worker'|'dispatcher'|'gateway';
-interface Proc {role:Role;child:ChildProcess;port?:number}
+interface Proc {role:Role;child:ChildProcess;port?:number;metricsPort?:number}
 interface ApiJson {session?:{id:string};turn?:{id:string;state:string;errorCode?:string|null};error?:{code?:string}}
 
 /** Spawns and supervises every process of the topology with an explicit environment (no inherited credentials). */
 class Fleet {
   private procs:Proc[]=[];
+  /**
+   * Metrics listeners : every worker and dispatcher gets its own PTR_METRICS_PORT (base +100… and +200…,
+   * never reused within a run, so a restarted child cannot collide with one still exiting); `--metrics=0` turns them off.
+   */
+  private launched={worker:0,dispatcher:0};
   readonly apiToken=randomBytes(24).toString('hex');
   /** The clients use the harness token : it admits only synthetic owners (`lt-*`), never the web's. */
   readonly harnessToken=randomBytes(24).toString('hex');
@@ -108,8 +117,14 @@ class Fleet {
   }
   private launch(role:Role,script:string,extra:NodeJS.ProcessEnv,port?:number):Proc {
     const out=openSync(join(this.directory,`${role}.log`),'a');
+    let metricsPort:number|undefined;
+    if(role==='worker'||role==='dispatcher') {
+      metricsPort=this.topology.metrics?this.basePort+(role==='worker'?100:200)+this.launched[role]++:0;
+      extra={...extra,PTR_METRICS_PORT:String(metricsPort)};
+    }
     // node with tsx as an import hook so the sampled PID is the process itself, not a wrapper.
-    const proc={role,child:spawn(process.execPath,['--import','tsx',script],{env:this.env(extra),stdio:['ignore',out,out]}),...(port?{port}:{})};
+    const proc={role,child:spawn(process.execPath,['--import','tsx',script],{env:this.env(extra),stdio:['ignore',out,out]}),...(port?{port}:{}),
+      ...(metricsPort?{metricsPort}:{})};
     this.procs.push(proc);return proc;
   }
   live(role:Role):Proc[] {return this.procs.filter(p=>p.role===role&&p.child.exitCode===null&&p.child.signalCode===null);}
@@ -163,6 +178,18 @@ class Fleet {
       headers:{Authorization:`Bearer ${this.harnessToken}`,'X-PTR-Owner':owner,'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});
     const retryAfter=Number(response.headers.get('retry-after'));
     return {status:response.status,json:await response.json().catch(()=>({})) as ApiJson,retryAfterMs:Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:null};
+  }
+  /** `/metrics/prom` of every live process (api and gateway on their own port): which answered, and their sample counts. */
+  async prometheusCheck():Promise<{role:Role;port:number;ok:boolean;samples:number}[]> {
+    const targets=(['api','worker','dispatcher','gateway'] as const).flatMap(role=>this.live(role).flatMap(p=>{
+      const port=role==='worker'||role==='dispatcher'?p.metricsPort:p.port;return port?[{role,port}]:[];}));
+    return Promise.all(targets.map(async({role,port})=>{
+      try {
+        const response=await fetch(`http://127.0.0.1:${port}/metrics/prom`,{signal:AbortSignal.timeout(2000)});
+        const text=await response.text();
+        return {role,port,ok:response.ok,samples:text.split('\n').filter(line=>line&&!line.startsWith('#')).length};
+      } catch {return {role,port,ok:false,samples:0};}
+    }));
   }
   /** Metrics of the first gateway that answers (the standby once the primary is gone). */
   async gatewayMetrics():Promise<unknown> {
@@ -387,7 +414,7 @@ async function main():Promise<void> {
     leaseMs:Number(options['lease-ms']??5000),provider,selfhostedBaseUrl:failover?`http://127.0.0.1:${enginePort}/v1`:options['base-url']??'http://127.0.0.1:18000/v1',
     selfhostedModel:options.model??'gemma-4-e4b',structured:options.structured==='1',client:options.client==='poll'?'poll':'sse',
     ...(failover?{failover:{breakerCooldownMs:Number(options['breaker-cooldown-ms']??5000)}}:{}),
-    ...(options['standby-gateway']==='1'?{standbyGateway:true}:{})};
+    ...(options['standby-gateway']==='1'?{standbyGateway:true}:{}),metrics:options.metrics!=='0'};
   const engine=failover?fakeEngine(enginePort,latency,primaryFailure):undefined;
   const fleet=new Fleet(Number(options.port??56451),seeded.file,latency,directory,topology);
   const report:Record<string,unknown>={mode,runId,startedAt:new Date().toISOString(),latencyProfile:latency,topology,
@@ -399,6 +426,8 @@ async function main():Promise<void> {
     sampler=startResourceSampler(fleet);
     const capacity=await fleet.capacityCheck();
     if(capacity) {report.capacityCheck=capacity;console.log(capacity.warning??`gateway capacity ok: worker concurrency ${capacity.workerConcurrencyTotal} <= ${JSON.stringify(capacity.capacity)}`);}
+    report.prometheusAtStart=await fleet.prometheusCheck();
+    console.log(JSON.stringify({prometheus:report.prometheusAtStart}));
     if(mode==='ramp') {
       const levels=(options.levels??'1,4,16,64,128,256').split(',').map(Number);const seconds=Number(options['stage-seconds']??45);
       const stages=[];
@@ -428,7 +457,7 @@ async function main():Promise<void> {
       const result=await stage;
       await sleep(Math.max(20_000,topology.leaseMs*3)); // past turn timeout + lease + dispatcher: anything still active now is orphaned
       // The drained gateway's own summary lines (refused while draining, still in flight) from its log.
-      const drainLog=signal==='SIGTERM'?(await readFile(join(directory,'gateway.log'),'utf8').catch(()=>'')).split('\n').filter(line=>/gateway drain/.test(line)):undefined;
+      const drainLog=signal==='SIGTERM'?(await readFile(join(directory,'gateway.log'),'utf8').catch(()=>'')).split('\n').filter(line=>/"event":"gateway_drain/.test(line)):undefined;
       report.crash={target,signal,users,standbyGateway:!!topology.standbyGateway,restart,activeAtKill:before,downtimeMs:restart?2000:null,stage:result,
         ...(drainLog?{drainLog}:{}),orphanedActiveTurns:await activeTurns(runStarted)};
       console.log(JSON.stringify(report.crash));
@@ -462,6 +491,8 @@ async function main():Promise<void> {
       }
       report.sameSession={trials,statusPairs:outcomes};console.log(JSON.stringify(report.sameSession));
     } else throw new Error(`unknown mode ${mode}`);
+    report.prometheusAtEnd=await fleet.prometheusCheck();
+    console.log(JSON.stringify({prometheus:report.prometheusAtEnd}));
   } finally {
     await sampler?.stop();await fleet.stopAll();await engine?.stop();
     const queue=new BullMqTurnDelivery(redisUrl(),{queueName:QUEUE});await queue.close(true).catch(()=>undefined);

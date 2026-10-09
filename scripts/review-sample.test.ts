@@ -201,15 +201,24 @@ describe('review-sample run', () => {
     expect(failing.err.join('\n')).toMatch(/failed .*42P01/);
   });
 
-  it('excludes fake or synthetic serving, synthetic personas, non-local owners and empty replies', async () => {
-    const rows = dbRows(1, 25).map((row, i) => ({ ...row, user_text: `keep-${i}`, reply: reply(i, { serving: { calls: 1, upstreams: ['gpu-a'], secondaryCalls: 0 } }) }));
+  it('excludes turns served by the fake model (reply.serving), synthetic personas, non-local owners and empty replies', async () => {
+    // reply.serving : real upstreams are kept; turns stored before O4 have no serving and stay eligible.
+    const servings = [{ calls: 1, upstreams: ['primary'], secondaryCalls: 0 }, { calls: 2, upstreams: ['primary', 'secondary'], secondaryCalls: 1 },
+      { calls: 1, upstreams: ['openrouter'], secondaryCalls: 0 }, undefined];
+    const rows = dbRows(1, 25).map((row, i) => ({ ...row, user_text: `keep-${i}`, reply: reply(i, servings[i % 4] ? { serving: servings[i % 4] } : {}) }));
     const bad: Row[] = [
       { ...rows[0]!, id: 'b1', owner_id: 'lt-x', user_text: 'DROP-owner-lt' },
       { ...rows[0]!, id: 'b2', owner_id: 'owner_synthetic_a', user_text: 'DROP-owner-synth' },
       { ...rows[0]!, id: 'b3', review_status: 'synthetic', user_text: 'DROP-persona' },
-      // D21 shape (O4): ChatReply.serving = {calls, upstreams[], secondaryCalls}.
-      { ...rows[0]!, id: 'b4', reply: reply(1, { serving: { calls: 1, upstreams: ['fake-engine'], secondaryCalls: 0 } }), user_text: 'DROP-serving-fake' },
-      { ...rows[0]!, id: 'b5', reply: reply(1, { serving: { calls: 2, upstreams: ['real-a', 'synthetic-b'], secondaryCalls: 1 } }), user_text: 'DROP-serving-synth' },
+      // Any call answered by the fake model (in-process, or the gateway's fake upstream) drops the turn.
+      { ...rows[0]!, id: 'b4', reply: reply(1, { serving: { calls: 1, upstreams: ['fake'], secondaryCalls: 0 } }), user_text: 'DROP-serving-fake' },
+      { ...rows[0]!, id: 'b5', reply: reply(1, { serving: { calls: 2, upstreams: ['primary', 'fake'], secondaryCalls: 0 } }), user_text: 'DROP-serving-mixed' },
+      // A serving record that does not have the D21 shape fails closed.
+      { ...rows[0]!, id: 'b8', reply: reply(1, { serving: { calls: 1 } }), user_text: 'DROP-serving-shape' },
+      { ...rows[0]!, id: 'b9', reply: reply(1, { serving: 'primary' }), user_text: 'DROP-serving-string' },
+      { ...rows[0]!, id: 'b10', reply: reply(1, { serving: { calls: 1, upstreams: [7], secondaryCalls: 0 } }), user_text: 'DROP-serving-number' },
+      // Only known real upstreams count (fail-closed): `unknown` cannot be told apart from a fake one.
+      { ...rows[0]!, id: 'b11', reply: reply(1, { serving: { calls: 1, upstreams: ['unknown'], secondaryCalls: 0 } }), user_text: 'DROP-serving-unknown' },
       { ...rows[0]!, id: 'b6', reply: reply(1, { content: '' }), user_text: 'DROP-empty' },
       { ...rows[0]!, id: 'b7', reply: null, user_text: 'DROP-null' },
     ];

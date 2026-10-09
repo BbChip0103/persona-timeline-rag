@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
 import type { UpstreamRecord } from '@ptr/messaging/registry';
+import { Histogram, TTFT_SECONDS_BUCKETS, createLog } from '@ptr/ops';
 import { UpstreamHealth, type BreakerMetrics, type BreakerOptions, type BreakerState } from './health';
 import { CentralQueue, cachedOn, chooseUpstream, estimateRequest, kvReservation, queueRetryAfterSeconds, uncachedTokens, type AffinityOptions,
   type AffinityOutcome, type Band, type QueuedRequest, type RequestEstimate, type RouteDecision, type RoutingPolicy } from './admission';
-import { HASH_SALT, PrefixTable } from './prefix';
+import { PrefixTable } from './prefix';
 import { GatewayRejection } from './limiter';
 import type { SourceMetrics, UpstreamSource } from './sources';
 import { EngineTelemetry, type TelemetryMetrics, type TelemetryOptions } from './telemetry';
@@ -41,6 +41,8 @@ export interface FailoverMetrics {
   rateLimited:number; secondaryErrors:number;
   /** The ceiling in force: PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE / k with k active gateways in the gateway registry (1 without it). */
   perMinuteCap:number;
+  /** Retries (another primary or the secondary) not sent after a primary attempt because the deadline left too little time. */
+  retryDeadline:number;
 }
 /** A primary: an upstream with an engine `/health` check and, optionally, its Prometheus `/metrics` text (OpenAICompatibleUpstream). */
 export type Primary=Upstream&{health(signal:AbortSignal):Promise<boolean>;metrics?(signal:AbortSignal):Promise<string|null>};
@@ -56,6 +58,8 @@ export interface UpstreamMemberMetrics {
   /** N/S_eff and Kres/(κ·K − G) (null when unknown). */
   seqUtil:number|null; kvUtil:number|null;
   dispatched:number; answered:number; connectFailures:number;
+  /** Calls that timed out on this upstream (headers or call timeout, or a caller that gave up without headers) and times its breaker opened. */
+  timeouts:number; breakerOpened:number;
   /** Engine telemetry (S4; null when off or the client has no /metrics). */
   telemetry:TelemetryMetrics|null;
   /** 2xx calls: dispatch → first body chunk (the engine's TTFT as the gateway sees it) and dispatch → end, ms. */
@@ -89,6 +93,8 @@ export interface PoolMetrics {
   retriedOnOtherPrimary:number;
   /** Requests that got the marked 503 GATEWAY_QUEUE_TIMEOUT from the pool queue (a subset of the gateway's rejected.queueTimeout). */
   queueTimeouts:number;
+  /** Retries (another primary or the secondary) not sent after a primary attempt because the deadline left too little time. */
+  retryDeadline:number;
   /** `restarted`: an engine restart seen in telemetry (process_start_time_seconds) cleared a member's state. */
   events:{added:number;removed:number;replaced:number;invalid:number;restarted:number};
   /** The telemetry filter settings (null = off). */
@@ -170,7 +176,7 @@ const PREFIX_MAX_ENTRIES=4096;
 const USAGE_CHUNKS=4;
 const DEFAULT_AFFINITY:AffinityOptions={minTokens:256,slack:0.5};
 class Member {
-  inFlight=0;dispatched=0;answered=0;connectFailures=0;gone=false;kvReserved=0;prefill=0;extraHits=0;
+  inFlight=0;dispatched=0;answered=0;connectFailures=0;timeouts=0;gone=false;kvReserved=0;prefill=0;extraHits=0;
   health!:UpstreamHealth;telemetry:EngineTelemetry|undefined;prefix!:PrefixTable;
   readonly ttfts:number[]=[];readonly e2es:number[]=[];
   /** T̂ / prompt_tokens × 1000 (integers for the percentile helper). */
@@ -243,6 +249,8 @@ export class UpstreamPool implements Upstream {
   /** Present when the pool owns admission: the gateway skips its own limiter and reports this instead. */
   readonly admission?:()=>{inFlight:number;queued:number;maxConcurrent:number;maxQueue:number};
   readonly admits:boolean;
+  /** Arrival at the pool (queue wait included) → first body chunk of 2xx calls, for /metrics/prom. */
+  readonly ttftSeconds=new Histogram(TTFT_SECONDS_BUCKETS);
   private readonly options:FailoverOptions;
   private readonly members=new Map<string,Member>();
   private readonly retiring=new Set<Member>();
@@ -259,7 +267,7 @@ export class UpstreamPool implements Upstream {
   private readonly started:number[]=[];
   private readonly waits:number[]=[];
   private readonly processed:{at:number;tokens:number}[]=[];
-  private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0};
+  private readonly counts={primary:0,secondary:0,closedNotFailedOver:0,rateLimited:0,secondaryErrors:0,retried:0,queueTimeouts:0,retryDeadline:0};
   private readonly rejected={queue_full:0,saturated:0,queue_timeout:0,draining:0,deadline:0};
   private draining=false;
   private readonly affinityCounts:Record<AffinityOutcome,number>={picked:0,brokenBySlack:0,none:0};
@@ -307,7 +315,7 @@ export class UpstreamPool implements Upstream {
       catch(error) {
         // After a failed attempt the request may have reached an engine (closed before response): no other upstream
         // in time must not become a marked "nothing was sent" rejection. Fall through to the secondary or the error.
-        if(attempt>0&&error instanceof GatewayRejection) break;
+        if(attempt>0&&error instanceof GatewayRejection) {if(error.code==='GATEWAY_DEADLINE') this.counts.retryDeadline++;break;}
         if(error instanceof GatewayRejection&&error.code==='GATEWAY_QUEUE_TIMEOUT') {this.counts.queueTimeouts++;this.rejected.queue_timeout++;}
         if(error instanceof GatewayRejection&&error.code==='GATEWAY_DEADLINE') this.rejected.deadline++;
         throw error;
@@ -330,7 +338,7 @@ export class UpstreamPool implements Upstream {
     // D16: the secondary only with SECONDARY_MIN_REMAINING_MS of the deadline left. Too late with nothing tried is a
     // marked refusal; after a primary attempt (which may have reached an engine) its failure stands.
     if(context?.deadlineAt!==undefined&&context.deadlineAt-Date.now()<SECONDARY_MIN_REMAINING_MS) {
-      if(tried.size) throw lastError;
+      if(tried.size) {this.counts.retryDeadline++;throw lastError;}
       this.rejected.deadline++;throw new GatewayRejection('GATEWAY_DEADLINE');
     }
     const now=Date.now();
@@ -342,7 +350,8 @@ export class UpstreamPool implements Upstream {
     try {
       const result=await secondary.complete(request,signal,context);
       this.counts.secondary++;
-      return {...result,upstream:'secondary'};
+      // A fake secondary (load tests) keeps its own name: fake answers must never be recorded as real ones (D21).
+      return {...result,upstream:result.upstream==='fake'?'fake':'secondary'};
     } catch(error) {if(!signal.aborted) this.counts.secondaryErrors++;throw error;}
   }
 
@@ -541,7 +550,7 @@ export class UpstreamPool implements Upstream {
       const result=await member.upstream.complete(request,primarySignal);
       member.health.answered(openGeneration);member.answered++;this.counts.primary++;reservation.ok=result.status>=200&&result.status<300;
       const body=typeof result.body==='string'?(chunk(Buffer.from(result.body)),release(true),result.body):relaying(result.body,chunk,release,signal);
-      return {...result,body,...(this.pool.secondary?{upstream:'primary' as const}:{})};
+      return {...result,body,upstream:'primary'};
     } catch(error) {
       // The breaker learns of the failure before the slot is handed to a queued request.
       if(!(error instanceof UpstreamConnectError)) {
@@ -551,7 +560,7 @@ export class UpstreamPool implements Upstream {
         // A caller that left after waiting at least the headers timeout without headers saw a hung primary too
         // (e.g. the timer ran late); it is counted for the breaker only, and the caller's own error is kept.
         const gaveUp=!timeout&&signal.aborted&&this.options.headersTimeoutMs>0&&Date.now()-reservation.dispatchedAt>=this.options.headersTimeoutMs;
-        if(timeout||gaveUp) member.health.timedOut();
+        if(timeout||gaveUp) {member.timeouts++;member.health.timedOut();}
         release();
         throw timeout??error;
       }
@@ -571,6 +580,7 @@ export class UpstreamPool implements Upstream {
       const now=Date.now();
       this.processed.push({at:now,tokens:reservation.prefill});
       this.record(member.ttfts,now-reservation.dispatchedAt);this.record(this.ttfts,now-reservation.arrivedAt);
+      this.ttftSeconds.observe((now-reservation.arrivedAt)/1000);
       if(!member.gone) member.prefix.record(reservation.estimate.chain);
     }
     while(this.processed.length&&Date.now()-this.processed[0]!.at>RATE_WINDOW_MS) this.processed.shift();
@@ -601,17 +611,17 @@ export class UpstreamPool implements Upstream {
       decision.affinity,Date.now()-pending.arrivedAt);
   }
   /**
-   * §8 routing decision log, sampled (PTR_GATEWAY_ROUTE_LOG_SAMPLE): no text, the request key only as a per-process salted sha256[:12], member
-   * ids (registry ids, never URLs), h_u and cost_u of the candidates. `affinity` (outcome) only when affinity is on.
+   * §8 routing decision log, sampled (PTR_GATEWAY_ROUTE_LOG_SAMPLE), one JSON line : no text, the request key
+   * (the worker's turn id) as is so the line joins the worker's, member ids (registry ids, never URLs), h_u and cost_u of the
+   * candidates. `affinity` (outcome) only when affinity is on.
    */
   private routeLog(requestKey:string|undefined,band:Band,tokens:number,scores:{id:string;h:number;cost:number}[],pick:string,reason:string,
     affinity:AffinityOutcome|null,waitMs:number):void {
     const sample=this.pool.routeLogSample??0.01;
     if(!(sample>0&&(this.pool.random??Math.random)()<sample)) return;
-    const rk=requestKey?createHash('sha256').update(HASH_SALT).update(requestKey).digest('hex').slice(0,12):'-';
     const map=(key:'h'|'cost')=>`{${scores.map(score=>`${score.id}:${score[key]}`).join(',')}}`;
-    this.log(`route rk=${rk} pool=${this.model} band=${band} est=${tokens} h=${map('h')} cost=${map('cost')} pick=${pick} reason=${reason}`
-      +`${affinity?` affinity=${affinity}`:''} wait=${Math.max(0,Math.round(waitMs))}ms`);
+    createLog('gateway',line=>this.log(line.trimEnd()))('gateway_route',{turnId:requestKey??null,pool:this.model,band,est:tokens,h:map('h'),cost:map('cost'),pick,reason,
+      ...(affinity?{affinity}:{}),waitMs:Math.max(0,waitMs)});
   }
   private limit(member:Member,now:number):number {
     const max=member.record.maxSeqs, ramp=this.pool.slowStartMs??30000;
@@ -685,7 +695,7 @@ export class UpstreamPool implements Upstream {
         slowStart:!member.gone&&this.ramping(member,now),rampReason:!member.gone&&this.ramping(member,now)?member.rampReason:null,breaker:member.health.state(),
         reservedKvTokens:member.kvReserved,prefillTokens:member.prefill,kvCapacityTokens:capacity,prefillTokensPerSec:member.record.prefillTokensPerSec??null,
         seqUtil:Number.isFinite(limit)?Math.round(member.inFlight/limit*1000)/1000:null,kvUtil:budget&&budget>0?Math.round(member.kvReserved/budget*1000)/1000:null,
-        dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures,
+        dispatched:member.dispatched,answered:member.answered,connectFailures:member.connectFailures,timeouts:member.timeouts,breakerOpened:member.health.metrics().opened,
         telemetry:member.telemetry&&!member.gone?member.telemetry.metrics():null,
         ttftMs:quantiles(member.ttfts),e2eMs:quantiles(member.e2es),
         estOverActualTokens:{...quantiles(member.ratios,1000),n:member.ratios.length},prefix:{...member.prefix.metrics(),extraHits:member.extraHits}};
@@ -696,7 +706,7 @@ export class UpstreamPool implements Upstream {
       members:{active:count(u=>u.state==='active'),ramping:count(u=>u.state==='active'&&u.slowStart),draining:count(u=>u.state==='draining'),
         gone:count(u=>u.state==='gone'),breakerOpen:count(u=>u.state!=='gone'&&u.breaker!=='closed'),
         telemetryBlocked:count(u=>!!u.telemetry?.blocked),telemetryStale:count(u=>!!u.telemetry?.stale)},
-      waiting:this.queue.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,events:{...this.events},
+      waiting:this.queue.size,retriedOnOtherPrimary:this.counts.retried,queueTimeouts:this.counts.queueTimeouts,retryDeadline:this.counts.retryDeadline,events:{...this.events},
       queue:{routing:this.routing,fairness:this.pool.fairness??'fifo',queued:this.queue.counts(),queuedTokens:this.queue.queuedTokens,
         waitMs:{p50:percentile(this.waits,0.5),p95:percentile(this.waits,0.95)},rejected:{...this.rejected},globalPrefixTokens:this.globalPrefix,
         prefillTokensPerSec:rate===null?null:Math.round(rate)},
@@ -714,6 +724,7 @@ export class UpstreamPool implements Upstream {
     return {secondary:this.pool.secondary!.model,
       breaker:{state,consecutiveFailures:max('consecutiveFailures'),consecutiveTimeouts:max('consecutiveTimeouts'),opened:sum('opened'),probesOk:sum('probesOk'),probesFailed:sum('probesFailed')},
       answered:{primary:this.counts.primary,secondary:this.counts.secondary},failovers:{...this.failovers},
-      closedNotFailedOver:this.counts.closedNotFailedOver,rateLimited:this.counts.rateLimited,secondaryErrors:this.counts.secondaryErrors,perMinuteCap:this.perMinuteCap()};
+      closedNotFailedOver:this.counts.closedNotFailedOver,rateLimited:this.counts.rateLimited,secondaryErrors:this.counts.secondaryErrors,perMinuteCap:this.perMinuteCap(),
+      retryDeadline:this.counts.retryDeadline};
   }
 }

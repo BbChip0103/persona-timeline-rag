@@ -19,7 +19,7 @@ skipped; each setting is still checked by its own parser. The load and acceptanc
 | Gateway registry, several gateways | one gateway (drain kept) | `PTR_GATEWAY_REGISTRY`, `PTR_GATEWAY_URLS` |
 | H2 per-replica credit split | no code | text only (below) |
 | Env-only single-engine gateway | not used (one engine is a one-line file) | `PTR_GATEWAY_UPSTREAM=selfhosted` + `PTR_SELFHOSTED_*` (load tests, acceptance) |
-| Several workers | one | `PTR_WORKER_REPLICAS_HINT`, `PTR_METRICS_PORT` |
+| Several workers | one (worker metrics on 56442, dispatcher on 56443) | `PTR_WORKER_REPLICAS_HINT`, `PTR_METRICS_PORT` (per process; `0` = off), see [observability.md](observability.md) |
 | Chat providers `fake`, `selfhosted` | `gateway` or `openrouter` | allowed |
 | Harness API token (`PTR_API_SYNTHETIC_TOKEN`) | none: the API takes only the web's `local-<40 hex>` owners | a second Bearer token for synthetic owners only (`lt-*`, `owner_synthetic_*`); see [runbook.md](runbook.md#authentication-and-owner-spaces) |
 
