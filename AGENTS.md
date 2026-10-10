@@ -24,3 +24,10 @@
 - 기술 선택/대안/정정/검증/대화 히스토리는 별도 `private design notes` 레포의 `<private-design-notes>/`에 남긴다.
 - `private design notes`는 결정/검증, `private design notes`는 원문과 논의, `private design notes`는 구현 상세 계획이다. 이 코드 레포의 docs는 현재 계약/재현 방법만 설명하며 과정 일지를 중복하지 않는다.
 - 이슈 파일은 이 코드 레포의 커밋에 복사하지 않는다. 별도 레포의 수정과 커밋은 범위를 확인해 분리한다. 접속 정보/키/원본 데이터는 이슈에도 기록하지 않는다.
+
+## LangChain-first 구현 원칙
+
+- 범용 LLM/RAG 기능은 공식 LangChain/LangGraph 구성요소를 먼저 확인하고 사용한다. 이미 직접 구현했더라도 동등한 계약을 지원하면 네이티브 구현으로 이관하고 중복 흐름을 제거한다.
+- 단순 Runnable 래퍼를 붙인 것을 알고리즘 이관이라고 보고하지 않는다. 실제 SDK가 담당하는 기능과 남는 custom adapter/정책을 구분한다([현재 경계](docs/langchain-components.md)).
+- 인물/기간/라이선스/원문·이미지 provenance, 삭제/소유권/deadline, 비용·unknown receipt/재제출 금지, 엄격한 JSON/바이트 제한은 유지한다. 기본 파서의 자동 보정·token split/extra batch/retry·고정top-N·두 번째 memory DB로 계약을 바꾸지 않는다.
+- SDK raw-document 자동 tracing은 차단하고 기존 redacted application telemetry만 유지한다. 의존성 업그레이드 시 private async hook/클라이언트 bridge 및 데이터·과금 동등성을 회귀 검증한다.

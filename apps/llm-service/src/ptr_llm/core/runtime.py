@@ -412,9 +412,11 @@ class LLMEngine:
                 safetyCategory=category,
             )
 
-        async def select_evidence(sources, query, summaries=None):
-            if not self.evidence_selector or not sources:
-                return sources
+        async def selection_documents(sources, summaries=None):
+            from .retrieval_pipeline import source_documents
+
+            if not sources:
+                return []
             check()
             if summaries is None and (
                 not self.retrieval or not hasattr(self.retrieval, "summaries")
@@ -427,38 +429,29 @@ class LLMEngine:
                     sources, {"personId": session["personId"]}, signal=cancelled
                 )
             check()
-            if not isinstance(summaries, dict) or set(summaries) != {s["id"] for s in sources}:
-                raise CoreError("TURN_FAILED", "SUMMARY_UNAVAILABLE")
-            candidates = [
-                {
-                    "id": source["id"],
-                    "summary": summaries[source["id"]],
-                    "postedAt": source["postedAt"],
-                    "eventDate": source["eventDate"],
-                }
-                for source in sources
-            ]
-            await guarded()
-            selected = await self.evidence_selector.select(
-                {
-                    "query": query.get("query") or text[:500],
-                    "candidates": candidates,
-                    "seed": turn["id"],
-                },
+            return source_documents(sources, summaries)
+
+        def evidence_compressor():
+            from .retrieval_pipeline import JevDocumentCompressor
+
+            return JevDocumentCompressor(
+                selector=self.evidence_selector,
+                seed=turn["id"],
                 signal=cancelled,
                 deadline_at=deadline,
                 before_costly=guarded,
+                check=check,
             )
-            check()
-            if (
-                not isinstance(selected, list)
-                or any(not isinstance(sid, str) for sid in selected)
-                or len(set(selected)) != len(selected)
-                or set(selected) - set(summaries)
-            ):
-                raise CoreError("TURN_FAILED", "EVIDENCE_SELECTION_INVALID")
-            by_id = {s["id"]: s for s in sources}
-            return [by_id[sid] for sid in selected]
+
+        async def select_evidence(sources, query, summaries=None):
+            if not self.evidence_selector or not sources:
+                return sources
+            documents = await selection_documents(sources, summaries)
+            selected = await evidence_compressor().acompress_documents(
+                documents,
+                query.get("query") or text[:500],
+            )
+            return [doc.metadata["source"] for doc in selected]
 
         async def search(query):
             if self.retrieval is None:
@@ -475,21 +468,40 @@ class LLMEngine:
                 if session.get("ragCondition") in ("caption", "caption_image")
                 else "caption",
             }
-            summaries = None
+
+            async def load_sources():
+                summaries = None
+                if self.evidence_selector:
+                    # External query embedding remains ownership/deadline fenced.
+                    await guarded()
+                if self.evidence_selector and hasattr(self.retrieval, "search_with_summaries"):
+                    found, summaries = await self.retrieval.search_with_summaries(
+                        scoped, {"personId": session["personId"]}, **options
+                    )
+                else:
+                    found = await self.retrieval.search(
+                        scoped, {"personId": session["personId"]}, **options
+                    )
+                return filter_evidence(found, scoped, session["personId"]), summaries
+
             if self.evidence_selector:
-                # Query embeddings are external paid work too. Recheck turn
-                # ownership, cancellation and deadline before the adapter runs.
-                await guarded()
-            if self.evidence_selector and hasattr(self.retrieval, "search_with_summaries"):
-                found, summaries = await self.retrieval.search_with_summaries(
-                    scoped, {"personId": session["personId"]}, **options
+                from .langchain import private_retrieve
+                from .retrieval_pipeline import PrivateCompressionRetriever, ScopedSourceRetriever
+
+                async def load_documents():
+                    found, summaries = await load_sources()
+                    return await selection_documents(found, summaries)
+
+                native = PrivateCompressionRetriever(
+                    base_retriever=ScopedSourceRetriever(
+                        load=load_documents, query=scoped["query"]
+                    ),
+                    base_compressor=evidence_compressor(),
                 )
+                documents = await private_retrieve(native, scoped["query"])
+                sources = [doc.metadata["source"] for doc in documents]
             else:
-                found = await self.retrieval.search(
-                    scoped, {"personId": session["personId"]}, **options
-                )
-            sources = filter_evidence(found, scoped, session["personId"])
-            sources = await select_evidence(sources, scoped, summaries)
+                sources, _ = await load_sources()
             return (
                 sources
                 if session.get("ragCondition") == "caption_image"

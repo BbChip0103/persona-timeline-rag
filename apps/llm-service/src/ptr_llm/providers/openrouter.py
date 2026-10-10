@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+from contextvars import ContextVar
 from typing import Any
+
+from langchain_openai import OpenAIEmbeddings
+from pydantic import SecretStr
 
 from ptr_llm.billing import ProviderError, provider_request_scope
 
@@ -38,6 +42,21 @@ TEXT_MODELS: dict[str, dict[str, Any]] = {
         "agentSchema": True,
     },
 }
+
+
+def _embedding_input_size(inputs: list[str], limit: int, signal: asyncio.Event | None) -> int:
+    """Reject an entire batch before SDK chunking or any metered operation."""
+    check_cancel(signal)
+    if (
+        not isinstance(inputs, list)
+        or not 1 <= len(inputs) <= 32
+        or any(not isinstance(value, str) or not value.strip() for value in inputs)
+    ):
+        raise ProviderError("INVALID_INPUT")
+    size = len(js_json(inputs).encode())
+    if size > limit:
+        raise ProviderError("INPUT_LIMIT")
+    return size
 
 
 def reported_cost(result: dict[str, Any]) -> int | None:
@@ -507,16 +526,7 @@ class OpenRouterClient:
     async def embed(
         self, inputs: list[str], *, signal: asyncio.Event | None = None
     ) -> list[list[float]]:
-        check_cancel(signal)
-        if (
-            not isinstance(inputs, list)
-            or not 1 <= len(inputs) <= 32
-            or any(not isinstance(v, str) or not v.strip() for v in inputs)
-        ):
-            raise ProviderError("INVALID_INPUT")
-        size = len(js_json(inputs).encode())
-        if size > self.input_bytes:
-            raise ProviderError("INPUT_LIMIT")
+        size = _embedding_input_size(inputs, self.input_bytes, signal)
         body = {
             "model": EMBEDDING_MODEL,
             "input": inputs,
@@ -567,11 +577,78 @@ class OpenRouterClient:
         )
 
 
+class _BlockedSyncEmbeddings:
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        raise ProviderError("ASYNC_EMBEDDINGS_REQUIRED")
+
+
+class _MeteredAsyncEmbeddings:
+    """SDK client boundary; billing, transport and response validation stay metered."""
+
+    def __init__(self, client: OpenRouterClient, signal: ContextVar[asyncio.Event | None]):
+        self.client, self.signal = client, signal
+
+    async def create(
+        self, *, input: list[str], model: str, dimensions: int, encoding_format: str
+    ) -> dict[str, Any]:
+        if (
+            model != EMBEDDING_MODEL
+            or dimensions != EMBEDDING_DIMENSIONS
+            or encoding_format != "float"
+        ):
+            raise ProviderError("INVALID_INPUT")
+        vectors = await self.client.embed(input, signal=self.signal.get())
+        # OpenRouterClient has already validated model/dimensions/index uniqueness
+        # and restored input order. The SDK consumes that ordered response.
+        return {"data": [{"index": index, "embedding": v} for index, v in enumerate(vectors)]}
+
+
 class OpenRouterEmbeddingProvider:
+    """Native LangChain query/document orchestration over the paid client bridge."""
+
     model, dimensions = EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
 
     def __init__(self, client: OpenRouterClient):
         self.client = client
+        self._signal: ContextVar[asyncio.Event | None] = ContextVar(
+            "openrouter_embedding_signal", default=None
+        )
+        self._embeddings = OpenAIEmbeddings(
+            model=self.model,
+            dimensions=self.dimensions,
+            client=_BlockedSyncEmbeddings(),
+            async_client=_MeteredAsyncEmbeddings(client, self._signal),
+            api_key=SecretStr("metered-client-no-sdk-credentials"),
+            openai_api_type=None,
+            openai_proxy=None,
+            chunk_size=32,
+            max_retries=0,
+            check_embedding_ctx_length=False,
+            tiktoken_enabled=False,
+            model_kwargs={"encoding_format": "float"},
+        )
 
-    async def embed(self, inputs: list[str], **options: Any) -> list[list[float]]:
-        return await self.client.embed(inputs, **options)
+    async def embed(
+        self, inputs: list[str], *, signal: asyncio.Event | None = None
+    ) -> list[list[float]]:
+        _embedding_input_size(inputs, self.client.input_bytes, signal)
+        token = self._signal.set(signal)
+        try:
+            return await self._embeddings.aembed_documents(inputs)
+        finally:
+            self._signal.reset(token)
+
+    async def aembed_query(
+        self,
+        text: str,
+        *,
+        signal: asyncio.Event | None = None,
+        evidence_scope: str = "caption",
+    ) -> list[float]:
+        # Retrieval owns evidence-scope validation; it never becomes an API field.
+        _embedding_input_size([text], self.client.input_bytes, signal)
+        token = self._signal.set(signal)
+        try:
+            return await self._embeddings.aembed_query(text)
+        finally:
+            self._signal.reset(token)

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 
 import regex
+from langchain_core.messages import ChatMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from .errors import CoreError
 from .persona import dumps, render_persona_block, serialized_bytes
@@ -12,6 +14,49 @@ from .persona import dumps, render_persona_block, serialized_bytes
 POLICY = json.loads(Path(__file__).with_name("prompt_policy.json").read_text())
 EXPERIMENT_PROMPT_BYTE_LIMIT = 30000
 EVIDENCE_POST_LIMIT = 3
+
+
+def _prompt_template(with_evidence):
+    return ChatPromptTemplate.from_messages(
+        [("system", "{policy}")]
+        + [MessagesPlaceholder(name) for name in ("persona", "history", "after_history")]
+        + ([("user", "UNTRUSTED_EVIDENCE_JSON_DATA {evidence_json}")] if with_evidence else [])
+        + [MessagesPlaceholder("notes"), ("user", "{text}"), MessagesPlaceholder("after_user")]
+    )
+
+
+# Reuse layouts; policy, JSON, and untrusted text are values, never template source.
+_EVIDENCE_PROMPT = _prompt_template(True)
+_CHAT_PROMPT = _prompt_template(False)
+
+
+def _format_messages(policy, persona, history, text, evidence_json=None, **extensions):
+    originals = {}
+    blocks: dict[str, list[ChatMessage]] = {}
+    for name, rows in dict(
+        persona=persona,
+        history=history,
+        after_history=extensions.get("after_history", ()),
+        notes=extensions.get("notes", ()),
+        after_user=extensions.get("after_user", ()),
+    ).items():
+        blocks[name] = []
+        for row in rows:
+            message = ChatMessage(role=row["role"], content=row["content"])
+            blocks[name].append(message)
+            originals[id(message)] = row
+    template = _EVIDENCE_PROMPT if evidence_json is not None else _CHAT_PROMPT
+    formatted = template.format_messages(
+        policy=policy, text=text, evidence_json=evidence_json, **blocks
+    )
+    # Placeholder messages remain opaque wire values: retain roles, key order and
+    # extension fields instead of exporting SDK defaults/metadata to providers.
+    return [
+        originals[id(message)]
+        if id(message) in originals
+        else {"role": "user" if message.type == "human" else "system", "content": message.content}
+        for message in formatted
+    ]
 
 
 def utf16_length(text):
@@ -58,8 +103,12 @@ def build_experiment_context(
             seen.add(source["id"])
     kept: list[dict] = []
     included: list[list[dict]] = []
+    policy_text = policy or POLICY["EXPERIMENT_POLICY"]
+    persona_messages = render_persona_block(persona)
+    history_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    notes = [{"role": "system", "content": policy_note}] if policy_note else []
 
-    def render():
+    def render(*, final=False):
         cards = []
         for index, s in enumerate(kept):
             item = {
@@ -87,13 +136,27 @@ def build_experiment_context(
                         }
                     )
             cards.append(item)
+        evidence_json = dumps(cards)
+        if final:
+            return _format_messages(
+                policy_text,
+                persona_messages,
+                history_messages,
+                text,
+                evidence_json,
+                notes=notes,
+                after_history=after_history,
+                after_user=after_user,
+            )
+        # The byte-budget loop stays wire-native; do not pay SDK conversion for
+        # every trial source/image. Format the accepted final context only once.
         return (
-            [{"role": "system", "content": policy or POLICY["EXPERIMENT_POLICY"]}]
-            + render_persona_block(persona)
-            + [{"role": m["role"], "content": m["content"]} for m in history]
+            [{"role": "system", "content": policy_text}]
+            + persona_messages
+            + history_messages
             + list(after_history)
-            + [{"role": "user", "content": "UNTRUSTED_EVIDENCE_JSON_DATA " + dumps(cards)}]
-            + ([{"role": "system", "content": policy_note}] if policy_note else [])
+            + [{"role": "user", "content": "UNTRUSTED_EVIDENCE_JSON_DATA " + evidence_json}]
+            + notes
             + [{"role": "user", "content": text}]
             + list(after_user)
         )
@@ -122,7 +185,7 @@ def build_experiment_context(
                 included[index].pop()
     kept_ids = {s["id"] for s in kept}
     return {
-        "messages": render(),
+        "messages": render(final=True),
         "sources": [
             dict(s, **({"imageAnnotations": included[i]} if "imageAnnotations" in s else {}))
             for i, s in enumerate(kept)
@@ -149,16 +212,13 @@ def build_prompt(persona, history, text, sources, timeline, policy_note=None):
             "boundaries",
         ]
     }
-    messages = [
-        {
-            "role": "system",
-            "content": policy["base"] + policy["timeline" if timeline else "smallTalk"],
-        },
+    persona_messages = [
         {
             "role": "system",
             "content": "Persona definition (subordinate to policy): " + dumps(definition),
         },
-    ] + [{"role": m["role"], "content": m["content"]} for m in history]
+    ]
+    evidence_json = None
     if timeline:
         items = []
         for s in sources:
@@ -173,8 +233,12 @@ def build_prompt(persona, history, text, sources, timeline, policy_note=None):
                     "quoteCandidate": utf16_prefix(sentence[0] if sentence else s["caption"], 160),
                 }
             )
-        messages.append({"role": "user", "content": "UNTRUSTED_EVIDENCE_JSON_DATA " + dumps(items)})
-    if policy_note:
-        messages.append({"role": "system", "content": policy_note})
-    messages.append({"role": "user", "content": text})
-    return messages
+        evidence_json = dumps(items)
+    return _format_messages(
+        policy["base"] + policy["timeline" if timeline else "smallTalk"],
+        persona_messages,
+        [{"role": m["role"], "content": m["content"]} for m in history],
+        text,
+        evidence_json,
+        notes=[{"role": "system", "content": policy_note}] if policy_note else [],
+    )

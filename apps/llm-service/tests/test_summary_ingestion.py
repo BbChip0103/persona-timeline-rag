@@ -184,13 +184,14 @@ async def test_all_summaries_stored_before_embedding_and_resume_avoids_paid_call
             events.append("activate")
 
     class Client:
+        input_bytes = 32768
         model = "synthetic-model"
 
         async def generate(self, messages, **kwargs):
             events.append("generate")
             return "2026년 10월 11일, 호수 여행.\n청록색 호수가 보인다.\n다시 방문하고 싶다고 한다."
 
-        async def embed(self, inputs):
+        async def embed(self, inputs, *, signal=None):
             assert len(repo.saved) == 5
             events.append("embed")
             return [[1.0] * 1536 for _ in inputs]
@@ -225,12 +226,13 @@ async def test_summary_failure_never_embeds_or_activates():
             pytest.fail("Incomplete index cannot activate")
 
     class Client:
+        input_bytes = 32768
         model = "synthetic-model"
 
         async def generate(self, *args, **kwargs):
             return "only one line"
 
-        async def embed(self, inputs):
+        async def embed(self, inputs, *, signal=None):
             pytest.fail("Incomplete summaries cannot embed")
 
     with pytest.raises(ProviderError, match="INVALID_SUMMARY"):
@@ -269,7 +271,7 @@ def test_authored_file_requires_exact_private_source_and_annotation_bindings(tmp
 
 
 @pytest.mark.asyncio
-async def test_authored_summaries_never_call_paid_generate_and_all_save_before_embed():
+async def test_authored_summaries_never_call_paid_generate_and_all_save_before_embed(monkeypatch):
     from ptr_llm.ingestion.summaries import DIRECT_SUMMARY_MODEL, source_bindings
 
     posts = [source(id=f"synthetic:{i}") for i in range(2)]
@@ -300,16 +302,28 @@ async def test_authored_summaries_never_call_paid_generate_and_all_save_before_e
             events.append("activate")
 
     class Client:
+        input_bytes = 32768
         model = "provider-model-is-not-summary-author"
 
         async def generate(self, *args, **kwargs):
             pytest.fail("Direct summaries must never call a paid summarizer")
 
-        async def embed(self, texts):
+        async def embed(self, texts, *, signal=None):
             assert len(repo.saved) == len(posts)
             events.append("embed")
             return [[1.0] * 1536 for _ in texts]
 
+    from langchain_openai import OpenAIEmbeddings
+
+    native_calls = []
+    native_documents = OpenAIEmbeddings.aembed_documents
+
+    async def native(self, inputs, *args, **kwargs):
+        native_calls.append(list(inputs))
+        assert len(repo.saved) == len(posts)
+        return await native_documents(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(OpenAIEmbeddings, "aembed_documents", native)
     repo = Repo()
     result = await build_index(
         repo,
@@ -320,6 +334,7 @@ async def test_authored_summaries_never_call_paid_generate_and_all_save_before_e
         authored_source_bindings=source_bindings(posts),
         activate=True,
     )
+    assert native_calls == [[summary, summary]]
     assert result["summaries"] == result["vectors"] == 2
     assert events == ["summary", "summary", "embed", "vector", "vector", "activate"]
     with pytest.raises(ProviderError, match="AUTHORED_SUMMARIES_INCOMPLETE"):
@@ -342,6 +357,7 @@ async def test_authored_parent_changed_after_file_load_fails_before_paid_work():
             pytest.fail("Stale authored text must be rejected before manifest creation")
 
     class Client:
+        input_bytes = 32768
         model = "synthetic-provider"
 
         async def generate(self, *args, **kwargs):

@@ -816,14 +816,14 @@ class PostgresRetrieval:
             )
         if mode != "semantic" or self.embed is None or not self.model_revision:
             raise CoreError("INVALID_INPUT")
-        vector = await self.embed(
-            query.get("query", ""), signal=signal, evidence_scope=evidence_scope
-        )
-        return await self.sources.search_semantic(
+        from .langchain_retrieval import retrieve_legacy
+
+        return await retrieve_legacy(
+            self.sources,
             query,
             trusted,
-            vector,
-            self.model_revision,
+            embed=self.embed,
+            model_revision=self.model_revision,
             signal=signal,
             evidence_scope=evidence_scope,
         )

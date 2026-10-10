@@ -268,11 +268,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         revision = env.get("PTR_LLM_EMBEDDING_MODEL_REVISION")
         if env.get("PTR_LLM_EMBEDDING_PROVIDER") == "openrouter" and client is not None:
             embedder = OpenRouterEmbeddingProvider(client)
-
-            async def embed(text: str, **options: Any) -> Any:
-                return (await embedder.embed([text], signal=options.get("signal")))[0]
-
-            embedding = embed
+            embedding = embedder.aembed_query
             revision = revision or "openai/text-embedding-3-small"
         retrieval = PostgresRetrieval(
             sources,

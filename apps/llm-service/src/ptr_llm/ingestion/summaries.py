@@ -14,6 +14,7 @@ from typing import Any
 
 from ptr_llm.billing import PostgresBudgetLedger, ProviderError
 from ptr_llm.providers.common import fingerprint, js_json
+from ptr_llm.providers.openrouter import OpenRouterEmbeddingProvider
 
 SUMMARY_PROMPT_REVISION = "post-summary-ko-three-lines-v1"
 SUMMARY_MODEL = "google/gemma-4-26b-a4b-it"
@@ -321,10 +322,13 @@ async def build_index(
         [run_id, EMBEDDING_MODEL],
     )
     indexed = {row["source_id"] for row in existing}
+    embedder = None
     for batch in embedding_batches([(s["id"], summaries[s["id"]]) for s in sources]):
         if not all(source_id in indexed for source_id, _ in batch):
             # Preserve original full batch request identity after a partial DB write/crash.
-            vectors = await client.embed([text for _, text in batch])
+            if embedder is None:
+                embedder = OpenRouterEmbeddingProvider(client)
+            vectors = await embedder.embed([text for _, text in batch])
             for (source_id, _), vector in zip(batch, vectors, strict=True):
                 if source_id not in indexed:
                     await repository.import_vector(run_id, source_id, EMBEDDING_MODEL, vector)

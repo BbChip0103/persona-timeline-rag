@@ -4,54 +4,101 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Sequence
-from typing import Any
+from typing import Any, Self
 
 from langchain_classic.retrievers.multi_vector import MultiVectorRetriever
-from langchain_core.callbacks import AsyncCallbackManagerForRetrieverRun
 from langchain_core.documents import Document
-from langchain_core.runnables.config import RunnableConfig, var_child_runnable_config
 from langchain_core.stores import BaseStore
-from langchain_core.vectorstores import VectorStore
+from langchain_core.vectorstores import VectorStore, VectorStoreRetriever
 
 from ptr_llm.core.errors import CoreError
+from ptr_llm.core.langchain import PrivateAsyncRetriever, private_retrieve
 from ptr_llm.providers.common import check_cancel
 
 from .sources import PostgresSourceRepository, validate_source
 from .summaries import validate_summary
 
 
-class PrivateMultiVectorRetriever(MultiVectorRetriever):
-    """Use SDK retrieval, without auto-configured raw-document callback export.
+class PrivateMultiVectorRetriever(PrivateAsyncRetriever, MultiVectorRetriever):
+    """SDK multi-vector algorithm with the common private async boundary."""
 
-    Even callbacks=[] inherits SDK global debug/tracing/configure hooks. Bypass
-    that lifecycle, not the SDK's actual child search/dedup/parent orchestration.
-    Only this internal async entry point is supported, not streaming or tracing.
-    """
 
-    async def ainvoke(
+class PrivateVectorStoreRetriever(PrivateAsyncRetriever, VectorStoreRetriever):
+    """SDK single-vector algorithm with the common private async boundary."""
+
+
+class ReadOnlyScopedVectorStore(VectorStore):
+    """Request-local identity/date/evidence policy shared by SDK vector stores."""
+
+    def __init__(
         self,
-        input: str,
-        config: RunnableConfig | None = None,
-        **kwargs: Any,
-    ) -> list[Document]:
-        if config or kwargs:
+        sources: PostgresSourceRepository,
+        query: dict[str, Any],
+        trusted: dict[str, str],
+        embed: Any,
+        model_revision: str,
+        signal: asyncio.Event | None,
+        evidence_scope: str,
+    ):
+        self.sources = sources
+        self.query, self.trusted = dict(query), dict(trusted)
+        self.embed, self.model_revision = embed, model_revision
+        self.signal, self.evidence_scope = signal, evidence_scope
+
+    async def _query_vector(self, query: str, k: int, kwargs: dict[str, Any]) -> list[float]:
+        check_cancel(self.signal)
+        if (
+            kwargs
+            or query != self.query.get("query", "")
+            or k != self.query["limit"]
+            or self.evidence_scope not in ("caption", "caption_image")
+        ):
             raise CoreError("INVALID_INPUT")
-        return await self._aget_relevant_documents(
-            input,
-            run_manager=AsyncCallbackManagerForRetrieverRun.get_noop_manager(),
-        )
+        vector = await self.embed(query, signal=self.signal, evidence_scope=self.evidence_scope)
+        check_cancel(self.signal)
+        return vector
 
-    def invoke(
-        self,
-        input: str,
-        config: RunnableConfig | None = None,
+    def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
+        raise NotImplementedError("async scoped similarity search only")
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: list[str],
+        embedding: Any,
+        metadatas: list[dict[str, Any]] | None = None,
+        *,
+        ids: list[str] | None = None,
         **kwargs: Any,
+    ) -> Self:
+        raise NotImplementedError("read-only vector index")
+
+    async def aadd_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: list[dict[str, Any]] | None = None,
+        *,
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        raise NotImplementedError("read-only vector index")
+
+    async def adelete(self, ids: list[str] | None = None, **kwargs: Any) -> bool | None:
+        raise NotImplementedError("read-only vector index")
+
+    async def amax_marginal_relevance_search(
+        self, query: str, k: int = 4, fetch_k: int = 20, lambda_mult: float = 0.5, **kwargs: Any
     ) -> list[Document]:
-        raise NotImplementedError("private async retrieval only")
+        raise NotImplementedError("scoped cosine similarity only")
+
+    async def asimilarity_search_with_score(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> list[tuple[Document, float]]:
+        raise NotImplementedError("scoped cosine similarity only")
 
 
-class SummaryVectorStore(VectorStore):
-    """Search summary children only; scope cannot be changed by SDK search kwargs."""
+class SummaryVectorStore(ReadOnlyScopedVectorStore):
+    """Search summary children only, pinned to one complete immutable run."""
 
     def __init__(
         self,
@@ -64,18 +111,12 @@ class SummaryVectorStore(VectorStore):
         signal: asyncio.Event | None,
         evidence_scope: str,
     ):
-        self.sources = sources
-        self.query, self.trusted = dict(query), dict(trusted)
-        self.embed, self.model_revision, self.run_id = embed, model_revision, run_id
-        self.signal, self.evidence_scope = signal, evidence_scope
+        super().__init__(sources, query, trusted, embed, model_revision, signal, evidence_scope)
+        self.run_id = run_id
         self.bindings: dict[str, tuple[str, str]] = {}
 
     async def asimilarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
-        check_cancel(self.signal)
-        if kwargs or query != self.query.get("query", "") or k != self.query["limit"]:
-            raise CoreError("INVALID_INPUT")
-        vector = await self.embed(query, signal=self.signal, evidence_scope=self.evidence_scope)
-        check_cancel(self.signal)
+        vector = await self._query_vector(query, k, kwargs)
         rows = await self.sources.search_summary_children(
             self.query,
             self.trusted,
@@ -99,43 +140,45 @@ class SummaryVectorStore(VectorStore):
             documents.append(Document(page_content=row["summary"], metadata={"source_id": key}))
         return documents
 
-    def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
-        raise NotImplementedError("async scoped summary search only")
 
-    @classmethod
-    def from_texts(
-        cls,
-        texts: list[str],
-        embedding: Any,
-        metadatas: list[dict[str, Any]] | None = None,
-        *,
-        ids: list[str] | None = None,
-        **kwargs: Any,
-    ) -> SummaryVectorStore:
-        raise NotImplementedError("read-only summary index")
+class LegacyVectorStore(ReadOnlyScopedVectorStore):
+    """Existing guarded caption/image SQL, dispatched by native SDK retriever."""
 
-    async def aadd_texts(
-        self,
-        texts: Iterable[str],
-        metadatas: list[dict[str, Any]] | None = None,
-        *,
-        ids: list[str] | None = None,
-        **kwargs: Any,
-    ) -> list[str]:
-        raise NotImplementedError("read-only summary index")
+    async def asimilarity_search(self, query: str, k: int = 4, **kwargs: Any) -> list[Document]:
+        vector = await self._query_vector(query, k, kwargs)
+        sources = await self.sources.search_semantic(
+            self.query,
+            self.trusted,
+            vector,
+            self.model_revision,
+            signal=self.signal,
+            evidence_scope=self.evidence_scope,
+        )
+        check_cancel(self.signal)
+        return [
+            Document(page_content=source["caption"], metadata={"source": source})
+            for source in sources
+        ]
 
-    async def adelete(self, ids: list[str] | None = None, **kwargs: Any) -> bool | None:
-        raise NotImplementedError("read-only summary index")
 
-    async def amax_marginal_relevance_search(
-        self, query: str, k: int = 4, fetch_k: int = 20, lambda_mult: float = 0.5, **kwargs: Any
-    ) -> list[Document]:
-        raise NotImplementedError("scoped cosine similarity only")
-
-    async def asimilarity_search_with_score(
-        self, query: str, k: int = 4, **kwargs: Any
-    ) -> list[tuple[Document, float]]:
-        raise NotImplementedError("scoped cosine similarity only")
+async def retrieve_legacy(
+    sources: PostgresSourceRepository,
+    query: dict[str, Any],
+    trusted: dict[str, str],
+    *,
+    embed: Any,
+    model_revision: str,
+    signal: asyncio.Event | None,
+    evidence_scope: str,
+) -> list[dict[str, Any]]:
+    vectorstore = LegacyVectorStore(
+        sources, query, trusted, embed, model_revision, signal, evidence_scope
+    )
+    retriever = PrivateVectorStoreRetriever(
+        vectorstore=vectorstore, search_kwargs={"k": query["limit"]}
+    )
+    documents = await private_retrieve(retriever, query.get("query", ""))
+    return [document.metadata["source"] for document in documents]
 
 
 class OriginalDocumentStore(BaseStore[str, Document]):
@@ -221,13 +264,7 @@ async def retrieve_originals(
         id_key="source_id",
         search_kwargs={"k": query["limit"]},
     )
-    # Do not inherit outer LangGraph callbacks/checkpoint metadata or private state.
-    # The application's separate OTel context is intentionally left intact.
-    token = var_child_runnable_config.set(None)
-    try:
-        documents = await retriever.ainvoke(query.get("query", ""))
-    finally:
-        var_child_runnable_config.reset(token)
+    documents = await private_retrieve(retriever, query.get("query", ""))
     check_cancel(signal)
     found = [document.metadata["source"] for document in documents]
     summaries = {
