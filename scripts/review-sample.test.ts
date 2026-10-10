@@ -19,7 +19,7 @@ const S = {
 };
 const OWNER = (n: number) => `local-${n.toString(16).padStart(40, '0')}`;
 const NOW = new Date('2026-10-10T03:00:00Z');
-const RESEARCH_URL = 'postgresql://ptr_researcher:pw@127.0.0.1:56432/ptr_research';
+const RESEARCH_URL = 'postgresql://ptr_split_owner:pw@127.0.0.1:58432/ptr_split_research';
 
 type Row = { id: string; owner_id: string; persona_id: string; review_status: string | null; finished_at: string; user_text: string; reply: unknown };
 function reply(i: number, extra: Record<string, unknown> = {}) {
@@ -35,7 +35,7 @@ function dbRows(personas = 4, perPersona = 20): Row[] {
       finished_at: '2026-10-08T05:00:00Z', user_text: `${S.user} ${p}-${i}`, reply: reply(i) });
   return rows;
 }
-function fakePool(rows: Row[], opts: { readOnly?: string; fail?: boolean; personas?: string[] } = {}) {
+function fakePool(rows: Row[], opts: { readOnly?: string; fail?: boolean; personas?: string[]; database?: string; username?: string } = {}) {
   const calls: string[] = [];
   const pool: Queryable & { calls: string[]; ended: boolean } = {
     calls, ended: false,
@@ -43,7 +43,8 @@ function fakePool(rows: Row[], opts: { readOnly?: string; fail?: boolean; person
       calls.push(sql);
       if (opts.fail) { const e = new Error(`boom ${S.error}`) as Error & { code: string }; e.code = '42P01'; throw e; }
       if (/^SHOW default_transaction_read_only/i.test(sql)) return { rows: [{ default_transaction_read_only: opts.readOnly ?? 'on' }] };
-      if (/FROM personas p/.test(sql)) return { rows: (opts.personas ?? [...new Set(rows.map(row => row.persona_id))].sort()).map(id => ({ id })) };
+      if (/current_database\(\)/.test(sql)) return { rows: [{ database: opts.database ?? 'ptr_split_research', username: opts.username ?? 'ptr_split_owner' }] };
+      if (/FROM llm\.personas p/.test(sql)) return { rows: (opts.personas ?? [...new Set(rows.map(row => row.persona_id))].sort()).map(id => ({ id })) };
       return { rows };
     },
     async end() { pool.ended = true; },
@@ -68,7 +69,7 @@ async function harness(rows: Row[] = dbRows(), poolOpts: Parameters<typeof fakeP
   const out: string[] = [], err: string[] = [];
   const pool = fakePool(rows, poolOpts);
   const connected: string[] = [];
-  const deps = { root, env: { DATABASE_URL: RESEARCH_URL } as Record<string, string | undefined>, now: NOW, salt: Buffer.from('fixed-test-salt'),
+  const deps = { root, env: { PTR_LLM_MAINTENANCE_DATABASE_URL: RESEARCH_URL } as Record<string, string | undefined>, now: NOW, salt: Buffer.from('fixed-test-salt'),
     connect: (url: string) => { connected.push(url); return pool; }, out: (l: string) => out.push(l), err: (l: string) => err.push(l) };
   return { root, out, err, pool, connected, deps };
 }
@@ -308,7 +309,7 @@ describe('review-sample run', () => {
     expect(JSON.parse(h.out.at(-1)!)).toMatchObject({ pruned: 2 });
   });
 
-  it('only connects to the local research database and refuses a session that is not read-only', async () => {
+  it('only connects to the explicit local split owner database and refuses a session that is not read-only', async () => {
     const wrong = await harness();
     wrong.deps.env = { DATABASE_URL: 'postgresql://ptr_loadtester:pw@127.0.0.1:56432/ptr_loadtest' };
     expect(await go(['--since', '7d', '--seed', '7'], wrong)).toBe(1);
@@ -322,6 +323,57 @@ describe('review-sample run', () => {
     expect(writable.err.join('\n')).toMatch(/not_read_only/);
     expect(writable.pool.calls).toHaveLength(1);
     expect(writable.pool.ended).toBe(true);
+  });
+
+  it.each([
+    {},
+    { DATABASE_URL: RESEARCH_URL },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: RESEARCH_URL.replace('ptr_split_owner', 'ptr_split_llm') },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: RESEARCH_URL.replace('58432', '56432') },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: RESEARCH_URL.replace('127.0.0.1', 'example.invalid') },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: RESEARCH_URL.replace('ptr_split_research', 'ptr_split_other') },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: `${RESEARCH_URL}?options=unsafe` },
+    { PTR_LLM_MAINTENANCE_DATABASE_URL: 'not-a-url' },
+  ])('refuses unauthorized maintenance targets before connecting: %j', async env => {
+    const h = await harness();
+    h.deps.env = env;
+    expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(1);
+    expect(h.connected).toEqual([]);
+    expect(h.err).toEqual(['review-sample: database_url']);
+    expect(h.err.join('')).not.toContain('pw');
+  });
+
+  it.each([
+    { username: 'ptr_split_llm' },
+    { database: 'ptr_split_test' },
+    { username: 'ptr_researcher', database: 'ptr_research' },
+  ])('refuses actual connection identity mismatch before content reads: %j', async identity => {
+    const h = await harness(dbRows(), identity);
+    expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(1);
+    expect(h.err).toEqual(['review-sample: database_identity']);
+    expect(h.pool.calls).toHaveLength(2);
+    expect(h.pool.calls.join('\n')).not.toMatch(/app\.turns|llm\.personas/);
+    expect(h.pool.ended).toBe(true);
+  });
+
+  it('queries only schema-qualified split content after both identity and read-only checks', async () => {
+    const h = await harness();
+    expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(0);
+    expect(h.connected).toEqual([RESEARCH_URL]);
+    expect(h.pool.calls[0]).toBe('SHOW default_transaction_read_only');
+    expect(h.pool.calls[1]).toMatch(/current_database\(\).*current_user/);
+    expect(h.pool.calls[2]).toMatch(/FROM app\.turns t JOIN app\.sessions s/);
+    expect(h.pool.calls[2]).toMatch(/JOIN llm\.persona_versions v/);
+    expect(h.pool.calls[3]).toMatch(/FROM llm\.personas p JOIN llm\.persona_versions v/);
+    expect(h.pool.calls.join('\n')).not.toMatch(/(?:FROM|JOIN) (?:turns|sessions|personas|persona_versions)\b/);
+  });
+
+  it('accepts the explicitly selected synthetic split database without ambient URL fallback', async () => {
+    const h = await harness(dbRows(), { database: 'ptr_split_test' });
+    const url = RESEARCH_URL.replace('ptr_split_research', 'ptr_split_test');
+    h.deps.env = { PTR_LLM_MAINTENANCE_DATABASE_URL: url, DATABASE_URL: 'not-used' };
+    expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(0);
+    expect(h.connected).toEqual([url]);
   });
 
   it('sends nothing over the network: no fetch call, no network or provider imports', async () => {
@@ -342,10 +394,10 @@ describe('review-sample run', () => {
   });
 });
 
-const integration = process.env.RUN_STORAGE_DB_TESTS === '1' && !!process.env.DATABASE_URL ? describe : describe.skip;
+const integration = process.env.RUN_STORAGE_DB_TESTS === '1' && !!process.env.PTR_LLM_MAINTENANCE_DATABASE_URL ? describe : describe.skip;
 integration('review-sample read-only pool (Postgres)', () => {
   it('opens sessions with default_transaction_read_only=on, so writes fail', async () => {
-    const pool = readOnlyPool(process.env.DATABASE_URL!);
+    const pool = readOnlyPool(process.env.PTR_LLM_MAINTENANCE_DATABASE_URL!);
     try {
       const { rows } = await pool.query('SHOW default_transaction_read_only');
       expect(rows[0]).toEqual({ default_transaction_read_only: 'on' });

@@ -2,7 +2,7 @@ import { createLangfuseClient } from '../packages/ops/src/langfuse';
 import { retainFrameworkData } from './framework-retention';
 import { SyntheticLangfuseServer } from './framework-langfuse.test-helper';
 
-describe('90-day OSS scoped deletion through supported v4 APIs', () => {
+describe('90-day OSS trace retention and explicit logical dataset deletion', () => {
   let server: SyntheticLangfuseServer;
   let client: ReturnType<typeof createLangfuseClient>;
   const scope = { environment: 'synthetic', from: '2025-01-01T00:00:00.000Z', now: new Date('2026-10-10T00:00:00.000Z'), datasetNames: ['managed'], queueIds: ['managed-queue'] };
@@ -23,7 +23,8 @@ describe('90-day OSS scoped deletion through supported v4 APIs', () => {
   afterEach(async () => { await client.shutdown(); await server.close(); });
   it('dry-run makes no writes and reports fixed cutoff and deduplicated scoped inventory', async () => {
     const plan = await retainFrameworkData(client, scope);
-    expect(plan).toMatchObject({ cutoff: '2026-07-12T00:00:00.000Z', traceIds: ['old'], applied: false, deletionSubmitted: false });
+    expect(plan).toMatchObject({ cutoff: '2026-07-12T00:00:00.000Z', traceIds: ['old'], applied: false, deletionSubmitted: false,
+      datasetDeletionSemantics: 'version-tombstone', historicalDatasetErasureVerified: false });
     expect(plan.datasetItems).toEqual([{ id: 'old-item', datasetName: 'managed' }]);
     expect(server.requests.every(request => request.method === 'GET')).toBe(true);
     expect(server.requests.some(request => request.path === '/api/public/traces')).toBe(false);
@@ -33,13 +34,31 @@ describe('90-day OSS scoped deletion through supported v4 APIs', () => {
     await expect(retainFrameworkData(client, { ...scope, days: 30 })).rejects.toThrow('90');
     expect(server.requests.every(request => request.method === 'GET')).toBe(true);
   });
-  it('submits supported trace/item deletions and leaves new/unscoped content intact', async () => {
-    const result = await retainFrameworkData(client, { ...scope, apply: true, confirmProject: 'synthetic-project' });
-    expect(result).toMatchObject({ applied: true, deletionSubmitted: true });
+  it('blocks all mutations after complete inventory unless logical dataset deletion is explicit', async () => {
+    await expect(retainFrameworkData(client, { ...scope, apply: true, confirmProject: 'synthetic-project' }))
+      .rejects.toThrow('Logical dataset deletion requires explicit opt-in');
+    expect(server.requests.some(request => request.path.includes('/dataset-items'))).toBe(true);
+    expect(server.requests.some(request => request.path.includes('/annotation-queues'))).toBe(true);
+    expect(server.requests.every(request => request.method === 'GET')).toBe(true);
+    expect(server.items.has('old-item')).toBe(true);
+    expect(server.queueItems.has('old-review')).toBe(true);
+  });
+  it('submits explicit logical item deletions without claiming historical erasure', async () => {
+    const options = { ...scope, apply: true, confirmProject: 'synthetic-project', allowLogicalDatasetDeletion: true };
+    const result = await retainFrameworkData(client, options);
+    expect(result).toMatchObject({ applied: true, deletionSubmitted: true,
+      datasetDeletionSemantics: 'version-tombstone', historicalDatasetErasureVerified: false });
     expect(server.observations.map(item => item.traceId)).toEqual(['new', 'other']);
     expect([...server.items.keys()]).toEqual(['new-item', 'other-item']); expect(server.queueItems.size).toBe(0);
     expect(server.requests.find(request => request.method === 'DELETE' && request.path === '/api/public/traces')?.body.toString()).toBe('{"traceIds":["old"]}');
     expect(server.requests.some(request => request.path.includes('/runs/'))).toBe(false);
+  });
+  it('allows trace and review retention without opt-in when no dataset items expire', async () => {
+    server.items.delete('old-item');
+    const result = await retainFrameworkData(client, { ...scope, apply: true, confirmProject: 'synthetic-project' });
+    expect(result).toMatchObject({ applied: true, deletionSubmitted: true, datasetItems: [], historicalDatasetErasureVerified: false });
+    expect(server.queueItems.size).toBe(0);
+    expect(server.requests.some(request => request.method === 'DELETE' && request.path.includes('/dataset-items'))).toBe(false);
   });
   it('enforces complete inventory cap before any deletion', async () => {
     await expect(retainFrameworkData(client, { ...scope, apply: true, confirmProject: 'synthetic-project', maxEntities: 1 })).rejects.toThrow('limit');

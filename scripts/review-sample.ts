@@ -1,7 +1,7 @@
 /**
- * Human review sample (docs/review-sampling.md). Reads the research DB read-only and S8 private outputs,
+ * Human review sample (docs/review-sampling.md). Reads the explicitly selected split DB read-only and optional S8 private outputs,
  * writes one masked review sheet under reports/review/ (0600), and prints counts only. Nothing leaves this machine.
- *   node --env-file=.env.local --import tsx scripts/review-sample.ts --since 7d --seed <n> [--s8 reports/s8/<dir> …] [--prune]
+ *   node --env-file=.env.llm-maintenance --import tsx scripts/review-sample.ts --since 7d --seed <n> [--s8 reports/s8/<dir> …] [--prune]
  * Agents never open the sheet or S8 row contents; the acceptance check looks at existence, mode and row count only.
  */
 import { createHash, randomBytes } from 'node:crypto';
@@ -76,15 +76,20 @@ function parseArgs(argv: string[]): { sinceDays: number; seed: number; s8: strin
   return { sinceDays: Number(days[1]), seed: Number(seed), s8, prune };
 }
 
-/** The research DB only (not the load-test DB), through the shared loopback guard. */
-function researchUrl(env: Deps['env']): string {
-  const url = env.DATABASE_URL;
-  try { if (url && new URL(assertLocalDatabaseUrl(url)).pathname === '/ptr_research') return url; } catch { /* reported below without the value */ }
+/** Owner-only explicit maintenance scope; serving credentials and ambient DATABASE_URL never suffice. */
+function maintenanceUrl(raw: string | undefined): string {
+  try {
+    if (raw) {
+      const parsed = new URL(assertLocalDatabaseUrl(raw));
+      if (decodeURIComponent(parsed.username) === 'ptr_split_owner'
+        && ['/ptr_split_test', '/ptr_split_research'].includes(parsed.pathname)) return raw;
+    }
+  } catch { /* reported below without the value */ }
   throw new ReviewError('database_url');
 }
 /** Every statement runs in a read-only transaction (client setting, so the URL guard is unchanged). */
 export function readOnlyPool(url: string): Pool {
-  const pool = new Pool({ connectionString: assertLocalDatabaseUrl(url), max: 1, connectionTimeoutMillis: 3000, options: '-c default_transaction_read_only=on -c statement_timeout=30000' });
+  const pool = new Pool({ connectionString: maintenanceUrl(url), max: 1, connectionTimeoutMillis: 3000, options: '-c default_transaction_read_only=on -c statement_timeout=30000' });
   pool.on('error', () => undefined);
   return pool;
 }
@@ -196,7 +201,7 @@ function renderSheet(day: string, seed: number, rows: (Candidate & { label: stri
 
 async function sample(argv: string[], deps: Deps): Promise<Record<string, number | boolean>> {
   const args = parseArgs(argv);
-  const url = researchUrl(deps.env);
+  const url = maintenanceUrl(deps.env.PTR_LLM_MAINTENANCE_DATABASE_URL);
   const s8Dirs: { dir: string; name: string }[] = [];
   for (const arg of args.s8) { const found = await insideS8(deps.root, arg); if (!s8Dirs.some(d => d.dir === found.dir)) s8Dirs.push(found); }
   const dir = await reviewDir(deps.root);
@@ -212,16 +217,19 @@ async function sample(argv: string[], deps: Deps): Promise<Record<string, number
   try {
     const mode = await pool.query('SHOW default_transaction_read_only');
     if (mode.rows[0]?.default_transaction_read_only !== 'on') throw new ReviewError('not_read_only');
+    const identity = (await pool.query('SELECT current_database() AS database, current_user AS username')).rows[0];
+    if (identity?.database !== new URL(url).pathname.slice(1) || identity.username !== 'ptr_split_owner')
+      throw new ReviewError('database_identity');
     dbRows = (await pool.query(
       `SELECT t.id, t.owner_id, s.persona_id, v.document->>'reviewStatus' AS review_status, t.finished_at, t.user_text, t.reply
-         FROM turns t JOIN sessions s ON s.id = t.session_id
-         JOIN persona_versions v ON v.persona_id = s.persona_id AND v.revision = s.persona_revision
+         FROM app.turns t JOIN app.sessions s ON s.id = t.session_id
+         JOIN llm.persona_versions v ON v.persona_id = s.persona_id AND v.revision = s.persona_revision
         WHERE t.state = 'completed' AND t.reply IS NOT NULL AND t.created_at >= $1 AND t.owner_id LIKE 'local-%'
           AND COALESCE(v.document->>'reviewStatus', '') <> 'synthetic'`,
       [new Date(deps.now.getTime() - args.sinceDays * DAY_MS)])).rows;
     // Labels come from every real-person persona, not the window, so P<n> stays the same between weekly sheets.
     personaIds = (await pool.query(
-      `SELECT p.id FROM personas p JOIN persona_versions v ON v.persona_id = p.id AND v.revision = p.current_revision
+      `SELECT p.id FROM llm.personas p JOIN llm.persona_versions v ON v.persona_id = p.id AND v.revision = p.current_revision
         WHERE COALESCE(v.document->>'reviewStatus', '') <> 'synthetic' ORDER BY p.id`)).rows.map(row => text(row.id));
   } finally { await pool.end(); }
 

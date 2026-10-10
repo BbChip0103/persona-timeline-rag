@@ -306,7 +306,8 @@ def test_evaluate_setup_only_module_opens_runs_closes_on_one_loop(monkeypatch, c
         lifecycle.append("run")
         return {"failedScores": 0, "missingScores": 0, "taskFailures": 0}
 
-    monkeypatch.setattr(cli.importlib, "import_module", lambda name: NS(setup=setup))
+    # Patch this CLI's injection surface, not stdlib importlib used by cold SDK imports.
+    monkeypatch.setattr(cli, "importlib", NS(import_module=lambda name: NS(setup=setup)))
     monkeypatch.setattr(experiments, "run_framework_experiment_async", run)
     assert cli.main(["evaluate", "--task", "synthetic.setup.only"]) == 0
     assert lifecycle == ["setup", "run", "close", "telemetry-close"]

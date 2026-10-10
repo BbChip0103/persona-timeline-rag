@@ -1,5 +1,30 @@
 # Framework observability, evaluation and human review
 
+## Current Python path and review boundary
+
+The default `pnpm evaluate` invokes `ptr-llm evaluate` in the Python LLM service.
+The TypeScript framework experiment commands described below remain explicit
+legacy/adaptor tools, not the default worker. Native Python dataset experiments
+record explicit case input/output and can enqueue their own experiment targets
+for human review. `--existing-dataset` does not import the hello fixture: it reads
+one explicit UTC Langfuse dataset snapshot and records that `datasetVersion` in
+run provenance; original case/rubric revisions stay on imported item metadata.
+
+Ordinary runtime root/model traces deliberately do not author raw user/model
+input/output, even when `capture_content` is set. That flag is not a runtime
+content-capture feature. Automatic production-turn sampling into the central
+Langfuse annotation queue is not wired; do not claim that all historical human
+annotations or production review have migrated. The existing **local** weekly
+sampler is supported against the split app/LLM schemas with explicit owner-only
+read-only maintenance access; see [review sampling](review-sampling.md).
+
+No daily retention scheduler is deployed by this repository. Native split-store
+maintenance is an explicit dry-run-first owner command, described in the
+[Python split operator guide](python-llm-split.md). Langfuse dataset-item deletion
+is logical latest-version removal on pinned server 4.56.0: older dataset payload
+versions remain. Latest-list emptiness is not physical erasure; historical
+dataset raw-content erasure remains an unresolved deployment acceptance gate.
+
 ## Contract and versions
 
 - Langfuse **server v4** is distinct from the JS SDK version. This migration uses
@@ -197,8 +222,9 @@ breach or scope mismatch aborts with zero writes. Observations v2 is read with
 fixed time cutoff, logical-root filter, environment scope and cursor pagination.
 Trace IDs are deduplicated and submitted in batches of <=1000 to
 `DELETE /api/public/traces`. This removes linked observations/scores through
-Langfuse. Named queue items and saved dataset content are separately deleted
-via supported item APIs. Historical imports retain their original retention
+Langfuse. Named queue items are separately deleted via supported item APIs. Dataset
+item deletion removes the latest logical item, not its retained historical
+versions; this CLI does not establish physical raw-content erasure. Historical imports retain their original retention
 clock, so reimport does not make old raw content young again. No deprecated
 `DELETE /datasets/:name/runs/:run` calls or direct ClickHouse/Postgres mutations.
 
@@ -213,7 +239,7 @@ Storage scope beyond the CLI:
 | Scope | Required deletion/retention control |
 |---|---|
 | Trace/observation/score rows | Scheduled project/environment CLI + server workers |
-| Saved dataset raw values / annotations | Explicit named dataset/queue item deletion |
+| Saved dataset raw values / annotations | Queue deletion supported; dataset history physical erasure unresolved on pinned v4.56.0 |
 | Uploaded blobs/media and temporary export blobs | Dedicated bucket/prefix expiration, <=90-day policy consistent with product retention |
 | Versioned object non-current data and delete markers | Non-current version expiration + expired marker cleanup, not DeleteObject alone |
 | ClickHouse system logs | Admin-defined system-log TTL; not trace API retention |
@@ -368,7 +394,8 @@ On the newly generated synthetic six-service Langfuse **4.56.0** stack:
   confirmed4 persisted `ANNOTATION` scores (initial read was eventually stale).
 - A deliberately aged synthetic fixture in separate `synthetic-retention`
   scope produced dry-run inventory1 trace/1 dataset item/1 review item with no
-  mutation; confirmed supported deletion then yielded post-read0/0/0.
+  mutation; confirmed supported deletion then yielded latest-list post-read0/0/0.
+  Dataset history was not erased by that check; this was logical deletion only.
 - CLI injection of an explicit temporary synthetic task module completed2
   cases0fail without model calls; current injected modules additionally require
   explicit scorePolicy (covered by regression tests).

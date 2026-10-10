@@ -12,7 +12,7 @@ import stat
 import threading
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -167,6 +167,9 @@ def migrate_dataset(client: Any, name: str, migration: EvaluationMigration) -> d
             "managedBy": "ptr-framework",
         }
         if historical:
+            # Shared project retention uses these top-level fields in both SDK languages.
+            metadata["originalRunAt"] = historical.originalRunAt
+            metadata["originalVersion"] = historical.originalVersion
             metadata["historicalArchive"] = {
                 **historical.model_dump(mode="json"),
                 "notANewExecution": True,
@@ -453,7 +456,12 @@ def run_framework_experiment(
     telemetry: Any = None,
     persistence_timeout: float = 20,
     review_dimensions: list[dict[str, Any]] | None = None,
+    dataset_version: datetime | None = None,
 ) -> dict[str, Any]:
+    if dataset_version is not None and (
+        not isinstance(dataset_version, datetime) or dataset_version.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("Dataset version requires explicit UTC timestamp")
     rules = {r["name"]: r for r in score_policy.get("rules", [])}
     if (
         not rules
@@ -552,7 +560,11 @@ def run_framework_experiment(
             failures["failedScores"] += 1
         return scores or [Evaluation(name="evaluation_invalid", value=0)]
 
-    dataset = client.get_dataset(dataset_name)
+    dataset = (
+        client.get_dataset(dataset_name, version=dataset_version)
+        if dataset_version is not None
+        else client.get_dataset(dataset_name)
+    )
     if not dataset.items:
         raise ValueError("Regression dataset must not be empty")
     # Invalid policy must fail BEFORE any task (and possible paid submission).

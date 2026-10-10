@@ -8,6 +8,7 @@ import importlib
 import inspect
 import json
 import sys
+from datetime import UTC, datetime
 
 
 def review(args: argparse.Namespace) -> int:
@@ -57,18 +58,22 @@ def evaluate(args: argparse.Namespace) -> int:
     telemetry = FrameworkTelemetry(config)
     client = telemetry.client
     try:
-        migration = (
-            load_approved_migration(args.private_file, args.approval)
-            if (args.private_file)
-            else domain.synthetic_domain_migration()
-        )
         if args.existing_dataset and (not args.dataset or args.private_file):
             raise ValueError("Existing dataset mode requires dataset and no import")
-        imported = (
-            {"items": 0}
-            if args.existing_dataset
-            else migrate_dataset(client, args.dataset, migration)
-        )
+        # Freeze the native dataset state, not an unrelated synthetic case revision.
+        # The runner fetches this same UTC version and passes it to the native SDK.
+        dataset_version = datetime.now(UTC) if args.existing_dataset else None
+        if dataset_version is not None:
+            imported = {"items": 0}
+            case_version = "langfuse-dataset@" + dataset_version.isoformat()
+        else:
+            migration = (
+                load_approved_migration(args.private_file, args.approval)
+                if args.private_file
+                else domain.synthetic_domain_migration()
+            )
+            imported = migrate_dataset(client, args.dataset, migration)
+            case_version = migration.revision
         if args.private_file and not args.task:
             print(json.dumps(imported))
             return 0
@@ -103,8 +108,13 @@ def evaluate(args: argparse.Namespace) -> int:
                     args.run,
                     {
                         "code": config.release,
-                        "cases": migration.revision,
+                        "cases": case_version,
                         "engine": "injected-app" if args.task else "native-core-boundary-no-model",
+                        **(
+                            {"datasetVersion": dataset_version.isoformat()}
+                            if dataset_version is not None
+                            else {}
+                        ),
                     },
                     selected_task,
                     selected_evaluators,
@@ -112,6 +122,7 @@ def evaluate(args: argparse.Namespace) -> int:
                     queue_name=args.review_queue,
                     telemetry=telemetry,
                     review_dimensions=dimensions,
+                    dataset_version=dataset_version,
                 )
             finally:
                 if close:
@@ -147,6 +158,12 @@ def main(argv: list[str] | None = None) -> int:
         return ingest_main(argv[1:])
     parser = argparse.ArgumentParser(description="Python LLM service tools")
     commands = parser.add_subparsers(dest="command", required=True)
+    retention = commands.add_parser("retention")
+    retention.add_argument("--days", type=int, default=90)
+    retention.add_argument("--limit", type=int, default=100)
+    retention.add_argument("--apply", action="store_true")
+    retention.add_argument("--confirm-database")
+    commands.add_parser("checkpoint-setup")
     evaluation = commands.add_parser("evaluate")
     evaluation.add_argument("--dataset", default="ptr-synthetic-domain-regression")
     evaluation.add_argument("--run", default="synthetic-python")
@@ -179,6 +196,18 @@ def main(argv: list[str] | None = None) -> int:
         persona.add_argument("--" + flag)
     args = parser.parse_args(argv)
     try:
+        if args.command == "retention":
+            from ptr_llm.retention import run_retention
+
+            print(json.dumps(asyncio.run(run_retention(args))))
+            return 0
+        if args.command == "checkpoint-setup":
+            from ptr_llm.providers.checkpoints import setup_call_checkpoints
+            from ptr_llm.retention import maintenance_url
+
+            asyncio.run(setup_call_checkpoints(maintenance_url()))
+            print(json.dumps({"checkpointSchemaReady": True}))
+            return 0
         if args.command == "review":
             return review(args)
         if args.command == "persona":

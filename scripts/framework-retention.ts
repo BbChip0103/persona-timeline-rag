@@ -11,6 +11,8 @@ export interface RetentionOptions {
   datasetNames?: string[];
   queueIds?: string[];
   apply?: boolean;
+  /** Accept version tombstones only; historical dataset payloads are not erased. */
+  allowLogicalDatasetDeletion?: boolean;
   confirmProject?: string;
   maxEntities?: number;
 }
@@ -25,6 +27,9 @@ export interface RetentionPlan {
   applied: boolean;
   /** APIs submit asynchronous deletion; this is not proof of physical erasure. */
   deletionSubmitted: boolean;
+  datasetDeletionSemantics: 'version-tombstone';
+  /** Public item DELETE preserves historical versions; never claim hard erasure. */
+  historicalDatasetErasureVerified: false;
 }
 const apiOptions = { maxRetries: 0, timeoutInSeconds: 5 };
 function expired(timestamp: string, cutoff: string): boolean { return Number.isFinite(Date.parse(timestamp)) && Date.parse(timestamp) < Date.parse(cutoff); }
@@ -41,7 +46,8 @@ export async function retainFrameworkData(client: LangfuseClient, options: Reten
   if (projects.data.length !== 1) throw new Error('Retention requires a single project-scoped credential');
   const projectId = projects.data[0].id;
   if (options.apply && options.confirmProject !== projectId) throw new Error('Destructive retention requires exact project confirmation');
-  const plan: RetentionPlan = { projectId, environment: options.environment, from: new Date(options.from).toISOString(), cutoff, traceIds: [], datasetItems: [], queueItems: [], applied: false, deletionSubmitted: false };
+  const plan: RetentionPlan = { projectId, environment: options.environment, from: new Date(options.from).toISOString(), cutoff, traceIds: [], datasetItems: [], queueItems: [], applied: false, deletionSubmitted: false,
+    datasetDeletionSemantics: 'version-tombstone', historicalDatasetErasureVerified: false };
   const enforceLimit = () => { if (plan.traceIds.length + plan.datasetItems.length + plan.queueItems.length > maxEntities) throw new Error('Retention plan limit exceeded; subdivide the time range'); };
   const ids = new Set<string>();
   const cursors = new Set<string>();
@@ -84,7 +90,11 @@ export async function retainFrameworkData(client: LangfuseClient, options: Reten
     }
   }
   if (!options.apply) return plan;
-  // Remove explicit review links and saved raw content before submitting trace deletion.
+  // Check after complete inventory, before any write (including review/trace deletion).
+  if (plan.datasetItems.length > 0 && options.allowLogicalDatasetDeletion !== true) {
+    throw new Error('Logical dataset deletion requires explicit opt-in; historical dataset erasure is unsupported');
+  }
+  // Remove review links and logically remove dataset items; history remains.
   for (const item of plan.queueItems) await client.api.annotationQueues.deleteQueueItem(item.queueId, item.id, apiOptions);
   for (const item of plan.datasetItems) await client.api.datasetItems.delete(item.id, apiOptions);
   for (let start = 0; start < plan.traceIds.length; start += 1000) await client.api.trace.deleteMultiple({ traceIds: plan.traceIds.slice(start, start + 1000) }, apiOptions);
@@ -103,7 +113,8 @@ async function main(): Promise<void> {
   const client = createLangfuseClient(evaluationConfig());
   try {
     const plan = await retainFrameworkData(client, { environment, from, datasetNames: values('--dataset'), queueIds: values('--queue'),
-      apply: args.includes('--apply'), confirmProject: value('--confirm-project') });
+      apply: args.includes('--apply'), confirmProject: value('--confirm-project'),
+      allowLogicalDatasetDeletion: args.includes('--allow-logical-dataset-deletion') });
     console.log(JSON.stringify(plan));
   } finally { await client.shutdown(); }
 }
