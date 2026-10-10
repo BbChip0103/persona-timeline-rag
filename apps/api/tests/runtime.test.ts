@@ -46,11 +46,11 @@ test('turns always run through Redis workers: queue knobs are validated and the 
 const framework={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'litellm',
   PTR_LITELLM_BASE_URL:'http://127.0.0.1:57460/v1',PTR_LITELLM_API_KEY:'synthetic_proxy_token_abcdefghij',
   PTR_GUARDRAILS_URL:'http://127.0.0.1:57464',PTR_GUARDRAILS_TOKEN:'synthetic_guard_token_abcdefghij'};
-test('single framework route uses actual LangChain LiteLLM adapter, durable saver, Guardrails and execution fencing',async()=>{
+test('nonbillable turn route checkpoints costly model calls only; raw adapter stays available for drafts',async()=>{
   const runtime=createRuntime(framework);
   expect(runtime.provider).toBeInstanceOf(LiteLLMTextProvider);expect(runtime.executionStore).toBe(runtime.leases);
   const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
-  expect(options.guardrails).toBeDefined();expect(options.agentCheckpoint).toBeDefined();expect(options.observeStage).toBeDefined();
+  expect(options.guardrails).toBeDefined();expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).not.toBe(runtime.provider);expect(options.observeStage).toBeDefined();
   expect(options.semanticSearch).toBe(false);await runtime.close?.();
 });
 test('legacy chat routes are rejected rather than retained as hidden parallel defaults',()=>{
@@ -132,4 +132,17 @@ describe('persona catalogue: generated list + authored list ',()=>{
       await expect(readPersonaCatalogue({...base,PTR_AUTHORED_PERSONAS_FILE:authored},databaseUrl)).rejects.toThrow();
     } finally {await rm(dir,{recursive:true,force:true});}
   });
+});
+
+test('paid model calls use their existing ledger instead of another checkpoint wrapper',async()=>{
+  const runtime=createRuntime({...framework,PTR_LITELLM_BILLABLE:'1',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true'});
+  const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
+  expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).toBe(runtime.provider);
+  expect(runtime.billable).toBe(true);await runtime.close?.();
+});
+test('fake domain generation has no stage or model checkpoint wrapper',async()=>{
+  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl});
+  const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
+  expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).toBe(runtime.provider);
+  await runtime.close?.();
 });

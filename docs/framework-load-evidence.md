@@ -60,6 +60,13 @@ never connect to this infrastructure.
 
 ## Measurement meanings
 
+The original numerical results below are historical evidence for the initial
+all-stage-checkpoint implementation. They are not rewritten or retuned by the
+later user-approved call-only policy. Original checkpoint counts/bytes covered
+only the outer `turn:` rows, omitting child threads/blobs/pending writes.
+
+### Original protocol
+
 End-to-end latency spans POST admission through terminal-state HTTP observation.
 It includes bounded polling resolution; it is not model-only latency. Worker peak is
 sampled at 20 ms and is a lower bound. Queue-wait quantiles are histogram upper bucket
@@ -70,6 +77,24 @@ Trace/cardinality/static stage-name ingestion checks and observation stage laten
 use the real Langfuse v4 Observations API v2 after shutdown, with bounded session filters,
 cursor pagination and core/basic/metrics fields only (no IO content). Reads never
 contaminate the timed load. Stage latency is an observed span duration, not a profiler.
+
+### Updated call-only protocol
+
+Current serving persists only costly nonbillable turn model-call receipts; paid
+model/Jev reuse their existing request ledgers. Cheap graph stages restart, and
+Guardrails/evidence/fencing remain mandatory. Current load tooling counts scoped
+model-call plus legacy turn/character threads across checkpoints, checkpoint_blobs
+and checkpoint_writes. The aggregate is live row payload, not physical disk/WAL/
+index or network traffic. The old original figures retain their old definition.
+
+Timed stages no longer scrape worker metrics every20ms: the new worker's collectors
+perform live DB/Redis reads, unlike the old worker's in-memory collector. Before/
+after metrics remain available; an unmeasured worker peak is unavailable, not an
+invented configured concurrency. Terminal HTTP polling is still100ms, so closed-
+loop finite-batch throughput is not sustained production capacity. Exact engine
+success/submission deltas, zero failure/timeout and nonfallback outputs are checked.
+The frozen original numeric LOAD_GATE is unchanged. Post-change results are
+recorded separately below; historical observations are not substituted.
 
 ## Current evidence
 
@@ -213,3 +238,82 @@ and owner/secret-safe DTO behavior remain intact. Native v4 readback: 6 traces /
 51 observations / 10 stages. HTTP-app experiment: 1 case, failed scores 0, missing
 scores 0, task failures 0, 1 trace, exactly 1 synthetic submission. Owned application
 and browser handles closed normally. Infrastructure remains intentionally running.
+
+
+### Call-only persistence — isolated synthetic verification, 2026-10-11 KST
+
+Current serving has no turn/character stage saver. A durable nonbillable call holds
+only its fingerprint and response receipt; expensive paid/Jev calls retain their
+existing ledgers. Actual PostgreSQL recovery destroys the first pool/saver and uses
+a fresh worker/pool: model calls stay at one while retrieval/safety/guards rerun.
+The pending-successful-task receipt case also replays without a new model request.
+Old fences cannot commit; successful completion leaves one assistant message.
+
+A bounded policy-only diagnostic compares the archived all-stage framework code
+with current code through the **same** LiteLLM/Guardrails/Langfuse stack. Four runs
+per policy, alternating order twice; each run warms16 and measures64 turns with
+clients8/worker4/pool8 and the same100ms engine. No active metrics sampler or query
+profiler runs inside measurements. Worker time is the existing `turn_finished`
+wall clock after execution claim, not pure CPU or queue wait. Warm-ups are excluded.
+All512 measured turns and128 warm-ups completed with one successful engine request
+per turn, identical full output-shape hash, no model errors/timeouts or fallback.
+
+| Order | Policy | Turns/s | Mean worker ms | HTTP p95 ms |
+|---|---|---:|---:|---:|
+| forward | previous | 15.8626 | 233.297 | 710.859 |
+| forward | current | 21.1367 | 175.562 | 424.441 |
+| reverse | current | 21.9919 | 171.625 | 422.474 |
+| reverse | previous | 21.9204 | 175.266 | 423.020 |
+| forward2 | previous | 18.7336 | 199.516 | 555.223 |
+| forward2 | current | 21.3270 | 174.797 | 423.261 |
+| reverse2 | current | 21.9600 | 170.953 | 425.661 |
+| reverse2 | previous | 21.9773 | 174.359 | 523.033 |
+
+Across four runs per policy, worker means are195.609ms before and173.234ms current;
+mean per-run completed rates are19.6235 and21.6039 turns/s. **Order variance is
+material:** reverse runs nearly tie, so these means do not establish a universal
+speedup or identify a production bottleneck. No production capacity forecast,
+CPU attribution or exact causal allocation is claimed.
+
+Storage is much less ambiguous for this authored single-model-call fixture:
+84→13 rows/turn and ~153,893→4,877 complete row bytes/turn across all saver tables
+(**96.83% less row payload**). Current per64 turns: checkpoints192/108,992 bytes,
+blobs384/95,040 bytes, writes256/108,096 bytes; no legacy stage rows. This is not
+physical disk/WAL/index I/O, and response length/tool rounds affect storage.
+One call-level checkpoint still entails multiple framework records/transactions.
+
+A fresh original-baseline comparison uses the unchanged numeric LOAD_GATE and
+updated no-active-sampler protocol, not the64-turn policy diagnostic:
+
+| Metric | Original baseline COPY | Current call-only framework |
+|---|---:|---:|
+| Measured completed/errors | 32/0 | 32/0 |
+| Turns/s | 32.9856 | 20.4182 |
+| HTTP p95 ms | 338.437 | 532.764 |
+| Successful submissions / failures / timeouts | 32/0/0 | 32/0/0 |
+| Nonfallback outputs | 32 | 32 |
+| Observed worker peak | unavailable | unavailable |
+| Checkpoint rows / row bytes | 0/0 | 416/156,064 |
+| Native traces / observations | unavailable | 32/320 |
+
+All nine gates pass; throughput ratio **0.619004 ≥0.60**. The current framework
+is still **38.10% slower** than the original topology in this finite
+batch. This is a fresh run, not an improvement percentage against the historical
+19.2926 result; changed sampling and run variance prevent that inference. Both
+32-turn outputs have the same full status/content/limitations hash. Paid/GPU calls0.
+
+
+Final verification on the call-only implementation: `pnpm check` passes
+1,492 standard tests plus17 isolated OTel/evaluation tests, TypeScript and ESLint;
+94 explicitly gated tests remain skipped in that offline suite. Separately, actual
+isolated PostgreSQL/Redis tests pass21/21, covering fresh-saver costly receipt
+recovery, pending writes, execution fencing, queue lock loss and both retention
+families. Final API/worker/Next/Chromium smoke passes23/23 gates, including real
+HTTP-app evaluation with one successful request/one trace and zero failed/missing
+scores. Run-scoped storage includes browser/experiment sessions:79 model rows /
+30,665 complete row bytes / zero legacy stage rows. Native sampled smoke readback:
+6 traces,55 observations, all10 safe stage names. Independent final read-only
+review reports no blockers. Runner-owned application/browser processes closed;
+the isolated infrastructure remains available. Real GPU/model quality/private
+imports/production deployment and Python LLM-service separation are not validated
+or implemented by this persistence change.

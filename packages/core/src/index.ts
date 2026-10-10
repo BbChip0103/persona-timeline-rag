@@ -18,3 +18,4 @@ export * from './persona-publish';
 export * from './reply-texts';
 export * from './reply-guard';
 export * from './guardrails';
+export * from './checkpointed-provider';

@@ -337,7 +337,8 @@ execution, original store ownership/lease/fencing and domain validators. Only
 the history store port is adapted for frozen assistant history (same original
 harness semantics); evolving cases use normal committed history. It rejects
 concurrent cases and resets the frozen history after each case. Supply the
-existing repositories/provider/ledger/checkpointer/Guardrails in `core`, then
+existing repositories/turn-provider/ledger/Guardrails in `core` (the turn provider
+may checkpoint expensive calls; stage graphs do not), then
 close the returned adapter; no independent evaluation service is added. Frozen assistant history cannot be created by replaying fresh model
 answers through the public API: fixed-history requests fail unless an existing
 in-process runtime supports that exact contract. These are explicit coverage

@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { Annotation, END, START, StateGraph, task, type BaseCheckpointSaver } from '@langchain/langgraph';
+import { randomUUID } from 'node:crypto';
+import { Annotation, END, START, StateGraph, task } from '@langchain/langgraph';
 import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatMessage, type Persona, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type ProviderMessage, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, LEASE_LOST, PROVIDER_DEADLINE, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
@@ -26,8 +26,6 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
   semanticSearch?:boolean;
   /** Required by the production composition; omitted only in the isolated domain test harness. */
   guardrails?:Pick<GuardrailsClient,'validateInput'|'validateReply'>;
-  /** Composition-owned durable saver; graph threads are bound to immutable turns, never sessions. */
-  agentCheckpoint?:{checkpointer:BaseCheckpointSaver};
   /** A bounded tracing adapter; stages have no credentials or raw text in their names. */
   observeStage?:<T>(name:string,work:()=>Promise<T>)=>Promise<T>;
   /** Parent trace surrounds the actual queued turn, not a standalone adapter smoke run. */
@@ -57,7 +55,7 @@ interface TurnSnapshot {
   cardPath:boolean;replyLanguage:string;level:ReturnType<typeof speechLevel>;
 }
 interface TurnFrame {
-  binding:string;snapshot?:TurnSnapshot;memoryTrace?:NonNullable<ChatReply['retrievalContext']>;
+  snapshot?:TurnSnapshot;memoryTrace?:NonNullable<ChatReply['retrievalContext']>;
   safety?:InputSafetyTrace;combinedIntent?:IntentClassification;intentFailure?:ReturnType<typeof classifierFallbackReason>;
   intent?:TurnIntent;routing?:ChatReply['intentRouting'];deflect?:boolean;safetyCategory?:Exclude<SafetyCategory,'prompt_injection'>;
   sources:SourcePost[];memorySources:SourcePost[];output?:TurnOutput;agent?:ChatReply['agent'];
@@ -258,9 +256,6 @@ export class ChatService {
       check();const applied=await store.transitionTurn(turn.id,[...activeStates],next);
       if(!applied){controller.abort(LEASE_LOST);throw new CoreError('TURN_FAILED','TURN_ABORTED');}
     };
-    const binding=createHash('sha256').update(JSON.stringify({revision:'turn-langgraph-v1',promptRevision:AGENT_PROMPT_REVISION,agentRevision:AGENT_RUNTIME_REVISION,session,value,maxToolRounds:this.options.maxToolRounds,guardrails:!!this.options.guardrails,
-      inputSafety:this.options.inputSafety?{thresholds:this.options.inputSafety.thresholds,classifier:this.options.inputSafety.classifier.name}:undefined,
-      intentClassifier:this.options.intentClassifier?{minConfidence:this.options.intentClassifier.minConfidence,classifier:this.options.intentClassifier.classifier.name}:undefined})).digest('hex');
     const initialize=task('turn-snapshot',async():Promise<TurnFrame>=>{
       if(session.retrievalMode==='semantic'&&this.options.semanticSearch===false)throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
       const history=await store.history(session.id,session.ownerId);
@@ -287,7 +282,7 @@ export class ChatService {
       const rule=signals.sensitive?'sensitive_pattern' as const:signals.explicitIntent==='unsupported'?'client_unsupported' as const:undefined;
       const combined=!!this.options.inputSafety&&!!this.options.intentClassifier&&!control&&needsIntentClassifier(signals);
       const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
-      return structuredClone({binding,sources:[],memorySources:[],served:[],snapshot:{persona,history,promptHistory,context,query,ownedPrevious,references,ambiguous,signals,recentUserTurns,control,combined,rule,
+      return structuredClone({sources:[],memorySources:[],served:[],snapshot:{persona,history,promptHistory,context,query,ownedPrevious,references,ambiguous,signals,recentUserTurns,control,combined,rule,
         cardPath,replyLanguage:cardPath?utteranceLanguage(value.text,session.language):session.language,level:speechLevel(persona)},
         memoryTrace:{revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]}});
     });
@@ -364,7 +359,6 @@ export class ChatService {
       let memoryTrace=frame.memoryTrace!;
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({provider,persona,history:promptHistory,text:value.text,sources:frame.sources,signal:controller.signal,
         maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),
-        ...(this.options.agentCheckpoint?{checkpoint:{checkpointer:this.options.agentCheckpoint.checkpointer,threadId:`character:${turn.id}`}}:{}),
         ...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!frame.deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
           check();const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
@@ -375,7 +369,7 @@ export class ChatService {
         }}:{}),
       }):undefined;
       const rawReply=agentRun?.rawReply??await provider.generate(experiment?.messages??buildPrompt(persona,promptHistory,value.text,frame.sources,frame.intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
-      // The task persists this result before the node's abort check; a resumed guard/evidence failure never regenerates.
+      // Cheap stages restart on a new attempt; the injected provider alone retains costly completed responses.
       if(agentRun?.agent.toolCalls) {
         const query=agentRun.agent.steps.filter(step=>step.phase==='tool').at(-1)?.query;
         if(query)memoryTrace={...memoryTrace,action:'search',query};
@@ -493,7 +487,7 @@ export class ChatService {
         await transition('validating');check();
         if(!await store.completeTurn(turn.id,frame.reply!)) {
           // Ownership may change after the preceding transition. A rejected final write must leave this
-          // node resumable, not mark the shared turn checkpoint complete with no committed assistant message.
+          // attempt uncommitted so a fresh fenced worker can restart the cheap stages safely.
           controller.abort(LEASE_LOST);throw new CoreError('TURN_FAILED','TURN_ABORTED');
         }
         this.options.onTurnCompleted?.({turnId:turn.id,reply:frame.reply!});
@@ -502,17 +496,7 @@ export class ChatService {
       .addEdge(START,'initialize').addEdge('initialize','safety').addEdge('safety','intent').addEdge('intent','retrieve')
       .addConditionalEdges('retrieve',({frame}:TurnGraphState)=>frame.output?'evidence':'generate',['evidence','generate'])
       .addEdge('generate','evidence').addEdge('evidence','output_guard').addEdge('output_guard','persist').addEdge('persist',END);
-    const graph=builder.compile(this.options.agentCheckpoint?{checkpointer:this.options.agentCheckpoint.checkpointer}:{});
-    const config={recursionLimit:32,...(this.options.agentCheckpoint?{configurable:{thread_id:`turn:${turn.id}`}}:{})};
-    let resume=false;
-    if(this.options.agentCheckpoint) {
-      const snapshot=await graph.getState(config),saved=(snapshot.values as Partial<TurnGraphState>).frame;
-      if(saved) {
-        if(saved.binding!==binding)throw new CoreError('INVALID_INPUT','CHECKPOINT_TURN_MISMATCH');
-        if(!snapshot.next.length)return;
-        resume=true;
-      }
-    }
-    await graph.invoke(resume?null:{frame:{binding,sources:[],memorySources:[],served:[]}},config);
+    const graph=builder.compile();
+    await graph.invoke({frame:{sources:[],memorySources:[],served:[]}},{recursionLimit:32});
   }
 }

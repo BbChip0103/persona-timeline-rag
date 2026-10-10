@@ -18,6 +18,28 @@ import { percentile, sseParser } from './loadtest-lib';
 
 export const sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 export function demand(condition:unknown,code:string):asserts condition {if(!condition)throw new Error(code);}
+export interface CheckpointStorage {
+  rows:number;bytes:number;modelRows:number;legacyStageRows:number;rowBytesOnly:true;
+  tables:Record<'checkpoints'|'checkpoint_blobs'|'checkpoint_writes',{rows:number;bytes:number}>;
+}
+/** All three saver tables, scoped by exact turn IDs. Bytes measure complete stored rows, not disk or WAL I/O. */
+export async function checkpointStorage(pool:Pool,turnIds:string[]):Promise<CheckpointStorage> {
+  const result:CheckpointStorage={rows:0,bytes:0,modelRows:0,legacyStageRows:0,rowBytesOnly:true,
+    tables:{checkpoints:{rows:0,bytes:0},checkpoint_blobs:{rows:0,bytes:0},checkpoint_writes:{rows:0,bytes:0}}};
+  if(!turnIds.length)return result;
+  const pattern='^model:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{64}$';
+  const rows=await pool.query(Object.keys(result.tables).map(table=>`SELECT '${table}' AS table_name,count(*)::int AS rows,
+    COALESCE(sum(pg_column_size(c)),0)::bigint AS bytes,count(*) FILTER(WHERE c.thread_id ~ '${pattern}')::int AS model_rows,
+    count(*) FILTER(WHERE c.thread_id=ANY($1::text[]))::int AS legacy_rows FROM public.${table} c
+    WHERE c.thread_id=ANY($1::text[]) OR (c.thread_id ~ '${pattern}' AND split_part(c.thread_id,':',2)=ANY($2::text[]))`).join(' UNION ALL '),
+  [turnIds.flatMap(id=>[`turn:${id}`,`character:${id}`]),turnIds]);
+  for(const row of rows.rows) {
+    const table=row.table_name as keyof CheckpointStorage['tables'];
+    const entry={rows:Number(row.rows),bytes:Number(row.bytes)};result.tables[table]=entry;
+    result.rows+=entry.rows;result.bytes+=entry.bytes;result.modelRows+=Number(row.model_rows);result.legacyStageRows+=Number(row.legacy_rows);
+  }
+  return result;
+}
 /** Only newly generated, private test env files. Never source a shell or read the research .env. */
 export async function readGeneratedEnv(path:string):Promise<NodeJS.ProcessEnv> {
   demand(/^\/tmp\/ptr-fw-[A-Za-z0-9_.-]+\.env$/.test(path),'GENERATED_ENV_PATH_REQUIRED');
@@ -196,8 +218,8 @@ export async function smoke(source:NodeJS.ProcessEnv,appKey:NodeJS.ProcessEnv,we
     gates.dto=!JSON.stringify(complete).includes('"agent"')&&!JSON.stringify(complete).includes('"serving"');
     const again=await sendTurn(fleet,session,'smoke-hello');await sleep(250);const after=await engineCounts(source);
     gates.idempotency=again.id===turn.id&&after.submitted-before.submitted===1;
-    const checkpoint=(await pool.query('SELECT count(*)::int AS n FROM checkpoints WHERE thread_id=$1',[`turn:${turn.id}`])).rows[0].n;
-    gates.checkpoints=checkpoint>0;
+    let storage=await checkpointStorage(pool,[turn.id]);
+    gates.checkpoints=storage.modelRows>0&&storage.tables.checkpoints.rows>0&&storage.legacyStageRows===0;
     const captionSession=await createSession(fleet,data.personas[0]!.personId,true);
     const factual=await waitForTurn(fleet,(await sendTurn(fleet,captionSession,'smoke-evidence','파란책 게시물 기록을 알려주세요.',true)).id);
     gates.evidence=factual.state==='completed'&&!!factual.reply?.evidence.length&&factual.reply.evidence.every(e=>e.personId===data.personas[0]!.personId&&data.posts.some(p=>p.id===e.sourceId&&p.caption.includes(e.quote)));
@@ -264,8 +286,13 @@ export async function smoke(source:NodeJS.ProcessEnv,appKey:NodeJS.ProcessEnv,we
     await fleet.close();let traces:Awaited<ReturnType<typeof traceEvidence>>={count:0,observations:0,stageNames:[],stageLatencyMs:{}};
     await waitFor(async()=>{traces=await traceEvidence(env,[session,captionSession],traceStart);return traces.count>=5&&traces.observations>=5;},60000,'TRACE_INGESTION_TIMEOUT');
     gates.tracing=traces.stageNames.includes('model')&&traces.stageNames.includes('retrieve')&&traces.stageNames.includes('output_guard');
+    // Exact run-unique fixture persons include sessions created by browser and HTTP experiments too.
+    const scopedTurns=(await pool.query('SELECT t.id FROM turns t JOIN sessions s ON s.id=t.session_id WHERE s.person_id=ANY($1::text[])',
+      [data.personas.map(persona=>persona.personId)])).rows.map(row=>String(row.id));
+    storage=await checkpointStorage(pool,scopedTurns);
+    gates.checkpoints=gates.checkpoints&&storage.modelRows>0&&storage.legacyStageRows===0;
     if(!Object.values(gates).every(Boolean))throw Object.assign(new Error(`FUNCTIONAL_${Object.keys(gates).find(name=>!gates[name])?.toUpperCase()}_FAILED`),{evidence:{gates,traces,experiment}});
-    return {syntheticOnly:true,paidCalls:0,webIncluded:web,gates,checkpointRows:checkpoint,traces,experiment};
+    return {syntheticOnly:true,paidCalls:0,webIncluded:web,gates,checkpointRows:storage.rows,checkpointStorage:storage,traces,experiment};
   } finally {await fleet.close();await pool.end();}
 }
 if(process.argv[1]?.endsWith('framework-smoke.ts')) {

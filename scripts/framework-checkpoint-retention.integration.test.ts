@@ -15,10 +15,10 @@ const enabled=(()=>{if(!raw)return false;const u=new URL(raw);return u.hostname=
   async function fixture(expired:boolean,terminal=true) {
     const id=`synthetic-retention-${randomUUID()}`;const session:ChatSession={id,ownerId:'synthetic-retention-owner',personId:persona.personId,personaId:persona.id,personaRevision:persona.revision,language:'ko',timezone:'UTC',retrievalMode:'off',createdAt:new Date().toISOString()};
     await store.create(session,{id:randomUUID(),sessionId:id,turnId:null,role:'assistant',content:'synthetic',createdAt:session.createdAt});sessions.push(id);
-    const input={sessionId:id,clientRequestId:randomUUID(),text:'synthetic retention'};const {turn}=await store.reserveTurn(id,session.ownerId,input.clientRequestId,input.text,undefined,input);
+    const input={sessionId:id,clientRequestId:randomUUID(),text:'synthetic retention'};const {turn}=await store.reserveTurn(id,session.ownerId,input.clientRequestId,input.text);
     if(terminal)await store.transitionTurn(turn.id,['pending'],'failed','SYNTHETIC_DONE');
     if(expired)await pool.query("UPDATE turns SET created_at=now()-interval '91 days',finished_at=CASE WHEN state='failed' THEN now()-interval '91 days' ELSE NULL END WHERE id=$1",[turn.id]);
-    for(const thread of [`turn:${turn.id}`,`character:${turn.id}`]) {
+    for(const thread of [`turn:${turn.id}`,`character:${turn.id}`,`model:${turn.id}:${'a'.repeat(64)}`,`model:${turn.id}:${'b'.repeat(64)}`]) {
       threads.push(thread);const checkpoint={...emptyCheckpoint(),channel_values:{synthetic:'synthetic retention sentinel'},channel_versions:{synthetic:'1'}};
       const config=await saver.put({configurable:{thread_id:thread,checkpoint_ns:''}},checkpoint,{source:'input',step:-1,parents:{}},{synthetic:'1'});
       await saver.putWrites(config,[['synthetic','synthetic pending write']],`synthetic-task-${randomUUID()}`);
@@ -26,16 +26,35 @@ const enabled=(()=>{if(!raw)return false;const u=new URL(raw);return u.hostname=
     return turn.id;
   }
   async function counts(id:string) {
-    const result:number[]=[];for(const table of ['checkpoint_writes','checkpoint_blobs','checkpoints'])result.push((await pool.query(`SELECT count(*)::int AS n FROM public.${table} WHERE thread_id=ANY($1::text[])`,[[`turn:${id}`,`character:${id}`]])).rows[0].n);
+    const result:number[]=[];for(const table of ['checkpoint_writes','checkpoint_blobs','checkpoints'])result.push((await pool.query(`SELECT count(*)::int AS n FROM public.${table} WHERE thread_id=ANY($1::text[])`,[[`turn:${id}`,`character:${id}`,`model:${id}:${'a'.repeat(64)}`,`model:${id}:${'b'.repeat(64)}`]])).rows[0].n);
     return result;
   }
   test('dryrun preserves all rows; apply deletes only expired terminal threads across all three tables, never live/recent ones',async()=>{
     const expired=await fixture(true),recent=await fixture(false),active=await fixture(true,false),turnIds=[expired,recent,active];
     const before=await counts(expired);expect(before.every(count=>count>0)).toBe(true);
     const dry=await retainFrameworkCheckpoints(pool,{turnIds});expect(dry.turnIds).toEqual([expired]);expect(await counts(expired)).toEqual(before);
-    const applied=await retainFrameworkCheckpoints(pool,{turnIds,apply:true});expect(applied.turnIds).toEqual([expired]);expect(applied.deleted).toEqual({writes:2,blobs:2,checkpoints:2});
+    const applied=await retainFrameworkCheckpoints(pool,{turnIds,apply:true});expect(applied.turnIds).toEqual([expired]);expect(applied.deleted).toEqual({writes:4,blobs:4,checkpoints:4});
     expect(await counts(expired)).toEqual([0,0,0]);expect((await counts(recent)).every(count=>count>0)).toBe(true);expect((await counts(active)).every(count=>count>0)).toBe(true);
     expect((await retainFrameworkCheckpoints(pool,{turnIds,apply:true})).turnIds).toEqual([]);
+  });
+  test('discovers model-only orphan writes/blobs but rejects malformed fingerprints and wildcard turn scopes',async()=>{
+    const id=await fixture(true),onlyWrites=`model:${id}:${'c'.repeat(64)}`,onlyBlobs=`model:${id}:${'d'.repeat(64)}`;
+    const malformed=[`model:${id}:${'A'.repeat(64)}`,`model:${id}:${'e'.repeat(63)}`,`model:${id}:${'f'.repeat(64)}:extra`];
+    for(const thread of [onlyWrites,onlyBlobs,...malformed]) {
+      threads.push(thread);const checkpoint={...emptyCheckpoint(),channel_values:{synthetic:'sentinel'},channel_versions:{synthetic:'1'}};
+      const config=await saver.put({configurable:{thread_id:thread,checkpoint_ns:''}},checkpoint,{source:'input',step:-1,parents:{}},{synthetic:'1'});
+      await saver.putWrites(config,[['synthetic','pending']],`synthetic-${randomUUID()}`);
+    }
+    for(const table of ['checkpoint_writes','checkpoint_blobs','checkpoints']) {
+      await pool.query(`DELETE FROM public.${table} WHERE thread_id=ANY($1::text[])`,[[`turn:${id}`,`character:${id}`,`model:${id}:${'a'.repeat(64)}`,`model:${id}:${'b'.repeat(64)}`]]);
+      if(table!=='checkpoint_writes')await pool.query(`DELETE FROM public.${table} WHERE thread_id=$1`,[onlyWrites]);
+      if(table!=='checkpoint_blobs')await pool.query(`DELETE FROM public.${table} WHERE thread_id=$1`,[onlyBlobs]);
+    }
+    expect((await retainFrameworkCheckpoints(pool,{turnIds:[`${id}%`],apply:true})).turnIds).toEqual([]);
+    const result=await retainFrameworkCheckpoints(pool,{turnIds:[id],apply:true});
+    expect(result.threadIds.sort()).toEqual([onlyWrites,onlyBlobs].sort());expect(result.deleted).toEqual({writes:1,blobs:1,checkpoints:0});
+    for(const table of ['checkpoint_writes','checkpoint_blobs','checkpoints'])
+      expect((await pool.query(`SELECT count(*)::int AS n FROM public.${table} WHERE thread_id=ANY($1::text[])`,[malformed])).rows[0].n).toBe(3);
   });
   test('concurrent terminal row lock is skipped, not waited for or deleted',async()=>{
     const expired=await fixture(true),client=await pool.connect();

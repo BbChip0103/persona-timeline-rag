@@ -7,7 +7,7 @@ import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { ChatService, CoreError, type ChatServiceOptions, DEFAULT_SAFETY_THRESHOLDS, parsePersonaList, SAFETY_CATEGORIES, type InputSafetyOptions, type IntentClassifierOptions, type PersonaRepository, type TextProvider, type TurnDelivery, type TurnEventSource, type TurnEvents, type TurnLeaseStore, type TurnExecutionStore } from '@ptr/core';
 import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents, createRedisConnection } from '@ptr/messaging';
 import { createLog, FrameworkTelemetry, frameworkTelemetryConfig, type FrameworkObservation } from '@ptr/ops';
-import { GuardrailsClient, AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, REPLY_GUARD_REVISION } from '@ptr/core';
+import { CheckpointedTextProvider, GuardrailsClient, AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, REPLY_GUARD_REVISION } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, LiteLLMTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 export interface CreativeArtifact {
@@ -203,9 +203,15 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const events=new RedisTurnEvents(redisUrl,{namespace});const eventSource=new RedisTurnEventSource(redisUrl,{namespace});
   // Only synthetic vectors have the matching fake query embedder; no hashes against real source embeddings.
   const semanticSearch=providerName==='fake';
-  const checkpointer=new PostgresSaver(pool);
-  const chat=new ChatService({store,personas,provider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,semanticSearch,
-    ...(guardrails?{guardrails}:{}),agentCheckpoint:{checkpointer},
+  // Only costly self-hosted turn calls get a minimal durable response checkpoint. Paid chat/Jev already
+  // have independent request ledgers; drafts keep the unwrapped provider. Cheap graph stages restart.
+  const turnProvider=providerName==='litellm'&&env.PTR_LITELLM_BILLABLE!=='1'
+    ?new CheckpointedTextProvider(provider,{checkpointer:new PostgresSaver(pool),
+      identity:JSON.stringify({revision:'litellm-turn-receipt-v1',baseUrl:env.PTR_LITELLM_BASE_URL,
+        model,maxOutputTokens:512,temperature:0,structuredOutput:'agent-json-schema-v1'})})
+    :provider;
+  const chat=new ChatService({store,personas,provider:turnProvider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,semanticSearch,
+    ...(guardrails?{guardrails}:{}),
     observeStage:(name,work)=>telemetry.stage(name,()=>work()),
     observeTurn:async(queued,work)=>{
       const session=await store.getOwnedSession(queued.turn.sessionId,queued.turn.ownerId);

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { CheckpointedTextProvider } from '../src/checkpointed-provider';
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
 import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat, voiceText } from '../src';
 const persona:Persona={id:'agent-synthetic',personId:'agent-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
@@ -229,21 +231,19 @@ test('every model call of a turn carries the turn id as its request key (gateway
   expect(h.provider.generate.mock.calls.map(call=>(call as unknown[])[1])).toEqual([expect.objectContaining({requestKey:turn.id,deadlineAt:expect.any(Number)}),expect.objectContaining({requestKey:turn.id,deadlineAt:expect.any(Number)})]);
 });
 
-test('graph reuses a completed per-turn checkpoint without another model or tool call',async()=>{
+test('graph reruns cheap tool stages while reusing completed costly model calls',async()=>{
   const { MemorySaver }=await import('@langchain/langgraph');
   const checkpointer=new MemorySaver(),signal=new AbortController().signal;
   const outputs=[tool(),final({message:'합성 숲 이야기야.'})];
   const provider={generate:jest.fn(async()=>outputs.shift()!)};
   const search=jest.fn(async()=>[source]);
-  const input={provider,persona,history:[],text:'안녕',sources:[],signal,search,requestKey:'synthetic-turn',checkpoint:{checkpointer,threadId:'synthetic-turn'}};
+  const input={provider:new CheckpointedTextProvider(provider,{checkpointer,identity:'synthetic-model'}),persona,history:[],text:'안녕',sources:[],signal,search,requestKey:randomUUID()};
   const first=await runCharacterAgent(input),second=await runCharacterAgent(input);
-  expect(second).toEqual(first);expect(provider.generate).toHaveBeenCalledTimes(2);expect(search).toHaveBeenCalledTimes(1);
+  expect(second).toEqual(first);expect(provider.generate).toHaveBeenCalledTimes(2);expect(search).toHaveBeenCalledTimes(2);
   expect(second.agent.steps.map(step=>step.phase)).toEqual(['context','model','tool','context','model']);
-  await expect(runCharacterAgent({...input,text:'다른 턴'})).rejects.toMatchObject({code:'INVALID_INPUT',message:'CHECKPOINT_TURN_MISMATCH'});
-  expect(provider.generate).toHaveBeenCalledTimes(2);
 });
 
-test.each(['model','tool'] as const)('graph resumes the successful %s task after interruption without replaying its side effect',async port=>{
+test.each(['model','tool'] as const)('graph replays the costly response after %s interruption but reruns cheap search',async port=>{
   const { MemorySaver }=await import('@langchain/langgraph');
   const checkpointer=new MemorySaver(),controller=new AbortController();
   const provider={generate:jest.fn(async(_messages:ProviderMessage[],options:{onServed?:(upstream:string)=>void})=>{
@@ -255,13 +255,12 @@ test.each(['model','tool'] as const)('graph resumes the successful %s task after
     return final();
   })};
   const search=jest.fn(async()=>{if(port==='tool')controller.abort();return [source];});
-  const input={provider,persona,history:[],text:'안녕',sources:[],signal:controller.signal,search,requestKey:`interrupt-${port}`,
-    checkpoint:{checkpointer,threadId:`interrupt-${port}`}};
+  const input={provider:new CheckpointedTextProvider(provider,{checkpointer,identity:'synthetic-model'}),persona,history:[],text:'안녕',sources:[],signal:controller.signal,search,requestKey:randomUUID()};
   await expect(runCharacterAgent(input)).rejects.toMatchObject({code:'TURN_FAILED',message:'TURN_ABORTED'});
   const result=await runCharacterAgent({...input,signal:new AbortController().signal});
   expect(result.response.message).toBe('편하게 이야기해요.');
   expect(provider.generate).toHaveBeenCalledTimes(port==='model'?1:2);
-  expect(search).toHaveBeenCalledTimes(port==='model'?0:1);
+  expect(search).toHaveBeenCalledTimes(port==='model'?0:2);
   expect(result.agent).toMatchObject({modelCalls:port==='model'?1:2,toolCalls:port==='model'?0:1});
   expect(result.upstreams).toEqual(port==='model'?['primary']:['primary','primary']);
 });
@@ -273,14 +272,6 @@ test('graph pins deep source snapshots even when an authorized search mutates it
     search:async()=>{mutable.caption='바뀐 합성 캡션';mutable.imageAnnotations![0].text='바뀐 합성 설명';return [mutable];}});
   expect(result.context.sources[0].caption).toBe(source.caption);
   expect(result.context.sources[0].imageAnnotations![0].text).toBe(source.imageAnnotations![0].text);
-});
-
-test.each([undefined,''])('checkpoint requires a stable request key before calling the model (%s)',async requestKey=>{
-  const { MemorySaver }=await import('@langchain/langgraph');
-  const provider={generate:jest.fn(async()=>final())};
-  await expect(runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[],signal:new AbortController().signal,requestKey,
-    checkpoint:{checkpointer:new MemorySaver(),threadId:'invalid-turn'}})).rejects.toMatchObject({code:'INVALID_INPUT'});
-  expect(provider.generate).not.toHaveBeenCalled();
 });
 
 test.each([0,1,10])('graph conditional edges respect the exact configured tool-round bound %i',async maxToolRounds=>{

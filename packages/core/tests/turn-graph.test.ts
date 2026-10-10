@@ -1,3 +1,4 @@
+import { CheckpointedTextProvider } from '../src/checkpointed-provider';
 import { MemorySaver } from '@langchain/langgraph';
 import type { Persona, SourcePost } from '@ptr/contracts';
 import { ChatService, type ChatServiceOptions } from '../src/chat-service';
@@ -70,7 +71,7 @@ test('configured Guardrails is authoritative: a passing response is not sent thr
   expect(turn.reply?.content).toBe(message);expect(turn.reply?.replyGuard?.action).toBe('none');await chat.stop();
 });
 
-test('durable outer snapshot resumes under a new DB fence without repeating successful model, retrieval or Guardrails calls',async()=>{
+test('new fenced attempt restarts cheap stages while replaying only its completed costly response',async()=>{
   const fixture=options(),checkpointer=new MemorySaver(),delivery=new InMemoryTurnDelivery();
   let active=new AbortController(),stop=true,firstMessageId:string|undefined;
   const complete=fixture.store.completeTurn.bind(fixture.store);
@@ -79,7 +80,7 @@ test('durable outer snapshot resumes under a new DB fence without repeating succ
     return complete(id,reply,fence);
   });
   const history=jest.spyOn(fixture.store,'history');
-  const setup:ChatServiceOptions={...fixture,leases:fixture.store,delivery,agentCheckpoint:{checkpointer}};
+  const setup:ChatServiceOptions={...fixture,provider:new CheckpointedTextProvider(fixture.provider,{checkpointer,identity:'synthetic-model'}),leases:fixture.store,delivery};
   const firstChat=new ChatService(setup),session=await firstChat.createSession('owner',sessionInput);
   const request={sessionId:session.id,clientRequestId:'one',text:'그 게시물 기억나?'};
   const reserved=await firstChat.submitTurn('owner',request),first=await fixture.store.claimTurn(reserved.turn.id,'first-worker',1);
@@ -89,13 +90,16 @@ test('durable outer snapshot resumes under a new DB fence without repeating succ
   const second=await fixture.store.claimTurn(reserved.turn.id,'second-worker',30_000);active=new AbortController();
   const resumedChat=new ChatService(setup);await resumedChat.executeQueued(second!,active);
   const done=await resumedChat.getTurn('owner',reserved.turn.id);
-  expect(done.state).toBe('completed');expect(done.reply?.messageId).toBe(firstMessageId);
-  expect(fixture.provider.generate).toHaveBeenCalledTimes(1);expect(fixture.retrieval.search).toHaveBeenCalledTimes(1);
-  expect(fixture.inputSafety.classifier.assess).toHaveBeenCalledTimes(1);
-  expect(fixture.guardrails.validateInput).toHaveBeenCalledTimes(1);expect(fixture.guardrails.validateReply).toHaveBeenCalledTimes(1);
-  expect(history).toHaveBeenCalledTimes(1);expect(done.reply?.evidence[0].sourceId).toBe(source.id);
-  // Re-delivering the completed checkpoint cannot generate or persist a second message.
-  await resumedChat.executeQueued(second!,new AbortController());expect(fixture.provider.generate).toHaveBeenCalledTimes(1);
+  expect(done.state).toBe('completed');expect(done.reply?.messageId).not.toBe(firstMessageId);
+  expect(fixture.provider.generate).toHaveBeenCalledTimes(1);expect(fixture.retrieval.search).toHaveBeenCalledTimes(2);
+  expect(fixture.inputSafety.classifier.assess).toHaveBeenCalledTimes(2);
+  expect(fixture.guardrails.validateInput).toHaveBeenCalledTimes(2);expect(fixture.guardrails.validateReply).toHaveBeenCalledTimes(2);
+  expect(history).toHaveBeenCalledTimes(2);expect(done.reply?.evidence[0].sourceId).toBe(source.id);
+  // Queue ownership rejects redelivery of an already committed turn.
+  expect(await fixture.store.claimTurn(reserved.turn.id,'duplicate',30_000)).toBeUndefined();
+  const rows=[];for await(const row of checkpointer.list({}))rows.push(row);
+  expect(rows.every(row=>String(row.config.configurable!.thread_id).startsWith('model:'))).toBe(true);
+  expect(JSON.stringify(rows)).not.toContain('Fictional painter');
   const messages=await fixture.store.history(session.id,'owner');expect(messages.filter(message=>message.role==='assistant')).toHaveLength(2);
 });
 
@@ -109,9 +113,9 @@ test('one parent observation surrounds the queued work and all stage observation
   expect(done.state).toBe('completed');expect(marks).toEqual(['turn:start','initialize','safety','intent','retrieve','generate','evidence','output_guard','persist','turn:end']);await chat.stop();
 });
 
-test('nested agent replay reuses a successful tool task instead of treating undefined checkpoint id as time travel',async()=>{
+test('nested agent replays its costly tool request response but reruns the successful cheap search',async()=>{
   const fixture=options(),checkpointer=new MemorySaver(),delivery=new InMemoryTurnDelivery();
-  const active=new AbortController(),setup:ChatServiceOptions={...fixture,leases:fixture.store,delivery,agentCheckpoint:{checkpointer}};
+  const active=new AbortController(),setup:ChatServiceOptions={...fixture,provider:new CheckpointedTextProvider(fixture.provider,{checkpointer,identity:'synthetic-model'}),leases:fixture.store,delivery};
   fixture.provider.generate.mockResolvedValueOnce(JSON.stringify({status:'answered',message:'',evidenceRefs:[],variableUpdates:{},function:{name:'timeline_search',arguments:{query:'합성 숲'}}}));
   fixture.retrieval.search.mockImplementationOnce(async()=>{active.abort(LEASE_LOST);return [source];});
   const firstChat=new ChatService(setup),session=await firstChat.createSession('owner',sessionInput);
@@ -122,15 +126,15 @@ test('nested agent replay reuses a successful tool task instead of treating unde
   await new ChatService(setup).executeQueued(second!,new AbortController());
   const done=await firstChat.getTurn('owner',reserved.turn.id);
   expect(done.state).toBe('completed');expect(done.reply?.agent).toMatchObject({modelCalls:2,toolCalls:1});
-  expect(fixture.provider.generate).toHaveBeenCalledTimes(2);expect(fixture.retrieval.search).toHaveBeenCalledTimes(1);
-  expect(fixture.inputSafety.classifier.assess).toHaveBeenCalledTimes(1);expect(fixture.guardrails.validateInput).toHaveBeenCalledTimes(1);
+  expect(fixture.provider.generate).toHaveBeenCalledTimes(2);expect(fixture.retrieval.search).toHaveBeenCalledTimes(2);
+  expect(fixture.inputSafety.classifier.assess).toHaveBeenCalledTimes(2);expect(fixture.guardrails.validateInput).toHaveBeenCalledTimes(2);
 });
 
-test('a false final-write CAS cannot finalize a checkpoint and strand a fresh fenced attempt',async()=>{
+test('a false final-write CAS leaves a new attempt able to replay the model receipt and commit',async()=>{
   const fixture=options(),checkpointer=new MemorySaver(),delivery=new InMemoryTurnDelivery();
   const complete=fixture.store.completeTurn.bind(fixture.store);
   jest.spyOn(fixture.store,'completeTurn').mockResolvedValueOnce(false).mockImplementation(complete);
-  const setup:ChatServiceOptions={...fixture,leases:fixture.store,delivery,agentCheckpoint:{checkpointer}};
+  const setup:ChatServiceOptions={...fixture,provider:new CheckpointedTextProvider(fixture.provider,{checkpointer,identity:'synthetic-model'}),leases:fixture.store,delivery};
   const firstChat=new ChatService(setup),session=await firstChat.createSession('owner',sessionInput);
   const reserved=await firstChat.submitTurn('owner',{sessionId:session.id,clientRequestId:'final-cas',text:'그 게시물 기억나?'});
   const first=await fixture.store.claimTurn(reserved.turn.id,'first-final-cas',1),active=new AbortController();
@@ -141,7 +145,7 @@ test('a false final-write CAS cannot finalize a checkpoint and strand a fresh fe
   const second=await fixture.store.claimTurn(reserved.turn.id,'second-final-cas',30_000);
   await new ChatService(setup).executeQueued(second!,new AbortController());
   expect((await firstChat.getTurn('owner',reserved.turn.id)).state).toBe('completed');
-  expect(fixture.provider.generate).toHaveBeenCalledTimes(1);expect(fixture.retrieval.search).toHaveBeenCalledTimes(1);
+  expect(fixture.provider.generate).toHaveBeenCalledTimes(1);expect(fixture.retrieval.search).toHaveBeenCalledTimes(2);
   expect((await fixture.store.history(session.id,'owner')).filter(message=>message.role==='assistant')).toHaveLength(2);
 });
 

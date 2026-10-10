@@ -74,10 +74,26 @@ worker-local maintenance republishes missing jobs and repairs queue/DB disagreem
 using compare-and-swap and a new dispatch sequence. No Postgres heartbeat duplicates
 the BullMQ lock in the framework path. Queue-age expiry defaults to 60 seconds.
 
-LangGraph persists separate initialize/safety/intent/retrieve/generate/evidence/
-output_guard/persist stages, immutable prompt snapshots and successful side-effect
-tasks. A resumed turn reuses its message ID; completion, turn state and outbox
-removal are transactional. Cancellation and old generations cannot commit.
+LangGraph still executes initialize/safety/intent/retrieve/generate/evidence/
+output_guard/persist and character/tool branches, but does **not** persist their
+whole-stage state. A recovered job restarts these cheap stages, including evidence
+and Guardrails validation. Final message identity is assigned again if its prior
+attempt never committed; exactly one committed assistant message remains protected
+by the completion transaction and fence. Cancellation and old generations cannot
+commit.
+
+Only expensive call results are durable. Non-billable/self-hosted **turn** model
+calls use a small standalone LangGraph graph with root namespace and a stable
+`model:<turn UUID>:<request fingerprint>` thread. Its state holds only the request
+fingerprint and raw response/upstream/usage receipt, never persona/history/search
+frames or full request messages. The fingerprint binds trusted provider/model/
+output revision and exact messages; changed evidence/context makes a different
+request, never reuses an incompatible answer. Completed calls replay usage/upstream
+callbacks, while the rest of the job reruns. Existing paid chat/Jev request ledgers
+already persist receipts and block uncertain resubmission, so they are not wrapped
+in a duplicate checkpoint. Creative drafts retain their original provider path.
+A small call graph still writes framework checkpoint/pending-write records: this
+policy means call-level recovery, not literally one SQL row per call.
 
 ## Observability, evaluation and retention
 
@@ -95,9 +111,12 @@ HTTP diagnostics are not fabricated as passing scores. Historical unlinked resul
 retain archive provenance and never become fabricated original traces/reviews.
 
 Retention is explicit: 90-day supported deletion of traces, dataset/review items,
-private blob lifecycle and separate backup expiry. Terminal graph checkpoints also
-contain raw turn/source snapshots: run the explicit checkpoint retention CLI with
-dry-run first. Never delete active/resumable checkpoint threads. OSS support and
+private blob lifecycle and separate backup expiry. New model-call checkpoints contain raw model responses; old turn/character
+checkpoints may still contain full turn/source snapshots. Run the explicit checkpoint
+retention CLI with dry-run first; it covers both legacy and model-call threads in
+all three saver tables and defaults to at least90days after terminal completion.
+There is no automatic bulk purge of existing checkpoints. Never delete active/
+resumable checkpoint threads. OSS support and
 unsupported enterprise automation are distinguished in the runbooks.
 
 ## Validation and rollback
