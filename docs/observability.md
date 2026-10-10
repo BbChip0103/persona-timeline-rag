@@ -1,5 +1,8 @@
 # Observability: `/metrics/prom`, JSON logs, `reply.serving` and `ops:status`
 
+> Historical pre-framework procedure. For current serving, use [framework runtime](framework-runtime.md). Old gateway/dispatcher/local review-sheet commands below are not the default migration path.
+
+
  and decisions D18–D21. A single user runs this service on one host, so there is no Prometheus server,
 Grafana or alert rules file. Each role serves Prometheus text and writes JSON log lines, and `pnpm ops:status` reads
 the four endpoints and prints one health table.

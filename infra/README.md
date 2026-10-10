@@ -1,5 +1,8 @@
 # Dedicated DB-only local Supabase
 
+> Historical pre-framework procedure. For current serving, use [framework runtime](../docs/framework-runtime.md). Old gateway/dispatcher/local review-sheet commands below are not the default migration path.
+
+
 `compose.db.yml` uses the cached official Supabase PostgreSQL 15 distribution,
 not a complete Supabase Auth/Storage deployment. Its only published listener is
 `127.0.0.1:56432`; project/container/volume names are `ptr_goal1`,

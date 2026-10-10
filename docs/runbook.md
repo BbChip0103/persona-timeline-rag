@@ -1,5 +1,8 @@
 # Local chat / Goal 1 research runbook
 
+> Historical pre-framework procedure. For current serving, use [framework runtime](framework-runtime.md). Old gateway/dispatcher/local review-sheet commands below are not the default migration path.
+
+
 ## Scope and prerequisite
 
 Node24 compatible, pnpm workspace, TypeScript5.7, Nest10, Next15.5.27/React19.2.6.

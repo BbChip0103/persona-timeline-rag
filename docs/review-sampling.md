@@ -1,5 +1,8 @@
 # 사람 검수 표본
 
+> Historical pre-framework procedure. For current serving, use [framework runtime](framework-runtime.md). Old gateway/dispatcher/local review-sheet commands below are not the default migration path.
+
+
 정규식 가드와 프롬프트 정책을 동결한 동안, 실제 대화 품질은 사람이 표본을 직접 읽어 판정합니다. 판정은 사람만 합니다. LLM 자동 판정으로 대신하지 않습니다.
 
 ## 에이전트 열람 금지

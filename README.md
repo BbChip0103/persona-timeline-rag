@@ -7,17 +7,21 @@
 - Python 승인 데이터 준비·검증 CLI 유지.
 - TypeScript/pnpm workspace: NestJS API, Next.js/React 채팅, shared contracts/core/providers/storage.
 - 전용 **DB-only 로컬 Supabase PostgreSQL15 + pgvector**: Auth/Storage/Studio 전체 배포가 아니다. owner/person/revision 고정 세션, history/reload, idempotency/cancel, lexical substring baseline 및1536dim exact cosine 검색.
-- fake-by-default provider와 총 **US$2 / 10,000요청 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
+- 명시적 fake/LiteLLM provider와 총 **US$2 / 10,000요청 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
 - 공개 fixture는 합성이다. 실제 persona는 개발 캡션 통계 기반 **silver**이며 사람 검수 완료/본인 복제 정확도를 주장하지 않는다. 근거 없는 사건 날짜를 게시일로 대체하지 않는다.
 - 새 API 세션은 **agent-loop 캐릭터 에이전트**다. 페르소나·실제 누적 대화·최소 대화 변수와 근거를 받아 자연어 답변을 만들고, 선택적 읽기 전용 검색 도구를 제한된 루프로 실행한다. 과거 legacy 원문 인용 renderer와 구분하며 다른 프로젝트 reference agent loop 전체 엔진의 동등성을 주장하지 않는다.
 - **RAG 없음 / 본문만 / 본문+이미지 설명**을 세션에 고정한다. 이미지 설명은 `gpt-6-luna`/`medium`으로 생성한 관찰·강조·의도 해석을 별도 출처로 색인하며, 원사진을 매 채팅 요청에 직접 넣는 방식은 아니다. 의도 해석은 단정형 어미여도 실제 작성자의 확정 의도가 아니다.
 - 최근 사용자 대화를 활용한 검색과 직전 답변의 원근거 재사용은 별도 rewrite LLM 호출 없이 처리한다. 인용 검증은 출처·범위·문자열 결합을 확인하지만, 자연어 답변의 모든 주장을 의미적으로 검증하지는 않는다.
 
-**[목표1 구현·결과 요약](docs/goal1-summary.md)**에서 최신 한국어 3조건 비교, 합성 대화 예시, 관측·비용과 잔여 한계를 확인한다. 실제 모델/이미지/평가 자료는 ignored `reports/`에만 둔다. 결과는 AI-assisted silver 개발 회귀이며 사람 gold·실인물 개성 복제·새 질문 일반화 성능을 입증하지 않는다. 전체 재테스트는 현재 보류하며 수정한 동작만 표적 검증한다. 독립 OCR/ASR, 사람 검수된 사건 추출/병합, 웹검색 및 목표2 서빙·부하 실험은 완료 항목이 아니다. 다른 프로젝트 코드·DB·운영 설정은 변경하지 않는다.
+**[목표1 구현·결과 요약](docs/goal1-summary.md)**에서 최신 한국어 3조건 비교, 합성 대화 예시, 관측·비용과 잔여 한계를 확인한다. 실제 모델/이미지/평가 자료는 ignored `reports/`에만 둔다. 결과는 AI-assisted silver 개발 회귀이며 사람 gold·실인물 개성 복제·새 질문 일반화 성능을 입증하지 않는다. 실자료·실모델 전체 재측정은 보류 상태다. 프레임워크 전환의 오프라인 전체 회귀와 신규 합성 통합 검증은 별도로 수행했다. 독립 OCR/ASR, 사람 검수된 사건 추출/병합, 웹검색 및 목표2 서빙·부하 실험은 완료 항목이 아니다. 다른 프로젝트 코드·DB·운영 설정은 변경하지 않는다.
+
+## 현재 프레임워크 실행 경로
+
+API → Nest/BullMQ worker → LangGraph/LangChain → LiteLLM, 내부 Guardrails 검증 및 Langfuse v4 추적·평가·검수 경로로 전환했습니다. 별도 gateway·dispatcher·fleet scheduler는 기본 실행 경로에서 제거했습니다. [현재 실행 계약](docs/framework-runtime.md), [인프라 배포](docs/framework-deployment.md), [평가·검수](docs/framework-evaluation.md)를 먼저 따르세요. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
 
 ## 실행
 
-채팅/DB/live 재현은 [서비스 runbook](docs/runbook.md)을 따른다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.
+새 채팅/DB 구성은 [프레임워크 실행 계약](docs/framework-runtime.md)을 따른다. [기존 서비스 runbook](docs/runbook.md)은 이전 버전 재현 기록이다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.
 
 
 ```bash
