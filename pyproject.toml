@@ -7,7 +7,7 @@ name = "persona-timeline-rag"
 version = "0.1.0"
 description = "Evidence-grounded personal timeline research from licensed social media data"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["httpx==0.28.1", "tenacity==9.2.1", "beautifulsoup4==4.15.0"]
 
 [project.scripts]
 persona-timeline = "persona_timeline_rag.cli:main"

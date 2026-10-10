@@ -6,6 +6,7 @@
   "dependencies": {
     "@ptr/contracts": "workspace:*",
     "@ptr/core": "workspace:*",
+    "kysely": "0.28.8",
     "pg": "8.16.3"
   },
   "main": "./src/index.ts",
