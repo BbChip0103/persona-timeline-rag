@@ -1,0 +1,11 @@
+[Unit]
+Description=PTR daily retention schedule (explicit private config required)
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=ptr-maintenance-daily.service
+
+[Install]
+WantedBy=timers.target

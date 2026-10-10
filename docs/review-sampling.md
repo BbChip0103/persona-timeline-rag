@@ -1,6 +1,6 @@
 # 사람 검수 표본
 
-> 현재 Python split 런타임의 로컬 주간 검수 절차입니다. 중앙 Langfuse 검수 큐와는 별도이며, 실제 사용자 턴을 자동으로 그 큐에 보내지는 않습니다. 런타임 구조는 [framework runtime](framework-runtime.md), 실험 검수 범위는 [framework evaluation](framework-evaluation.md)을 참조하세요.
+> 현재 Python split 런타임의 로컬 주간 검수 절차입니다. 중앙 Langfuse 검수 복사본은 별도 명시 승인·설정 경로이며 기본적으로 비활성화되어 있습니다. 런타임 구조는 [framework runtime](framework-runtime.md), 실험 검수 범위는 [framework evaluation](framework-evaluation.md)을 참조하세요.
 
 
 가드와 프롬프트 정책을 검증하는 동안, 실제 대화 품질은 사람이 표본을 직접 읽어 판정합니다. 판정은 사람만 합니다. LLM 자동 판정으로 대신하지 않습니다.
@@ -22,9 +22,11 @@ S8는 **선택 사항인 기존 로컬 결과 입력**입니다. 함께 검토�
 `--s8`는 `reports/s8` 아래 어느 폴더든 받으며, 그 폴더 바로 안의 `run*.json`만 읽습니다(하위 폴더와 심볼릭 링크는 읽지 않음). 개정이 바뀌면 새 개정의 폴더로 바꿉니다. `roleplay`·`unknown` 폴더의 행은 관문 d·e·f가 아니라 넣지 않습니다. S8 라벨(A…)은 각 실행의 페르소나 초안 순서로 정해지므로, 함께 주는 폴더들은 같은 초안 목록으로 실행한 것이어야 `S8-A`가 한 사람을 가리킵니다.
 
 - **DB:** `PTR_LLM_MAINTENANCE_DATABASE_URL`만 씁니다. `DATABASE_URL` fallback은 없습니다. 대상은 `127.0.0.1:58432`의 `ptr_split_research` 또는 합성 시험용 `ptr_split_test`, 역할은 `ptr_split_owner`뿐입니다. 내용 조회 전에 실제 연결의 `current_user`·`current_database()`가 URL과 일치하고 `SHOW default_transaction_read_only`가 `on`인지 확인합니다. `app.turns`·`app.sessions`·`llm.personas`·`llm.persona_versions`만 명시적인 스키마로 조회하며, legacy `public` 테이블로 fallback하지 않습니다. 소유자 자격 증명은 이 로컬 운영 도구에만 사용하고 서비스에는 배포하지 않습니다.
+- **조회 상한:** 내용 조회는10,000행까지입니다. 10,001행이면 fail-closed로 중단합니다. 완료 시각은 현재 이하이고 outbox가 없는 최종 턴만 사용합니다. 큰 모집단은 기간을 줄이거나 별도 검토해야 합니다.
 - **모집단:** `--since` 기간(1~90일)에 완료된 턴 중 owner가 `local-*`이고, 페르소나 `reviewStatus`가 `synthetic`이 아니고, 응답 본문이 있고, `reply.serving`(`{calls, upstreams[], secondaryCalls}`, 호출마다 업스트림 이름 하나)의 모든 호출이 실제 업스트림(`primary`·`secondary`·`openrouter`·`direct`)이 답한 것. `fake`·`unknown`이 하나라도 있거나 형식이 맞지 않는 `serving`은 제외합니다(fail-closed). 기록 방식은 [observability.md](observability.md#replyserving-d21)에 있습니다.
 - **알려진 공백:** `reply.serving`이 없는 턴은 모집단에 남습니다. 관측 단계 O4 이전의 턴이 여기에 해당하며, 이 턴들은 fake 응답인지 가릴 수 없습니다. O4 이후에는 모델을 부른 모든 턴에 기록이 남습니다(in-process fake는 `fake`, 게이트웨이의 fake 업스트림도 `fake`). 모델 호출이 없는 고정 응답에는 기록이 없습니다.
 - **층:** DB 턴은 `responseKind` × `replyGuard.action` × `grounding` × 입력 안전 검사 조치, S8 행은 관문(d·e·f) × `replyGuard.action` × 안전 조치입니다. 드문 층부터 한 건씩 돌아가며 뽑으므로 층 수가 할당량 이하이면 비지 않은 층마다 1건 이상 들어갑니다. 층 수가 할당량보다 많으면 마지막 한 칸은 가장 흔한 층에 줍니다(사용자가 가장 많이 받는 응답을 늘 보기 위해). 같은 `--seed`와 같은 입력은 같은 표본을 냅니다.
+- **예약 실행의 빈 표본:** timer는 `--allow-empty`를 명시하여 대상이 없으면 파일을 새로 만들지 않고 `rows:0`, `dbSkipped:true`, `emptySample:true`를 기록합니다. 이는 검수 완료/사람 승인이라는 뜻이 아닙니다. 기본 수동 명령은 기존대로 `empty_sample`로 실패합니다.
 - **분량:** DB 페르소나마다 6건, S8 페르소나마다 2건(`S8-A`…, 관문 d·e·f 행, 합성 페르소나 `S-ko`·`S-en` 제외). 4명이면 32건, 약 20~30분입니다. 기간 안의 대상 DB 턴이 20건 미만이면 DB 행은 넣지 않고 S8 행만 넣습니다(출력의 `dbSkipped`).
 - **라벨:** `P1`…은 선택한 split DB의 실존 인물 페르소나 전체(합성 제외)를 id 순으로 매긴 것이라, 그 주에 턴이 없는 페르소나가 있어도 바뀌지 않습니다(새 페르소나가 추가되면 바뀔 수 있음). `S8-A`…는 S8 실행 파일의 라벨을 그대로 쓰는 **별도 체계**입니다. S8 결과에는 DB 페르소나 id가 없어 `P` 번호와 이을 수 없으므로, 같은 사람이 `P2`와 `S8-C`로 따로 나올 수 있습니다. 출력의 `personas`는 라벨 수(4명이면 8)이고, "페르소나당 8건"은 DB 라벨 6건 + S8 라벨 2건을 뜻합니다. 비공개 설계 노트에 기록할 때도 두 체계를 섞지 않습니다.
 - **마스킹:** id는 시트마다 새로 만든 솔트로 sha256한 앞 10자입니다. owner·personId·persona id·턴 id·근거 URL·S8 파일 이름은 넣지 않고, 시각 없이 날짜(KST)만 넣습니다. 발화와 응답 전문은 시트에만 들어갑니다. 응답은 사용자가 받은 최종 응답(가드 적용 후)입니다. 가드가 바꾸기 전 모델 원문은 시트에 넣지 않습니다.
@@ -32,6 +34,18 @@ S8는 **선택 사항인 기존 로컬 결과 입력**입니다. 함께 검토�
 - **추적 파일(사고 대응용):** 같은 폴더의 `<KST 날짜>-<seed>.trace.private.json`(0600)에 그 시트의 솔트와 행마다 `행 번호 → 마스킹 id → 턴 id`(S8 행이면 `폴더/파일#라벨/질문/턴`)를 남깁니다. 실존 인물 사생활 노출처럼 해당 턴을 찾거나 지워야 할 때만 사람이 엽니다. 비공개 설계 노트에는 옮기지 않습니다. 터미널에는 건수 JSON 한 줄(`rows`, `db`, `s8`, `personas`, `population`, `s8Population`, `strata`, `pruned`, `dbSkipped`)만 나오고, 오류도 코드와 건수만 나옵니다.
 - **보존:** 파일 이름(`<날짜>-<seed>.private.md`, `<날짜>-<seed>.trace.private.json`)의 날짜 기준으로 90일보다 오래된 시트나 추적 파일이 하나라도 있으면 실행을 거부합니다(`retention stale=<n>`, 파일 수). `--prune`을 주면 둘 다 지우고 진행합니다. 이 이름 형식이 아닌 파일은 건드리지 않습니다. 시트를 편집해도 보존 기한은 늘어나지 않습니다.
 - **외부 전송 없음:** 스크립트는 로컬 DB와 로컬 파일만 읽습니다. 네트워크 모듈과 공급자 패키지를 import하지 않는다는 것을 시험이 확인합니다.
+
+## 선택적인 중앙 검수 복사본
+
+`scripts/production-review.ts`는 같은 owner/read-only DB 선정·층화 알고리즘으로 고른 **최종 사용자 발화·최종 응답**만 새로운 Langfuse native trace에 복사합니다. 일반 runtime tracing의 원문 capture는 계속 꺼져 있습니다. 기존 runtime trace ID를 추측해서 연결하지 않고, SDK가 실제 생성한 별도 trace/observation ID와 v2 조회의 project/environment/root/source 시각을 검증한 뒤 native annotation queue에 넣습니다. 원문 dataset item은 만들지 않습니다.
+
+- 별도 승인 marker·stable HMAC salt·private journal·정확한 project confirmation이 필요합니다. URL·이메일·연락처·credential 패턴을 가리고 source/person/owner IDs·근거·이미지/코퍼스는 내보내지 않습니다. **정규식 마스킹은 익명화가 아니므로 대화 전문의 사생활 위험은 남습니다.** 실제 내용 전송은 별도 명시 승인 이후에만 허용합니다.
+- source `finished_at`를 SDK observation start/end와 `originalRunAt`에 보존하며, 90일 이상/미래 시각은 거부합니다. 새 복사본을 만들어 보존 시계를 되돌리지 않습니다. 본문+metadata UTF-8 전체 상한은64KiB입니다.
+- journal은 실제 SDK IDs와 HMAC/hash·상태만 저장하고 발화·응답·source ID는 저장하지 않습니다. file/directory fsync 후 export/queue 쓰기를 시작합니다. unknown reservation/queue write, 불일치, crash lock은 자동으로 새 trace를 만들지 않으며 운영자가 metadata로 조정해야 합니다.
+- 중앙 rubric은 `weekly_ai_disclosure/privacy/fabrication/meta_talk/voice/language`, severity0통과/1경미/2중대/3치명입니다. 사람만 판정합니다. 6개 native numeric score config의 이름·0..3 범위를 검증합니다.
+- `production-review` 환경과 정확한 전용 queue의 daily trace/queue 정리 설정을 먼저 활성화하고 timer의 성공을 확인해야 중앙 예약 전송을 허용합니다. 과거 dataset history의 미해결 삭제 문제를 이 경로가 해결했다고 주장하지 않습니다.
+
+구체적인 private config·dry-run/status·timer 절차는 [maintenance](../infra/split/maintenance/README.md)를 따릅니다. 로컬 검수 시트 흐름과 중앙 복사본은 각각 독립된 출력이며, 과거 사람 판정이 자동으로 이전되지는 않습니다.
 
 ## 판정 기준
 
@@ -50,7 +64,7 @@ S8는 **선택 사항인 기존 로컬 결과 입력**입니다. 함께 검토�
 
 ## 주기
 
-- 자동 스케줄러는 아직 배치되지 않았습니다. 운영자가 주 1회 `--since 7d`로 실행합니다. 그 주 대상 턴이 20건 미만이면 S8 행만 봅니다.
+- [호스트 maintenance timer 정의](../infra/split/maintenance/README.md)가 있습니다. 실제 설치·active 상태·최근 성공은 별도 배포 검증이며, 정의만으로 배치되었다고 하지 않습니다. 수동으로는 주 1회 `--since 7d`로 실행합니다. 그 주 대상 턴이 20건 미만이면 S8 행만 봅니다.
 - 프롬프트·가드를 개정할 때마다: 채택 전에는 새 S8 결과(`--s8`)로, 채택 1주 뒤에는 DB 턴으로 봅니다.
 
 ## 반영

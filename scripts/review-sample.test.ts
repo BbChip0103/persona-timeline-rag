@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { allocate, readOnlyPool, run, type Queryable } from './review-sample';
+import { allocate, readOnlyPool, run, selectDatabaseReview, type Queryable } from './review-sample';
 
 // Pass-through wrapper so one test can make the sheet write fail (node:fs/promises properties cannot be spied on).
 jest.mock('node:fs/promises', () => {
@@ -374,6 +374,33 @@ describe('review-sample run', () => {
     h.deps.env = { PTR_LLM_MAINTENANCE_DATABASE_URL: url, DATABASE_URL: 'not-used' };
     expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(0);
     expect(h.connected).toEqual([url]);
+  });
+
+  it('shares bounded split selection without creating local export files', async () => {
+    const h = await harness();
+    const selected = await selectDatabaseReview(7, 7, h.deps);
+    expect(selected).toHaveLength(24);
+    expect(selected.every(row => row.finishedAt === '2026-10-08T05:00:00.000Z')).toBe(true);
+    expect(h.pool.calls[2]).toMatch(/t.finished_at <= \$2/);
+    expect(h.pool.calls[2]).toMatch(/NOT EXISTS.*app\.turn_outbox/);
+    expect(h.pool.calls[2]).toMatch(/LIMIT 10001/);
+    expect(await readdir(h.root)).toEqual([]);
+  });
+
+  it('fails closed when the source population exceeds the bounded scan', async () => {
+    const h = await harness(Array.from({ length: 10001 }, (_, i) => ({ ...dbRows(1, 1)[0]!, id: `bounded-${i}` })));
+    await expect(selectDatabaseReview(7, 7, h.deps)).rejects.toThrow('population_limit');
+    expect(h.pool.ended).toBe(true);
+  });
+
+  it('explicit scheduler empty allowance reports a skipped review with no sheet or trace', async () => {
+    const h = await harness([]);
+    expect(await go(['--since', '7d', '--seed', '7', '--allow-empty'], h)).toBe(0);
+    expect(JSON.parse(h.out[0]!)).toMatchObject({ rows: 0, db: 0, s8: 0, population: 0, dbSkipped: true, emptySample: true });
+    expect(await readdir(join(h.root, 'reports', 'review'))).toEqual([]);
+    const manual = await harness([]);
+    expect(await go(['--since', '7d', '--seed', '7'], manual)).toBe(1);
+    expect(manual.err).toEqual(['review-sample: empty_sample population=0']);
   });
 
   it('sends nothing over the network: no fetch call, no network or provider imports', async () => {

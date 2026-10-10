@@ -24,7 +24,7 @@ export interface Deps {
   /** Tests only: a fixed masking salt. Real sheets get a fresh random salt. */
   salt?: Buffer;
 }
-interface Candidate { id: string; stratum: string; persona: string; source: 'DB' | 'S8'; date: string; stratumText: string; userText: string; reply: string }
+export interface Candidate { finishedAt?: string; id: string; stratum: string; persona: string; source: 'DB' | 'S8'; date: string; stratumText: string; userText: string; reply: string }
 interface ReplyLike { responseKind?: unknown; grounding?: unknown; content?: unknown; serving?: unknown; replyGuard?: { action?: unknown }; inputSafety?: { action?: unknown } }
 
 /** Error whose code and detail are fixed strings or counts: safe to print. */
@@ -59,12 +59,13 @@ export function allocate<T extends { id: string; stratum: string }>(items: T[], 
   return picked;
 }
 
-function parseArgs(argv: string[]): { sinceDays: number; seed: number; s8: string[]; prune: boolean } {
+function parseArgs(argv: string[]): { sinceDays: number; seed: number; s8: string[]; prune: boolean; allowEmpty: boolean } {
   const tokens = argv.flatMap(arg => (/^--[a-z0-9]+=/.test(arg) ? [arg.slice(0, arg.indexOf('=')), arg.slice(arg.indexOf('=') + 1)] : [arg]));
-  let since: string | undefined, seed: string | undefined, prune = false;
+  let since: string | undefined, seed: string | undefined, prune = false, allowEmpty = false;
   const s8: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const key = tokens[i], value = tokens[i + 1];
+    if (key === '--allow-empty') { allowEmpty = true; continue; }
     if (key === '--prune') { prune = true; continue; }
     if (!['--since', '--seed', '--s8'].includes(key ?? '') || value === undefined || value.startsWith('--')) throw new ReviewError('usage');
     i++;
@@ -73,7 +74,7 @@ function parseArgs(argv: string[]): { sinceDays: number; seed: number; s8: strin
   const days = /^(\d{1,2})d$/.exec(since ?? '');
   if (!days || Number(days[1]) < 1 || Number(days[1]) > RETENTION_DAYS) throw new ReviewError('usage', 'since');
   if (!/^\d{1,9}$/.test(seed ?? '')) throw new ReviewError('usage', 'seed');
-  return { sinceDays: Number(days[1]), seed: Number(seed), s8, prune };
+  return { sinceDays: Number(days[1]), seed: Number(seed), s8, prune, allowEmpty };
 }
 
 /** Owner-only explicit maintenance scope; serving credentials and ambient DATABASE_URL never suffice. */
@@ -199,20 +200,9 @@ function renderSheet(day: string, seed: number, rows: (Candidate & { label: stri
   return parts.join('\n');
 }
 
-async function sample(argv: string[], deps: Deps): Promise<Record<string, number | boolean>> {
-  const args = parseArgs(argv);
+async function readDatabaseReview(sinceDays: number, deps: Deps): Promise<{ dbRows: Record<string, unknown>[]; personaIds: string[] }> {
+  const pool = deps.connect(maintenanceUrl(deps.env.PTR_LLM_MAINTENANCE_DATABASE_URL));
   const url = maintenanceUrl(deps.env.PTR_LLM_MAINTENANCE_DATABASE_URL);
-  const s8Dirs: { dir: string; name: string }[] = [];
-  for (const arg of args.s8) { const found = await insideS8(deps.root, arg); if (!s8Dirs.some(d => d.dir === found.dir)) s8Dirs.push(found); }
-  const dir = await reviewDir(deps.root);
-  const stale = await staleSheets(dir, deps.now);
-  if (stale.length && !args.prune) throw new ReviewError('retention', `stale=${stale.length}`);
-  for (const name of stale) await unlink(join(dir, name));
-  const day = kstDay(deps.now), sheetName = `${day}-${args.seed}.private.md`, traceName = `${day}-${args.seed}.trace.private.json`;
-  if ((await readdir(dir)).some(name => name === sheetName || name === traceName)) throw new ReviewError('sheet_exists');
-  const s8 = await s8Candidates(s8Dirs);
-
-  const pool = deps.connect(url);
   let dbRows: Record<string, unknown>[], personaIds: string[];
   try {
     const mode = await pool.query('SHOW default_transaction_read_only');
@@ -224,29 +214,70 @@ async function sample(argv: string[], deps: Deps): Promise<Record<string, number
       `SELECT t.id, t.owner_id, s.persona_id, v.document->>'reviewStatus' AS review_status, t.finished_at, t.user_text, t.reply
          FROM app.turns t JOIN app.sessions s ON s.id = t.session_id
          JOIN llm.persona_versions v ON v.persona_id = s.persona_id AND v.revision = s.persona_revision
-        WHERE t.state = 'completed' AND t.reply IS NOT NULL AND t.created_at >= $1 AND t.owner_id LIKE 'local-%'
-          AND COALESCE(v.document->>'reviewStatus', '') <> 'synthetic'`,
-      [new Date(deps.now.getTime() - args.sinceDays * DAY_MS)])).rows;
+        WHERE t.state = 'completed' AND t.reply IS NOT NULL AND t.created_at >= $1 AND t.finished_at <= $2 AND t.owner_id LIKE 'local-%'
+          AND COALESCE(v.document->>'reviewStatus', '') <> 'synthetic'
+          AND NOT EXISTS(SELECT 1 FROM app.turn_outbox o WHERE o.turn_id=t.id)
+        ORDER BY t.id LIMIT 10001`,
+      [new Date(deps.now.getTime() - sinceDays * DAY_MS), deps.now])).rows;
     // Labels come from every real-person persona, not the window, so P<n> stays the same between weekly sheets.
     personaIds = (await pool.query(
       `SELECT p.id FROM llm.personas p JOIN llm.persona_versions v ON v.persona_id = p.id AND v.revision = p.current_revision
         WHERE COALESCE(v.document->>'reviewStatus', '') <> 'synthetic' ORDER BY p.id`)).rows.map(row => text(row.id));
   } finally { await pool.end(); }
 
+  if (dbRows.length > 10000) throw new ReviewError('population_limit');
+  return { dbRows, personaIds };
+}
+
+function databaseCandidates(dbRows: Record<string, unknown>[], personaIds: string[]) {
+
   const eligibleRows = dbRows.filter(eligible);
   const dbSkipped = eligibleRows.length < MIN_DB_POPULATION;
   for (const id of [...new Set(eligibleRows.map(row => text(row.persona_id)))].sort()) if (!personaIds.includes(id)) personaIds.push(id);
   const db: Candidate[] = dbSkipped ? [] : eligibleRows.map(row => {
     const reply = row.reply as ReplyLike, [stratum, stratumText] = dbStratum(reply);
-    return { id: `turn:${text(row.id)}`, stratum, persona: `P${personaIds.indexOf(text(row.persona_id)) + 1}`, source: 'DB', date: kstDay(row.finished_at),
+    return { id: `turn:${text(row.id)}`, stratum, persona: `P${personaIds.indexOf(text(row.persona_id)) + 1}`, source: 'DB', date: kstDay(row.finished_at), finishedAt: new Date(row.finished_at as string).toISOString(),
       stratumText, userText: text(row.user_text), reply: text(reply.content) };
   });
+  return { eligibleRows, dbSkipped, db };
+}
+
+/** Shared local/central selection; no files or external calls. Source remains private until explicit exporter approval. */
+export async function selectDatabaseReview(sinceDays: number, seed: number, deps: Deps): Promise<Candidate[]> {
+  if (!Number.isInteger(sinceDays) || sinceDays < 1 || sinceDays > 90 || !Number.isInteger(seed) || seed < 0 || seed > 999999999)
+    throw new ReviewError('usage');
+  const { dbRows, personaIds } = await readDatabaseReview(sinceDays, deps);
+  const { db } = databaseCandidates(dbRows, personaIds);
+  return [...new Set(db.map(row => row.persona))].sort().flatMap(persona =>
+    allocate(db.filter(row => row.persona === persona), DB_PER_PERSONA, seed));
+}
+
+async function sample(argv: string[], deps: Deps): Promise<Record<string, number | boolean>> {
+  const args = parseArgs(argv);
+  maintenanceUrl(deps.env.PTR_LLM_MAINTENANCE_DATABASE_URL);
+  const s8Dirs: { dir: string; name: string }[] = [];
+  for (const arg of args.s8) { const found = await insideS8(deps.root, arg); if (!s8Dirs.some(d => d.dir === found.dir)) s8Dirs.push(found); }
+  const dir = await reviewDir(deps.root);
+  const stale = await staleSheets(dir, deps.now);
+  if (stale.length && !args.prune) throw new ReviewError('retention', `stale=${stale.length}`);
+  for (const name of stale) await unlink(join(dir, name));
+  const day = kstDay(deps.now), sheetName = `${day}-${args.seed}.private.md`, traceName = `${day}-${args.seed}.trace.private.json`;
+  if ((await readdir(dir)).some(name => name === sheetName || name === traceName)) throw new ReviewError('sheet_exists');
+  const s8 = await s8Candidates(s8Dirs);
+
+  const { dbRows, personaIds } = await readDatabaseReview(args.sinceDays, deps);
+  const { eligibleRows, dbSkipped, db } = databaseCandidates(dbRows, personaIds);
+
   const picked: Candidate[] = [];
   for (const [candidates, quota] of [[db, DB_PER_PERSONA], [s8, S8_PER_PERSONA]] as const) {
     const labels = [...new Set(candidates.map(c => c.persona))].sort((a, b) => a.localeCompare(b, 'en', { numeric: true }));
     for (const label of labels) picked.push(...allocate(candidates.filter(c => c.persona === label), quota, args.seed));
   }
-  if (!picked.length) throw new ReviewError('empty_sample', `population=${eligibleRows.length}`);
+  if (!picked.length) {
+    if (!args.allowEmpty) throw new ReviewError('empty_sample', `population=${eligibleRows.length}`);
+    return { rows: 0, db: 0, s8: 0, personas: 0, population: eligibleRows.length,
+      s8Population: s8.length, strata: 0, pruned: stale.length, dbSkipped, emptySample: true };
+  }
   const salt = deps.salt ?? randomBytes(16);
   const rows = picked.map(c => ({ ...c, label: c.persona, masked: createHash('sha256').update(salt).update(c.id).digest('hex').slice(0, 10) }));
   // Incident trace (private, same retention as the sheet): the salt and each masked id's turn or S8 row.

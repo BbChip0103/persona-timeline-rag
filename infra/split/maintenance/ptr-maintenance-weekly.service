@@ -1,0 +1,12 @@
+[Unit]
+Description=PTR private local weekly review (central content export opt-in only)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.nvm/versions/node/v24.14.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=<checkout>
+ExecStart=%h/.local/bin/uv run --no-sync --project apps/llm-service python scripts/split-maintenance.py --config %h/.config/ptr-maintenance/maintenance.json --operation weekly --scheduled
+UMask=0077
+TimeoutStartSec=310
+KillMode=control-group
+NoNewPrivileges=true

@@ -1,5 +1,7 @@
 # Framework observability, evaluation and human review
 
+> Historical TypeScript runtime reference: current API is split-only and the Node worker/legacy execution commands are retired. Reproduce these experiments from their archived reference checkout; use [current Python split](python-llm-split.md) and [native ownership](generic-framework-components.md) for current operation.
+
 ## Current Python path and review boundary
 
 The default `pnpm evaluate` invokes `ptr-llm evaluate` in the Python LLM service.
@@ -12,13 +14,16 @@ run provenance; original case/rubric revisions stay on imported item metadata.
 
 Ordinary runtime root/model traces deliberately do not author raw user/model
 input/output, even when `capture_content` is set. That flag is not a runtime
-content-capture feature. Automatic production-turn sampling into the central
-Langfuse annotation queue is not wired; do not claim that all historical human
+content-capture feature. Automatic runtime-path sampling is not enabled. An explicit approved
+maintenance exporter can copy selected redacted final turns into a dedicated
+native trace annotation queue, without datasets or guessed runtime trace IDs; do not claim that all historical human
 annotations or production review have migrated. The existing **local** weekly
 sampler is supported against the split app/LLM schemas with explicit owner-only
 read-only maintenance access; see [review sampling](review-sampling.md).
 
-No daily retention scheduler is deployed by this repository. Native split-store
+Host daily/weekly timer definitions and a bounded owner-only runner are provided
+in [maintenance](../infra/split/maintenance/README.md). Their installation, active
+state and successful runs are separate deployment acceptance evidence. Native split-store
 maintenance is an explicit dry-run-first owner command, described in the
 [Python split operator guide](python-llm-split.md). Langfuse dataset-item deletion
 is logical latest-version removal on pinned server 4.56.0: older dataset payload

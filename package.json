@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "packageManager": "pnpm@10.32.1",
   "scripts": {
-    "test": "NODE_OPTIONS=--max-old-space-size=8192 jest --runInBand --testPathIgnorePatterns packages/ops/test/langfuse.test.ts scripts/framework-evaluate.test.ts && pnpm test:otel",
+    "test": "NODE_OPTIONS=--max-old-space-size=8192 jest --runInBand --testPathIgnorePatterns packages/ops/test/langfuse.test.ts packages/ops/test/production-review-transport.test.ts scripts/framework-evaluate.test.ts && pnpm test:otel",
     "typecheck": "NODE_OPTIONS=--max-old-space-size=8192 tsc --noEmit",
     "lint": "eslint packages apps/api apps/web scripts e2e --no-error-on-unmatched-pattern",
     "check": "pnpm test && pnpm typecheck && pnpm lint",
@@ -20,7 +20,7 @@
     "ops:status": "tsx scripts/ops-status.ts",
     "framework:checkpoints": "tsx scripts/framework-checkpoints.ts",
     "framework:retention": "tsx scripts/framework-retention.ts",
-    "test:otel": "NODE_OPTIONS=\"--experimental-vm-modules --max-old-space-size=8192\" jest --runInBand --runTestsByPath packages/ops/test/langfuse.test.ts scripts/framework-evaluate.test.ts",
+    "test:otel": "NODE_OPTIONS=\"--experimental-vm-modules --max-old-space-size=8192\" jest --runInBand --runTestsByPath packages/ops/test/langfuse.test.ts packages/ops/test/production-review-transport.test.ts scripts/framework-evaluate.test.ts",
     "framework:checkpoint-retention": "tsx scripts/framework-checkpoint-retention.ts",
     "framework:receipt-retention": "tsx scripts/framework-receipt-retention.ts",
     "persona": "uv run --project apps/llm-service ptr-llm persona",

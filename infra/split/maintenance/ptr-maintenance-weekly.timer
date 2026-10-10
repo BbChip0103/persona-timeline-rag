@@ -1,0 +1,11 @@
+[Unit]
+Description=PTR weekly private local review schedule
+
+[Timer]
+OnCalendar=Mon *-*-* 03:45:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=ptr-maintenance-weekly.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+{
+  "database": "ptr_split_test",
+  "stateDir": "/home/REPLACE/.config/ptr-maintenance/state",
+  "timeoutSeconds": 90,
+  "env": {
+    "PTR_LLM_MAINTENANCE_DATABASE_URL": "postgresql://ptr_split_owner:REPLACE@127.0.0.1:58432/ptr_split_test"
+  },
+  "daily": {"apply": false, "limit": 100},
+  "weekly": {"apply": false, "sinceDays": 7}
+}
