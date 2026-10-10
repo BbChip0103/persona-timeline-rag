@@ -26,7 +26,7 @@ from .evidence import (
 from .guardrails import validate_input, validate_output
 from .persona import dumps, match_lore, render_lore_message, serialized_bytes, validate_persona
 from .policy import REVISION
-from .prompts import POLICY, build_experiment_context
+from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
 from .protocol import variables
 from .routing import (
     DEFAULT_SAFETY_THRESHOLDS,
@@ -101,6 +101,7 @@ class LLMEngine:
         agent_validator=None,
         telemetry=None,
         semantic_search=True,
+        evidence_selector=None,
     ):
         self.provider = provider
         self.personas = personas
@@ -114,6 +115,7 @@ class LLMEngine:
         self.agent_validator = agent_validator
         self.telemetry = telemetry
         self.semantic_search = semantic_search
+        self.evidence_selector = evidence_selector
         self._turn_graph = _compiled_turn_graph()
 
     async def handle(self, grant, *, before_costly, cancelled):
@@ -410,20 +412,84 @@ class LLMEngine:
                 safetyCategory=category,
             )
 
+        async def select_evidence(sources, query, summaries=None):
+            if not self.evidence_selector or not sources:
+                return sources
+            check()
+            if summaries is None and (
+                not self.retrieval or not hasattr(self.retrieval, "summaries")
+            ):
+                raise CoreError("TURN_FAILED", "SUMMARY_UNAVAILABLE")
+            if len(sources) > 20 or len({s["id"] for s in sources}) != len(sources):
+                raise CoreError("TURN_FAILED", "EVIDENCE_SELECTION_INVALID")
+            if summaries is None:
+                summaries = await self.retrieval.summaries(
+                    sources, {"personId": session["personId"]}, signal=cancelled
+                )
+            check()
+            if not isinstance(summaries, dict) or set(summaries) != {s["id"] for s in sources}:
+                raise CoreError("TURN_FAILED", "SUMMARY_UNAVAILABLE")
+            candidates = [
+                {
+                    "id": source["id"],
+                    "summary": summaries[source["id"]],
+                    "postedAt": source["postedAt"],
+                    "eventDate": source["eventDate"],
+                }
+                for source in sources
+            ]
+            await guarded()
+            selected = await self.evidence_selector.select(
+                {
+                    "query": query.get("query") or text[:500],
+                    "candidates": candidates,
+                    "seed": turn["id"],
+                },
+                signal=cancelled,
+                deadline_at=deadline,
+                before_costly=guarded,
+            )
+            check()
+            if (
+                not isinstance(selected, list)
+                or any(not isinstance(sid, str) for sid in selected)
+                or len(set(selected)) != len(selected)
+                or set(selected) - set(summaries)
+            ):
+                raise CoreError("TURN_FAILED", "EVIDENCE_SELECTION_INVALID")
+            by_id = {s["id"]: s for s in sources}
+            return [by_id[sid] for sid in selected]
+
         async def search(query):
             if self.retrieval is None:
                 raise CoreError("TURN_FAILED", "RETRIEVAL_UNAVAILABLE")
             scoped = validate_query(query, session["personId"])
-            found = await self.retrieval.search(
-                scoped,
-                {"personId": session["personId"]},
-                signal=cancelled,
-                mode=session["retrievalMode"],
-                evidence_scope=session.get("ragCondition")
+            if self.evidence_selector:
+                scoped["limit"] = min(20, max(10, scoped["limit"]))
+                if not scoped.get("query"):
+                    scoped["query"] = text[:500]
+            options = {
+                "signal": cancelled,
+                "mode": session["retrievalMode"],
+                "evidence_scope": session.get("ragCondition")
                 if session.get("ragCondition") in ("caption", "caption_image")
                 else "caption",
-            )
+            }
+            summaries = None
+            if self.evidence_selector:
+                # Query embeddings are external paid work too. Recheck turn
+                # ownership, cancellation and deadline before the adapter runs.
+                await guarded()
+            if self.evidence_selector and hasattr(self.retrieval, "search_with_summaries"):
+                found, summaries = await self.retrieval.search_with_summaries(
+                    scoped, {"personId": session["personId"]}, **options
+                )
+            else:
+                found = await self.retrieval.search(
+                    scoped, {"personId": session["personId"]}, **options
+                )
             sources = filter_evidence(found, scoped, session["personId"])
+            sources = await select_evidence(sources, scoped, summaries)
             return (
                 sources
                 if session.get("ragCondition") == "caption_image"
@@ -518,7 +584,40 @@ class LLMEngine:
             refs = snap["references"]
             sources = []
             trace = frame["memoryTrace"]
-            if refs and self.retrieval and hasattr(self.retrieval, "resolve"):
+            if (
+                refs
+                and self.retrieval
+                and self.evidence_selector
+                and hasattr(self.retrieval, "resolve_with_summaries")
+            ):
+                # This capability validates the old owned references before
+                # hydrating their same parents and full current photos from one
+                # pinned summary run. Do not narrow those photos back to old refs.
+                resolved, summaries = await self.retrieval.resolve_with_summaries(
+                    refs,
+                    {"personId": session["personId"]},
+                    signal=cancelled,
+                    evidence_scope=session.get("ragCondition")
+                    if session.get("ragCondition") in ("caption", "caption_image")
+                    else "caption",
+                )
+                pinned = [
+                    source
+                    for source in resolved
+                    if any(
+                        ref["sourceId"] == source.get("id")
+                        and ref["hash"] == source.get("hash")
+                        and ref["snapshot"] == source.get("snapshot")
+                        and ref["personId"] == source.get("personId")
+                        for ref in refs
+                    )
+                ]
+                sources = filter_evidence(pinned, q, session["personId"])
+                if sources:
+                    sources = await select_evidence(sources, q, summaries)
+                if sources:
+                    trace = dict(trace, action="reuse", reusedSourceIds=[s["id"] for s in sources])
+            elif refs and self.retrieval and hasattr(self.retrieval, "resolve"):
                 resolved = await self.retrieval.resolve(
                     refs,
                     {"personId": session["personId"]},
@@ -571,6 +670,8 @@ class LLMEngine:
                         )
                     )
                 sources = filter_evidence(pinned, q, session["personId"])
+                if sources:
+                    sources = await select_evidence(sources, q)
                 if sources:
                     trace = dict(trace, action="reuse", reusedSourceIds=[s["id"] for s in sources])
             if not sources:
@@ -644,6 +745,7 @@ class LLMEngine:
                     deadline_at=deadline,
                     before_costly=guarded,
                     telemetry=self.telemetry,
+                    max_sources=20 if self.evidence_selector else EVIDENCE_POST_LIMIT,
                 )
                 return dict(
                     frame,
@@ -661,6 +763,7 @@ class LLMEngine:
                     frame["sources"],
                     policy_note=note,
                     after_history=[lore] if lore else [],
+                    max_sources=20 if self.evidence_selector else EVIDENCE_POST_LIMIT,
                 )
                 messages = experiment["messages"]
             else:

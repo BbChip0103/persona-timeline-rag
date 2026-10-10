@@ -10,7 +10,7 @@ from langgraph.runtime import Runtime
 
 from .errors import CoreError
 from .persona import dumps
-from .prompts import POLICY, build_experiment_context
+from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
 from .protocol import parse_agent_response, variables
 from .safety import contains_credential, contains_internal_path
 from .texts import is_korean, speech_level, utterance_language, voice_text
@@ -95,6 +95,7 @@ async def run_character_agent(
     deadline_at=None,
     before_costly=None,
     telemetry=None,
+    max_sources=EVIDENCE_POST_LIMIT,
 ):
     persona = copy.deepcopy(persona)
     history = copy.deepcopy(history)
@@ -175,6 +176,7 @@ async def run_character_agent(
             policy_note=policy_note,
             after_history=after,
             after_user=run["transcript"],
+            max_sources=max_sources,
         )
         if len(ctx["messages"]) > 64:
             raise CoreError("CONTEXT_LIMIT")

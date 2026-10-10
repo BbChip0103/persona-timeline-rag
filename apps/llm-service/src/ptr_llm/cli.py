@@ -130,6 +130,10 @@ def evaluate(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "summarize":
+        from ptr_llm.ingestion.summaries import main as summarize_main
+
+        return summarize_main(argv[1:])
     # Lazy loading keeps domain CLI free of the runtime/queue connection side effects.
     if argv and argv[0] in {"worker", "serve"}:
         from ptr_llm.__main__ import run_process

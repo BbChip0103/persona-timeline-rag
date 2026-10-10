@@ -46,7 +46,10 @@ def build_experiment_context(
     policy_note=None,
     after_history=(),
     after_user=(),
+    max_sources=EVIDENCE_POST_LIMIT,
 ):
+    if type(max_sources) is not int or not 1 <= max_sources <= 20:
+        raise CoreError("INVALID_INPUT")
     unique = []
     seen = set()
     for source in sources:
@@ -101,7 +104,7 @@ def build_experiment_context(
     if not fits():
         raise CoreError("CONTEXT_LIMIT")
     for source in unique:
-        if len(kept) >= EVIDENCE_POST_LIMIT:
+        if len(kept) >= max_sources:
             break
         kept.append(source)
         included.append([])

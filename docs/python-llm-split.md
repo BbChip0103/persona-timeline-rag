@@ -61,13 +61,90 @@ Explicit lexical and RAG-off sessions remain supported, and existing sessions ke
 their stored retrieval mode. RAG-off remains the initial experimental condition.
 The current query embedder calls OpenRouter with `openai/text-embedding-3-small`,
 explicitly requesting **1536 dimensions**, then compares against stored vectors with
-the matching model revision using pgvector cosine distance. No new embedder or corpus
-re-embedding is introduced. Approved runtime configuration requires
+the matching model revision using pgvector cosine distance. The search-mode default change alone introduces no new embedder or corpus
+re-embedding; the optional summary-index build below is a separate operation. Approved runtime configuration requires
 `PTR_LLM_EMBEDDING_PROVIDER=openrouter`,
 `PTR_LLM_EMBEDDING_MODEL_REVISION=openai/text-embedding-3-small`, the existing OpenRouter
 credentials/live/data-consent/budget gates, and the matching backend capability flag.
 Example envs keep external calls disabled; changing the default does not enable paid
 requests, change private deployment envs, or migrate existing sessions.
+
+### Summary-only retrieval and evidence selection
+
+The optional replacement index embeds **one three-line Korean summary per eligible
+licensed post**, not concatenated caption/image annotation text. Summarization uses
+the complete caption, all stored image descriptions and explicit location-tag names.
+Known activity dates take precedence; otherwise the stored upload calendar date is
+used without rewriting `eventDate` (the current stored uploads use UTC calendar dates). Missing information and explanations such as
+“date unknown” or “shared via a caption” are omitted. Image hypotheses do not become
+verified author intent. Summaries are generated retrieval aids, never quote evidence.
+
+Apply `supabase/split/0003_post_summaries.sql` with the isolated migration owner after
+a private backup. It adds immutable run manifests, summaries and 1536-dimensional
+summary vectors, plus a single active-index pointer. Original corpus, annotations
+and caption/image vectors remain untouched for rollback. Activation requires exact
+eligible corpus coverage, current source/annotation bindings and a matching nonzero
+vector for every summary. New/changed sources or annotations invalidate completeness;
+summary mode never silently falls back to old vectors.
+
+`ptr-llm summarize` defaults to a read-only dry run. Explicit execution requires a
+private LLM-only env, approved external-data/provider flags, an additional cost cap
+and an owner-only budget record. One live builder per database is enforced by a
+session advisory lock. Both the run cap and existing durable global/migration cap
+apply, including in-flight/unknown reservations; neither old ledger nor budget baseline
+is reset. Original geotag metadata is bound to the immutable DB source hash. Only
+the tag name is sent, not coordinates, tagged people or comments.
+
+```sh
+uv run --project apps/llm-service ptr-llm summarize \
+  --env /private/llm-summary.env \
+  --processed-posts /private/approved/target_posts.jsonl \
+  --metadata-root /private/approved/instagram-subset \
+  --run post-summary-v1
+# For summaries authored directly in a Codex session, add:
+# --summary-file /private/source-bound-summaries.jsonl
+# Add only within an approved embedding run:
+# --execute --max-usd 1 --budget-record /private/summary-budget.json --activate
+```
+
+All summaries are saved before the embedding phase. Stable full batches and durable
+provider receipts support resume after partial DB writes; ambiguous submissions are
+not retried. `--summary-file` imports session-authored text without calling a paid
+summarizer, records `codex-session-direct` provenance and binds the artifact digest.
+Its private JSONL must contain exactly one row per eligible source with `source_id`,
+`source_hash`, `annotation_revision`, `annotation_hash` and `summary`. Every row is
+validated before any embedding call, and all rows are saved to DB first. The initial
+manifest membership must match exactly; per-source freshness is checked during import.
+Direct-summary execution permits an embedding cap of at most US$1. Without that
+option, the separately authorized provider-summary path uses the approved Gemma model.
+Both paths use `openai/text-embedding-3-small` for vectors; runtime selection uses
+`typesafe/jev-1.13`. An embedding authorization does not authorize paid Jev evaluation.
+Exact three-line/date/location/length checks are structural guards, not factual-quality
+certification. Do not start a new run/record to bypass a spent cap or unresolved request.
+
+Enable the paired Python settings only after index validation:
+`PTR_LLM_RETRIEVAL_INDEX=summary`, `PTR_LLM_EVIDENCE_SELECTOR=jev`, and the existing
+approved OpenRouter query-embedding settings. Search gathers 10–20 candidates. Jev
+judges which posts supply necessary/useful answer evidence, independently of a fixed
+quota, and orders selected posts by relevance. Selection can return zero, one or more
+than three posts. The provisional threshold is separately configurable with
+`PTR_LLM_EVIDENCE_THRESHOLD` (default `0.7`); it is not a calibrated accuracy claim.
+Size-bounded requests may require several Jev batches, each ownership/deadline fenced;
+an invalid/missing answer fails closed, not a partial selection or fallback to all posts.
+
+Candidate vectors and selector summaries are pinned to the same immutable run. Followups
+resolve trusted prior references before loading full current parent evidence. Tool
+searches also use selection. Off/creative/safety-deflected paths do not invoke it.
+Answer generation still receives original captions and permitted image annotations,
+not summary quotes. The fixed three-post prompt cap is lifted in selected mode, but
+the existing 30KB total prompt budget remains; omitted evidence is tracked. Summary
+mode requires semantic search, and refuses explicit lexical search rather than using
+the old caption index. Legacy-index mode retains its old lexical/semantic behavior.
+
+The full-post summary index uses images in retrieval for both `caption` and
+`caption_image`; those conditions only control answer-evidence scope in this mode.
+It must not be described as the historical no-image retrieval ablation. Use explicit
+legacy-index mode when reproducing that older comparison.
 
 ## Migration / rollback
 

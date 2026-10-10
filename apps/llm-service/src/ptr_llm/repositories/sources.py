@@ -481,8 +481,56 @@ class PostgresSourceRepository(LlmRepository):
         *,
         signal: asyncio.Event | None = None,
         evidence_scope: str = "caption",
+        summary_index: bool = False,
+        summary_run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         values = parameters(query, trusted)
+        if summary_index:
+            from .summaries import ACTIVE_SQL, checked_active_run
+
+            if evidence_scope not in ("caption", "caption_image"):
+                raise CoreError("INVALID_INPUT")
+            vector = checked_vector(embedding)
+            if summary_run_id is None:
+                active_rows = await self.fetch(ACTIVE_SQL, signal=signal)
+            else:
+                active_rows = await self.fetch(
+                    "SELECT run_id,embedding_model_revision,"
+                    "llm.ptr_summary_run_complete(run_id,embedding_model_revision) AS complete "
+                    "FROM llm.post_summary_runs WHERE run_id=$1",
+                    [summary_run_id],
+                    signal=signal,
+                )
+            active = checked_active_run(active_rows, model_revision)
+            sql = (
+                f"WITH scoped AS MATERIALIZED (SELECT p.id,p.document,p.posted_at,"
+                f"r.document AS annotations,v.embedding FROM llm.source_posts p "
+                f"JOIN llm.post_summary_run_sources s ON s.source_id=p.id AND s.run_id=$6 "
+                f"AND s.source_hash=p.source_hash AND s.person_id=p.person_id "
+                f"JOIN llm.post_summary_vectors v ON v.run_id=s.run_id AND v.source_id=p.id "
+                f"AND v.model_revision=$7 LEFT JOIN LATERAL (SELECT revision,document "
+                f"FROM llm.source_image_revisions WHERE source_id=p.id ORDER BY ordinal "
+                f"DESC LIMIT 1) r ON true WHERE {SCOPE} AND p.origin='licensed_source' "
+                f"AND r.revision IS NOT DISTINCT FROM s.annotation_revision) "
+                f"SELECT document,annotations FROM scoped ORDER BY embedding <=> "
+                f"$8::vector,posted_at DESC,id ASC LIMIT $9"
+            )
+            rows = await self.fetch(
+                sql,
+                [*values, active["run_id"], model_revision, vector, query["limit"]],
+                signal=signal,
+            )
+            return [
+                {
+                    **validate_source(row["document"]),
+                    **(
+                        {"imageAnnotations": row["annotations"]}
+                        if evidence_scope == "caption_image" and row.get("annotations")
+                        else {}
+                    ),
+                }
+                for row in rows
+            ]
         if evidence_scope == "caption_image":
             sql = (
                 f"WITH scoped AS MATERIALIZED (SELECT "
@@ -640,8 +688,10 @@ class PostgresRetrieval:
         *,
         embed: Any = None,
         model_revision: str | None = None,
+        summary_index: bool = False,
     ):
         self.sources, self.embed, self.model_revision = sources, embed, model_revision
+        self.summary_index = summary_index
 
     async def search(
         self,
@@ -654,6 +704,8 @@ class PostgresRetrieval:
     ) -> list[dict[str, Any]]:
         parameters(query, trusted)
         check_cancel(signal)
+        if self.summary_index and mode != "semantic":
+            raise CoreError("SUMMARY_INDEX_REQUIRES_SEMANTIC")
         if mode == "lexical":
             return await self.sources.search_lexical(
                 query, trusted, signal=signal, evidence_scope=evidence_scope
@@ -663,6 +715,7 @@ class PostgresRetrieval:
         vector = await self.embed(
             query.get("query", ""), signal=signal, evidence_scope=evidence_scope
         )
+        summary_options: dict[str, Any] = {"summary_index": True} if self.summary_index else {}
         return await self.sources.search_semantic(
             query,
             trusted,
@@ -670,7 +723,125 @@ class PostgresRetrieval:
             self.model_revision,
             signal=signal,
             evidence_scope=evidence_scope,
+            **summary_options,
         )
+
+    async def summaries(
+        self,
+        candidates: list[dict[str, Any]],
+        trusted: dict[str, str],
+        *,
+        signal: asyncio.Event | None = None,
+    ) -> dict[str, str]:
+        from .summaries import PostgresSummaryRepository
+
+        check_cancel(signal)
+        if not self.summary_index or any(
+            s.get("personId") != trusted.get("personId") or s.get("unsafe") is not False
+            for s in candidates
+        ):
+            raise CoreError("FORBIDDEN")
+        repository = PostgresSummaryRepository(self.sources.pool, self.sources.pool.conninfo)
+        return await repository.get_summaries(
+            [s["id"] for s in candidates], trusted["personId"], signal=signal
+        )
+
+    async def search_with_summaries(
+        self,
+        query: dict[str, Any],
+        trusted: dict[str, str],
+        *,
+        signal: asyncio.Event | None = None,
+        mode: str = "semantic",
+        evidence_scope: str = "caption",
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        from .summaries import PostgresSummaryRepository
+
+        parameters(query, trusted)
+        check_cancel(signal)
+        if (
+            not self.summary_index
+            or mode != "semantic"
+            or self.embed is None
+            or not self.model_revision
+        ):
+            raise CoreError("SUMMARY_INDEX_REQUIRES_SEMANTIC")
+        repository = PostgresSummaryRepository(self.sources.pool, self.sources.pool.conninfo)
+        run = await repository.active_run(self.model_revision, signal=signal)
+        vector = await self.embed(
+            query.get("query", ""), signal=signal, evidence_scope=evidence_scope
+        )
+        found = await self.sources.search_semantic(
+            query,
+            trusted,
+            vector,
+            self.model_revision,
+            signal=signal,
+            evidence_scope=evidence_scope,
+            summary_index=True,
+            summary_run_id=run["run_id"],
+        )
+        summaries = await repository.get_summaries(
+            [s["id"] for s in found],
+            trusted["personId"],
+            signal=signal,
+            run_id=run["run_id"],
+        )
+        return found, summaries
+
+    async def resolve_with_summaries(
+        self,
+        references: list[dict[str, Any]],
+        trusted: dict[str, str],
+        *,
+        signal: asyncio.Event | None = None,
+        evidence_scope: str = "caption",
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        from .summaries import PostgresSummaryRepository
+
+        if not self.summary_index or evidence_scope not in ("caption", "caption_image"):
+            raise CoreError("INVALID_INPUT")
+        check_cancel(signal)
+        resolved = await self.sources.resolve_evidence(
+            references,
+            trusted,
+            signal=signal,
+            evidence_scope=evidence_scope,
+        )
+        if not resolved:
+            return [], {}
+        repository = PostgresSummaryRepository(self.sources.pool, self.sources.pool.conninfo)
+        run = await repository.active_run(self.model_revision, signal=signal)
+        rows = await repository.fetch(
+            "SELECT p.document,r.document AS annotations FROM llm.source_posts p "
+            "JOIN llm.post_summary_run_sources s ON s.source_id=p.id AND s.run_id=$1 "
+            "AND s.source_hash=p.source_hash LEFT JOIN LATERAL(SELECT document,revision "
+            "FROM llm.source_image_revisions WHERE source_id=p.id ORDER BY ordinal DESC LIMIT 1) "
+            "r ON true WHERE p.id=ANY($2::text[]) AND p.person_id=$3 AND s.person_id=$3 "
+            "AND NOT p.unsafe AND p.origin='licensed_source' "
+            "AND r.revision IS NOT DISTINCT FROM s.annotation_revision ORDER BY p.id",
+            [run["run_id"], [s["id"] for s in resolved], trusted["personId"]],
+            signal=signal,
+        )
+        originals = {s["id"]: s for s in resolved}
+        found = []
+        for row in rows:
+            post = validate_source(row["document"])
+            previous = originals.get(post["id"])
+            if not previous or any(
+                post[k] != previous[k] for k in ("hash", "snapshot", "personId")
+            ):
+                raise CoreError("SUMMARY_SOURCE_STALE")
+            if evidence_scope == "caption_image" and row.get("annotations"):
+                post["imageAnnotations"] = row["annotations"]
+            found.append(post)
+        summaries = await repository.get_summaries(
+            [s["id"] for s in found],
+            trusted["personId"],
+            signal=signal,
+            run_id=run["run_id"],
+        )
+        return found, summaries
 
     async def resolve(
         self, references: list[dict[str, Any]], trusted: dict[str, str], **options: Any
