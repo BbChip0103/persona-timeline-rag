@@ -24,6 +24,8 @@ def source(**changes):
         "eventDate": None,
         "hash": "synthetic-hash",
         "unsafe": False,
+        "annotationRevision": None,
+        "annotationHash": None,
         "imageAnnotations": [{"text": "Visual description: 청록색 호수가 보인다."}],
         **changes,
     }
@@ -268,7 +270,7 @@ def test_authored_file_requires_exact_private_source_and_annotation_bindings(tmp
 
 @pytest.mark.asyncio
 async def test_authored_summaries_never_call_paid_generate_and_all_save_before_embed():
-    from ptr_llm.ingestion.summaries import DIRECT_SUMMARY_MODEL
+    from ptr_llm.ingestion.summaries import DIRECT_SUMMARY_MODEL, source_bindings
 
     posts = [source(id=f"synthetic:{i}") for i in range(2)]
     summary = "2026년 10월 11일, 호수 여행.\n청록색 호수가 보인다.\n다시 방문하고 싶다고 한다."
@@ -315,9 +317,77 @@ async def test_authored_summaries_never_call_paid_generate_and_all_save_before_e
         run_id="direct",
         locations={},
         authored_summaries={p["id"]: summary for p in posts},
+        authored_source_bindings=source_bindings(posts),
         activate=True,
     )
     assert result["summaries"] == result["vectors"] == 2
     assert events == ["summary", "summary", "embed", "vector", "vector", "activate"]
     with pytest.raises(ProviderError, match="AUTHORED_SUMMARIES_INCOMPLETE"):
         await build_index(repo, Client(), run_id="direct", locations={}, authored_summaries={})
+
+
+@pytest.mark.asyncio
+async def test_authored_parent_changed_after_file_load_fails_before_paid_work():
+    from ptr_llm.ingestion.summaries import source_bindings
+
+    original = source(annotationRevision="v1", annotationHash="old")
+    updated = {**original, "annotationRevision": "v2", "annotationHash": "new"}
+    summary = "2026년 10월 11일, 호수 여행.\n청록색 호수가 보인다.\n다시 방문하고 싶다고 한다."
+
+    class Repo:
+        async def list_sources(self):
+            return [updated]
+
+        async def start_run(self, *args, **kwargs):
+            pytest.fail("Stale authored text must be rejected before manifest creation")
+
+    class Client:
+        model = "synthetic-provider"
+
+        async def generate(self, *args, **kwargs):
+            pytest.fail("No paid calls")
+
+        async def embed(self, *args, **kwargs):
+            pytest.fail("No paid calls")
+
+    with pytest.raises(ProviderError, match="AUTHORED_SUMMARY_SOURCE_MISMATCH"):
+        await build_index(
+            Repo(),
+            Client(),
+            run_id="direct",
+            locations={},
+            authored_summaries={original["id"]: summary},
+            authored_source_bindings=source_bindings([original]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_budget_is_one_usd_and_missing_resume_record_cannot_rebaseline(tmp_path):
+    from argparse import Namespace
+    from contextlib import asynccontextmanager
+
+    from ptr_llm.ingestion.summaries import SUMMARY_MODEL, execute_live
+
+    args = Namespace(
+        max_usd=2, budget_record=str(tmp_path / "budget.json"), run="direct", model=SUMMARY_MODEL
+    )
+    with pytest.raises(ProviderError, match="EMBEDDING_RUN_BUDGET_EXCEEDS_ONE_USD"):
+        await execute_live(args, {}, "synthetic", None, None, {}, {}, {})
+    args.max_usd = 1
+
+    class Connection:
+        async def execute(self, sql, values):
+            assert "post_summary_runs" in sql
+            return self
+
+        async def fetchone(self):
+            return {"run_id": "direct"}
+
+    class Pool:
+        @asynccontextmanager
+        async def connection(self):
+            yield Connection()
+
+    with pytest.raises(ProviderError, match="RUN_BUDGET_RECORD_REQUIRED_FOR_RESUME"):
+        await execute_live(args, {}, "synthetic", Pool(), None, {}, {}, {})
+    assert not (tmp_path / "budget.json").exists()

@@ -104,6 +104,13 @@ def validate_summary(value: str, source: dict[str, Any], location_tag: str | Non
     return value
 
 
+def source_bindings(sources: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        s["id"]: {k: s[k] for k in ("hash", "annotationRevision", "annotationHash")}
+        for s in sources
+    }
+
+
 def load_authored_summaries(
     path: Path, sources: list[dict[str, Any]], locations: dict[str, str]
 ) -> dict[str, str]:
@@ -237,6 +244,7 @@ async def build_index(
     activate: bool = False,
     progress: Any = None,
     authored_summaries: dict[str, str] | None = None,
+    authored_source_bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int | bool]:
     """Complete and save ALL summaries before embedding; incomplete runs never activate."""
     from ptr_llm.providers.openrouter import EMBEDDING_MODEL
@@ -249,6 +257,8 @@ async def build_index(
     if authored_summaries is not None:
         if set(authored_summaries) != {s["id"] for s in sources}:
             raise ProviderError("AUTHORED_SUMMARIES_INCOMPLETE")
+        if source_bindings(sources) != authored_source_bindings:
+            raise ProviderError("AUTHORED_SUMMARY_SOURCE_MISMATCH")
         for source in sources:
             validate_summary(authored_summaries[source["id"]], source, locations.get(source["id"]))
         model = DIRECT_SUMMARY_MODEL
@@ -423,7 +433,16 @@ async def execute_cli(args: argparse.Namespace) -> dict[str, Any]:
                 "dbWrites": 0,
             }
         async with exclusive_run(pool, args.run):
-            return await execute_live(args, env, url, pool, repository, tags, authored)
+            return await execute_live(
+                args,
+                env,
+                url,
+                pool,
+                repository,
+                tags,
+                authored,
+                source_bindings(sources) if authored is not None else None,
+            )
 
 
 async def execute_live(
@@ -434,6 +453,7 @@ async def execute_live(
     repository: Any,
     tags: dict[str, str],
     authored: dict[str, str] | None = None,
+    authored_bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from ptr_llm.providers.openrouter import OpenRouterClient
 
@@ -447,6 +467,7 @@ async def execute_live(
         "run": args.run,
         "model": DIRECT_SUMMARY_MODEL if authored is not None else args.model,
         "authoredHash": fingerprint(authored) if authored is not None else None,
+        "authoredSourceHash": fingerprint(authored_bindings) if authored is not None else None,
         "prompt": SUMMARY_PROMPT_REVISION,
         "locations": fingerprint(tags),
         "capMicrousd": math.floor(args.max_usd * 1_000_000),
@@ -459,6 +480,13 @@ async def execute_live(
             raise ProviderError("RUN_BUDGET_BINDING_MISMATCH")
     else:
         async with pool.connection() as conn:
+            previous = await (
+                await conn.execute(
+                    "SELECT run_id FROM llm.post_summary_runs WHERE run_id=%s", (args.run,)
+                )
+            ).fetchone()
+            if previous is not None:
+                raise ProviderError("RUN_BUDGET_RECORD_REQUIRED_FOR_RESUME")
             keys: Any = await (
                 await conn.execute("SELECT key FROM llm.ptr_provider_requests")
             ).fetchall()
@@ -489,6 +517,7 @@ async def execute_live(
         activate=args.activate,
         progress=lambda counts: print(json.dumps(counts), flush=True),
         authored_summaries=authored,
+        authored_source_bindings=authored_bindings,
     )
     return {**result, "newExposureMicrousd": await ledger.exposure()}
 

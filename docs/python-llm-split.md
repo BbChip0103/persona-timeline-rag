@@ -113,8 +113,10 @@ not retried. `--summary-file` imports session-authored text without calling a pa
 summarizer, records `codex-session-direct` provenance and binds the artifact digest.
 Its private JSONL must contain exactly one row per eligible source with `source_id`,
 `source_hash`, `annotation_revision`, `annotation_hash` and `summary`. Every row is
-validated before any embedding call, and all rows are saved to DB first. The initial
-manifest membership must match exactly; per-source freshness is checked during import.
+validated before any embedding call, and all rows are saved to DB first. Original
+source/annotation bindings survive the builder's refreshed source read; changed parents
+fail before paid work. A resumed run without its existing budget record is rejected,
+never silently rebased. The initial manifest membership must match exactly; per-source freshness is checked during import.
 Direct-summary execution permits an embedding cap of at most US$1. Without that
 option, the separately authorized provider-summary path uses the approved Gemma model.
 Both paths use `openai/text-embedding-3-small` for vectors; runtime selection uses
