@@ -17,6 +17,13 @@ class FakeResponse:
     def read(self, size):
         return b"data"
 
+    @property
+    def status_code(self):
+        return self.status
+
+    def iter_raw(self):
+        yield self.read(65536)
+
 
 class DriveTests(unittest.TestCase):
     def test_warning_only_allows_correct_drive_host_and_id(self):
@@ -65,7 +72,7 @@ class DriveTests(unittest.TestCase):
             patch.object(client, "resolve", return_value="https://example.invalid"),
             patch.object(client, "_open", return_value=response),
             patch.object(FakeResponse, "read", side_effect=[TimeoutError(), b"data"]) as read,
-            patch("persona_timeline_rag.datasets.drive.time.sleep"),
+            patch("tenacity.nap.time.sleep"),
         ):
             self.assertEqual(client.read_range(DriveFile("a.zip", "fake", 100), 0, 4), b"data")
             self.assertEqual(read.call_count, 2)

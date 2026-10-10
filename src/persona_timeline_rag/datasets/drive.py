@@ -10,15 +10,21 @@ import json
 import re
 import shutil
 import threading
-import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from http.client import IncompleteRead
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+from typing import Any
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler
+
+import httpx
+from bs4 import BeautifulSoup, Tag
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 
 class DownloadError(RuntimeError):
@@ -32,36 +38,70 @@ class DriveFile:
     size_bytes: int
 
 
-class WarningForm(HTMLParser):
+class _FormEndPositions(HTMLParser):
+    """Native closing-token positions preserve legacy malformed-form boundaries."""
+
     def __init__(self) -> None:
         super().__init__()
-        self.action: str | None = None
-        self.fields: dict[str, str] = {}
-        self.inside = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        if tag == "form" and values.get("id") == "download-form":
-            self.inside = True
-            self.action = values.get("action")
-        if tag == "input" and self.inside and values.get("name"):
-            self.fields[str(values["name"])] = values.get("value") or ""
+        self.positions: list[tuple[int, int]] = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "form":
-            self.inside = False
+            self.positions.append(self.getpos())
+
+
+class _NoCookies(DefaultCookiePolicy):
+    """The original urllib opener had no HTTPCookieProcessor."""
+
+    def set_ok(self, cookie: Cookie, request: Any) -> bool:
+        return False
+
+    def return_ok(self, cookie: Cookie, request: Any) -> bool:
+        return False
 
 
 def parse_warning(html: str, file_id: str) -> str:
-    form = WarningForm()
-    form.feed(html)
-    if not form.action or urlparse(form.action).hostname != "drive.usercontent.google.com":
+    soup = BeautifulSoup(html, "html.parser")
+    ends = _FormEndPositions()
+    ends.feed(html)
+    action = None
+    fields: dict[str, str] = {}
+    # BeautifulSoup owns attribute/entity parsing and tag traversal. Its repaired
+    # DOM parentage is NOT the old policy: any closing form ended the active
+    # region, while unrelated malformed end tags did not. Replay native token
+    # positions, retaining only this distribution-specific compatibility policy.
+    events: list[tuple[int, int, int, Tag | None]] = [
+        (element.sourceline or 0, element.sourcepos or 0, 0, element)
+        for element in soup.find_all(["form", "input"])
+    ]
+    events.extend((line, column, 1, None) for line, column in ends.positions)
+    active = False
+    for _line, _column, _kind, element in sorted(events, key=lambda event: event[:3]):
+        if element is None:
+            active = False
+        elif element.name == "form" and element.get("id") == "download-form":
+            active = True
+            value = element.get("action")
+            action = str(value) if value is not None else None
+        elif element.name == "input" and active and element.get("name"):
+            fields[str(element.get("name"))] = str(element.get("value") or "")
+    if not action or urlparse(action).hostname != "drive.usercontent.google.com":
         raise DownloadError("Drive access/quota/login page instead of a download warning")
-    if urlparse(form.action).scheme != "https" or form.fields.get("id") != file_id:
+    if urlparse(action).scheme != "https" or fields.get("id") != file_id:
         raise DownloadError("Invalid Drive download warning form")
-    if form.fields.get("confirm") != "t" or not form.fields.get("uuid"):
+    if fields.get("confirm") != "t" or not fields.get("uuid"):
         raise DownloadError("Unsupported Drive warning; no automatic acceptance")
-    return form.action + "?" + urlencode(form.fields)
+    return action + "?" + urlencode(fields)
+
+
+def _read_bounded(response: httpx.Response, size: int) -> bytes:
+    """Read at most the caller's sentinel budget, without decoding binary data."""
+    body = bytearray()
+    for chunk in response.iter_raw():
+        body.extend(chunk[: size - len(body)])
+        if len(body) == size:
+            break
+    return bytes(body)
 
 
 def parse_folder(html: str) -> list[DriveFile]:
@@ -87,25 +127,90 @@ class DriveClient:
         self.lock = threading.Lock()
         self.network_bytes = 0
 
-    def _open(self, request: Request):
-        for attempt in range(self.attempts):
+    def _retrying(self, predicate: Callable[[BaseException], bool]) -> Retrying:
+        return Retrying(
+            stop=stop_after_attempt(self.attempts),
+            wait=wait_exponential(multiplier=1, max=10),
+            retry=retry_if_exception(predicate),
+            reraise=True,
+        )
+
+    @contextmanager
+    def _open(self, url: str, headers: dict[str, str] | None = None) -> Iterator[httpx.Response]:
+        if self.attempts <= 0:
+            raise DownloadError("Retry limit reached")
+
+        def retryable(error: BaseException) -> bool:
+            if isinstance(error, httpx.HTTPStatusError):
+                return error.response.status_code in (429, 500, 502, 503, 504)
+            return isinstance(error, (httpx.TransportError, TimeoutError, OSError))
+
+        visited: dict[str, int] = {}
+        initial_request = True
+
+        def redirect_policy(request: httpx.Request) -> None:
+            nonlocal initial_request
+            if initial_request:
+                initial_request = False
+                return
+            # HTTPX owns redirect construction and dispatch. Match urllib's
+            # distinct-target/repeat policy on the resulting native next request;
+            # a total-10 cap would wrongly reject allowed multi-URL cycles.
+            target = str(request.url)
+            if (visited.get(target, 0) >= HTTPRedirectHandler.max_repeats
+                    or len(visited) >= HTTPRedirectHandler.max_redirections):
+                raise DownloadError("Drive redirect limit exceeded")
+            visited[target] = visited.get(target, 0) + 1
+
+        # Per-open ownership avoids a persistent client escaping this historical
+        # synchronous API. HTTPX follows the redirects urllib previously followed;
+        # native transport retries stay disabled so Tenacity owns all attempts.
+        with httpx.Client(
+            timeout=self.timeout,
+            follow_redirects=True,
+            headers={"Accept-Encoding": "identity"},
+            cookies=CookieJar(policy=_NoCookies()),
+            max_redirects=HTTPRedirectHandler.max_repeats * HTTPRedirectHandler.max_redirections,
+            event_hooks={"request": [redirect_policy]},
+        ) as client:
+            request = client.build_request("GET", url, headers=headers)
+
+            def send() -> httpx.Response:
+                nonlocal initial_request
+                initial_request = True
+                visited.clear()
+                response = client.send(request, stream=True)
+                try:
+                    response.raise_for_status()
+                except BaseException:
+                    response.close()
+                    raise
+                return response
+
             try:
-                return urlopen(request, timeout=self.timeout)
-            except HTTPError as error:
-                if error.code not in (429, 500, 502, 503, 504) or attempt + 1 == self.attempts:
-                    raise DownloadError(
-                        f"Drive HTTP {error.code}: access/quota/network failure"
-                    ) from error
-            except (URLError, TimeoutError, OSError) as error:
-                if attempt + 1 == self.attempts:
-                    raise DownloadError(f"Drive transport failed: {error}") from error
-            time.sleep(min(2**attempt, 10))
-        raise DownloadError("Retry limit reached")
+                response = self._retrying(retryable)(send)
+            except httpx.HTTPStatusError as error:
+                raise DownloadError(
+                    f"Drive HTTP {error.response.status_code}: access/quota/network failure"
+                ) from error
+            except httpx.TooManyRedirects as error:
+                raise DownloadError("Drive redirect limit exceeded") from error
+            except (httpx.TransportError, TimeoutError, OSError) as error:
+                raise DownloadError(f"Drive transport failed: {error}") from error
+            try:
+                yield response
+            except httpx.TimeoutException as error:
+                raise TimeoutError("Drive body transfer timed out") from error
+            except httpx.TransportError as error:
+                # Keep the historical CLI's OSError boundary for interrupted
+                # streamed bodies; range retries remain owned by the outer policy.
+                raise OSError("Drive body transfer failed") from error
+            finally:
+                response.close()
 
     def folder(self, folder_id: str) -> list[DriveFile]:
-        request = Request(f"https://drive.google.com/drive/folders/{folder_id}")
-        with self._open(request) as response:
-            body = response.read(8 * 1024 * 1024 + 1)
+        with self._open(f"https://drive.google.com/drive/folders/{folder_id}") as response:
+            body = _read_bounded(response, 8 * 1024 * 1024 + 1)
         if len(body) > 8 * 1024 * 1024:
             raise DownloadError("Folder HTML exceeded bounded inventory limit")
         return parse_folder(body.decode("utf-8"))
@@ -117,15 +222,15 @@ class DriveClient:
         url = "https://drive.usercontent.google.com/download?" + urlencode(
             {"id": file_id, "export": "download"}
         )
-        with self._open(Request(url)) as response:
+        with self._open(url) as response:
             content_type = response.headers.get("Content-Type", "")
             if "text/html" in content_type:
-                body = response.read(65537)
+                body = _read_bounded(response, 65537)
                 if len(body) > 65536:
                     raise DownloadError("Drive returned an oversized non-file HTML page")
                 url = parse_warning(body.decode("utf-8"), file_id)
             else:
-                url = response.url
+                url = str(response.url)
         with self.lock:
             self.urls[file_id] = url
         return url
@@ -135,32 +240,33 @@ class DriveClient:
             return b""
         if offset < 0 or size < 0 or offset + size > file.size_bytes:
             raise DownloadError("Range is outside the declared archive volume")
-        request = Request(
-            self.resolve(file.id),
-            headers={"Range": f"bytes={offset}-{offset + size - 1}", "Accept-Encoding": "identity"},
-        )
-        for attempt in range(self.attempts):
-            try:
-                with self._open(request) as response:
-                    expected = f"bytes {offset}-{offset + size - 1}/{file.size_bytes}"
-                    if response.status != 206 or response.headers.get("Content-Range") != expected:
-                        raise DownloadError(
-                            "Server ignored/mismatched Range; refusing full archive download"
-                        )
-                    if "text/html" in response.headers.get("Content-Type", ""):
-                        raise DownloadError("HTML returned for a binary archive range")
-                    body = response.read(size + 1)
-                if len(body) != size:
-                    raise IncompleteRead(body, size - len(body))
-            except (IncompleteRead, TimeoutError, OSError) as error:
-                if attempt + 1 == self.attempts:
-                    raise DownloadError(f"Archive range transfer failed: {error}") from error
-                time.sleep(min(2**attempt, 10))
-                continue
-            with self.lock:
-                self.network_bytes += size
+        url = self.resolve(file.id)
+        headers = {"Range": f"bytes={offset}-{offset + size - 1}", "Accept-Encoding": "identity"}
+        if self.attempts <= 0:
+            raise DownloadError("Range retry limit reached")
+
+        def transfer() -> bytes:
+            with self._open(url, headers) as response:
+                expected = f"bytes {offset}-{offset + size - 1}/{file.size_bytes}"
+                if response.status_code != 206 or response.headers.get("Content-Range") != expected:
+                    raise DownloadError(
+                        "Server ignored/mismatched Range; refusing full archive download"
+                    )
+                if "text/html" in response.headers.get("Content-Type", ""):
+                    raise DownloadError("HTML returned for a binary archive range")
+                body = _read_bounded(response, size + 1)
+            if len(body) != size:
+                raise IncompleteRead(body, size - len(body))
             return body
-        raise DownloadError("Range retry limit reached")
+
+        failures = (IncompleteRead, TimeoutError, OSError, httpx.TransportError)
+        try:
+            body = self._retrying(lambda error: isinstance(error, failures))(transfer)
+        except failures as error:
+            raise DownloadError(f"Archive range transfer failed: {error}") from error
+        with self.lock:
+            self.network_bytes += size
+        return body
 
     def download(self, file: DriveFile, destination: Path, max_bytes: int) -> dict:
         if file.size_bytes > max_bytes:
@@ -172,11 +278,12 @@ class DriveClient:
         digest = hashlib.sha256()
         written = 0
         try:
-            with self._open(Request(self.resolve(file.id))) as response:
+            with self._open(self.resolve(file.id)) as response:
                 if "text/html" in response.headers.get("Content-Type", ""):
                     raise DownloadError("Drive returned HTML, not dataset bytes")
                 with temporary.open("wb") as handle:
-                    while chunk := response.read(min(1024 * 1024, max_bytes - written + 1)):
+                    for chunk in response.iter_raw():
+                        chunk = chunk[:max_bytes - written + 1]
                         written += len(chunk)
                         if written > max_bytes or written > file.size_bytes:
                             raise DownloadError("Download exceeded its declared size")
