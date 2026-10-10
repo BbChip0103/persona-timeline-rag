@@ -94,6 +94,9 @@ jobs:
           exported = {
               **roles,
               'PTR_PROVIDER_PG_TEST_URL': roles['PTR_SPLIT_TEST_LLM_DATABASE_URL'],
+              'PTR_SPLIT_PREPARATION_TEST_DATABASE_URL': roles['PTR_SPLIT_TEST_OWNER_DATABASE_URL'],
+              'PTR_SPLIT_PREPARATION_TEST_APP_DATABASE_URL': roles['PTR_SPLIT_TEST_APP_DATABASE_URL'],
+              'PTR_SPLIT_PREPARATION_TEST_LLM_DATABASE_URL': roles['PTR_SPLIT_TEST_LLM_DATABASE_URL'],
               'PTR_CI_OWNER_PASSWORD': owner, 'PTR_CI_APP_PASSWORD': app,
               'PTR_CI_LLM_PASSWORD': llm, 'PTR_CI_REDIS_PASSWORD': redis,
               'PTR_SPLIT_CI_REDIS_CONTAINER': 'ptr-split-ci-' + token,
@@ -147,6 +150,8 @@ jobs:
           # Give the disposable retention fixture a local tag for this exact pinned image.
           docker tag pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6 pgvector/pgvector:0.8.1-pg15
           uv run --project apps/llm-service pytest apps/llm-service/tests -q
+      - name: Actual atomic preparation, provenance and owner-only import regressions
+        run: pnpm exec jest --runInBand --runTestsByPath scripts/split-prepare-research.test.ts scripts/split-prepare-research.integration.test.ts
       - name: Actual app-schema generation, fencing and durable ACK regressions
         run: pnpm exec jest --runInBand --runTestsByPath packages/storage/test/llm-control.integration.test.ts
       - name: Actual Nest to Python wire, RAG-off, cancellation and crash recovery

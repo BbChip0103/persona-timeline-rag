@@ -305,8 +305,10 @@ Use the split integration/bootstrap gates for cutover readiness, not just a gree
 health response.
 
 `ptr-llm ingest` reuses licensed download/normalization tooling; it is not a new-source
-DB importer. `prepare:research` and the historical TS preparation/index scripts remain
-legacy/public-schema research tools. Existing licensed data is copied by the explicit
-split migration. A future licensed-source preparation/import command must deliberately
-preserve source screening, authored persona protections and immutable provenance before
-it can replace those legacy scripts; do not point them at split runtime credentials.
+DB importer. New approved source batches use the explicit offline owner-maintenance
+[`pnpm prepare:split`](split-source-preparation.md) command. It reuses the original
+screening/chronological split policy and atomically imports into qualified `llm` tables;
+it does not call models, embed sources or activate a summary index. `prepare:research`
+refuses split targets; historical TS preparation/index tools are legacy/public-schema
+tools, not split import/index surfaces. Existing licensed data is copied by the explicit
+split migration; do not point legacy scripts at split runtime credentials.

@@ -14,6 +14,7 @@
     "dev:web": "pnpm --filter @ptr/web dev",
     "db:migrate": "tsx scripts/db-migrate.ts",
     "prepare:research": "tsx scripts/prepare-research.ts",
+    "prepare:split": "tsx scripts/split-prepare-research.ts",
     "harness:smoke": "tsx scripts/harness-smoke.ts",
     "evaluate": "uv run --project apps/llm-service ptr-llm evaluate",
     "ops:check-env": "tsx packages/ops/scripts/check-env.ts",
