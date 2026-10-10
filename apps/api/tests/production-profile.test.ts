@@ -1,27 +1,14 @@
 import { BullMqTurnDelivery, RedisTurnEvents } from '@ptr/messaging';
-import { loadConfig } from '@ptr/ops';
-import { createRecoveryRuntime, createRuntime } from '../src/runtime';
-
-// : the production profile's code changes. Synthetic loopback targets; nothing connects.
-const databaseUrl='postgresql://ptr_loadtester:synthetic-password@127.0.0.1:56432/ptr_loadtest';
-const redisUrl='redis://ptr:synthetic-password@127.0.0.1:56479/0';
-const gateway={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'};
-const structuredOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.provider as unknown as {options:{structuredAgentReplies?:boolean}}).options.structuredAgentReplies;
-
-test('the gateway provider asks for structured agent replies by default; PTR_GATEWAY_STRUCTURED=0 (demo layer) turns it off',async()=>{
-  const byDefault=createRuntime(gateway);expect(structuredOf(byDefault)).toBe(true);await byDefault.close?.();
-  const off=createRuntime({...gateway,PTR_GATEWAY_STRUCTURED:'0'});expect(structuredOf(off)).toBe(false);await off.close?.();
-  const on=createRuntime({...gateway,PTR_GATEWAY_STRUCTURED:'1'});expect(structuredOf(on)).toBe(true);await on.close?.();
-});
-test('the dispatcher starts without any provider key: its runtime has leases, delivery, events and the outbox age reading only',async()=>{
-  const env={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl};
-  expect(loadConfig('dispatcher',env,()=>undefined).errors).toEqual([]);
-  // Provider settings that createRuntime would refuse are never read.
-  const runtime=createRecoveryRuntime({...env,PTR_CHAT_PROVIDER:'gateway',PTR_INTENT_CLASSIFIER:'jev'});
-  expect(runtime.delivery).toBeInstanceOf(BullMqTurnDelivery);expect(runtime.events).toBeInstanceOf(RedisTurnEvents);expect(runtime.leases).toBeDefined();
-  expect(Object.keys(runtime).sort()).toEqual(['close','delivery','events','leases','oldestPendingAgeSeconds']);
-  await runtime.close();
-  // Same validation as createRuntime for what it does read.
-  for(const extra of [{PTR_TURN_QUEUE:'Bad:Name'},{PTR_DB_POOL_MAX:'0'},{PTR_REDIS_URL:'redis://127.0.0.1:56479/0'}])
-    expect(()=>createRecoveryRuntime({...env,...extra})).toThrow();
+import { loadFrameworkConfig } from '@ptr/ops';
+import { createRuntime } from '../src/runtime';
+const env={DATABASE_URL:'postgresql://ptr_framework_tester:synthetic-password@127.0.0.1:57432/ptr_framework_test',
+ PTR_REDIS_URL:'redis://:synthetic-password@127.0.0.1:57479/0',PTR_CHAT_PROVIDER:'fake',PTR_GUARDRAILS_URL:'http://127.0.0.1:57464',PTR_GUARDRAILS_TOKEN:'synthetic_guard_token_abcdefghij',
+ PTR_PERSONAS_FILE:'data/synthetic/personas.json',PTR_API_TOKEN:'synthetic_private_token_abcdefghij'};
+test('api and worker compose same durable execution path; no dispatcher runtime or provider keys for fake',async()=>{
+ expect(loadFrameworkConfig('api',env).PTR_CHAT_PROVIDER).toBe('fake');
+ expect(loadFrameworkConfig('worker',env).PTR_WORKER_CONCURRENCY).toBe(32);
+ const runtime=createRuntime(env);
+ expect(runtime.delivery).toBeInstanceOf(BullMqTurnDelivery);expect(runtime.events).toBeInstanceOf(RedisTurnEvents);
+ expect(runtime.executionStore).toBe(runtime.leases);expect('gateways' in runtime).toBe(false);
+ await runtime.close?.();
 });

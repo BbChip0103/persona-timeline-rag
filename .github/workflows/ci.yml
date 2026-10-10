@@ -1,8 +1,9 @@
 #  (D24).
 # - check: every push and pull request. No secrets, and the checkout has no data/ and no .env* (the clean-clone
 #   acceptance), so a test that depends on a private local file fails here.
-# - integration: the Postgres and Redis suites, on pushes to main and on manual runs, against throwaway containers on the
+# - integration: historical scientific Postgres and Redis regression suites, on main/manual runs, against throwaway containers on the
 #   runner (synthetic ptr_loadtest database, Redis with the repo's ACL config). Credentials are generated per run.
+# - framework-integration: the migrated framework's six bounded suites against its own generated DB/queue only.
 name: ci
 
 on:
@@ -38,9 +39,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - name: Compose file renders
-        run: docker compose -f infra/compose.app.yml --profile gateway config -q
+        run: |
+          env_file="$RUNNER_TEMP/ptr-framework-check.env"
+          python3 infra/langfuse/init-framework-env.py --output "$env_file"
+          PTR_FRAMEWORK_APP_ENV_FILE="$env_file" docker compose --env-file "$env_file" -f infra/compose.app.yml config -q
+          docker compose --env-file "$env_file" -f infra/compose.framework.yml --profile smoke --profile observability --profile guardrails --profile runtime-test config -q
+      - name: Offline framework deployment and fixture regressions
+        run: |
+          python3 infra/langfuse/test-deployment.py
+          python3 infra/litellm/test-fixture.py
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+      - name: Remove this check's private generated configuration
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ptr-framework-check.env"
 
   integration:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -101,3 +113,58 @@ jobs:
       - name: Remove Redis
         if: always()
         run: docker compose -f infra/compose.redis.yml down --volumes
+
+  framework-integration:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - name: Enable pnpm (packageManager in package.json)
+        run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generate private synthetic framework configuration
+        run: |
+          env_file="$RUNNER_TEMP/ptr-framework-integration.env"
+          python3 infra/langfuse/init-framework-env.py --output "$env_file"
+          # This file was exclusively created by this job; no existing/private deployment env is loaded.
+          set -a
+          # shellcheck disable=SC1090
+          source "$env_file"
+          set +a
+          db_url="postgresql://ptr_framework_tester:${PTR_FRAMEWORK_TEST_DB_PASSWORD}@127.0.0.1:57432/ptr_framework_test"
+          redis_url="redis://:${PTR_FRAMEWORK_QUEUE_PASSWORD}@127.0.0.1:57479/0"
+          for value in "$PTR_FRAMEWORK_BOOTSTRAP_PASSWORD" "$PTR_FRAMEWORK_TEST_DB_PASSWORD" "$PTR_FRAMEWORK_QUEUE_PASSWORD" "$db_url" "$redis_url"; do
+            echo "::add-mask::${value}"
+          done
+          printf 'DATABASE_URL=%s\nPTR_FRAMEWORK_TEST_DATABASE_URL=%s\n' "$db_url" "$db_url" >> "$GITHUB_ENV"
+          printf 'PTR_REDIS_URL=%s\nPTR_FRAMEWORK_TEST_REDIS_URL=%s\n' "$redis_url" "$redis_url" >> "$GITHUB_ENV"
+      - name: Start only the new synthetic DB and queue
+        run: |
+          docker compose --env-file "$RUNNER_TEMP/ptr-framework-integration.env" -f infra/compose.framework.yml --profile runtime-test up -d --wait framework-test-db framework-test-queue
+      - name: Explicit framework migrations and checkpoint setup
+        run: |
+          pnpm db:migrate
+          pnpm framework:checkpoints
+      - name: Six bounded real framework integration suites
+        run: |
+          pnpm exec jest --runInBand --runTestsByPath \
+            apps/api/tests/postgres-checkpoint.integration.test.ts \
+            apps/api/tests/queue-worker.integration.test.ts \
+            packages/core/tests/postgres-checkpoint.integration.test.ts \
+            packages/storage/test/framework-executions.integration.test.ts \
+            scripts/framework-checkpoint-retention.integration.test.ts \
+            scripts/framework-receipt-retention.integration.test.ts
+      - name: Remove only this synthetic project's DB and queue
+        if: always()
+        run: |
+          env_file="$RUNNER_TEMP/ptr-framework-integration.env"
+          if [ -f "$env_file" ]; then
+            docker compose --env-file "$env_file" -f infra/compose.framework.yml --profile runtime-test down --volumes
+            rm -f "$env_file"
+          fi

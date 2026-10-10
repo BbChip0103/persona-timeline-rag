@@ -1,17 +1,19 @@
-import { randomUUID } from 'node:crypto';
-import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type ProviderMessage, type SendTurnInput, type SourcePost } from '@ptr/contracts';
+import { createHash, randomUUID } from 'node:crypto';
+import { Annotation, END, START, StateGraph, task, type BaseCheckpointSaver } from '@langchain/langgraph';
+import { CreateSessionSchema, PersonaSchema, SendTurnSchema, TimelineQuerySchema, type ChatMessage, type Persona, type ChatReply, type InputSafetyTrace, type ChatSession, type ChatTurn, type CreateSessionInput, type ProviderMessage, type SendTurnInput, type SourcePost } from '@ptr/contracts';
 import { CoreError, LEASE_LOST, PROVIDER_DEADLINE, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type Retrieval, type TextProvider, type TurnDelivery, type TurnDispatch, type TurnEvents, type TurnLeaseStore } from './ports';
 import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
-import { containsCredentialPattern, containsUngroundedBiography } from './safety';
-import { intentSignals, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, type IntentClassifierOptions } from './intent-routing';
-import { RULE_PATH_CATEGORIES, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
+import { containsCredentialPattern, containsInternalPathPattern, containsUngroundedBiography } from './safety';
+import { intentSignals, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, classifierFallbackReason, type IntentClassification, type IntentSignals, type TurnIntent, type IntentClassifierOptions } from './intent-routing';
+import { DEFAULT_SAFETY_THRESHOLDS, RULE_PATH_CATEGORIES, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
 import { REPLY_GUARD_REVISION, guardReply } from './reply-guard';
+import type { GuardrailsClient } from './guardrails';
 import { replyText, speechLevel, utteranceLanguage, voiceText, type VoiceTextKey } from './reply-texts';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
@@ -22,6 +24,14 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
    * searching an embedding space no source vector is in. Default true.
    */
   semanticSearch?:boolean;
+  /** Required by the production composition; omitted only in the isolated domain test harness. */
+  guardrails?:Pick<GuardrailsClient,'validateInput'|'validateReply'>;
+  /** Composition-owned durable saver; graph threads are bound to immutable turns, never sessions. */
+  agentCheckpoint?:{checkpointer:BaseCheckpointSaver};
+  /** A bounded tracing adapter; stages have no credentials or raw text in their names. */
+  observeStage?:<T>(name:string,work:()=>Promise<T>)=>Promise<T>;
+  /** Parent trace surrounds the actual queued turn, not a standalone adapter smoke run. */
+  observeTurn?:<T>(queued:QueuedTurn,work:()=>Promise<T>)=>Promise<T>;
   /** Backlog bound for admission control (default 256). */
   maxQueueDepth?:number;
   /** State-change notices for push delivery (SSE); never carries model output. */
@@ -39,6 +49,25 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
   onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
   /** Observability: a turn completed with this stored reply (metrics read its internal trace, never its text). */
   onTurnCompleted?:(event:{turnId:string;reply:ChatReply})=>void}
+type TurnOutput=Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
+interface TurnSnapshot {
+  persona:Persona;history:ChatMessage[];promptHistory:ChatMessage[];context:ReturnType<typeof retrievalContext>;
+  query:ReturnType<typeof TimelineQuerySchema.parse>;ownedPrevious?:ChatReply;references:ChatReply['evidence'];ambiguous:boolean;
+  signals:IntentSignals;recentUserTurns:string[];control:boolean;combined:boolean;rule?:NonNullable<InputSafetyTrace['rule']>;
+  cardPath:boolean;replyLanguage:string;level:ReturnType<typeof speechLevel>;
+}
+interface TurnFrame {
+  binding:string;snapshot?:TurnSnapshot;memoryTrace?:NonNullable<ChatReply['retrievalContext']>;
+  safety?:InputSafetyTrace;combinedIntent?:IntentClassification;intentFailure?:ReturnType<typeof classifierFallbackReason>;
+  intent?:TurnIntent;routing?:ChatReply['intentRouting'];deflect?:boolean;safetyCategory?:Exclude<SafetyCategory,'prompt_injection'>;
+  sources:SourcePost[];memorySources:SourcePost[];output?:TurnOutput;agent?:ChatReply['agent'];
+  lore?:ProviderMessage;personaContext?:ChatReply['personaContext'];promptEvidence?:ChatReply['promptEvidence'];replyGuard?:ChatReply['replyGuard'];
+  agentRun?:Awaited<ReturnType<typeof runCharacterAgent>>;experiment?:ReturnType<typeof buildExperimentContext>;rawReply?:string;
+  served:string[];reply?:ChatReply;
+}
+const TurnAnnotation=Annotation.Root({frame:Annotation<TurnFrame>()});
+type TurnGraphState=typeof TurnAnnotation.State;
+type TurnGraphUpdate={frame:TurnFrame};
 /** Backlog readings are reused briefly so admission control stays cheap while it is rejecting. */
 const DEPTH_READING_TTL_MS=200;
 /** Upstream names a provider may report for reply.serving; anything else is recorded as `unknown`. */
@@ -114,9 +143,20 @@ export class ChatService {
    */
   async screenDraftBrief(brief:string,seed:string,language:string,signal:AbortSignal):Promise<{trace?:InputSafetyTrace;reply?:string;limitations:string[];policyNote?:string}> {
     const options=this.options.inputSafety;
-    if(!options) return {limitations:[]};
-    const trace=safetyOutcome(await startSafetyAssessment(options,{text:brief,recentUserTurns:[],seed,intent:false,categories:SAFETY_CATEGORIES},signal).all,options,signal);
-    if(trace.fallbackReason) this.options.onSafetyFallback?.({scope:'draft',reason:trace.fallbackReason});
+    if(!options&&!this.options.guardrails)return {limitations:[]};
+    let trace=options?safetyOutcome(await startSafetyAssessment(options,{text:brief,recentUserTurns:[],seed,intent:false,categories:SAFETY_CATEGORIES},signal).all,options,signal):undefined;
+    if(trace?.fallbackReason)this.options.onSafetyFallback?.({scope:'draft',reason:trace.fallbackReason});
+    if(this.options.guardrails) {
+      try {
+        if(trace?.fallbackReason&&trace.action==='none')throw new Error('unavailable');
+        const decision=await this.options.guardrails.validateInput({classification:options?'jev':'rules-only',text:brief,probabilities:trace?.probabilities??{},thresholds:options?.thresholds??DEFAULT_SAFETY_THRESHOLDS,categories:SAFETY_CATEGORIES},{signal});
+        trace={...(trace??{decidedBy:'rule' as const}),action:decision.action,category:decision.category,fired:decision.fired};
+      } catch {
+        if(signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');
+        return {trace,reply:voiceText('fallback',utteranceLanguage(brief,language),'polite'),limitations:['GUARDRAILS_INPUT_UNAVAILABLE']};
+      }
+    }
+    if(!trace)return {limitations:[]};
     if((trace.action==='refuse'||trace.action==='support')&&trace.category)
       return {trace,reply:safetyReply(trace.category as Exclude<SafetyCategory,'prompt_injection'>,language),limitations:trace.action==='support'?['SAFETY_SUPPORT']:[]};
     return {trace,limitations:[],...(trace.action==='deflect'?{policyNote:SAFETY_DEFLECTION_NOTE}:{})};
@@ -151,6 +191,10 @@ export class ChatService {
   }
   /** Worker entry point: runs a claimed turn with every state write fenced by its lease. */
   async executeQueued(queued:QueuedTurn,controller:AbortController):Promise<void> {
+    const work=()=>this.executeQueuedWork(queued,controller);
+    if(this.options.observeTurn)await this.options.observeTurn(queued,work);else await work();
+  }
+  private async executeQueuedWork(queued:QueuedTurn,controller:AbortController):Promise<void> {
     const store=fencedStore(this.options.store,queued.fence,this.options.events);
     let prepared:Awaited<ReturnType<ChatService['prepare']>>;
     try {prepared=await this.prepare(queued.turn.ownerId,queued.input);}
@@ -204,204 +248,271 @@ export class ChatService {
         :error instanceof Error?error.constructor.name:'UNKNOWN'});
     } finally { if(timer) clearTimeout(timer); }
   }
-  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,query:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {
-    // Any turn of a semantic session may search (the agent's tool too): with no real embedder, fail it up front.
-    if(session.retrievalMode==='semantic'&&this.options.semanticSearch===false) throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
-    const history=await store.history(session.id,session.ownerId);
-    if(history.length>(this.options.maxHistoryMessages ?? 100)) {
-      if(await store.transitionTurn(turn.id,['pending'],'failed','CONTEXT_LIMIT')) this.options.onTurnFailure?.({turnId:turn.id,code:'CONTEXT_LIMIT'});
-      return;
-    }
-    const raw=await this.options.personas.get(session.personaId,session.personaRevision);
-    const persona=PersonaSchema.parse(raw);
-    if(persona.id !== session.personaId || persona.personId !== session.personId || persona.revision !== session.personaRevision) throw new CoreError('PERSONA_UNAVAILABLE');
-    // With the filter on, refused turns (from their turn records) are dropped from everything that builds prompts or
-    // retrieval queries; the full history still sizes the session and feeds the safety classifier's context.
-    const promptHistory=this.options.inputSafety?withoutRefusedTurns(history,await store.refusedTurnIds(session.id,session.ownerId)):history;
-    const context=retrievalContext(promptHistory,value.text,!!value.timeline);
-    if(!value.timeline)query={...query,query:context.query};
-    let memoryTrace:NonNullable<ChatReply['retrievalContext']>={revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]};
-    const previousMessage=[...promptHistory].reverse().find(message=>message.role==='user'&&message.turnId);
-    const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await store.getTurn(previousMessage.turnId,session.ownerId):undefined;
-    const ownedPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
-      &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
-      &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
-    const boundPrevious=context.followUp?ownedPrevious:undefined;
-    // Per-turn view of the provider that records which upstream answered each call (reply.serving, D21).
-    const served:string[]=[];
-    const provider:TextProvider={generate:async(messages,options)=>{
-      let upstream:string|undefined;
-      const text=await this.options.provider.generate(messages,{...options,onServed:name=>{upstream=name;}});
-      served.push(upstream!==undefined&&UPSTREAM_LABEL.test(upstream)?upstream:'unknown');
-      return text;
-    }};
-    const signals=intentSignals({text:value.text,context,...(value.intent?{explicitIntent:value.intent}:{}),explicitTimeline:!!value.timeline,
-      ...(session.ragCondition?{ragCondition:session.ragCondition}:{}),previousTimeline:boundPrevious?.responseKind==='timeline'});
-    // Only the current text and the last two non-sensitive user turns may reach a classifier: no persona, posts, replies or IDs.
-    const recentUserTurns=history.filter(message=>message.role==='user'&&message.turnId!==null&&!containsCredentialPattern(message.content)&&!isSensitive(message.content)).slice(-2).map(message=>[...message.content].slice(0,300).join(''));
-    // Retrieval-off control sessions keep the pure rule routing (no classifier call) so experiment arms stay
-    // unchanged; with a classifier configured, the internal trace still records that the rule decided.
-    const control=session.retrievalMode==='off'&&!session.ragCondition;
-    const classifierInput={text:[...value.text].slice(0,500).join(''),recentUserTurns,seed:turn.id};
-    // Input safety runs on every turn (control sessions included) over the whole message. Turns the rules refuse ask
-    // only self_harm (support may replace the refusal). When the intent gate is open, window 0 also answers intent.
-    const safetyOptions=this.options.inputSafety;const intentOptions=this.options.intentClassifier;
-    const rule=signals.sensitive?'sensitive_pattern' as const:signals.explicitIntent==='unsupported'?'client_unsupported' as const:undefined;
-    const combined=!!safetyOptions&&!!intentOptions&&!control&&needsIntentClassifier(signals);
-    const safetyRun=safetyOptions?startSafetyAssessment(safetyOptions,{text:value.text,recentUserTurns,seed:turn.id,intent:combined,categories:rule?RULE_PATH_CATEGORIES:SAFETY_CATEGORIES},controller.signal):undefined;
-    const classifier=safetyRun&&combined?{...intentOptions!,classifier:{name:intentOptions!.classifier.name,classify:async()=>{
-      const settled=await safetyRun.first;
-      if(!settled.ok) throw settled.error;
-      if(settled.value.intent instanceof Error) throw settled.value.intent;
-      return settled.value.intent;
-    }}}:intentOptions;
-    const routed=control&&intentOptions?{intent:ruleIntent(signals),routing:{decidedBy:'rule' as const,ruleIntent:ruleIntent(signals)}}
-      :await routeIntent(signals,classifierInput,control?undefined:classifier,controller.signal);
-    const routing=routed.routing;let intent=routed.intent;
-    let safety=safetyRun?safetyOutcome(await safetyRun.all,safetyOptions!,controller.signal,rule):undefined;
-    if(controller.signal.aborted) return;
-    if(safety?.fallbackReason) this.options.onSafetyFallback?.({scope:'turn',reason:safety.fallbackReason});
-    // Refusal/support replies are deterministic templates (no chat model); deflection answers without retrieval.
-    const safetyCategory=safety?.decidedBy==='classifier'&&(safety.action==='refuse'||safety.action==='support')?safety.category as Exclude<SafetyCategory,'prompt_injection'>:undefined;
-    const deflect=safety?.action==='deflect';
-    if(safetyCategory) intent='unsupported';
-    else if(deflect&&intent==='timeline'&&session.retrievalMode!=='off') {intent='small_talk';safety={...safety!,intentOverride:'safety_deflect'};}
-    let output:Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
-    let sources:SourcePost[]=[];
-    let memorySources:SourcePost[]=[];
-    const references=context.followUp&&!value.timeline&&boundPrevious?.grounding==='source_bound_quotes'&&boundPrevious.responseKind==='timeline'
-      ?(boundPrevious.sourceContext?.revision===RETRIEVAL_CONTEXT_REVISION?boundPrevious.sourceContext.references:boundPrevious.evidence)
-        .filter(ref=>ref.personId===session.personId&&boundPrevious.evidence.some(cited=>cited.sourceId===ref.sourceId&&cited.hash===ref.hash&&cited.snapshot===ref.snapshot)):[];
-    const ambiguous=new Set(references.map(ref=>ref.sourceId)).size>1
-      || /photo|picture|사진/i.test(value.text)&&new Set((boundPrevious?.evidence??[]).flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
-    let promptEvidence:ChatReply['promptEvidence'];
-    let agent:ChatReply['agent'];
-    let personaContext:ChatReply['personaContext'];let lore:ProviderMessage|undefined;
-    let replyGuard:ChatReply['replyGuard'];
-    // Character paths (experiment and agent): fixed texts are persona-voice texts in the user's utterance
-    // language and the persona's speech level; the legacy path keeps its texts in the session language.
-    const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
-    const replyLanguage=cardPath?utteranceLanguage(value.text,session.language):session.language, level=speechLevel(persona);
-    const fixed=(key:'rule_refusal'|'clarification'|'ambiguous_reference'|'event_timezone')=>cardPath
-      ?voiceText(({rule_refusal:'decline',clarification:'clarification',ambiguous_reference:'ambiguous_reference',event_timezone:'event_timezone'} as const satisfies Record<string,VoiceTextKey>)[key],replyLanguage,level)
-      :replyText(key,session.language);
-    // Reply guard (agent and experiment paths, S8 follow-up): fail-closed persona-voice reply.
-    const guard=(candidate:typeof output):typeof output=>{
-      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:persona.reviewStatus!=='synthetic',language:replyLanguage,level});
-      replyGuard=guarded?{revision:REPLY_GUARD_REVISION,action:guarded.edited?'edited':'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
-      // v7: an edit (meta-talk sentences removed) keeps the reply's status and evidence.
-      if(guarded?.edited) return {...candidate,content:guarded.content,limitations:[...(candidate.limitations??[]),`REPLY_GUARD_${guarded.reason.toUpperCase()}`]};
-      return guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate;
+  private async execute(session:ChatSession,turn:ChatTurn,value:ReturnType<typeof SendTurnSchema.parse>,initialQuery:ReturnType<typeof TimelineQuerySchema.parse>,controller:AbortController,store:ConversationStore,deadlineAt:number):Promise<void> {
+    const check=()=>{if(controller.signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');};
+    const observed=async<T>(name:string,work:()=>Promise<T>):Promise<T>=>this.options.observeStage?this.options.observeStage(name,work):work();
+    const stage=(name:string,work:(frame:TurnFrame)=>Promise<TurnFrame>)=>async({frame}:TurnGraphState):Promise<TurnGraphUpdate>=>{
+      check();return {frame:await observed(name,()=>work(frame))};
     };
-    if(intent==='clarification' || intent==='unsupported') {
-      output={status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?fixed('clarification'):safetyCategory?safetyReply(safetyCategory,replyLanguage):fixed('rule_refusal'),claims:[],evidence:[],limitations:safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]};
-    } else if(intent==='timeline' && session.retrievalMode!=='off' && ambiguous) {
-      memoryTrace={...memoryTrace,action:'clarify'};
-      output={status:'needs_clarification',content:fixed('ambiguous_reference'),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']};
-    } else if(intent==='timeline' && session.retrievalMode !== 'off' && query.dateBasis==='event' && query.start && query.timezone !== 'UTC') {
-      output={status:'needs_clarification',content:fixed('event_timezone'),claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']};
-    } else if(intent==='timeline' && session.retrievalMode==='off' && session.ragCondition===undefined) {
-      output={status:'insufficient_evidence',content:replyText('retrieval_off',session.language),claims:[],evidence:[],limitations:['RETRIEVAL_OFF']};
-    } else {
-      if(intent==='timeline' && session.retrievalMode!=='off') {
-        if(!this.options.retrieval) throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
-        if(!await store.transitionTurn(turn.id,['pending'],'retrieving') || controller.signal.aborted) return;
-        const lookupOptions={signal:controller.signal,...(session.ragCondition && session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})};
-        if(references.length&&this.options.retrieval.resolve) {
-          const resolved=await this.options.retrieval.resolve(references,{personId:session.personId},lookupOptions);
-          // Recheck parent provenance even for a faulty resolver; annotations remain pinned to cited revisions.
-          const pinned=resolved.flatMap(source=>{
-            const matching=references.filter(ref=>ref.sourceId===source.id&&ref.hash===source.hash&&ref.snapshot===source.snapshot
-              &&(ref.annotationId?source.imageAnnotations?.some(annotation=>ref.annotationId===annotation.id&&ref.annotationRevision===annotation.revision&&ref.imageHash===annotation.imageHash&&ref.annotationHash===annotation.annotationHash&&annotation.text.includes(ref.quote)):source.caption.includes(ref.quote)));
-            if(!matching.length||references.some(ref=>ref.sourceId===source.id&&ref.annotationId&&!matching.includes(ref)))return [];
-            return [{...source,...(source.imageAnnotations?{imageAnnotations:source.imageAnnotations.filter(annotation=>matching.some(ref=>ref.annotationId===annotation.id))}:{})}];
-          });
-          sources=filterEvidence(pinned,query,session.personId);
-          if(sources.length)memoryTrace={...memoryTrace,action:'reuse',reusedSourceIds:sources.map(source=>source.id)};
+    const transition=async(next:'retrieving'|'generating'|'validating'):Promise<void>=>{
+      check();const applied=await store.transitionTurn(turn.id,[...activeStates],next);
+      if(!applied){controller.abort(LEASE_LOST);throw new CoreError('TURN_FAILED','TURN_ABORTED');}
+    };
+    const binding=createHash('sha256').update(JSON.stringify({revision:'turn-langgraph-v1',promptRevision:AGENT_PROMPT_REVISION,agentRevision:AGENT_RUNTIME_REVISION,session,value,maxToolRounds:this.options.maxToolRounds,guardrails:!!this.options.guardrails,
+      inputSafety:this.options.inputSafety?{thresholds:this.options.inputSafety.thresholds,classifier:this.options.inputSafety.classifier.name}:undefined,
+      intentClassifier:this.options.intentClassifier?{minConfidence:this.options.intentClassifier.minConfidence,classifier:this.options.intentClassifier.classifier.name}:undefined})).digest('hex');
+    const initialize=task('turn-snapshot',async():Promise<TurnFrame>=>{
+      if(session.retrievalMode==='semantic'&&this.options.semanticSearch===false)throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
+      const history=await store.history(session.id,session.ownerId);
+      if(history.length>(this.options.maxHistoryMessages??100))throw new CoreError('CONTEXT_LIMIT');
+      const persona=PersonaSchema.parse(await this.options.personas.get(session.personaId,session.personaRevision));
+      if(persona.id!==session.personaId||persona.personId!==session.personId||persona.revision!==session.personaRevision)throw new CoreError('PERSONA_UNAVAILABLE');
+      const promptHistory=this.options.inputSafety?withoutRefusedTurns(history,await store.refusedTurnIds(session.id,session.ownerId)):history;
+      const context=retrievalContext(promptHistory,value.text,!!value.timeline),query=value.timeline?initialQuery:{...initialQuery,query:context.query};
+      const previousMessage=[...promptHistory].reverse().find(message=>message.role==='user'&&message.turnId);
+      const previous=(context.followUp||session.executionProfile==='agent_loop')&&previousMessage?.turnId?await store.getTurn(previousMessage.turnId,session.ownerId):undefined;
+      const ownedPrevious=previous?.state==='completed'&&previous.ownerId===session.ownerId&&previous.sessionId===session.id
+        &&previous.reply?.sessionId===session.id&&previous.reply.turnId===previous.id&&previous.reply.personId===session.personId
+        &&previous.reply.personaRevision===session.personaRevision?previous.reply:undefined;
+      const boundPrevious=context.followUp?ownedPrevious:undefined;
+      const references=context.followUp&&!value.timeline&&boundPrevious?.grounding==='source_bound_quotes'&&boundPrevious.responseKind==='timeline'
+        ?(boundPrevious.sourceContext?.revision===RETRIEVAL_CONTEXT_REVISION?boundPrevious.sourceContext.references:boundPrevious.evidence)
+          .filter(ref=>ref.personId===session.personId&&boundPrevious.evidence.some(cited=>cited.sourceId===ref.sourceId&&cited.hash===ref.hash&&cited.snapshot===ref.snapshot)):[];
+      const ambiguous=new Set(references.map(ref=>ref.sourceId)).size>1
+        ||/photo|picture|사진/i.test(value.text)&&new Set((boundPrevious?.evidence??[]).flatMap(ref=>ref.annotationId?[ref.annotationId]:[])).size>1;
+      const signals=intentSignals({text:value.text,context,...(value.intent?{explicitIntent:value.intent}:{}),explicitTimeline:!!value.timeline,
+        ...(session.ragCondition?{ragCondition:session.ragCondition}:{}),previousTimeline:boundPrevious?.responseKind==='timeline'});
+      const recentUserTurns=history.filter(message=>message.role==='user'&&message.turnId!==null&&!containsCredentialPattern(message.content)&&!isSensitive(message.content)).slice(-2).map(message=>[...message.content].slice(0,300).join(''));
+      const control=session.retrievalMode==='off'&&!session.ragCondition;
+      const rule=signals.sensitive?'sensitive_pattern' as const:signals.explicitIntent==='unsupported'?'client_unsupported' as const:undefined;
+      const combined=!!this.options.inputSafety&&!!this.options.intentClassifier&&!control&&needsIntentClassifier(signals);
+      const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
+      return structuredClone({binding,sources:[],memorySources:[],served:[],snapshot:{persona,history,promptHistory,context,query,ownedPrevious,references,ambiguous,signals,recentUserTurns,control,combined,rule,
+        cardPath,replyLanguage:cardPath?utteranceLanguage(value.text,session.language):session.language,level:speechLevel(persona)},
+        memoryTrace:{revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]}});
+    });
+    const assess=task('turn-safety',async(frame:TurnFrame):Promise<Pick<TurnFrame,'safety'|'combinedIntent'|'intentFailure'|'output'>>=>{
+      const snap=frame.snapshot!,options=this.options.inputSafety;
+      let safety:InputSafetyTrace|undefined,combinedIntent:IntentClassification|undefined,intentFailure:TurnFrame['intentFailure'];
+      if(options) {
+        const results=await startSafetyAssessment(options,{text:value.text,recentUserTurns:snap.recentUserTurns,seed:turn.id,intent:snap.combined,categories:snap.rule?RULE_PATH_CATEGORIES:SAFETY_CATEGORIES},controller.signal).all;
+        safety=safetyOutcome(results,options,controller.signal,snap.rule);
+        const first=results[0];
+        if(snap.combined) {
+          if(first.ok&&!(first.value.intent instanceof Error))combinedIntent=first.value.intent;
+          else intentFailure=classifierFallbackReason(first.ok?first.value.intent:first.error,controller.signal);
         }
-        if(!sources.length) {
-          sources=filterEvidence(await this.options.retrieval.search(query,{personId:session.personId},{...lookupOptions,mode:session.retrievalMode as 'lexical'|'semantic'}),query,session.personId);
-          memoryTrace={...memoryTrace,action:'search',query:query.query};
-        }
-        if(session.ragCondition!=='caption_image') sources=sources.map(({imageAnnotations:_,...source})=>source);
       }
-      if(!await store.transitionTurn(turn.id,['pending','retrieving'],'generating') || controller.signal.aborted) return;
-      const policyNote=deflect?SAFETY_DEFLECTION_NOTE:undefined;
-      // Persona lore , experiment and agent paths only: never on a deflected turn; the last two user
-      // messages count unless the input-safety filter acted on their turn (deflected injections stay in the history).
+      check();
+      if(this.options.guardrails) {
+        try {
+          // An incomplete Jev check is not silently promoted to safe by an empty validator metadata record.
+          if(safety?.fallbackReason&&safety.action==='none')throw new Error('unavailable');
+          const decision=await this.options.guardrails.validateInput({classification:options?'jev':'rules-only',text:value.text,probabilities:safety?.probabilities??{},thresholds:options?.thresholds??DEFAULT_SAFETY_THRESHOLDS,
+            categories:snap.rule?RULE_PATH_CATEGORIES:SAFETY_CATEGORIES,...(combinedIntent?{intent:combinedIntent}:{})},{signal:controller.signal});
+          if(decision.action!=='none'||!snap.rule)safety={...(safety??{decidedBy:'rule' as const}),
+            action:decision.action,category:decision.category,fired:decision.fired};
+          if(decision.intent)combinedIntent=decision.intent;
+        } catch {
+          check();return {safety,combinedIntent,intentFailure,output:{status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_INPUT_UNAVAILABLE']}};
+        }
+      }
+      return {safety,combinedIntent,intentFailure};
+    });
+    const retrieve=task('turn-retrieve',async(frame:TurnFrame):Promise<Pick<TurnFrame,'sources'|'memoryTrace'>>=>{
+      const {references,query}=frame.snapshot!;let sources:SourcePost[]=[];let memoryTrace=frame.memoryTrace!;
+      if(!this.options.retrieval)throw new CoreError('TURN_FAILED','RETRIEVAL_UNAVAILABLE');
+      const lookupOptions={signal:controller.signal,...(session.ragCondition&&session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})};
+      if(references.length&&this.options.retrieval.resolve) {
+        const resolved=await this.options.retrieval.resolve(references,{personId:session.personId},lookupOptions);
+        const pinned=resolved.flatMap(source=>{
+          const matching=references.filter(ref=>ref.sourceId===source.id&&ref.hash===source.hash&&ref.snapshot===source.snapshot
+            &&(ref.annotationId?source.imageAnnotations?.some(annotation=>ref.annotationId===annotation.id&&ref.annotationRevision===annotation.revision&&ref.imageHash===annotation.imageHash&&ref.annotationHash===annotation.annotationHash&&annotation.text.includes(ref.quote)):source.caption.includes(ref.quote)));
+          if(!matching.length||references.some(ref=>ref.sourceId===source.id&&ref.annotationId&&!matching.includes(ref)))return [];
+          return [{...source,...(source.imageAnnotations?{imageAnnotations:source.imageAnnotations.filter(annotation=>matching.some(ref=>ref.annotationId===annotation.id))}:{})}];
+        });
+        sources=filterEvidence(pinned,query,session.personId);
+        if(sources.length)memoryTrace={...memoryTrace,action:'reuse',reusedSourceIds:sources.map(source=>source.id)};
+      }
+      if(!sources.length) {
+        sources=filterEvidence(await this.options.retrieval.search(query,{personId:session.personId},{...lookupOptions,mode:session.retrievalMode as 'lexical'|'semantic'}),query,session.personId);
+        memoryTrace={...memoryTrace,action:'search',query:query.query};
+      }
+      if(session.ragCondition!=='caption_image')sources=sources.map(({imageAnnotations:_,...source})=>source);
+      return structuredClone({sources,memoryTrace});
+    });
+    const generate=task('turn-generate',async(frame:TurnFrame):Promise<TurnFrame>=>{
+      const {persona,promptHistory,cardPath,context,query,ownedPrevious}=frame.snapshot!;let lore:ProviderMessage|undefined,personaContext:ChatReply['personaContext'];
       if(cardPath&&persona.lore?.length) {
         const previous:string[]=[];
-        if(!deflect) for(const message of promptHistory.filter(message=>message.role==='user'&&message.turnId).slice(-2)) {
-          // Fail closed: a turn whose record cannot be read counts as flagged.
+        if(!frame.deflect)for(const message of promptHistory.filter(message=>message.role==='user'&&message.turnId).slice(-2)) {
           const record=await store.getTurn(message.turnId!,session.ownerId);
-          if(record&&(record.reply?.inputSafety?.action??'none')==='none') previous.push(message.content);
+          if(record&&(record.reply?.inputSafety?.action??'none')==='none')previous.push(message.content);
         }
-        const matched=deflect?{entries:[],omitted:0}:matchLore(persona,{current:value.text,previous});
+        const matched=frame.deflect?{entries:[],omitted:0}:matchLore(persona,{current:value.text,previous});
         personaContext={loreIds:matched.entries.map(entry=>entry.id),loreOmitted:matched.omitted};
-        if(matched.entries.length) lore=renderLoreMessage(matched.entries);
+        if(matched.entries.length)lore=renderLoreMessage(matched.entries);
       }
-      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,sources,policyNote||lore?{...(policyNote?{policyNote}:{}),...(lore?{afterHistory:[lore]}:{})}:undefined):undefined;
-      memorySources=experiment?.sources??sources;
-      if(experiment)promptEvidence={sourceIds:experiment.sources.map(source=>source.id),annotationIds:experiment.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
-        omittedAnnotations:experiment.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(experiment.messages),'utf8'),
-        ...(experiment.omittedSourceIds.length?{omittedSourceIds:experiment.omittedSourceIds}:{})};
-      const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({
-        provider,persona,history:promptHistory,text:value.text,sources,signal:controller.signal,maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,
-        variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
-        ...(session.retrievalMode!=='off'&&!context.creative&&!deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
-          if(controller.signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');
-          const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
+      const served:string[]=[],provider:TextProvider={generate:async(messages,options)=>{
+        let upstream:string|undefined;
+        const text=await this.options.provider.generate(messages,{...options,onServed:name=>{upstream=name;options.onServed?.(name);}});
+        served.push(upstream!==undefined&&UPSTREAM_LABEL.test(upstream)?upstream:'unknown');return text;
+      }};
+      const policyNote=frame.deflect?SAFETY_DEFLECTION_NOTE:undefined;
+      const experiment=session.ragCondition&&session.executionProfile!=='agent_loop'?buildExperimentContext(persona,promptHistory,value.text,frame.sources,
+        policyNote||lore?{...(policyNote?{policyNote}:{}),...(lore?{afterHistory:[lore]}:{})}:undefined):undefined;
+      let memoryTrace=frame.memoryTrace!;
+      const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({provider,persona,history:promptHistory,text:value.text,sources:frame.sources,signal:controller.signal,
+        maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),
+        ...(this.options.agentCheckpoint?{checkpoint:{checkpointer:this.options.agentCheckpoint.checkpointer,threadId:`character:${turn.id}`}}:{}),
+        ...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
+        ...(session.retrievalMode!=='off'&&!context.creative&&!frame.deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
+          check();const scopedQuery=TimelineQuerySchema.parse({...query,query:toolQuery});
           const found=filterEvidence(await this.options.retrieval!.search(scopedQuery,{personId:session.personId},{signal:controller.signal,mode:session.retrievalMode as 'lexical'|'semantic',
             ...(session.ragCondition&&session.ragCondition!=='off'?{evidenceScope:session.ragCondition}:{})}),scopedQuery,session.personId);
           memoryTrace={...memoryTrace,action:'search',query:toolQuery};
           return session.ragCondition==='caption_image'?found:found.map(({imageAnnotations:_,...source})=>source);
         }}:{}),
       }):undefined;
-      const result=agentRun?.rawReply??await provider.generate(experiment?.messages ?? buildPrompt(persona,promptHistory,value.text,sources,intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
-      if(controller.signal.aborted) return;
-      if(agentRun) {
-        agent=agentRun.agent;memorySources=agentRun.context.sources;
-        promptEvidence={sourceIds:memorySources.map(source=>source.id),annotationIds:memorySources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),
-          omittedAnnotations:agentRun.context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(agentRun.context.messages),'utf8'),
-          ...(agentRun.context.omittedSourceIds.length?{omittedSourceIds:agentRun.context.omittedSourceIds}:{})};
-        output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),replyLanguage,level);
-        if(!session.ragCondition&&intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
-        if(!session.ragCondition&&intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
-        agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
-        // The optional judge also sees model text kept after an evidence failure , not only answered replies.
-        if(this.options.agentValidator&&(output.status==='answered'||output.limitations.includes('INVALID_MODEL_EVIDENCE')&&output.content!==voiceText('fallback',replyLanguage,level))) {
-          if(agent.toolCalls)agent.validator='skipped_tool_followup';
-          else {
-            try {agent.validator=await this.options.agentValidator.validate({question:value.text,answer:output.content,sources:memorySources,personId:session.personId,signal:controller.signal})==='accept'?'accepted':'rejected';}
-            catch {agent.validator='error';}
-            if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:voiceText('fallback',replyLanguage,level),claims:[],evidence:[],grounding:'unverified_model',
-              limitations:[...output.limitations.filter(code=>/^[A-Z_]+$/.test(code)),`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
-          }
+      const rawReply=agentRun?.rawReply??await provider.generate(experiment?.messages??buildPrompt(persona,promptHistory,value.text,frame.sources,frame.intent==='timeline',policyNote),{signal:controller.signal,requestKey:turn.id,deadlineAt});
+      // The task persists this result before the node's abort check; a resumed guard/evidence failure never regenerates.
+      if(agentRun?.agent.toolCalls) {
+        const query=agentRun.agent.steps.filter(step=>step.phase==='tool').at(-1)?.query;
+        if(query)memoryTrace={...memoryTrace,action:'search',query};
+      }
+      return structuredClone({...frame,lore,personaContext,experiment,agentRun,rawReply,memorySources:agentRun?.context.sources??experiment?.sources??frame.sources,served:agentRun?.upstreams??served,memoryTrace});
+    });
+    const validateAgent=task('turn-agent-validator',async(frame:TurnFrame):Promise<'accepted'|'rejected'|'error'>=>{
+      try {return await this.options.agentValidator!.validate({question:value.text,answer:frame.output!.content,sources:frame.memorySources,personId:session.personId,signal:controller.signal})==='accept'?'accepted':'rejected';}
+      catch {return 'error';}
+    });
+    const outputGuard=task('turn-output-guard',async(frame:TurnFrame):Promise<Pick<TurnFrame,'output'|'replyGuard'>>=>{
+      const snap=frame.snapshot!,candidate=frame.output!;
+      if(!snap.cardPath&&!this.options.guardrails)return {output:candidate};
+      if(this.options.guardrails) {
+        try {
+          const guarded=await this.options.guardrails.validateReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level},{signal:controller.signal});
+          if(!guarded.content.trim()||guarded.content.length>8000||containsCredentialPattern(guarded.content)||containsInternalPathPattern(guarded.content))throw new Error('invalid validator output');
+          const replyGuard:ChatReply['replyGuard']={revision:guarded.revision,action:guarded.reason?guarded.edited?'edited':'replaced':'none',...(guarded.reason?{reason:guarded.reason}:{})};
+          if(guarded.reason&&guarded.edited)return {replyGuard,output:{...candidate,content:guarded.content,limitations:[...candidate.limitations,`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
+          if(guarded.reason)return {replyGuard,output:{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
+          return {replyGuard,output:{...candidate,content:guarded.content}};
+        } catch {check();return {output:{status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_OUTPUT_UNAVAILABLE']}};}
+      }
+      // Offline domain harness only: production supplies Guardrails and never falls back here on a service failure.
+      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level});
+      const replyGuard:ChatReply['replyGuard']=guarded?{revision:REPLY_GUARD_REVISION,action:guarded.edited?'edited':'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
+      if(guarded?.edited)return {replyGuard,output:{...candidate,content:guarded.content,limitations:[...candidate.limitations,`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
+      return {replyGuard,output:guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate};
+    });
+    const decideIntent=task('turn-intent',async(frame:TurnFrame):Promise<TurnFrame>=>{
+        const snap=frame.snapshot!,intentOptions=this.options.intentClassifier;
+        if(frame.output)return {...frame,intent:'unsupported'};
+        const classifier=snap.combined?{...intentOptions!,classifier:{name:intentOptions!.classifier.name,classify:async()=>{
+          if(frame.intentFailure)throw frame.intentFailure==='timeout'?'timeout':Object.assign(new Error('classifier unavailable'),{code:frame.intentFailure==='unresolved'?'REQUEST_UNRESOLVED_NO_RESUBMIT':frame.intentFailure==='budget'?'BUDGET_EXCEEDED':undefined});
+          return frame.combinedIntent;
+        }}}:intentOptions;
+        const routed=snap.control&&intentOptions?{intent:ruleIntent(snap.signals),routing:{decidedBy:'rule' as const,ruleIntent:ruleIntent(snap.signals)}}
+          :await routeIntent(snap.signals,{text:[...value.text].slice(0,500).join(''),recentUserTurns:snap.recentUserTurns,seed:turn.id},snap.control?undefined:classifier,controller.signal);
+        let intent=routed.intent,safety=frame.safety;const deflect=safety?.action==='deflect';
+        const safetyCategory=safety&&(safety.action==='refuse'||safety.action==='support')?safety.category as Exclude<SafetyCategory,'prompt_injection'>:undefined;
+        if(safetyCategory)intent='unsupported';else if(deflect&&intent==='timeline'&&session.retrievalMode!=='off'){intent='small_talk';safety={...safety!,intentOverride:'safety_deflect'};}
+        return {...frame,intent,routing:routed.routing,safety,deflect,safetyCategory};
+    });
+    const builder=new StateGraph(TurnAnnotation)
+      .addNode('initialize',stage('initialize',async()=>initialize()))
+      .addNode('safety',stage('safety',async frame=>{
+        const result=await assess(frame);check();
+        if(result.safety?.fallbackReason)this.options.onSafetyFallback?.({scope:'turn',reason:result.safety.fallbackReason});
+        return {...frame,...result};
+      }))
+      .addNode('intent',stage('intent',async frame=>decideIntent(frame)))
+      .addNode('retrieve',stage('retrieve',async frame=>{
+        const snap=frame.snapshot!,intent=frame.intent!;
+        const fixed=(key:'rule_refusal'|'clarification'|'ambiguous_reference'|'event_timezone')=>snap.cardPath
+          ?voiceText(({rule_refusal:'decline',clarification:'clarification',ambiguous_reference:'ambiguous_reference',event_timezone:'event_timezone'} as const satisfies Record<string,VoiceTextKey>)[key],snap.replyLanguage,snap.level):replyText(key,session.language);
+        if(frame.output)return frame;
+        if(intent==='clarification'||intent==='unsupported')return {...frame,output:{status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?fixed('clarification'):frame.safetyCategory?safetyReply(frame.safetyCategory,snap.replyLanguage):fixed('rule_refusal'),claims:[],evidence:[],limitations:frame.safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]}};
+        if(intent==='timeline'&&session.retrievalMode!=='off'&&snap.ambiguous)return {...frame,memoryTrace:{...frame.memoryTrace!,action:'clarify'},output:{status:'needs_clarification',content:fixed('ambiguous_reference'),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']}};
+        if(intent==='timeline'&&session.retrievalMode!=='off'&&snap.query.dateBasis==='event'&&snap.query.start&&snap.query.timezone!=='UTC')return {...frame,output:{status:'needs_clarification',content:fixed('event_timezone'),claims:[],evidence:[],limitations:['EVENT_TIMEZONE_UNAVAILABLE']}};
+        if(intent==='timeline'&&session.retrievalMode==='off'&&session.ragCondition===undefined)return {...frame,output:{status:'insufficient_evidence',content:replyText('retrieval_off',session.language),claims:[],evidence:[],limitations:['RETRIEVAL_OFF']}};
+        if(intent==='timeline'&&session.retrievalMode!=='off') {
+          await transition('retrieving');
+          const result=await retrieve(frame);check();return {...frame,...result};
         }
-        output=guard(output);
-        // A deflected turn never updates the conversational state the injection attempt may have targeted.
-        if(output.status==='answered'&&!deflect)agent.variables=AgentVariablesSchema.parse({...agent.variables,...agentRun.response.variableUpdates});
-        if(agentRun.serviceLimitation)output.limitations.push(agentRun.serviceLimitation);
-        if(agentRun.context.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${agentRun.context.omittedAnnotations}`);
-      }
-      else if(session.ragCondition) {
-        output=guard(validateExperimentReply(result,experiment!.sources,session.personId,session.ragCondition,replyLanguage,level));
-        if(experiment!.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${experiment!.omittedAnnotations}`);
-      }
-      else if(intent==='timeline') output=validateSourceBoundReply(result,sources,session.personId);
-      else {
-        const safe=result.trim();
-        if(!safe || safe.length>8000 || containsCredentialPattern(safe)) throw new CoreError('TURN_FAILED','REPLY_REJECTED');
-        output=containsUngroundedBiography(safe)
-          ? {status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']}
-          : {status:'answered',content:safe,claims:[],evidence:[],limitations:[]};
+        return frame;
+      }))
+      .addNode('generate',stage('generate',async frame=>{
+        await transition('generating');
+        const result=await generate(frame);check();return result;
+      }))
+      .addNode('evidence',stage('evidence',async frame=>{
+        if(frame.output)return frame;
+        const snap=frame.snapshot!,result=frame.rawReply!,memorySources=frame.memorySources;let output:TurnOutput;let agent:ChatReply['agent'],promptEvidence:ChatReply['promptEvidence'];
+        if(frame.agentRun) {
+          agent=structuredClone(frame.agentRun.agent);
+          output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),snap.replyLanguage,snap.level);
+          if(!session.ragCondition&&frame.intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
+          if(!session.ragCondition&&frame.intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
+          agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
+          if(this.options.agentValidator&&(output.status==='answered'||output.limitations.includes('INVALID_MODEL_EVIDENCE')&&output.content!==voiceText('fallback',snap.replyLanguage,snap.level))) {
+            if(agent.toolCalls)agent.validator='skipped_tool_followup';else {
+              agent.validator=await validateAgent({...frame,output});
+              if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:[...output.limitations.filter(code=>/^[A-Z_]+$/.test(code)),`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
+            }
+          }
+        } else if(session.ragCondition)output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition,snap.replyLanguage,snap.level);
+        else if(frame.intent==='timeline')output=validateSourceBoundReply(result,frame.sources,session.personId);
+        else {
+          const safe=result.trim();if(!safe||safe.length>8000||containsCredentialPattern(safe))throw new CoreError('TURN_FAILED','REPLY_REJECTED');
+          output=containsUngroundedBiography(safe)?{status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']}:{status:'answered',content:safe,claims:[],evidence:[],limitations:[]};
+        }
+        const context=frame.agentRun?.context??frame.experiment;
+        if(context)promptEvidence={sourceIds:context.sources.map(source=>source.id),annotationIds:context.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),omittedAnnotations:context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(context.messages),'utf8'),...(context.omittedSourceIds.length?{omittedSourceIds:context.omittedSourceIds}:{})};
+        return {...frame,output,agent,promptEvidence};
+      }))
+      .addNode('output_guard',stage('output_guard',async frame=>{
+        // Deterministic safety/support texts do not go through a guard that could erase critical help resources.
+        const result=frame.rawReply===undefined?{output:frame.output}:await outputGuard(frame);check();
+        const output={...result.output!,limitations:[...result.output!.limitations]},snap=frame.snapshot!;
+        let agent=frame.agent?structuredClone(frame.agent):undefined;
+        if(agent&&frame.agentRun) {
+          if(output.status==='answered'&&!frame.deflect)agent.variables=AgentVariablesSchema.parse({...agent.variables,...frame.agentRun.response.variableUpdates});
+          if(frame.agentRun.serviceLimitation)output.limitations.push(frame.agentRun.serviceLimitation);
+        }
+        const context=frame.agentRun?.context??frame.experiment;
+        if(context?.omittedAnnotations)output.limitations.push(`IMAGE_ANNOTATIONS_OMITTED:${context.omittedAnnotations}`);
+        if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(snap.ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
+        const remembered=rememberSourceContext(frame.memorySources,output.evidence),reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:frame.memoryTrace!,
+          ...(frame.routing?{intentRouting:frame.routing}:{}),...(frame.safety?{inputSafety:frame.safety}:{}),...(frame.promptEvidence?{promptEvidence:frame.promptEvidence}:{}),...(frame.personaContext?{personaContext:frame.personaContext}:{}),...(result.replyGuard?{replyGuard:result.replyGuard}:{}),
+          ...(frame.served.length?{serving:{calls:frame.served.length,upstreams:frame.served,secondaryCalls:frame.served.filter(name=>name==='secondary').length}}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,
+          responseKind:agent?.toolCalls&&output.evidence.length?'timeline':frame.intent==='small_talk'?'small_talk':frame.intent==='clarification'?'clarification':frame.intent==='unsupported'?'unsupported':'timeline'};
+        return {...frame,...result,output,agent,reply};
+      }))
+      .addNode('persist',stage('persist',async frame=>{
+        await transition('validating');check();
+        if(!await store.completeTurn(turn.id,frame.reply!)) {
+          // Ownership may change after the preceding transition. A rejected final write must leave this
+          // node resumable, not mark the shared turn checkpoint complete with no committed assistant message.
+          controller.abort(LEASE_LOST);throw new CoreError('TURN_FAILED','TURN_ABORTED');
+        }
+        this.options.onTurnCompleted?.({turnId:turn.id,reply:frame.reply!});
+        return frame;
+      }))
+      .addEdge(START,'initialize').addEdge('initialize','safety').addEdge('safety','intent').addEdge('intent','retrieve')
+      .addConditionalEdges('retrieve',({frame}:TurnGraphState)=>frame.output?'evidence':'generate',['evidence','generate'])
+      .addEdge('generate','evidence').addEdge('evidence','output_guard').addEdge('output_guard','persist').addEdge('persist',END);
+    const graph=builder.compile(this.options.agentCheckpoint?{checkpointer:this.options.agentCheckpoint.checkpointer}:{});
+    const config={recursionLimit:32,...(this.options.agentCheckpoint?{configurable:{thread_id:`turn:${turn.id}`}}:{})};
+    let resume=false;
+    if(this.options.agentCheckpoint) {
+      const snapshot=await graph.getState(config),saved=(snapshot.values as Partial<TurnGraphState>).frame;
+      if(saved) {
+        if(saved.binding!==binding)throw new CoreError('INVALID_INPUT','CHECKPOINT_TURN_MISMATCH');
+        if(!snapshot.next.length)return;
+        resume=true;
       }
     }
-    if(controller.signal.aborted || !await store.transitionTurn(turn.id,['pending','generating'],'validating')) return;
-    if(session.executionProfile==='agent_loop'&&!agent)agent={revision:AGENT_RUNTIME_REVISION,promptRevision:AGENT_PROMPT_REVISION,modelCalls:0,toolCalls:0,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),steps:[],validator:'disabled'};
-    const remembered=rememberSourceContext(memorySources,output.evidence);
-    const reply:ChatReply={...output,...(agent?{agent}:{}),...(remembered.length?{sourceContext:{revision:RETRIEVAL_CONTEXT_REVISION,references:remembered}}:{}),retrievalContext:memoryTrace,...(routing?{intentRouting:routing}:{}),...(safety?{inputSafety:safety}:{}),...(promptEvidence?{promptEvidence}:{}),...(personaContext?{personaContext}:{}),...(replyGuard?{replyGuard}:{}),
-      ...(served.length?{serving:{calls:served.length,upstreams:served,secondaryCalls:served.filter(name=>name==='secondary').length}}:{}),sessionId:session.id,turnId:turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:agent?.toolCalls&&output.evidence.length?'timeline':intent==='small_talk'?'small_talk':intent==='clarification'?'clarification':intent==='unsupported'?'unsupported':'timeline'};
-    if(!controller.signal.aborted&&await store.completeTurn(turn.id,reply)) this.options.onTurnCompleted?.({turnId:turn.id,reply});
+    await graph.invoke(resume?null:{frame:{binding,sources:[],memorySources:[],served:[]}},config);
   }
 }

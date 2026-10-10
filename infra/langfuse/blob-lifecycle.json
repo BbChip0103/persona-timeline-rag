@@ -1,0 +1,10 @@
+{
+  "Rules": [{
+    "ID": "ptr-90-day-private-data",
+    "Status": "Enabled",
+    "Filter": {"Prefix": ""},
+    "Expiration": {"Days": 90},
+    "NoncurrentVersionExpiration": {"NoncurrentDays": 90},
+    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+  }]
+}

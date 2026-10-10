@@ -1,12 +1,12 @@
-# Production profile : one image (../Dockerfile), one process per role, TypeScript through tsx.
+# Production profile : one image (../Dockerfile), API, Nest BullMQ worker and Next web only, TypeScript through tsx.
 # Host network: the roles keep their loopback-only guards and fixed 127.0.0.1 ports (Linux only). Postgres and Redis
-# stay in compose.db.yml / compose.redis.yml (fixed project and container names); a role started before them keeps
-# reconnecting, and the api reports unhealthy until both answer. The gateway is needed only with PTR_CHAT_PROVIDER=gateway.
+# use separately provisioned isolated services; a role started before them keeps reconnecting,
+# and the api reports unhealthy until both answer. Synthetic targets are in compose.framework.yml.
 #
-#   docker compose --env-file .env.local -f infra/compose.app.yml [--profile gateway] up -d
+#   PTR_FRAMEWORK_APP_ENV_FILE=<new-framework-app-env> docker compose --env-file <new-framework-app-env> -f infra/compose.app.yml up -d
 #
-# `--env-file` lets Compose read PTR_UID / PTR_GID and the gateway's PTR_GATEWAY_UPSTREAMS_FILE (repo-relative) for the
-# mounts below; env_file passes the same file to the roles. Procedures: docs/runbook.md "Deploy with Compose".
+# `--env-file` lets Compose read PTR_UID / PTR_GID values for the
+# mounts below; PTR_FRAMEWORK_APP_ENV_FILE explicitly selects the new file to the roles. Procedures: docs/framework-runtime.md.
 name: ptr_app
 
 x-role: &role
@@ -17,8 +17,8 @@ x-role: &role
   user: "${PTR_UID:-900}:${PTR_GID:-2000}"
   init: true
   env_file:
-    - path: ../.env.local
-      required: false
+    - path: ${PTR_FRAMEWORK_APP_ENV_FILE:?select a new explicit private framework app environment}
+      required: true
   restart: unless-stopped
   logging:
     driver: json-file
@@ -62,38 +62,6 @@ services:
     stop_grace_period: 35s
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:56442/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-
-  dispatcher:
-    <<: *role
-    command: [node, --import, tsx, apps/api/src/dispatcher.ts]
-    healthcheck:
-      test: [CMD, node, -e, "fetch('http://127.0.0.1:56443/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-
-  gateway:
-    <<: *role
-    profiles: [gateway]
-    command: [node, --import, tsx, apps/gateway/src/main.ts]
-    volumes:
-      # Mounted as a file: edit it in place (the gateway re-reads it on mtime change or SIGHUP). An editor that replaces
-      # the file leaves the container on the old copy until `docker compose restart gateway`.
-      - type: bind
-        source: ../${PTR_GATEWAY_UPSTREAMS_FILE:-configs/gateway-upstreams.example.json}
-        target: /app/${PTR_GATEWAY_UPSTREAMS_FILE:-configs/gateway-upstreams.example.json}
-        read_only: true
-        bind:
-          create_host_path: false
-    # SIGTERM drains: queued and new calls get the marked 503, calls in flight run to their deadline.
-    stop_grace_period: 35s
-    healthcheck:
-      test: [CMD, node, -e, "fetch('http://127.0.0.1:56460/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 3

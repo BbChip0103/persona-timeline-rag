@@ -1,8 +1,8 @@
-import { loadConfig } from '@ptr/ops';
+import { loadFrameworkConfig } from '@ptr/ops';
 import { createApiApplication } from './app';
 import { createRuntime } from './runtime';
 async function main() {
-  loadConfig('api',process.env);
+  loadFrameworkConfig('api',process.env);
   const runtime=createRuntime();
   const app=await createApiApplication(runtime,process.env.PTR_API_TOKEN??'',{syntheticToken:process.env.PTR_API_SYNTHETIC_TOKEN||undefined});
   const port=Number(process.env.PTR_API_PORT??56441);

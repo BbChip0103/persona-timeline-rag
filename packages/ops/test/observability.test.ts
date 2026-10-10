@@ -1,31 +1,30 @@
 import { createServer } from 'node:net';
-import { Counter, Histogram, commonFamilies, parseExposition, renderFamilies, type Family } from '../src/metrics';
+import { Counter, Gauge, Histogram, Registry, createMetricsRegistry, parseExposition } from '../src/metrics';
 import { createLog } from '../src/log';
 import { metricsPort, PROM_CONTENT_TYPE, startMetricsListener } from '../src/http-metrics';
 
-describe('Prometheus text exposition ',()=>{
-  test('renders HELP/TYPE once per family, escapes label values and parses back',()=>{
-    const counter=new Counter();counter.inc({reason:'queue_full'});counter.inc({reason:'queue_full'},2);counter.inc({reason:'a"b\\c\nd'});
-    const histogram=new Histogram([0.5,1]);histogram.observe(0.2);histogram.observe(0.7);histogram.observe(3);
-    const families:Family[]=[
-      {name:'ptr_x_total',help:'X.',type:'counter',samples:counter.samples()},
-      {name:'ptr_y',help:'Y with "quotes" and \\ backslash.',type:'gauge',samples:[{value:1.5}]},
-      {name:'ptr_z_seconds',help:'Z.',type:'histogram',samples:histogram.samples()},
-      {name:'ptr_empty_total',help:'No samples yet.',type:'counter',samples:[]},
-    ];
-    const text=renderFamilies(families);
-    expect(text.endsWith('\n')).toBe(true);
-    expect(text).toContain('ptr_x_total{reason="queue_full"} 3');
-    expect(text).toContain('ptr_x_total{reason="a\\"b\\\\c\\nd"} 1');
+describe('standard Prometheus collectors',()=>{
+  test('genuine SDK owns counters, buckets, gauges and escaping; parser reads exported text',async()=>{
+    const registry=new Registry();
+    const counter=new Counter({name:'ptr_x_total',help:'X.',labelNames:['reason'],registers:[registry]});
+    counter.inc({reason:'queue_full'});counter.inc({reason:'queue_full'},2);counter.inc({reason:'a"b\\c\nd'});
+    const histogram=new Histogram({name:'ptr_z_seconds',help:'Z.',buckets:[0.5,1],registers:[registry]});
+    histogram.observe(0.2);histogram.observe(0.7);histogram.observe(3);
+    new Gauge({name:'ptr_y',help:'Y.',registers:[registry]}).set(1.5);
+    new Counter({name:'ptr_empty_total',help:'No samples yet.',labelNames:['reason'],registers:[registry]});
+    const text=await registry.metrics();
+    expect(registry.getSingleMetric('ptr_x_total')).toBeInstanceOf(Counter);
+    expect(registry.getSingleMetric('ptr_z_seconds')).toBeInstanceOf(Histogram);
+    expect(text.endsWith('\n')).toBe(true);expect(text).toContain('ptr_x_total{reason="queue_full"} 3');
     expect(text).toContain('# TYPE ptr_empty_total counter');
     const parsed=parseExposition(text);
-    expect([...parsed.types.entries()]).toEqual([['ptr_x_total','counter'],['ptr_y','gauge'],['ptr_z_seconds','histogram'],['ptr_empty_total','counter']]);
     expect(parsed.samples.find(s=>s.name==='ptr_x_total'&&s.labels.reason==='a"b\\c\nd')?.value).toBe(1);
-    // Cumulative buckets, +Inf = count, sum.
     const bucket=(le:string)=>parsed.samples.find(s=>s.name==='ptr_z_seconds_bucket'&&s.labels.le===le)?.value;
     expect([bucket('0.5'),bucket('1'),bucket('+Inf')]).toEqual([1,2,3]);
     expect(parsed.samples.find(s=>s.name==='ptr_z_seconds_count')?.value).toBe(3);
     expect(parsed.samples.find(s=>s.name==='ptr_z_seconds_sum')?.value).toBeCloseTo(3.9);
+    expect(parsed.samples.find(s=>s.name==='ptr_y')?.value).toBe(1.5);
+    expect(text.match(/# TYPE ptr_x_total counter/g)).toHaveLength(1);
   });
   test('the parser rejects malformed lines, unknown types and samples outside their family',()=>{
     expect(()=>parseExposition('# TYPE a counter\na{x="1" 2\n')).toThrow();
@@ -33,16 +32,21 @@ describe('Prometheus text exposition ',()=>{
     expect(()=>parseExposition('# TYPE a counter\nb 1\n')).toThrow();
     expect(()=>parseExposition('# TYPE a counter\na one\n')).toThrow();
   });
-  test('invalid metric or label names are refused when rendering',()=>{
-    expect(()=>renderFamilies([{name:'bad-name',help:'',type:'gauge',samples:[]}])).toThrow();
-    expect(()=>renderFamilies([{name:'ok',help:'',type:'gauge',samples:[{labels:{'bad-label':'x'},value:1}]}])).toThrow();
+  test('SDK rejects invalid metric or label names and negative counter increments',()=>{
+    expect(()=>new Gauge({name:'bad-name',help:'Bad.',registers:[]})).toThrow();
+    expect(()=>new Gauge({name:'ok',help:'Ok.',labelNames:['bad-label'],registers:[]})).toThrow();
+    const counter=new Counter({name:'ptr_check_total',help:'Check.',registers:[]});
+    expect(()=>counter.inc(-1)).toThrow();
   });
-  test('common families: build info with role and version, process start time',()=>{
-    const parsed=parseExposition(renderFamilies(commonFamilies('worker')));
+  test('common gauges retain role/version/start values and isolated registries',async()=>{
+    const registry=createMetricsRegistry('worker'), second=createMetricsRegistry('api');
+    const parsed=parseExposition(await registry.metrics());
     const info=parsed.samples.find(s=>s.name==='ptr_build_info');
     expect(info?.labels.role).toBe('worker');expect(info?.labels.version).toMatch(/^\d+\.\d+\.\d+/);expect(info?.value).toBe(1);
     const started=parsed.samples.find(s=>s.name==='process_start_time_seconds')!.value;
     expect(Math.abs(started-(Date.now()/1000-process.uptime()))).toBeLessThan(5);
+    expect(await second.metrics()).not.toContain('role="worker"');
+    expect(registry.getSingleMetric('ptr_build_info')).toBeInstanceOf(Gauge);
   });
 });
 

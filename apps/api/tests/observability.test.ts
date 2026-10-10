@@ -1,13 +1,12 @@
-import type { Server } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { INestApplication } from '@nestjs/common';
 import type { Persona } from '@ptr/contracts';
 import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, TurnWorker, createLocalChat, type TextProvider } from '@ptr/core';
-import { FakeTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
+import { FakeTextProvider, LiteLLMTextProvider } from '@ptr/providers';
 import { parseExposition, PROM_CONTENT_TYPE } from '@ptr/ops';
-import { createGateway, StaticUpstreamSource, UpstreamPool, type Primary } from '../../gateway/src';
 import { createApiApplication } from '../src/app';
-import { dispatcherObservability, workerObservability } from '../src/observability';
+import { workerMaintenanceObservability, workerObservability } from '../src/observability';
 import { publicTurn } from '../src/public-turn';
 import type { ApiRuntime } from '../src/runtime';
 
@@ -16,7 +15,7 @@ const COMMON=['ptr_build_info','process_start_time_seconds'];
 const API_NAMES=[...COMMON,'ptr_http_requests_total','ptr_turns_created_total','ptr_sse_streams_open','ptr_owner_rejected_total'];
 const WORKER_NAMES=[...COMMON,'ptr_turns_finished_total','ptr_turn_duration_seconds','ptr_turn_queue_wait_seconds','ptr_turns_inflight',
   'ptr_safety_fallback_total','ptr_reply_guard_total','ptr_model_calls_total'];
-const DISPATCHER_NAMES=[...COMMON,'ptr_dispatch_requeued_total','ptr_dispatch_failed_total','ptr_outbox_republished_total','ptr_queue_waiting',
+const MAINTENANCE_NAMES=[...COMMON,'ptr_dispatch_requeued_total','ptr_dispatch_failed_total','ptr_outbox_republished_total','ptr_queue_waiting',
   'ptr_oldest_pending_age_seconds'];
 const SENTINEL='SENTINEL-사용자-문장';
 const token='synthetic_api_token_abcdefghijklmnop', productionToken='production_api_token_abcdefghijklmnop';
@@ -82,13 +81,17 @@ describe('api /metrics/prom and health ',()=>{
     health={database:true,redis:false};
     expect((await call('health')).status).toBe(503);
   });
+  test.each([true,false])('health reports the actual LiteLLM billable flag (%s), not the retired provider route',async billable=>{
+    runtime.providerName='litellm';runtime.billable=billable;
+    expect((await (await call('health')).json()).liveEnabled).toBe(billable);
+  });
 });
 
-describe('worker and dispatcher observability',()=>{
+describe('worker and outbox observability',()=>{
   test('worker: exact names; finished by outcome and code, durations, model calls by upstream, reply guard, safety fallback; JSON logs with turnId only',async()=>{
     const lines:string[]=[];
     const observed=workerObservability({activeTurns:()=>2,write:line=>lines.push(line)});
-    expect(names(observed.render())).toEqual([...WORKER_NAMES].sort());
+    expect(names(await observed.render())).toEqual([...WORKER_NAMES].sort());
     const store=new InMemoryConversationStore();
     let fail=false;
     const provider:TextProvider={generate:async(_messages,options)=>{if(fail) throw Object.assign(new Error(SENTINEL),{code:'PROVIDER_TRANSPORT'});options.onServed?.('secondary');return '반가워요.';}};
@@ -100,7 +103,7 @@ describe('worker and dispatcher observability',()=>{
     fail=true;
     const bad=await chat.submitTurn('lt-obs',{sessionId:session.id,clientRequestId:'b',text:SENTINEL});await worker.handle(bad.dispatch!);
     observed.chatHooks.onSafetyFallback({scope:'turn',reason:'timeout'});
-    const text=observed.render();
+    const text=await observed.render();
     expect(value(text,'ptr_turns_finished_total',{outcome:'completed',code:'none'})).toBe(1);
     expect(value(text,'ptr_turns_finished_total',{outcome:'failed',code:'PROVIDER_TRANSPORT'})).toBe(1);
     expect(value(text,'ptr_turn_duration_seconds_count')).toBe(2);expect(value(text,'ptr_turn_queue_wait_seconds_count')).toBe(2);
@@ -113,22 +116,22 @@ describe('worker and dispatcher observability',()=>{
     expect(events).toContainEqual(expect.objectContaining({role:'worker',event:'input_safety_fallback',scope:'turn',reason:'timeout'}));
     expect(lines.join('')).not.toContain('SENTINEL');expect(lines.join('')).not.toContain('사용자');
   });
-  test('reply guard outcomes are counted by action and reason',()=>{
+  test('reply guard outcomes are counted by action and reason',async()=>{
     const observed=workerObservability({activeTurns:()=>0,write:()=>undefined});
     const reply=(replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'meta_talk'})=>({sessionId:'s',turnId:'t',messageId:'m',personId:'p',personaRevision:'v',
       responseKind:'small_talk' as const,status:'answered' as const,content:SENTINEL,claims:[],evidence:[],limitations:[],...(replyGuard?{replyGuard}:{})});
     observed.chatHooks.onTurnCompleted({turnId:'t1',reply:reply({revision:'r',action:'edited',reason:'meta_talk'})});
     observed.chatHooks.onTurnCompleted({turnId:'t2',reply:reply({revision:'r',action:'none'})});
     observed.chatHooks.onTurnCompleted({turnId:'t3',reply:reply()});
-    const text=observed.render();
+    const text=await observed.render();
     expect(value(text,'ptr_reply_guard_total',{action:'edited',reason:'meta_talk'})).toBe(1);
     expect(value(text,'ptr_reply_guard_total',{action:'none',reason:'none'})).toBe(1);
     expect(parseExposition(text).samples.filter(sample=>sample.name==='ptr_reply_guard_total')).toHaveLength(2);
   });
-  test('dispatcher: exact names; requeues, failures by code, republished; queue gauges read at scrape time, a failing source is left out',async()=>{
+  test('worker maintenance: exact names; requeues, failures by code, republished; queue gauges read at scrape time, a failing source is left out',async()=>{
     const lines:string[]=[];let backlog:number|Error=7;
-    const observed=dispatcherObservability({queueWaiting:async()=>{if(backlog instanceof Error) throw backlog;return backlog;},oldestPendingAgeSeconds:async()=>12.5,write:line=>lines.push(line)});
-    expect(names(await observed.render())).toEqual([...DISPATCHER_NAMES].sort());
+    const observed=workerMaintenanceObservability(workerObservability({activeTurns:()=>0}).registry,{queueWaiting:async()=>{if(backlog instanceof Error) throw backlog;return backlog;},oldestPendingAgeSeconds:async()=>12.5,write:line=>lines.push(line)});
+    expect(names(await observed.render())).toEqual([...new Set([...WORKER_NAMES,...MAINTENANCE_NAMES])].sort());
     observed.onEvent({type:'requeued',turnId:'t1'});observed.onEvent({type:'failed',turnId:'t2',errorCode:'QUEUE_TIMEOUT'});
     observed.onEvent({type:'failed',turnId:'t3',errorCode:'WORKER_LOST'});observed.onEvent({type:'republished',turnId:'t4'});
     let text=await observed.render();
@@ -142,34 +145,46 @@ describe('worker and dispatcher observability',()=>{
   });
 });
 
-describe('turnId correlation and reply.serving end to end (worker → gateway pool)',()=>{
+describe('turnId correlation through the real LangChain proxy transport',()=>{
   const servers:Server[]=[];
   afterEach(async()=>{await Promise.all(servers.splice(0).map(server=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve));}));});
-  test('the worker and gateway logs carry the same turnId; the turn records the serving upstream, which the public DTO leaves out',async()=>{
-    const gatewayLines:string[]=[], workerLines:string[]=[];
-    const engine:Primary={model:'m',health:async()=>true,complete:async()=>({status:200,contentType:'text/event-stream',
-      body:`data: ${JSON.stringify({choices:[{delta:{content:'반가워요.'},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`})};
-    const pool=new UpstreamPool({model:'m',admission:true,routeLogSample:1,log:line=>gatewayLines.push(line),create:()=>engine,
-      source:new StaticUpstreamSource([{pool:'m',id:'gpu-a',baseUrl:'static:a',maxSeqs:4,kvCapacityTokens:null,weight:1,state:'active',epoch:'e',seq:0}])});
-    const gatewayToken='synthetic_gateway_token_abcdefghij';
-    const gateway=createGateway({token:gatewayToken,upstream:pool,limits:{maxConcurrent:4,maxQueue:4,queueTimeoutMs:2000,upstreamTimeoutMs:30000},log:line=>gatewayLines.push(line)});
-    servers.push(gateway.server);await new Promise<void>(r=>gateway.server.listen(0,'127.0.0.1',r));
-    const provider=new OpenAICompatibleTextProvider({baseUrl:`http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}/v1`,model:'gateway',apiKey:gatewayToken});
+  test('worker records LiteLLM serving and sanitized logs while public DTO omits serving',async()=>{
+    const workerLines:string[]=[];let requests=0;
+    const proxy=createServer((_req,res)=>{
+      requests++;res.writeHead(200,{'content-type':'application/json'});
+      res.end(JSON.stringify({id:'synthetic-1',object:'chat.completion',created:1,model:'synthetic-model',
+        choices:[{index:0,message:{role:'assistant',content:'반가워요.'},finish_reason:'stop'}],
+        usage:{prompt_tokens:12,completion_tokens:4,total_tokens:16}}));
+    });
+    servers.push(proxy);await new Promise<void>(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+    const provider=new LiteLLMTextProvider({baseUrl:`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/v1`,model:'synthetic-model',apiKey:'synthetic-token'});
     const observed=workerObservability({activeTurns:()=>0,write:line=>workerLines.push(line)});
     const store=new InMemoryConversationStore();
-    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,leases:store,delivery:{publish:async()=>undefined,backlog:async()=>0},...observed.chatHooks}); // default 30 s turn deadline (X-PTR-Deadline)
+    const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,leases:store,delivery:{publish:async()=>undefined,backlog:async()=>0},...observed.chatHooks});
     const session=await chat.createSession('lt-obs',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});
     const {turn,dispatch}=await chat.submitTurn('lt-obs',{sessionId:session.id,clientRequestId:'corr',text:SENTINEL});
     await new TurnWorker({chat,leases:store,workerId:'w',leaseMs:1000,onFinished:observed.onFinished}).handle(dispatch!);
-    const workerTurn=workerLines.map(line=>JSON.parse(line)).find(event=>event.event==='turn_finished')!;
-    const gatewayRoute=gatewayLines.map(line=>JSON.parse(line)).find(event=>event.event==='gateway_route')!;
-    expect(workerTurn.turnId).toBe(turn.id);expect(gatewayRoute.turnId).toBe(turn.id);
+    const finished=workerLines.map(line=>JSON.parse(line)).find(event=>event.event==='turn_finished')!;
+    expect(finished.turnId).toBe(turn.id);expect(requests).toBe(1);
     const done=await chat.getTurn('lt-obs',turn.id);
-    expect(done.reply?.serving).toEqual({calls:1,upstreams:['primary'],secondaryCalls:0});
+    expect(done.reply?.serving).toEqual({calls:1,upstreams:['litellm'],secondaryCalls:0});
     expect(publicTurn(done).reply).not.toHaveProperty('serving');
     expect(JSON.stringify(publicTurn(done))).not.toContain('serving');
-    expect([...gatewayLines,...workerLines].join('')).not.toContain('SENTINEL');
-    expect(value(observed.render(),'ptr_model_calls_total',{upstream_kind:'primary'})).toBe(1);
-    await pool.close();
+    expect(workerLines.join('')).not.toContain('SENTINEL');
+    expect(value(await observed.render(),'ptr_model_calls_total',{upstream_kind:'litellm'})).toBe(1);
   });
+});
+
+test('metric registries are isolated and reject model/user sentinels as outcome labels',async()=>{
+  const first=workerObservability({activeTurns:()=>1,write:()=>undefined});
+  const second=workerObservability({activeTurns:()=>0,write:()=>undefined});
+  first.chatHooks.onTurnFailure({turnId:'synthetic-turn',code:SENTINEL});
+  first.chatHooks.onSafetyFallback({scope:'turn',reason:SENTINEL});
+  first.onFinished({turnId:'synthetic-turn',durationMs:NaN,queueWaitMs:Infinity});
+  const text=await first.render(), other=await second.render();
+  expect(text).not.toContain('SENTINEL');expect(text).not.toContain('synthetic-turn');
+  expect(value(text,'ptr_turns_finished_total',{outcome:'failed',code:'UNSPECIFIED'})).toBe(1);
+  expect(value(other,'ptr_turns_finished_total')).toBeUndefined();
+  expect(value(text,'ptr_turn_duration_seconds_count')).toBe(0);
+  expect(value(text,'ptr_turn_queue_wait_seconds_count')).toBe(0);
 });

@@ -1,0 +1,66 @@
+# Explicit deployment-only config. Never used by the synthetic profile.
+# Distinct aliases are deliberate: no failover from self-hosted to billable calls.
+model_list:
+  - model_name: primary
+    litellm_params:
+      model: os.environ/PTR_VLLM_MODEL
+      api_base: os.environ/PTR_VLLM_BASE_URL
+      api_key: os.environ/PTR_VLLM_API_KEY
+      max_retries: 0
+      timeout: 25
+      chat_template_kwargs:
+        enable_thinking: false
+    model_info:
+      id: primary
+      mode: chat
+      disable_background_health_check: true
+  - model_name: primary
+    litellm_params:
+      model: os.environ/PTR_VLLM_SECONDARY_MODEL
+      api_base: os.environ/PTR_VLLM_SECONDARY_BASE_URL
+      api_key: os.environ/PTR_VLLM_SECONDARY_API_KEY
+      max_retries: 0
+      timeout: 25
+      chat_template_kwargs:
+        enable_thinking: false
+    model_info:
+      id: secondary
+      mode: chat
+      disable_background_health_check: true
+  - model_name: openrouter-primary
+    litellm_params:
+      model: os.environ/PTR_OPENROUTER_MODEL
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_retries: 0
+      timeout: 25
+    model_info:
+      id: openrouter-primary
+      mode: chat
+      disable_background_health_check: true
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 0
+  max_fallbacks: 0
+  enable_weighted_failover: false
+  fallbacks: []
+  default_fallbacks: []
+  context_window_fallbacks: []
+  content_policy_fallbacks: []
+  redis_host: litellm-redis
+  redis_port: 6379
+  redis_password: os.environ/PTR_LITELLM_REDIS_PASSWORD
+litellm_settings:
+  num_retries: 0
+  request_timeout: 25
+  drop_params: false
+  set_verbose: false
+  max_budget: 1.0
+  budget_duration: 1d
+  success_callback: [prometheus]
+general_settings:
+  master_key: os.environ/PTR_LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  background_health_checks: false
+  allow_requests_on_db_unavailable: false
+  maximum_spend_logs_retention_period: 90d
+  disable_error_logs: true

@@ -1,93 +1,102 @@
-import { renderFamilies, type Family } from '@ptr/ops';
+import { Counter, Registry } from '@ptr/ops';
 import { ROLE_TARGETS, run } from '../ops-status';
 
-// Synthetic /metrics/prom bodies per role, before and after the window .
-type Counts={served?:Record<string,number>;breakers?:Record<string,0|1>;queueTimeoutGateway?:number;queueTimeoutDispatcher?:number;
-  finished?:Record<string,number>;safety?:number};
-const family=(name:string,type:Family['type'],samples:Family['samples']):Family=>({name,help:'synthetic',type,samples});
-function bodies(c:Counts):Record<string,string> {
-  return {
-    api:renderFamilies([family('ptr_turns_created_total','counter',[{value:1}])]),
-    worker:renderFamilies([family('ptr_turns_finished_total','counter',Object.entries(c.finished??{}).map(([key,value])=>{
-      const [outcome,code]=key.split(':');return {labels:{outcome:outcome!,code:code!},value};})),
-      family('ptr_safety_fallback_total','counter',c.safety===undefined?[]:[{labels:{scope:'turn',reason:'timeout'},value:c.safety}])]),
-    dispatcher:renderFamilies([family('ptr_dispatch_failed_total','counter',[{labels:{code:'QUEUE_TIMEOUT'},value:c.queueTimeoutDispatcher??0}])]),
-    gateway:renderFamilies([family('ptr_gateway_served_total','counter',Object.entries(c.served??{}).map(([upstream,value])=>({labels:{upstream},value}))),
-      family('ptr_gateway_breaker_open','gauge',Object.entries(c.breakers??{}).map(([upstream,value])=>({labels:{upstream},value}))),
-      family('ptr_gateway_rejected_total','counter',[{labels:{reason:'queue_timeout'},value:c.queueTimeoutGateway??0}])]),
-  };
+type Counts={finished?:Record<string,number>;safety?:number};
+/** Fixtures are produced by genuine standard collectors, not a hand-written exposition renderer. */
+async function bodies(counts:Counts):Promise<Record<string,string>> {
+  const api=new Registry(Registry.PROMETHEUS_CONTENT_TYPE);
+  new Counter({name:'ptr_turns_created_total',help:'Synthetic created turns',registers:[api]}).inc(1);
+  const worker=new Registry(Registry.PROMETHEUS_CONTENT_TYPE);
+  const finished=new Counter({name:'ptr_turns_finished_total',help:'Synthetic finished turns',labelNames:['outcome','code'],registers:[worker]});
+  for(const [key,value] of Object.entries(counts.finished??{})) {
+    const [outcome,code]=key.split(':');finished.inc({outcome:outcome!,code:code!},value);
+  }
+  const safety=new Counter({name:'ptr_safety_fallback_total',help:'Synthetic safety fallbacks',labelNames:['scope','reason'],registers:[worker]});
+  if(counts.safety!==undefined)safety.inc({scope:'turn',reason:'timeout'},counts.safety);
+  return {api:await api.metrics(),worker:await worker.metrics()};
 }
-async function status(before:Counts,after:Counts,options:{down?:string[];argv?:string[]}={}) {
-  const lines:string[]=[];let phase=0;const slept:number[]=[];
+const healthy:Counts={finished:{'completed:none':10},safety:0};
+async function status(before:Counts,after:Counts,options:{down?:string[];argv?:string[];env?:NodeJS.ProcessEnv;readyStatus?:number}={}) {
+  const lines:string[]=[],requests:{url:string;init:unknown}[]=[],slept:number[]=[];let phase=0;
+  const snapshots=[await bodies(before),await bodies(after)];
   const urls=new Map<string,string>(ROLE_TARGETS.map(target=>[target.url,target.role]));
-  const code=await run(options.argv??[],{
-    fetch:async url=>{
-      const role=urls.get(String(url))!;
-      if(options.down?.includes(role)) throw new TypeError('fetch failed');
-      return new Response((phase===0?bodies(before):bodies(after))[role]!,{status:200});
-    },
-    sleep:async ms=>{slept.push(ms);phase=1;},
-    write:line=>lines.push(line),
-  });
-  return {code,text:lines.join('\n'),lines,slept};
+  const code=await run(options.argv??[],{env:options.env,
+    fetch:async(url,init)=>{
+      requests.push({url,init});const role=urls.get(url);
+      if(!role)return new Response('PRIVATE_READINESS_BODY_SENTINEL',{status:options.readyStatus??200});
+      if(options.down?.includes(role))throw new TypeError('PRIVATE_FETCH_ERROR_SENTINEL');
+      return new Response(snapshots[phase]![role],{status:200});
+    },sleep:async ms=>{slept.push(ms);phase=1;},write:line=>lines.push(line)});
+  return {code,text:lines.join('\n'),lines,slept,requests};
 }
-const healthy:Counts={served:{primary:10},breakers:{'gpu-a':0},finished:{'completed:none':10},safety:0};
-
-test('the four roles: api 56441, worker 56442, dispatcher 56443, gateway 56460',()=>{
-  expect(ROLE_TARGETS.map(target=>`${target.role} ${target.url}`)).toEqual(['api http://127.0.0.1:56441/metrics/prom',
-    'worker http://127.0.0.1:56442/metrics/prom','dispatcher http://127.0.0.1:56443/metrics/prom','gateway http://127.0.0.1:56460/metrics/prom']);
+test('only API/worker metric targets; no old gateway or standalone dispatcher',()=>{
+  expect(ROLE_TARGETS.map(target=>`${target.role} ${target.url}`)).toEqual([
+    'api http://127.0.0.1:56441/metrics/prom','worker http://127.0.0.1:56442/metrics/prom']);
 });
-test('all quiet: every role up, no ALERT, exit 0; the window defaults to 30 s and is read twice',async()=>{
-  const {code,text,slept}=await status(healthy,{...healthy,served:{primary:30},finished:{'completed:none':30}});
-  expect(code).toBe(0);expect(slept).toEqual([30000]);
-  expect(text).toMatch(/api\s+up/);expect(text).toMatch(/gateway\s+up/);
-  expect(text).toMatch(/secondary ratio\s+0\.0% \(0\/20\)\s+ok/);
-  expect(text).not.toContain('ALERT ');expect(text).toContain('summary: 0 ALERT');
+test('quiet standard counters: both roles up, default window30seconds and no legacy routing assumptions',async()=>{
+  const {code,text,slept,requests}=await status(healthy,{finished:{'completed:none':30},safety:0});
+  expect(code).toBe(0);expect(slept).toEqual([30000]);expect(requests).toHaveLength(4);
+  expect(text).toMatch(/api\s+up/);expect(text).toMatch(/worker\s+up/);
+  expect(text).not.toMatch(/secondary ratio|breaker|dispatcher|gateway/u);expect(text).toContain('summary: 0 ALERT');
 });
-test('an open breaker is information (engine unreachable), never an ALERT',async()=>{
-  const {code,text}=await status(healthy,{...healthy,breakers:{'gpu-a':1},served:{primary:20},finished:{'completed:none':20}});
-  expect(code).toBe(0);
-  expect(text).toMatch(/breaker gpu-a\s+open\s+INFO engine unreachable/);
-  expect(text).not.toMatch(/ALERT .*breaker/);
+test('queue timeout, safety fallback and TURN_TIMEOUT rate retain alerts using worker counters',async()=>{
+  const after:Counts={finished:{'completed:none':16,'failed:TURN_TIMEOUT':3,'failed:QUEUE_TIMEOUT':1},safety:2};
+  const {code,text,lines}=await status(healthy,after);
+  expect(code).toBe(1);expect(text).toMatch(/queue timeouts\s+1\s+ALERT > 0/u);
+  expect(text).toMatch(/safety fallback\s+2\s+ALERT > 0/u);expect(text).toMatch(/TURN_TIMEOUT rate\s+30\.0% \(3\/10\)\s+ALERT > 5%/u);
+  expect(lines.at(-1)).toBe('summary: 3 ALERT');
+  expect((await status(healthy,{finished:{'completed:none':29,'failed:TURN_TIMEOUT':1},safety:0})).code).toBe(0);
 });
-test('ALERT: secondary ratio above 20%, any queue timeout, TURN_TIMEOUT above 5%, any safety fallback',async()=>{
-  const after:Counts={served:{primary:12,secondary:8},breakers:{'gpu-a':1},queueTimeoutGateway:0,queueTimeoutDispatcher:1,
-    finished:{'completed:none':16,'failed:TURN_TIMEOUT':4},safety:2};
-  const {code,lines}=await status(healthy,after);
-  expect(code).toBe(1);
-  const alerts=lines.filter(line=>line.includes('ALERT'));
-  expect(alerts.find(line=>line.startsWith('secondary ratio'))).toMatch(/80\.0% \(8\/10\)\s+ALERT > 20%/);
-  expect(alerts.find(line=>line.startsWith('queue timeouts'))).toMatch(/1 \(QUEUE_TIMEOUT 1, gateway 0\)\s+ALERT > 0/);
-  expect(alerts.find(line=>line.startsWith('TURN_TIMEOUT rate'))).toMatch(/40\.0% \(4\/10\)\s+ALERT > 5%/);
-  expect(alerts.find(line=>line.startsWith('safety fallback'))).toMatch(/2\s+ALERT > 0/);
-  expect(lines.at(-1)).toBe('summary: 4 ALERT');
-  // At the limits nothing fires: 20% secondary, 5% TURN_TIMEOUT.
-  const edge=await status(healthy,{served:{primary:18,secondary:2},breakers:{'gpu-a':0},finished:{'completed:none':29,'failed:TURN_TIMEOUT':1},safety:0});
-  expect(edge.code).toBe(0);
+test('role down means missing-baseline rate checks are n/a, not lifetime-total alerts',async()=>{
+  const {code,text}=await status(healthy,healthy,{down:['worker']});
+  expect(code).toBe(0);expect(text).toMatch(/worker\s+down/u);expect(text).toMatch(/TURN_TIMEOUT rate\s+n\/a \(worker down\)/u);
+  expect(text).not.toContain('PRIVATE_FETCH_ERROR_SENTINEL');
 });
-test('gateway queue timeouts alone raise the queue ALERT',async()=>{
-  const {code,text}=await status(healthy,{...healthy,queueTimeoutGateway:3});
-  expect(code).toBe(1);expect(text).toMatch(/queue timeouts\s+3 \(QUEUE_TIMEOUT 0, gateway 3\)\s+ALERT > 0/);
-});
-test('a role that does not answer is down; its checks are n/a, not ALERT',async()=>{
-  const {code,text}=await status(healthy,healthy,{down:['gateway','worker']});
-  expect(code).toBe(0);
-  expect(text).toMatch(/gateway\s+down/);expect(text).toMatch(/worker\s+down/);expect(text).toMatch(/api\s+up/);
-  expect(text).toMatch(/secondary ratio\s+n\/a \(gateway down\)/);expect(text).toMatch(/TURN_TIMEOUT rate\s+n\/a \(worker down\)/);
-});
-test('a role that did not answer the first read has no baseline: its checks are n/a, never an ALERT from lifetime totals',async()=>{
+test('missing first scrape cannot promote lifetime totals to window increments',async()=>{
+  const snapshots=await bodies({finished:{'failed:TURN_TIMEOUT':40,'failed:QUEUE_TIMEOUT':3},safety:9});
   const lines:string[]=[];let phase=0;
   const urls=new Map<string,string>(ROLE_TARGETS.map(target=>[target.url,target.role]));
-  const after=bodies({served:{primary:5,secondary:50},finished:{'failed:TURN_TIMEOUT':40},safety:9,queueTimeoutDispatcher:3,queueTimeoutGateway:2});
-  const code=await run([],{fetch:async url=>{const role=urls.get(String(url))!;if(phase===0) throw new TypeError('fetch failed');return new Response(after[role]!,{status:200});},
+  const code=await run([],{fetch:async url=>{if(phase===0)throw new TypeError('synthetic down');return new Response(snapshots[urls.get(url)!]);},
     sleep:async()=>{phase=1;},write:line=>lines.push(line)});
-  const text=lines.join('\n');
-  expect(code).toBe(0);expect(text).toContain('summary: 0 ALERT');
-  expect(text).toMatch(/secondary ratio\s+n\/a \(no baseline\)/);expect(text).toMatch(/TURN_TIMEOUT rate\s+n\/a \(no baseline\)/);
-  expect(text).toMatch(/safety fallback\s+n\/a \(no baseline\)/);expect(text).toMatch(/queue timeouts\s+n\/a \(no baseline\)/);
+  expect(code).toBe(0);for(const name of ['queue timeouts','safety fallback','TURN_TIMEOUT rate'])expect(lines.find(line=>line.startsWith(name))).toContain('n/a (no baseline)');
 });
-test('a counter that went back (restart) counts from zero; --window sets the wait; a bad window is refused',async()=>{
-  const {code,text,slept}=await status({...healthy,served:{primary:500}},{...healthy,served:{primary:10,secondary:0}},{argv:['--window','5']});
-  expect(code).toBe(0);expect(slept).toEqual([5000]);expect(text).toMatch(/secondary ratio\s+0\.0% \(0\/10\)/);
-  for(const argv of [['--window','0'],['--window','x'],['--window=601'],['--other']]) expect((await status(healthy,healthy,{argv})).code).toBe(2);
+test('counter reset counts from zero and explicit window changes only the observation interval',async()=>{
+  const {code,text,slept}=await status({finished:{'completed:none':500},safety:0},{finished:{'completed:none':10},safety:0},{argv:['--window','5']});
+  expect(code).toBe(0);expect(slept).toEqual([5000]);expect(text).toMatch(/TURN_TIMEOUT rate\s+0\.0% \(0\/10\)/u);
+});
+test('usage validation makes no requests and prints no raw arguments',async()=>{
+  for(const argv of [['--window','0'],['--window','x'],['--window=601'],['--PRIVATE_SENTINEL']]) {
+    const result=await status(healthy,healthy,{argv});expect(result.code).toBe(2);expect(result.requests).toEqual([]);expect(result.text).not.toContain('PRIVATE_SENTINEL');
+  }
+});
+test('explicit LiteLLM and Langfuse check only free readiness, without transferring credentials or outputting payloads',async()=>{
+  const env={PTR_LITELLM_BASE_URL:'http://127.0.0.1:59000/v1',LANGFUSE_BASE_URL:'http://127.0.0.1:59001',
+    PTR_LITELLM_API_KEY:'PRIVATE_KEY_SENTINEL',LANGFUSE_SECRET_KEY:'PRIVATE_SECRET_SENTINEL'};
+  const {code,text,requests}=await status(healthy,healthy,{env});
+  expect(code).toBe(0);expect(requests.slice(-2).map(request=>request.url)).toEqual([
+    'http://127.0.0.1:59000/health/readiness','http://127.0.0.1:59001/api/public/ready']);
+  expect(text).toMatch(/litellm readiness\s+ready/u);expect(text).toMatch(/langfuse readiness\s+ready/u);
+  expect(text).not.toMatch(/PRIVATE_|59000|59001/u);
+  for(const request of requests)expect(Object.keys(request.init as object).sort()).toEqual(['redirect','signal']);
+});
+test('explicit unavailable dependency readiness is visible as an alert, without leaking response body',async()=>{
+  const {code,text}=await status(healthy,healthy,{env:{PTR_LITELLM_BASE_URL:'http://127.0.0.1:59000/v1'},readyStatus:503});
+  expect(code).toBe(1);expect(text).toMatch(/litellm readiness\s+unavailable\s+ALERT unavailable/u);expect(text).not.toContain('PRIVATE_READINESS_BODY_SENTINEL');
+});
+test('explicit unsafe targets fail before any request; no credential-bearing URL prints',async()=>{
+  for(const env of [{PTR_LITELLM_BASE_URL:'https://u:PRIVATE_SENTINEL@host.invalid/v1'},
+    {LANGFUSE_BASE_URL:'https://cloud.langfuse.com'},{PTR_OPS_API_METRICS_URL:'file:///PRIVATE_SENTINEL'}]) {
+    const result=await status(healthy,healthy,{env});expect(result.code).toBe(2);expect(result.requests).toEqual([]);expect(result.text).toBe('usage invalid_status_target');
+  }
+});
+test('metrics probes remain bounded when a transport ignores cancellation',async()=>{
+  jest.useFakeTimers();const lines:string[]=[];
+  const requests:{signal:AbortSignal}[]=[];
+  try {
+    const promise=run([],{fetch:async(_url,init)=>{requests.push(init);return new Promise<Response>(()=>undefined);},
+      sleep:async()=>undefined,write:line=>lines.push(line)});
+    await jest.advanceTimersByTimeAsync(4001);
+    expect(await promise).toBe(0);expect(requests).toHaveLength(4);expect(requests.every(request=>request.signal.aborted)).toBe(true);
+    expect(lines.join('\n')).toMatch(/worker\s+down/u);
+  } finally {jest.useRealTimers();}
 });

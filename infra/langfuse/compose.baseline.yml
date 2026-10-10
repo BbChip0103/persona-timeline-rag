@@ -1,0 +1,38 @@
+# Historical-source benchmark ONLY. Entirely new project/stores, no research connections.
+name: ${PTR_BASELINE_PROJECT:?generate a new baseline env}
+services:
+  baseline-db:
+    image: pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6
+    environment:
+      POSTGRES_USER: ptr_framework_baseline_tester
+      POSTGRES_DB: ptr_framework_baseline
+      POSTGRES_PASSWORD: ${PTR_BASELINE_DB_PASSWORD:?required}
+    command: [postgres, -c, log_statement=none, -c, log_min_error_statement=panic]
+    ports: ["127.0.0.1:57433:5432"]
+    volumes:
+      - baseline_db:/var/lib/postgresql/data
+      - ./init-baseline-db.sh:/docker-entrypoint-initdb.d/10-baseline-test.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ptr_framework_baseline_tester -d ptr_framework_baseline"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  baseline-queue:
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    environment:
+      REDIS_PASSWORD: ${PTR_BASELINE_QUEUE_PASSWORD:?required}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction']
+    ports: ["127.0.0.1:57480:6379"]
+    volumes: [baseline_queue:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  baseline_db:
+  baseline_queue:
+networks:
+  default:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

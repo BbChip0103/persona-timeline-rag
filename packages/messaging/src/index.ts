@@ -3,6 +3,4 @@ export * from './redis.js';
 export * from './bullmq-delivery.js';
 export * from './turn-events.js';
 export * from './queued-chat.js';
-export * from './upstream-registry.js';
-export * from './capacity-controller.js';
-export * from './gateway-registry.js';
+export * from './engine-metrics.js';

@@ -1,8 +1,5 @@
-/**
- * `@ptr/messaging/registry`: the upstream registry and the guarded Redis connection only, without BullMQ, for the LLM
- * gateway and the upstream agent.
+/** Redis target guard/connection boundary, retained without BullMQ import side effects.
+ * Fleet registries and gateway discovery were retired in the framework migration.
  */
 export * from './local-guard.js';
 export * from './redis.js';
-export * from './upstream-registry.js';
-export * from './gateway-registry.js';

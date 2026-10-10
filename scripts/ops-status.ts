@@ -1,34 +1,60 @@
-/**
- * `pnpm ops:status [--window 30]` : reads `/metrics/prom` of the four roles twice, `--window` seconds
- * apart, and prints one health table. No Prometheus server and no alert rules: this is the whole alerting.
- *
- * - ALERT: secondary share of gateway answers > 20%, any queue timeout (dispatcher QUEUE_TIMEOUT or gateway
- *   queue_timeout), TURN_TIMEOUT share of finished turns > 5%, any input-safety fallback.
- * - INFO: an open breaker is `engine unreachable` (the GPU pod is often off), never an ALERT.
- * - A role that does not answer is `down`; checks that need it are n/a, as are checks of a role that missed the first
- *   read (no baseline). Breakers are read from the second read alone.
- *
- * Exit 0 without ALERT, 1 with one, 2 on bad arguments. Output is counts and fixed names only.
+/** Read-only framework status. API/worker counters come from standard collectors.
+ * Optional LiteLLM/Langfuse readiness probes never call models or transfer credentials.
  */
 import { parseExposition, type ParsedExposition } from '@ptr/ops';
 
-export const ROLE_TARGETS=[{role:'api',url:'http://127.0.0.1:56441/metrics/prom'},{role:'worker',url:'http://127.0.0.1:56442/metrics/prom'},
-  {role:'dispatcher',url:'http://127.0.0.1:56443/metrics/prom'},{role:'gateway',url:'http://127.0.0.1:56460/metrics/prom'}] as const;
+export const ROLE_TARGETS=[{role:'api',url:'http://127.0.0.1:56441/metrics/prom'},
+  {role:'worker',url:'http://127.0.0.1:56442/metrics/prom'}] as const;
 type Role=(typeof ROLE_TARGETS)[number]['role'];
 type Scrape=Partial<Record<Role,ParsedExposition>>;
-export interface Deps {fetch:(url:string,init:{signal:AbortSignal})=>Promise<Response>;sleep:(ms:number)=>Promise<void>;write:(line:string)=>void}
+export interface Deps {
+  fetch:(url:string,init:{signal:AbortSignal;redirect:'error'})=>Promise<Response>;
+  sleep:(ms:number)=>Promise<void>;write:(line:string)=>void;env?:NodeJS.ProcessEnv;
+}
 
-const SECONDARY_MAX=0.2, TURN_TIMEOUT_MAX=0.05;
-async function scrape(deps:Deps):Promise<Scrape> {
-  const entries=await Promise.all(ROLE_TARGETS.map(async({role,url})=>{
+/** No URL credentials, query secrets or fragments. Explicit endpoints are never printed. */
+function base(raw:string):URL {
+  const parsed=new URL(raw);
+  if(!['http:','https:'].includes(parsed.protocol)||parsed.username||parsed.password||parsed.search||parsed.hash)throw new Error('invalid_status_target');
+  return parsed;
+}
+function targets(env:NodeJS.ProcessEnv) {
+  const metrics=ROLE_TARGETS.map(target=>({role:target.role,url:base(env[target.role==='api'?'PTR_OPS_API_METRICS_URL':'PTR_OPS_WORKER_METRICS_URL']??target.url).href}));
+  const readiness:{role:'litellm'|'langfuse';url:string}[]=[];
+  if(env.PTR_LITELLM_BASE_URL) {
+    const url=base(env.PTR_LITELLM_BASE_URL);url.pathname=`${url.pathname.replace(/\/v1\/?$/u,'').replace(/\/$/u,'')}/health/readiness`;
+    readiness.push({role:'litellm',url:url.href});
+  }
+  if(env.LANGFUSE_BASE_URL) {
+    const url=base(env.LANGFUSE_BASE_URL);
+    if(url.hostname==='langfuse.com'||url.hostname.endsWith('.langfuse.com'))throw new Error('selfhost_status_target_required');
+    url.pathname=`${url.pathname.replace(/\/$/u,'')}/api/public/ready`;readiness.push({role:'langfuse',url:url.href});
+  }
+  return {metrics,readiness};
+}
+
+async function bounded<T>(work:(signal:AbortSignal)=>Promise<T>):Promise<T> {
+  const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;
+  try {
+    return await Promise.race([work(controller.signal),new Promise<never>((_,reject)=>{
+      timer=setTimeout(()=>{controller.abort();reject(new Error('status_timeout'));},2000);
+    })]);
+  } finally {clearTimeout(timer);controller.abort();}
+}
+async function scrape(deps:Deps,metrics:ReturnType<typeof targets>['metrics']):Promise<Scrape> {
+  const entries=await Promise.all(metrics.map(async({role,url})=>{
     try {
-      const response=await deps.fetch(url,{signal:AbortSignal.timeout(2000)});
-      return response.ok?[[role,parseExposition(await response.text())]]:[];
+      const parsed=await bounded(async signal=>{
+        const response=await deps.fetch(url,{signal,redirect:'error'});
+        if(!response.ok) {await response.body?.cancel();return undefined;}
+        const body=await response.text();if(body.length>2_000_000)throw new Error('status_body_too_large');
+        return parseExposition(body);
+      });
+      return parsed?[[role,parsed] as const]:[];
     } catch {return [];}
   }));
   return Object.fromEntries(entries.flat()) as Scrape;
 }
-/** Increase of a counter over the window, summed over the series that match `labels`; a series that went back (process restart) counts from zero. */
 function delta(before:ParsedExposition|undefined,after:ParsedExposition,name:string,labels:Record<string,string>={}):number {
   const matches=(sample:ParsedExposition['samples'][number])=>sample.name===name&&Object.entries(labels).every(([label,value])=>sample.labels[label]===value);
   const previous=new Map((before?.samples??[]).filter(matches).map(sample=>[JSON.stringify(sample.labels),sample.value]));
@@ -42,44 +68,39 @@ const row=(name:string,value:string,state:string)=>`${name.padEnd(23)} ${value.p
 
 export async function run(argv:string[],deps:Deps):Promise<number> {
   let window=30;
-  for(let i=0;i<argv.length;i++) {
-    const arg=argv[i]!;const [flag,inline]=arg.split('=',2) as [string,string|undefined];
-    if(flag!=='--window') {deps.write(`ops-status: unknown argument`);return 2;}
-    const raw=inline??argv[++i];
-    if(!raw||!/^\d+$/.test(raw)||Number(raw)<1||Number(raw)>600) {deps.write('ops-status: --window must be 1-600 seconds');return 2;}
+  for(let index=0;index<argv.length;index++) {
+    const [flag,inline]=argv[index]!.split('=',2);
+    if(flag!=='--window') {deps.write('usage unknown_argument');return 2;}
+    const raw=inline??argv[++index];
+    if(!raw||!/^\d+$/u.test(raw)||Number(raw)<1||Number(raw)>600) {deps.write('usage invalid_window');return 2;}
     window=Number(raw);
   }
-  const before=await scrape(deps);await deps.sleep(window*1000);const after=await scrape(deps);
+  let configured:ReturnType<typeof targets>;
+  try {configured=targets(deps.env??{});}catch {deps.write('usage invalid_status_target');return 2;}
+  const before=await scrape(deps,configured.metrics);await deps.sleep(window*1000);const after=await scrape(deps,configured.metrics);
   deps.write(`ops:status window ${window}s`);
-  for(const {role} of ROLE_TARGETS) deps.write(row(role,after[role]?'up':'down',''));
+  for(const {role} of configured.metrics)deps.write(row(role,after[role]?'up':'down',''));
   let alerts=0;
-  const check=(name:string,value:string,alert:string|false)=>{if(alert) alerts++;deps.write(row(name,value,alert?`ALERT ${alert}`:'ok'));};
-  // A role needs both reads: without the first, its lifetime totals would look like the window's increase.
-  const both=(role:Role)=>before[role]&&after[role];
-  const gateway=both('gateway')?after.gateway:undefined, worker=both('worker')?after.worker:undefined, dispatcher=both('dispatcher')?after.dispatcher:undefined;
-  const missing=(role:Role)=>after[role]?'no baseline':`${role} down`;
-  for(const sample of (after.gateway?.samples??[]).filter(sample=>sample.name==='ptr_gateway_breaker_open'))
-    deps.write(row(`breaker ${sample.labels.upstream??'-'}`,sample.value?'open':'closed',sample.value?'INFO engine unreachable':'ok'));
-  if(gateway) {
-    const secondary=delta(before.gateway,gateway,'ptr_gateway_served_total',{upstream:'secondary'}), served=delta(before.gateway,gateway,'ptr_gateway_served_total');
-    if(served) check('secondary ratio',percent(secondary,served),secondary/served>SECONDARY_MAX&&'> 20%');
-    else deps.write(row('secondary ratio','n/a (no answers)','ok'));
-  } else deps.write(row('secondary ratio',`n/a (${missing('gateway')})`,''));
-  if(dispatcher||gateway) {
-    const queued=dispatcher?delta(before.dispatcher,dispatcher,'ptr_dispatch_failed_total',{code:'QUEUE_TIMEOUT'}):0;
-    const refused=gateway?delta(before.gateway,gateway,'ptr_gateway_rejected_total',{reason:'queue_timeout'}):0;
-    check('queue timeouts',`${queued+refused} (QUEUE_TIMEOUT ${dispatcher?queued:'n/a'}, gateway ${gateway?refused:'n/a'})`,queued+refused>0&&'> 0');
-  } else deps.write(row('queue timeouts',`n/a (${after.dispatcher||after.gateway?'no baseline':'dispatcher and gateway down'})`,''));
+  const check=(name:string,value:string,alert:string|false)=>{if(alert)alerts++;deps.write(row(name,value,alert?`ALERT ${alert}`:'ok'));};
+  for(const {role,url} of configured.readiness) {
+    let ready=false;
+    try {ready=await bounded(async signal=>{const response=await deps.fetch(url,{signal,redirect:'error'});await response.body?.cancel();return response.ok;});}catch {ready=false;}
+    check(`${role} readiness`,ready?'ready':'unavailable',!ready&&'unavailable');
+  }
+  const worker=before.worker&&after.worker?after.worker:undefined;
   if(worker) {
-    const fallbacks=delta(before.worker,worker,'ptr_safety_fallback_total');
-    check('safety fallback',String(fallbacks),fallbacks>0&&'> 0');
-    const timeouts=delta(before.worker,worker,'ptr_turns_finished_total',{code:'TURN_TIMEOUT'}), finished=delta(before.worker,worker,'ptr_turns_finished_total');
-    if(finished) check('TURN_TIMEOUT rate',percent(timeouts,finished),timeouts/finished>TURN_TIMEOUT_MAX&&'> 5%');
+    const queueTimeouts=delta(before.worker,worker,'ptr_turns_finished_total',{code:'QUEUE_TIMEOUT'});
+    check('queue timeouts',String(queueTimeouts),queueTimeouts>0&&'> 0');
+    const fallbacks=delta(before.worker,worker,'ptr_safety_fallback_total');check('safety fallback',String(fallbacks),fallbacks>0&&'> 0');
+    const timeouts=delta(before.worker,worker,'ptr_turns_finished_total',{code:'TURN_TIMEOUT'});
+    const finished=delta(before.worker,worker,'ptr_turns_finished_total');
+    if(finished)check('TURN_TIMEOUT rate',percent(timeouts,finished),timeouts/finished>0.05&&'> 5%');
     else deps.write(row('TURN_TIMEOUT rate','n/a (no finished turns)','ok'));
-  } else {deps.write(row('safety fallback',`n/a (${missing('worker')})`,''));deps.write(row('TURN_TIMEOUT rate',`n/a (${missing('worker')})`,''));}
-  deps.write(`summary: ${alerts} ALERT`);
-  return alerts?1:0;
+  } else {
+    const missing=after.worker?'no baseline':'worker down';
+    for(const name of ['queue timeouts','safety fallback','TURN_TIMEOUT rate'])deps.write(row(name,`n/a (${missing})`,''));
+  }
+  deps.write(`summary: ${alerts} ALERT`);return alerts?1:0;
 }
-
-if(require.main===module) void run(process.argv.slice(2),{fetch:(url,init)=>fetch(url,{...init,redirect:'error'}),
+if(require.main===module)void run(process.argv.slice(2),{fetch:(url,init)=>fetch(url,init),env:process.env,
   sleep:ms=>new Promise(resolve=>setTimeout(resolve,ms)),write:line=>process.stdout.write(`${line}\n`)}).then(code=>{process.exitCode=code;});

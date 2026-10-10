@@ -3,9 +3,9 @@ import type { LogFields } from './log';
 
 export const PROM_CONTENT_TYPE='text/plain; version=0.0.4; charset=utf-8';
 /** Default listener ports of the roles without their own HTTP server . */
-export const WORKER_METRICS_PORT=56442, DISPATCHER_METRICS_PORT=56443;
+export const WORKER_METRICS_PORT=56442;
 
-/** PTR_METRICS_PORT (demo layer): the role default when unset, 0 = no listener, otherwise 1024–65535. */
+/** PTR_METRICS_PORT (per-process listener override): the role default when unset, 0 = no listener, otherwise 1024–65535. */
 export function metricsPort(env:NodeJS.ProcessEnv,fallback:number):number {
   const raw=env.PTR_METRICS_PORT;if(raw===undefined) return fallback;
   const port=/^\d+$/.test(raw)?Number(raw):NaN;
@@ -19,7 +19,7 @@ export async function servePrometheus(method:string|undefined,render:()=>string|
   catch {return {status:500,headers:{'Content-Type':'application/json'},body:'{"error":{"code":"INTERNAL_ERROR"}}'};}
 }
 /**
- * Loopback listener for `/metrics/prom` (worker, dispatcher). Observability never stops turn processing: a failed bind
+ * Loopback listener for `/metrics/prom` (worker). Observability never stops turn processing: a failed bind
  * is logged (`metrics_listener_failed` with the bare error code) and resolves undefined, as does port 0 (disabled).
  */
 export async function startMetricsListener(options:{port:number;render:()=>string|Promise<string>;onEvent:(event:string,fields?:LogFields)=>void}):
@@ -27,7 +27,7 @@ export async function startMetricsListener(options:{port:number;render:()=>strin
   if(options.port===0) {options.onEvent('metrics_listener_disabled');return undefined;}
   const server:Server=createServer((req,res)=>{
     const path=(req.url??'').split('?')[0];
-    // `/healthz`: liveness for Compose healthchecks , like the gateway's.
+    // `/healthz`: liveness for Compose healthchecks .
     void (path==='/metrics/prom'?servePrometheus(req.method,options.render)
       :path==='/healthz'&&req.method==='GET'?Promise.resolve({status:200,headers:{'Content-Type':'application/json'},body:'{"ok":true}'})
       :Promise.resolve({status:404,headers:{'Content-Type':'application/json'},body:'{"error":{"code":"NOT_FOUND"}}'}))

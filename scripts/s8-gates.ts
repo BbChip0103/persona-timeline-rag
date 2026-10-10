@@ -645,102 +645,15 @@ async function tokenProbe(o:Args):Promise<void> {
 
 // ───────────────────────────── vLLM metrics names, telemetry, abort ─────────────────────────────
 
-/** What the S4 parser reads (apps/gateway/src/telemetry.ts) and the older aliases it accepts. */
+/** Historical engine metrics parser (packages/messaging/src/engine-metrics.ts) and the older aliases it accepts. */
 export const TELEMETRY_EXPECTED=['vllm:num_requests_running','vllm:num_requests_waiting','vllm:kv_cache_usage_perc','vllm:prefix_cache_queries','vllm:prefix_cache_hits','process_start_time_seconds'];
 async function metrics(o:Args):Promise<void> {
-  const { parseEngineMetrics } = await import('../apps/gateway/src/telemetry');
+  const { parseEngineMetrics } = await import('@ptr/messaging');
   const text=await (await fetch(`${origin(o['base-url']!)}/metrics`,{signal:AbortSignal.timeout(5000)})).text();
   const names=metricNames(text);
   const expected=TELEMETRY_EXPECTED.map(name=>({name,exposed:names.filter(n=>n===name||n===`${name}_total`||n.replace(/^vllm:gpu_/,'vllm:')===name)}));
   console.log(JSON.stringify({expected,parsed:parseEngineMetrics(text),vllmNames:names.filter(n=>n.startsWith('vllm:')),process:names.filter(n=>n.startsWith('process_'))},null,1));
 }
-interface Gate {base:string;token:string;pool:{poolMetrics():{upstreams:{id:string;dispatched:number;inFlight:number;telemetry:Json|null}[]}};close():Promise<void>}
-async function gateway(o:Args,options:Json):Promise<Gate> {
-  const { createGateway } = await import('../apps/gateway/src/server');
-  const { UpstreamPool } = await import('../apps/gateway/src/pool');
-  const { StaticUpstreamSource } = await import('../apps/gateway/src/sources');
-  const record={pool:o.model!,id:'r',baseUrl:o['base-url']!,maxSeqs:Number(o['max-seqs']??64),kvCapacityTokens:o['kv-capacity']?Number(o['kv-capacity']):null,weight:1,state:'active',epoch:'file',seq:0};
-  const pool=new UpstreamPool({model:o.model!,source:new StaticUpstreamSource([record] as never),admission:true,maxQueue:1024,queueTimeoutMs:60000,slowStartMs:0,...options} as never);
-  const token=randomUUID();
-  const {server}=createGateway({token,upstream:pool,limits:{maxConcurrent:4096,maxQueue:4096,queueTimeoutMs:60000,upstreamTimeoutMs:120000}} as never);
-  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',()=>resolve()));
-  return {base:`http://127.0.0.1:${(server.address() as {port:number}).port}/v1`,token,pool:pool as never,close:async()=>{
-    server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await pool.close();}};
-}
-async function streamCall(url:string,token:string|null,body:Json,signal?:AbortSignal):Promise<{status:number;ttftMs:number|null;ms:number;done:boolean}> {
-  const started=Date.now();let ttft:number|null=null,text='';
-  const response=await fetch(`${url}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},body:JSON.stringify(body),signal:signal??AbortSignal.timeout(180000)});
-  if(response.status!==200) {await response.body?.cancel();return {status:response.status,ttftMs:null,ms:Date.now()-started,done:false};}
-  const reader=response.body!.getReader(), decoder=new TextDecoder();
-  for(;;) {const {done,value}=await reader.read();if(done) break;if(ttft===null) ttft=Date.now()-started;text+=decoder.decode(value,{stream:true});}
-  return {status:200,ttftMs:ttft,ms:Date.now()-started,done:text.includes('[DONE]')};
-}
-async function telemetry(o:Args):Promise<void> {
-  const prompts=(await loadLayouts(o.layouts!)).flatMap(f=>f.calls.map(c=>c.messages));
-  const levels=(o.levels??'4,16,64').split(',').map(Number), seconds=Number(o.seconds??30);
-  const gate=await gateway(o,{telemetry:{intervalMs:1000,kvHigh:0.95,waitingMax:2,...(o['timeout-ms']?{timeoutMs:Number(o['timeout-ms'])}:{})}});
-  const samples:Json[]=[], results:Json[]=[];const t0=Date.now();let level=0;
-  const sampler=setInterval(()=>{void (async()=>{
-    try {
-      const direct=await engineMetrics(o['base-url']!), member=gate.pool.poolMetrics().upstreams[0]!;
-      samples.push({at:Date.now()-t0,level,direct:{running:direct['vllm:num_requests_running'],waiting:direct['vllm:num_requests_waiting'],kv:direct['vllm:kv_cache_usage_perc']},
-        gateway:member.telemetry,inFlight:member.inFlight,dispatched:member.dispatched});
-    } catch {samples.push({at:Date.now()-t0,level,error:true});}
-  })();},500);
-  try {
-    await sleep(2500);
-    for(const concurrency of levels) {
-      level=concurrency;const until=Date.now()+seconds*1000;let n=0;
-      // Long-output variant (ignore_eos) keeps sequences resident so higher levels push the KV pool.
-      await Promise.all([...Array(concurrency).keys()].map(async worker=>{
-        while(Date.now()<until) {
-          const messages=prompts[(worker*7+n++)%prompts.length]!;
-          const body={model:o.model,messages,max_tokens:Number(o['max-tokens']??384),temperature:0.7,stream:true,stream_options:{include_usage:true},ignore_eos:true,chat_template_kwargs:{enable_thinking:false}};
-          try {const r=await streamCall(gate.base,gate.token,body);results.push({level:concurrency,...r});} catch {results.push({level:concurrency,status:599});}
-        }
-      }));
-      await sleep(3000);
-    }
-  } finally {clearInterval(sampler);}
-  const final=gate.pool.poolMetrics().upstreams[0]!;await gate.close();
-  const byLevel=Object.fromEntries(levels.map(l=>{
-    const s=samples.filter(x=>x.level===l&&!x.error) as {direct:{running:number|null;waiting:number|null;kv:number|null};gateway:{running:number|null;waiting:number|null;kvUsage:number|null;prefixHitRate:number|null;stale:boolean;blocked:boolean}|null}[];
-    const r=results.filter(x=>x.level===l);
-    const close=s.filter(x=>x.gateway&&x.direct.running!==null&&x.gateway.running!==null&&Math.abs(x.gateway.running-x.direct.running)<=Math.max(2,0.25*x.direct.running));
-    return [l,{requests:r.length,failed:r.filter(x=>x.status!==200).length,ttftP50:percentile(r.flatMap(x=>x.ttftMs===null||x.ttftMs===undefined?[]:[Number(x.ttftMs)]),0.5),
-      samples:s.length,stale:s.filter(x=>x.gateway?.stale).length,runningClose:close.length,blocked:s.filter(x=>x.gateway?.blocked).length,
-      directWaitingMax:Math.max(0,...s.map(x=>x.direct.waiting??0)),directKvMax:Math.max(0,...s.map(x=>x.direct.kv??0)),
-      gatewayKvMean:meanCi(s.flatMap(x=>x.gateway?.kvUsage===null||x.gateway?.kvUsage===undefined?[]:[x.gateway.kvUsage])).mean,
-      prefixHitRateNonNull:s.filter(x=>x.gateway?.prefixHitRate!==null&&x.gateway?.prefixHitRate!==undefined).length}];
-  }));
-  await privateWrite(o.out!,{createdAt:new Date().toISOString(),levels,seconds,byLevel,finalTelemetry:final.telemetry,samples,results});
-  console.log(JSON.stringify({byLevel,finalTelemetry:final.telemetry},null,1));
-}
-async function abort(o:Args):Promise<void> {
-  const gate=await gateway(o,{});const rows:Json[]=[];
-  const body={model:o.model,messages:[{role:'user',content:'Write a very long synthetic story about a watercolour studio. Keep going.'}],max_tokens:3000,ignore_eos:true,temperature:0.7,stream:true,chat_template_kwargs:{enable_thinking:false}};
-  try {
-    for(const [path,url,token] of [['direct',o['base-url']!,null],['gateway',gate.base,gate.token]] as const) for(let trial=0;trial<3;trial++) {
-      await sleep(1500);
-      const baseline=await engineMetrics(o['base-url']!), controller=new AbortController();
-      const response=await fetch(`${url}/chat/completions`,{method:'POST',headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},body:JSON.stringify(body),signal:controller.signal});
-      const reader=response.body!.getReader();let chunks=0;
-      while(chunks<20) {const {done}=await reader.read();if(done) break;chunks++;}
-      const atAbort=await engineMetrics(o['base-url']!);controller.abort();const abortedAt=Date.now();
-      let runningZeroMs:number|null=null;const trace:Json[]=[];
-      for(let i=0;i<20;i++) {
-        await sleep(250);const m=await engineMetrics(o['base-url']!);trace.push({ms:Date.now()-abortedAt,running:m['vllm:num_requests_running'],gen:m['vllm:generation_tokens_total']});
-        if(runningZeroMs===null&&(m['vllm:num_requests_running']??1)<=(baseline['vllm:num_requests_running']??0)) runningZeroMs=Date.now()-abortedAt;
-      }
-      const last=trace.at(-1) as {gen:number};const genAt1s=(trace.find(t=>Number(t.ms)>=1000) as {gen:number}|undefined)?.gen??null;
-      rows.push({path,trial,status:response.status,chunksRead:chunks,runningAtAbort:atAbort['vllm:num_requests_running'],runningBackToBaselineMs:runningZeroMs,
-        tokensAfterAbortPlus1s:genAt1s===null?null:last.gen-genAt1s,tokensSinceAbort:last.gen-(atAbort['vllm:generation_tokens_total']??0),trace});
-    }
-  } finally {await gate.close();}
-  await privateWrite(o.out!,{createdAt:new Date().toISOString(),rows});
-  console.log(JSON.stringify(rows.map(({trace:_,...r})=>r),null,1));
-}
-
 /** Gate f : pre-screen counts over probe outputs; every flagged row is listed for the manual read. */
 async function voice(o:Args):Promise<void> {
   type Row={persona:string;question:string;turn:number;text:string;content:string|null;modelMessage?:string|null;replyGuard?:{action?:string}|null;identity?:boolean;limitations?:string[];speechLevel?:string|null;koreanRegister?:string|null;voice?:ReturnType<typeof voiceFindings>};
@@ -770,7 +683,7 @@ async function voice(o:Args):Promise<void> {
 }
 async function main():Promise<void> {
   const [command,...rest]=process.argv.slice(2);const o=parseArgs(rest);
-  const commands:Record<string,(o:Args)=>Promise<void>>={capture,'probe-template':probeTemplate,template,openrouter,injection,recollection,probe,prefix,metrics,telemetry,abort,'token-probe':tokenProbe,voice};
+  const commands:Record<string,(o:Args)=>Promise<void>>={capture,'probe-template':probeTemplate,template,openrouter,injection,recollection,probe,prefix,metrics,'token-probe':tokenProbe,voice};
   const run=commands[command??''];if(!run) throw new Error(`command must be one of ${Object.keys(commands).join('|')}`);
   for(const url of [o['base-url']].filter(Boolean)) if(!/^http:\/\/127\.0\.0\.1:\d+\/v1$/.test(url!)) throw new Error('base-url must be a loopback tunnel http://127.0.0.1:<port>/v1');
   await run(o);

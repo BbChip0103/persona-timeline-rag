@@ -5,3 +5,4 @@ export * from './latency';
 export * from './openai-compatible';
 export * from './jev';
 export * from './control-tokens';
+export * from './langchain';

@@ -1,6 +1,6 @@
-#  (D22): one image for every role (api, worker, dispatcher, gateway, web), run by infra/compose.app.yml.
+#  (D22): one image for every role (api, worker, web), run by infra/compose.app.yml.
 # TypeScript runs through tsx; only the web is built (`next build`). Private configuration, research data and reports
-# never enter the image (.dockerignore): Compose passes .env.local as env_file and bind-mounts data/ and the upstreams file.
+# never enter the image (.dockerignore): Compose selects a new explicit private env_file and bind-mounts data/.
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
 
 ENV NEXT_TELEMETRY_DISABLED=1 COREPACK_HOME=/opt/corepack
@@ -10,7 +10,6 @@ WORKDIR /app
 # Manifests first, so a code change does not reinstall the dependencies.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/api/package.json apps/api/
-COPY apps/gateway/package.json apps/gateway/
 COPY apps/web/package.json apps/web/
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/core/package.json packages/core/

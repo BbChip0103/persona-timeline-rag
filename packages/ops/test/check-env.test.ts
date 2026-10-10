@@ -3,70 +3,49 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCheckEnv } from '../scripts/check-env';
 
-// Synthetic stand-ins for the 19 key names of the user's .env.local ; values are never read from it.
 const SENTINEL='SENTINEL-value-must-not-print-0123456789';
-const userKeys=(overrides:Record<string,string>={})=>({
-  DATABASE_URL:`postgresql://ptr_researcher:${SENTINEL}@127.0.0.1:56432/ptr_research`,
-  GOAL1_ALLOW_EXTERNAL_DATA:'true',GOAL1_BUDGET_USD:SENTINEL,GOAL1_LIVE_ENABLED:'true',OPENROUTER_API_KEY:SENTINEL,
-  PTR_API_TOKEN:`${SENTINEL}-api-token`,PTR_API_URL:'http://127.0.0.1:56441',PTR_CHAT_PROVIDER:'openrouter',PTR_DB_PASSWORD:SENTINEL,
-  PTR_EMBEDDING_MODEL:SENTINEL,PTR_LOADTEST_DATABASE_URL:SENTINEL,PTR_LOADTEST_DB_PASSWORD:SENTINEL,PTR_MODEL:'google/gemma-4-26b-a4b-it',
-  PTR_PERSONAS_FILE:'personas.json',PTR_REDIS_PASSWORD:SENTINEL,PTR_REDIS_URL:`redis://ptr:${SENTINEL}@127.0.0.1:56479/0`,
-  PTR_SESSION_SECRET:`${SENTINEL}-session-secret`,PTR_UI_PASSWORD:SENTINEL,REPLICATE_API_TOKEN:SENTINEL,...overrides});
+const valid=()=>({DATABASE_URL:`postgresql://ptr_framework_tester:${SENTINEL}@127.0.0.1:57432/ptr_framework_test`,
+  PTR_REDIS_URL:`redis://:${SENTINEL}@127.0.0.1:57479/0`,PTR_CHAT_PROVIDER:'fake',PTR_API_TOKEN:SENTINEL,
+  PTR_PERSONAS_FILE:'synthetic-personas.json',PTR_GUARDRAILS_URL:'http://127.0.0.1:58000',PTR_GUARDRAILS_TOKEN:SENTINEL,
+  PTR_SESSION_SECRET:SENTINEL,PTR_UI_PASSWORD:SENTINEL});
 let dir:string;
-beforeAll(()=>{dir=mkdtempSync(join(tmpdir(),'ptr-check-env-'));writeFileSync(join(dir,'personas.json'),'[]');});
+beforeAll(()=>{dir=mkdtempSync(join(tmpdir(),'ptr-check-framework-env-'));});
 afterAll(()=>rmSync(dir,{recursive:true,force:true}));
-function run(env:Record<string,string>,args:string[]=[]):{code:number;lines:string[]} {
-  writeFileSync(join(dir,'.env.local'),Object.entries(env).map(([key,value])=>`${key}=${value}`).join('\n')+'\n');
-  const lines:string[]=[];
-  const code=runCheckEnv(args,{cwd:dir,write:line=>lines.push(line)});
-  expect(lines.join('\n')).not.toContain(SENTINEL);
-  return {code,lines};
+function run(env:NodeJS.ProcessEnv=valid(),args:string[]=['--file','synthetic.env']) {
+  writeFileSync(join(dir,'synthetic.env'),Object.entries(env).filter(([,value])=>value!==undefined).map(([key,value])=>`${key}=${value}`).join('\n')+'\n');
+  const lines:string[]=[];const code=runCheckEnv(args,{cwd:dir,write:line=>lines.push(line)});
+  expect(lines.join('\n')).not.toContain(SENTINEL);return {code,lines};
 }
-// File order (the synthetic file lists the names alphabetically).
-const WARNINGS=['warning all unused_key GOAL1_BUDGET_USD','warning all constant_ignored PTR_API_URL','warning all unused_key PTR_EMBEDDING_MODEL',
-  'warning all unused_key REPLICATE_API_TOKEN'];
-
-test('the user\'s key set: no errors, the four documented warnings ',()=>{
-  const {code,lines}=run(userKeys());
-  expect(lines).toEqual(['roles api,worker,dispatcher,web (demo off)',...WARNINGS,'errors 0 warnings 4']);
-  expect(code).toBe(0);
-  expect(userKeys()).toHaveProperty('PTR_CHAT_PROVIDER');expect(Object.keys(userKeys())).toHaveLength(19);
+test('defaults validate only API, worker and web with the new framework contract',()=>{
+  expect(run()).toEqual({code:0,lines:['roles api,worker,web','errors 0 warnings 0']});
 });
-test('PTR_CHAT_PROVIDER=gateway adds the gateway role and its missing keys, one line per role',()=>{
-  const {code,lines}=run(userKeys({PTR_CHAT_PROVIDER:'gateway'}));
-  expect(lines).toEqual(['roles api,worker,dispatcher,web,gateway (demo off)',...WARNINGS,'error api missing PTR_GATEWAY_TOKEN',
-    'error worker missing PTR_GATEWAY_TOKEN','error gateway missing PTR_GATEWAY_TOKEN','error gateway missing PTR_GATEWAY_UPSTREAMS_FILE','errors 4 warnings 4']);
-  expect(code).toBe(1);
+test('never auto-reads .env.local, even when a valid file exists',()=>{
+  writeFileSync(join(dir,'.env.local'),'PTR_API_TOKEN=PRIVATE_SENTINEL\n');
+  expect(run(valid(),[])).toEqual({code:2,lines:['usage explicit_file_required']});
 });
-test('--roles names the roles (gateway regardless of the provider); --role is accepted too',()=>{
-  const gateway=run(userKeys(),['--roles','gateway']);
-  expect(gateway.lines).toEqual(['roles gateway (demo off)',...WARNINGS,'error gateway missing PTR_GATEWAY_TOKEN','error gateway missing PTR_GATEWAY_UPSTREAMS_FILE','errors 2 warnings 4']);
-  expect(run(userKeys(),['--role','web']).lines[0]).toBe('roles web (demo off)');
-  expect(run(userKeys(),['--roles','api,nope']).code).toBe(2);
-  expect(run(userKeys(),['--roles',' , ']).code).toBe(2);
+test('--roles/--role replace defaults; removed roles and missing arguments are usage errors',()=>{
+  expect(run(valid(),['--file','synthetic.env','--role','web']).lines[0]).toBe('roles web');
+  expect(run(valid(),['--file','synthetic.env','--roles','worker,api,worker']).lines[0]).toBe('roles worker,api');
+  for(const args of [['--file','synthetic.env','--roles','gateway'],['--file','synthetic.env','--roles','dispatcher'],
+    ['--file','synthetic.env','--roles',' , '],['--file','--roles','api'],['--file','synthetic.env','--unknown']])expect(run(valid(),args).code).toBe(2);
 });
-test('value rules print rule ids only; absolute persona paths are flagged for Compose',()=>{
-  const {code,lines}=run(userKeys({PTR_CHAT_PROVIDER:'fake',PTR_PERSONAS_FILE:join(dir,'personas.json'),PTR_API_URL:`http://${SENTINEL}`}));
-  expect(lines).toEqual(['roles api,worker,dispatcher,web (demo off)','warning all unused_key GOAL1_BUDGET_USD','warning all unused_key PTR_EMBEDDING_MODEL',
-    'warning all unused_key REPLICATE_API_TOKEN','warning all path_not_repo_relative PTR_PERSONAS_FILE','error all api_url_constant PTR_API_URL',
-    'error api production_provider PTR_CHAT_PROVIDER','error worker production_provider PTR_CHAT_PROVIDER','errors 3 warnings 4']);
-  expect(code).toBe(1);
+test('validation errors are framework codes, never values, and do not open connections',()=>{
+  const {code,lines}=run({...valid(),PTR_CHAT_PROVIDER:'gateway'});
+  expect(code).toBe(1);expect(lines).toContain('error api invalid_enum_value PTR_CHAT_PROVIDER');
+  expect(lines).toContain('error worker invalid_enum_value PTR_CHAT_PROVIDER');
 });
-test('an absolute upstreams file path is flagged for Compose too (its bind mount is repo-relative)',()=>{
-  writeFileSync(join(dir,'upstreams.json'),JSON.stringify({pools:{m:{upstreams:[{id:'a',baseUrl:'http://127.0.0.1:18000/v1'}]}}}));
-  const gateway=(file:string)=>run(userKeys({PTR_GATEWAY_TOKEN:`${SENTINEL}-gateway`,PTR_GATEWAY_UPSTREAMS_FILE:file}),['--roles','gateway']);
-  expect(gateway(join(dir,'upstreams.json')).lines).toEqual(['roles gateway (demo off)',...WARNINGS,
-    'warning all path_not_repo_relative PTR_GATEWAY_UPSTREAMS_FILE','errors 0 warnings 5']);
-  expect(gateway('upstreams.json').lines).toEqual(['roles gateway (demo off)',...WARNINGS,'errors 0 warnings 4']);
+test('absolute persona paths are warnings without opening persona data or printing paths',()=>{
+  const {code,lines}=run({...valid(),PTR_PERSONAS_FILE:join(dir,'private-sentinel.json')});
+  expect(code).toBe(0);expect(lines).toContain('warning all path_not_repo_relative PTR_PERSONAS_FILE');
+  expect(lines.join('\n')).not.toContain('private-sentinel.json');
 });
-test('a Redis URL without the ACL user ptr is flagged for every role that reads it ',()=>{
-  const {code,lines}=run(userKeys({PTR_REDIS_URL:`redis://:${SENTINEL}@127.0.0.1:56479/0`}));
-  expect(lines.filter(line=>line.startsWith('error '))).toEqual(['error api redis_username_ptr PTR_REDIS_URL','error worker redis_username_ptr PTR_REDIS_URL',
-    'error dispatcher redis_username_ptr PTR_REDIS_URL']);
-  expect(code).toBe(1);
-});
-test('a missing file is a usage error, named by its path only',()=>{
+test('missing and malformed explicit files produce only sanitized usage codes',()=>{
   const lines:string[]=[];
-  expect(runCheckEnv(['--file','missing.env'],{cwd:dir,write:line=>lines.push(line)})).toBe(2);
-  expect(lines).toEqual(['env file not found: missing.env']);
+  expect(runCheckEnv(['--file',`missing-${SENTINEL}.env`],{cwd:dir,write:line=>lines.push(line)})).toBe(2);
+  expect(lines).toEqual(['usage env_file_unreadable']);
+});
+test('file environment is isolated from process.env and cannot silently inherit credentials',()=>{
+  const saved=process.env.PTR_API_TOKEN;process.env.PTR_API_TOKEN=SENTINEL;
+  try {const {code,lines}=run({...valid(),PTR_API_TOKEN:undefined});expect(code).toBe(1);expect(lines.some(line=>line.endsWith(' PTR_API_TOKEN'))).toBe(true);}
+  finally {if(saved===undefined)delete process.env.PTR_API_TOKEN;else process.env.PTR_API_TOKEN=saved;}
 });

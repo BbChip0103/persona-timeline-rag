@@ -228,3 +228,76 @@ test('every model call of a turn carries the turn id as its request key (gateway
   const turn=await send(h,session.id,'이야기하자');
   expect(h.provider.generate.mock.calls.map(call=>(call as unknown[])[1])).toEqual([expect.objectContaining({requestKey:turn.id,deadlineAt:expect.any(Number)}),expect.objectContaining({requestKey:turn.id,deadlineAt:expect.any(Number)})]);
 });
+
+test('graph reuses a completed per-turn checkpoint without another model or tool call',async()=>{
+  const { MemorySaver }=await import('@langchain/langgraph');
+  const checkpointer=new MemorySaver(),signal=new AbortController().signal;
+  const outputs=[tool(),final({message:'합성 숲 이야기야.'})];
+  const provider={generate:jest.fn(async()=>outputs.shift()!)};
+  const search=jest.fn(async()=>[source]);
+  const input={provider,persona,history:[],text:'안녕',sources:[],signal,search,requestKey:'synthetic-turn',checkpoint:{checkpointer,threadId:'synthetic-turn'}};
+  const first=await runCharacterAgent(input),second=await runCharacterAgent(input);
+  expect(second).toEqual(first);expect(provider.generate).toHaveBeenCalledTimes(2);expect(search).toHaveBeenCalledTimes(1);
+  expect(second.agent.steps.map(step=>step.phase)).toEqual(['context','model','tool','context','model']);
+  await expect(runCharacterAgent({...input,text:'다른 턴'})).rejects.toMatchObject({code:'INVALID_INPUT',message:'CHECKPOINT_TURN_MISMATCH'});
+  expect(provider.generate).toHaveBeenCalledTimes(2);
+});
+
+test.each(['model','tool'] as const)('graph resumes the successful %s task after interruption without replaying its side effect',async port=>{
+  const { MemorySaver }=await import('@langchain/langgraph');
+  const checkpointer=new MemorySaver(),controller=new AbortController();
+  const provider={generate:jest.fn(async(_messages:ProviderMessage[],options:{onServed?:(upstream:string)=>void})=>{
+    options.onServed?.('primary');
+    if(provider.generate.mock.calls.length===1) {
+      if(port==='model')controller.abort();
+      return port==='model'?final():tool();
+    }
+    return final();
+  })};
+  const search=jest.fn(async()=>{if(port==='tool')controller.abort();return [source];});
+  const input={provider,persona,history:[],text:'안녕',sources:[],signal:controller.signal,search,requestKey:`interrupt-${port}`,
+    checkpoint:{checkpointer,threadId:`interrupt-${port}`}};
+  await expect(runCharacterAgent(input)).rejects.toMatchObject({code:'TURN_FAILED',message:'TURN_ABORTED'});
+  const result=await runCharacterAgent({...input,signal:new AbortController().signal});
+  expect(result.response.message).toBe('편하게 이야기해요.');
+  expect(provider.generate).toHaveBeenCalledTimes(port==='model'?1:2);
+  expect(search).toHaveBeenCalledTimes(port==='model'?0:1);
+  expect(result.agent).toMatchObject({modelCalls:port==='model'?1:2,toolCalls:port==='model'?0:1});
+  expect(result.upstreams).toEqual(port==='model'?['primary']:['primary','primary']);
+});
+
+test('graph pins deep source snapshots even when an authorized search mutates its caller-owned objects',async()=>{
+  const mutable=structuredClone(source);let calls=0;
+  const provider={generate:jest.fn(async()=>++calls===1?tool():final())};
+  const result=await runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[mutable],signal:new AbortController().signal,
+    search:async()=>{mutable.caption='바뀐 합성 캡션';mutable.imageAnnotations![0].text='바뀐 합성 설명';return [mutable];}});
+  expect(result.context.sources[0].caption).toBe(source.caption);
+  expect(result.context.sources[0].imageAnnotations![0].text).toBe(source.imageAnnotations![0].text);
+});
+
+test.each([undefined,''])('checkpoint requires a stable request key before calling the model (%s)',async requestKey=>{
+  const { MemorySaver }=await import('@langchain/langgraph');
+  const provider={generate:jest.fn(async()=>final())};
+  await expect(runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[],signal:new AbortController().signal,requestKey,
+    checkpoint:{checkpointer:new MemorySaver(),threadId:'invalid-turn'}})).rejects.toMatchObject({code:'INVALID_INPUT'});
+  expect(provider.generate).not.toHaveBeenCalled();
+});
+
+test.each([0,1,10])('graph conditional edges respect the exact configured tool-round bound %i',async maxToolRounds=>{
+  let call=0;
+  const provider={generate:jest.fn(async()=>++call<=maxToolRounds?tool(`synthetic-query-${call}`):final())};
+  const search=jest.fn(async()=>[source]);
+  const result=await runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[],signal:new AbortController().signal,search,maxToolRounds});
+  expect(provider.generate).toHaveBeenCalledTimes(maxToolRounds+1);expect(search).toHaveBeenCalledTimes(maxToolRounds);
+  expect(result.agent).toMatchObject({modelCalls:maxToolRounds+1,toolCalls:maxToolRounds});
+});
+
+test('graph prompt inputs remain immutable if a tool callback mutates caller-owned persona and history',async()=>{
+  const mutablePersona=structuredClone(persona),history=[{id:'synthetic-history',sessionId:'s',turnId:'t',role:'user' as const,content:'합성 이전 발화',createdAt:'2024-01-01T00:00:00Z'}];
+  let calls=0;const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>++calls===1?tool():final())};
+  await runCharacterAgent({provider,persona:mutablePersona,history,text:'안녕',sources:[],signal:new AbortController().signal,
+    search:async()=>{mutablePersona.identity='변경된 합성 정체성';history[0].content='변경된 합성 발화';return [];} });
+  const messages=provider.generate.mock.calls[1][0];
+  expect(messages[1].content).toContain(persona.identity);expect(messages[1].content).not.toContain(mutablePersona.identity);
+  expect(messages.some(message=>message.content==='합성 이전 발화')).toBe(true);
+});

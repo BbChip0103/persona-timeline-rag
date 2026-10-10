@@ -37,3 +37,5 @@ playwright-report
 .venv
 **/__pycache__
 .omx
+
+.venv-guardrails

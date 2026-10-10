@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, QueryResultRow } from 'pg';
 import type { ChatMessage, ChatReply, ChatSession, ChatTurn, SendTurnInput, TurnState } from '@ptr/contracts';
-import { CoreError, turnTextFingerprint, type ConversationStore, type LeaseFence, type QueuedTurn, type TurnDispatch, type TurnLeaseStore } from '@ptr/core';
+import { CoreError, turnTextFingerprint, type ConversationStore, type LeaseFence, type QueuedTurn, type TurnDispatch, type TurnLeaseStore, type TurnExecutionStore, type ExecutionDispatch } from '@ptr/core';
 import { transaction } from './pool.js';
 
 const terminal = ['completed', 'failed', 'cancelled'];
@@ -26,7 +26,7 @@ function turn(row: QueryResultRow): ChatTurn {
     ...(row.reply ? { reply: row.reply } : {}), ...(row.error_code ? { errorCode: row.error_code } : {}) };
 }
 
-export class PostgresConversationStore implements ConversationStore, TurnLeaseStore {
+export class PostgresConversationStore implements ConversationStore, TurnLeaseStore, TurnExecutionStore {
   constructor(private readonly pool: Pool) {}
   async create(session: ChatSession, greeting: ChatMessage): Promise<void> {
     if (greeting.sessionId !== session.id || greeting.turnId !== null || greeting.role !== 'assistant')
@@ -98,6 +98,7 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
     return transaction(this.pool, async client => {
       if ((await update(client)).rowCount !== 1) return false;
       await client.query('DELETE FROM turn_leases WHERE turn_id=$1', [turnId]);
+      await client.query('DELETE FROM turn_outbox WHERE turn_id=$1', [turnId]);
       return true;
     });
   }
@@ -112,6 +113,7 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
         throw new CoreError('INVALID_INPUT', 'Reply does not match immutable session binding');
       await client.query("UPDATE turns SET state='completed',reply=$2,finished_at=now() WHERE id=$1", [turnId, reply]);
       await client.query('DELETE FROM turn_leases WHERE turn_id=$1', [turnId]);
+      await client.query('DELETE FROM turn_outbox WHERE turn_id=$1', [turnId]);
       await client.query(`INSERT INTO messages(id,session_id,turn_id,role,content,created_at) VALUES
         ($1,$2,$3,'user',$4,now()),($5,$2,$3,'assistant',$6,now())`,
       [randomUUID(), row.session_id, turnId, row.user_text, reply.messageId, reply.content]);
@@ -127,8 +129,64 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
       const result = await client.query(`UPDATE turns t SET state='cancelled',finished_at=now()
         FROM sessions s WHERE t.session_id=s.id AND t.id=$1 AND s.owner_id=$2 AND NOT(t.state=ANY($3::text[])) RETURNING t.id`, [turnId, ownerId, terminal]);
       if (result.rowCount !== 1) return false;
-      await client.query('DELETE FROM turn_leases WHERE turn_id=$1', [turnId]); // see transitionTurn
+      await client.query('DELETE FROM turn_leases WHERE turn_id=$1', [turnId]);
+      await client.query('DELETE FROM turn_outbox WHERE turn_id=$1', [turnId]); // see transitionTurn
       return true;
+    });
+  }
+  async claimExecution(dispatch: TurnDispatch, workerId: string, maxQueueMs: number, maxAttempts: number): Promise<QueuedTurn | undefined> {
+    return transaction(this.pool, async client => {
+      const result = await client.query(`SELECT t.*,o.created_at < now()-make_interval(secs=>$4::double precision/1000) AS queue_expired FROM turns t
+        JOIN turn_outbox o ON o.turn_id=t.id AND o.seq=t.dispatch_seq
+        WHERE t.id=$1 AND t.dispatch_seq=$2 AND t.state=ANY($3::text[]) AND t.request_input IS NOT NULL
+        FOR UPDATE OF t`, [dispatch.turnId, dispatch.seq, active, maxQueueMs]);
+      const row = result.rows[0];
+      if (!row || row.lease_owner === workerId) return undefined;
+      const timedOut = row.lease_owner === null && row.queue_expired;
+      if (row.attempts >= maxAttempts || timedOut) {
+        const errorCode = row.attempts > 0 ? 'WORKER_LOST' : 'QUEUE_TIMEOUT';
+        await client.query("UPDATE turns SET state='failed',error_code=$2,finished_at=now(),lease_owner=NULL WHERE id=$1", [row.id,errorCode]);
+        await client.query('DELETE FROM turn_outbox WHERE turn_id=$1', [row.id]);
+        return undefined;
+      }
+      // This is a generation token, never a timed DB lease: BullMQ owns the job lock and stalled recovery.
+      const claimed = await client.query("UPDATE turns SET lease_owner=$2,attempts=attempts+1,state='pending',error_code=NULL WHERE id=$1 RETURNING *", [row.id,workerId]);
+      const current = claimed.rows[0];
+      return {turn:turn(current),input:current.request_input as SendTurnInput,fence:{workerId,attempt:current.attempts}};
+    });
+  }
+  async executionStatus(turnId: string, fence: LeaseFence): Promise<'current'|'cancelled'|'lost'> {
+    const result = await this.pool.query('SELECT state,lease_owner,attempts FROM turns WHERE id=$1', [turnId]);
+    const row = result.rows[0];
+    if (row?.state === 'cancelled') return 'cancelled';
+    return row && active.includes(row.state) && row.lease_owner === fence.workerId && row.attempts === fence.attempt ? 'current' : 'lost';
+  }
+  async executionDispatches(graceMs: number, limit: number): Promise<ExecutionDispatch[]> {
+    const result = await this.pool.query(`WITH due AS (
+      SELECT o.turn_id FROM turn_outbox o JOIN turns t ON t.id=o.turn_id
+      WHERE t.state=ANY($3::text[]) AND o.created_at < now()-make_interval(secs=>$1::double precision/1000)
+        AND (o.published_at IS NULL OR o.published_at < now()-make_interval(secs=>$1::double precision/1000))
+      ORDER BY o.created_at FOR UPDATE OF o SKIP LOCKED LIMIT $2), published AS (
+      UPDATE turn_outbox o SET published_at=now() FROM due d WHERE o.turn_id=d.turn_id RETURNING o.turn_id,o.seq)
+      SELECT p.*,t.lease_owner,t.attempts FROM published p JOIN turns t ON t.id=p.turn_id`, [graceMs,limit,active]);
+    return result.rows.map(row => ({turnId:row.turn_id,seq:row.seq,...(row.lease_owner ? {fence:{workerId:row.lease_owner,attempt:row.attempts}} : {})}));
+  }
+  async repairExecution(dispatch: ExecutionDispatch, maxAttempts: number, exhausted = false): Promise<TurnDispatch | undefined> {
+    return transaction(this.pool, async client => {
+      const result = await client.query(`SELECT * FROM turns WHERE id=$1 AND dispatch_seq=$2 AND state=ANY($3::text[])
+        AND lease_owner IS NOT DISTINCT FROM $4::text AND attempts=COALESCE($5::integer,attempts)
+        FOR UPDATE`, [dispatch.turnId,dispatch.seq,active,dispatch.fence?.workerId??null,dispatch.fence?.attempt??null]);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      if (exhausted || row.attempts >= maxAttempts) {
+        await client.query("UPDATE turns SET state='failed',error_code='WORKER_LOST',finished_at=now(),lease_owner=NULL WHERE id=$1",[row.id]);
+        await client.query('DELETE FROM turn_outbox WHERE turn_id=$1',[row.id]);
+        return undefined;
+      }
+      // Redis loss/DB-finalization failure: invalidate the old generation before publishing a fresh job id.
+      const next = await client.query("UPDATE turns SET state='pending',lease_owner=NULL,dispatch_seq=dispatch_seq+1 WHERE id=$1 RETURNING dispatch_seq",[row.id]);
+      await client.query('UPDATE turn_outbox SET seq=$2,created_at=now(),published_at=NULL WHERE turn_id=$1',[row.id,next.rows[0].dispatch_seq]);
+      return {turnId:row.id,seq:next.rows[0].dispatch_seq};
     });
   }
   async claimTurn(turnId: string, workerId: string, leaseMs: number, maxQueueMs?: number): Promise<QueuedTurn | undefined> {

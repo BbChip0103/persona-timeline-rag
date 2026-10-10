@@ -15,6 +15,7 @@ export interface TurnWorkerOptions {
 }
 
 /**
+ * Historical/local test harness only; production uses FrameworkTurnWorker with no Postgres heartbeat.
  * Executes dispatched turns. Delivery (BullMQ) decides when and how many run; the Postgres lease decides
  * whether this worker may run a turn at all, so duplicated or stale deliveries are skipped.
  */
@@ -83,6 +84,7 @@ export interface TurnDispatcherOptions {
 export type TurnDispatcherEvent={type:'requeued';turnId:string}|{type:'failed';turnId:string;errorCode:'WORKER_LOST'|'QUEUE_TIMEOUT'}|{type:'republished';turnId:string};
 
 /**
+ * Historical/local lease harness only; the default production worker uses WorkerOutboxMaintenance.
  * Recovery loop: requeues expired leases (or fails them with WORKER_LOST), fails turns that waited too long for a
  * worker (QUEUE_TIMEOUT; WORKER_LOST for a requeued one) and re-publishes undelivered outbox entries.
  */
@@ -125,5 +127,86 @@ export class TurnDispatcher {
         await this.options.delivery.publish(dispatch);report({type:'republished',turnId:dispatch.turnId});
       }
     } catch(error) {this.options.onError?.('dispatch',error);}
+  }
+}
+
+/** Framework execution: no DB heartbeat, lease expiry or retry loop. BullMQ owns those responsibilities. */
+export class FrameworkTurnWorker {
+  private readonly inFlight=new Map<string,{controller:AbortController;done:Promise<void>}>();
+  constructor(private readonly options:Omit<TurnWorkerOptions,'leases'|'leaseMs'>&{
+    executions:import('./ports').TurnExecutionStore;maxAttempts:number;maxQueueMs:number;
+    /** Read-only cancellation/generation checks; this never renews DB or queue ownership. Default 500 ms. */
+    cancellationPollMs?:number;
+  }) {}
+  get activeTurns():number {return this.inFlight.size;}
+  async handle(dispatch:TurnDispatch,executionId:string):Promise<'executed'|'skipped'> {
+    const queued=await this.options.executions.claimExecution(dispatch,`${this.options.workerId}-${executionId}`,this.options.maxQueueMs,this.options.maxAttempts);
+    if(!queued) return 'skipped';
+    const started=Date.now(),controller=new AbortController();
+    let off:(()=>void)|undefined,finished=false,poll:ReturnType<typeof setTimeout>|undefined;
+    let read:Promise<void>|undefined,failures=0;
+    const check=():Promise<void>=>{
+      if(finished||controller.signal.aborted)return Promise.resolve();
+      return read??=(async()=>{
+        let deadline:ReturnType<typeof setTimeout>|undefined;
+        try {
+          const status=await Promise.race([this.options.executions.executionStatus(queued.turn.id,queued.fence),
+            new Promise<never>((_resolve,reject)=>{deadline=setTimeout(()=>reject(new Error('EXECUTION_STATUS_TIMEOUT')),1000);})]);
+          failures=0;
+          if(status==='cancelled')controller.abort();else if(status==='lost')controller.abort(LEASE_LOST);
+        } catch {if(++failures>=2)controller.abort(LEASE_LOST);}
+        finally {clearTimeout(deadline);}
+      })().finally(()=>{read=undefined;});
+    };
+    const schedule=()=>{
+      if(!finished&&!controller.signal.aborted)poll=setTimeout(()=>{
+        void check().finally(schedule);
+      },Math.max(5,Math.min(1000,this.options.cancellationPollMs??500)));
+    };
+    void this.options.cancellations?.subscribe(queued.turn.id,event=>{if(event.state==='cancelled')controller.abort();})
+      .then(unsubscribe=>{if(finished)unsubscribe();else {off=unsubscribe;void check();}},()=>undefined);
+    const done=(async()=>{
+      await check();
+      if(controller.signal.aborted)return;
+      schedule();await this.options.chat.executeQueued(queued,controller);
+    })().finally(()=>{
+      finished=true;clearTimeout(poll);off?.();this.inFlight.delete(executionId);
+      this.options.onFinished?.({turnId:queued.turn.id,queueWaitMs:Math.max(0,started-Date.parse(queued.turn.createdAt)),durationMs:Date.now()-started});
+    });
+    this.inFlight.set(executionId,{controller,done});
+    await done;return 'executed';
+  }
+  /** Called on the framework's lock-loss notification. No DB writes occur on this abort path. */
+  loseLock(executionId:string):void {this.inFlight.get(executionId)?.controller.abort(LEASE_LOST);}
+  async stop():Promise<void> {await Promise.all([...this.inFlight.values()].map(entry=>entry.done));}
+}
+
+/** Worker-local outbox reconciliation. Queue state, not a second lease clock, decides redispatch. */
+export class WorkerOutboxMaintenance {
+  private timer?:ReturnType<typeof setInterval>;
+  private running?:Promise<void>;
+  constructor(private readonly options:{executions:import('./ports').TurnExecutionStore;delivery:TurnDelivery;
+    state(dispatch:TurnDispatch):Promise<string>;events?:TurnEvents;maxQueueMs:number;maxAttempts:number;
+    graceMs:number;intervalMs:number;batch?:number;onError?:(error:unknown)=>void;onEvent?:(event:TurnDispatcherEvent)=>void}) {}
+  start():void {
+    if(this.timer)return;
+    const run=()=>{this.running??=this.tick().catch(error=>this.options.onError?.(error)).finally(()=>{this.running=undefined;});};
+    run();this.timer=setInterval(run,this.options.intervalMs);
+  }
+  async stop():Promise<void> {clearInterval(this.timer);this.timer=undefined;await this.running;}
+  async tick():Promise<void> {
+    for(const {turnId,errorCode} of await this.options.executions.expireQueued(this.options.maxQueueMs)) {
+      await this.options.events?.publish({turnId,state:'failed',errorCode}).catch(()=>undefined);
+      this.options.onEvent?.({type:'failed',turnId,errorCode});
+    }
+    for(const entry of await this.options.executions.executionDispatches(this.options.graceMs,this.options.batch??500)) {
+      // A Redis command failure is not evidence that a job disappeared: leave DB generation untouched.
+      const state=await this.options.state(entry);
+      if(['active','waiting','wait','delayed','prioritized','waiting-children'].includes(state)) continue;
+      if(state==='unknown'&&!entry.fence) {await this.options.delivery.publish(entry);this.options.onEvent?.({type:'republished',turnId:entry.turnId});continue;}
+      if(!['unknown','completed','failed'].includes(state)) continue;
+      const next=await this.options.executions.repairExecution(entry,this.options.maxAttempts);
+      if(next) {await this.options.delivery.publish(next);this.options.onEvent?.({type:'requeued',turnId:next.turnId});}
+    }
   }
 }

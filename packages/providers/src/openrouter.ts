@@ -3,7 +3,7 @@ import { AGENT_RESPONSE_JSON_SCHEMA, type TextProvider } from '@ptr/core';
 import type { ProviderMessage } from '@ptr/contracts';
 import { assertLocalDatabaseUrl } from '@ptr/storage';
 import { neutralizeJsonStrings, neutralizeMessages } from './control-tokens';
-import { ProviderError, type BudgetLedger } from './budget';
+import { ProviderError, providerRequestScope, type BudgetLedger } from './budget';
 
 const API='https://openrouter.ai/api/v1';
 export const DEFAULT_TEXT_MODEL='google/gemini-3-flash-preview';
@@ -191,7 +191,9 @@ export class OpenRouterClient {
     if (endpoint!=='decisions') await this.verifyPricing(signal);
     const key=hash({endpoint,body,schema:SCHEMA_REVISION,...(idempotencyKey===undefined?{}:{idempotencyKey})});
     // Decisions are optional helpers: they keep a share of the call cap free so they can never starve chat.
-    const saved=endpoint==='decisions'?await this.options.ledger.reserve(key,reservation,{reservedCallFraction:this.reservedCallFraction}):await this.options.ledger.reserve(key,reservation);
+    const scope=providerRequestScope(idempotencyKey,endpoint==='decisions'?'decision':'chat');
+    const reserveOptions=endpoint==='decisions'?{reservedCallFraction:this.reservedCallFraction,...(scope?{scope}:{})}:scope?{scope}:undefined;
+    const saved=await this.options.ledger.reserve(key,reservation,reserveOptions);
     if (!saved.created) {
       if (saved.request.response!==null) {
         const result=object(saved.request.response);

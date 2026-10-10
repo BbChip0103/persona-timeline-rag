@@ -1,0 +1,369 @@
+# Isolated, digest-pinned infrastructure; no research DB, existing env, host networking or fixed container names.
+# Always pass a NEW generated --env-file. Profiles: smoke (real proxy/local fake), proxy, guardrails, observability.
+name: ${PTR_FRAMEWORK_PROJECT:?generate a NEW isolated environment file}
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-langfuse-environment: &langfuse-environment
+  HOSTNAME: 0.0.0.0
+  DATABASE_URL: postgresql://ptr_langfuse:${PTR_LANGFUSE_DB_PASSWORD:?required}@langfuse-postgres:5432/ptr_langfuse
+  NEXTAUTH_URL: http://127.0.0.1:${PTR_LANGFUSE_PORT:?required}
+  SALT: ${PTR_LANGFUSE_SALT:?required}
+  ENCRYPTION_KEY: ${PTR_LANGFUSE_ENCRYPTION_KEY:?required}
+  TELEMETRY_ENABLED: "false"
+  LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+  CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+  CLICKHOUSE_USER: ptr_langfuse
+  CLICKHOUSE_PASSWORD: ${PTR_LANGFUSE_CLICKHOUSE_PASSWORD:?required}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: langfuse-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${PTR_LANGFUSE_REDIS_PASSWORD:?required}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ptr-langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${PTR_LANGFUSE_BLOB_USER:?required}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${PTR_LANGFUSE_BLOB_PASSWORD:?required}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-blob:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ptr-langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${PTR_LANGFUSE_BLOB_USER:?required}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${PTR_LANGFUSE_BLOB_PASSWORD:?required}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-blob:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+  LANGFUSE_OBSERVATION_FIELD_OVERFLOW_ENABLED: "false"
+  # No enterprise license, automatic EE-only retention claim, external judge or in-app agent.
+  LANGFUSE_IN_APP_AGENT_ENABLED: "false"
+
+x-langfuse-dependencies: &langfuse-dependencies
+  langfuse-postgres:
+    condition: service_healthy
+  langfuse-clickhouse:
+    condition: service_healthy
+  langfuse-redis:
+    condition: service_healthy
+  langfuse-blob-init:
+    condition: service_completed_successfully
+
+services:
+  # Root runtime integration uses these NEW synthetic stores only. No live DB migration.
+  framework-test-db:
+    <<: *service
+    profiles: [runtime-test]
+    image: pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6
+    environment:
+      POSTGRES_USER: ptr_framework_bootstrap
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${PTR_FRAMEWORK_BOOTSTRAP_PASSWORD:?required}
+      PTR_FRAMEWORK_TEST_DB_PASSWORD: ${PTR_FRAMEWORK_TEST_DB_PASSWORD:?required}
+    command: [postgres, -c, log_statement=none, -c, log_min_error_statement=panic]
+    ports: ["127.0.0.1:57432:5432"]
+    volumes:
+      - framework_test_postgres:/var/lib/postgresql/data
+      - ./langfuse/init-framework-test-db.sh:/docker-entrypoint-initdb.d/10-framework-test.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ptr_framework_tester -d ptr_framework_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [runtime-test]
+
+  framework-test-queue:
+    <<: *service
+    profiles: [runtime-test]
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    environment:
+      REDIS_PASSWORD: ${PTR_FRAMEWORK_QUEUE_PASSWORD:?required}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction']
+    ports: ["127.0.0.1:57479:6379"]
+    volumes: [framework_test_queue:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [runtime-test]
+
+  litellm:
+    <<: *service
+    profiles: [proxy, smoke]
+    image: ghcr.io/berriai/litellm:main-stable@sha256:3d88bd757134a00e8c00237b85a021ab1f6d54abb9c1df750f411dbe7256a500
+    command: [--config, /app/ptr-config.yaml, --host, 0.0.0.0, --port, "4000"]
+    environment:
+      DATABASE_URL: postgresql://ptr_litellm:${PTR_LITELLM_DB_PASSWORD:?required}@litellm-postgres:5432/ptr_litellm
+      PTR_LITELLM_MASTER_KEY: ${PTR_LITELLM_MASTER_KEY:?required}
+      LITELLM_MASTER_KEY: ${PTR_LITELLM_MASTER_KEY:?required}
+      LITELLM_SALT_KEY: ${PTR_LITELLM_SALT_KEY:?required}
+      PTR_LITELLM_REDIS_PASSWORD: ${PTR_LITELLM_REDIS_PASSWORD:?required}
+      LITELLM_TELEMETRY: "False"
+      DO_NOT_TRACK: "1"
+      DISABLE_ADMIN_UI: "true"
+      PTR_VLLM_MODEL: ${PTR_VLLM_MODEL:-}
+      PTR_VLLM_BASE_URL: ${PTR_VLLM_BASE_URL:-}
+      PTR_VLLM_API_KEY: ${PTR_VLLM_API_KEY:-}
+      PTR_VLLM_SECONDARY_MODEL: ${PTR_VLLM_SECONDARY_MODEL:-}
+      PTR_VLLM_SECONDARY_BASE_URL: ${PTR_VLLM_SECONDARY_BASE_URL:-}
+      PTR_VLLM_SECONDARY_API_KEY: ${PTR_VLLM_SECONDARY_API_KEY:-}
+      PTR_OPENROUTER_MODEL: ${PTR_OPENROUTER_MODEL:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - type: bind
+        source: ${PTR_LITELLM_CONFIG:-./litellm/config.synthetic.yaml}
+        target: /app/ptr-config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${PTR_LITELLM_PORT:?required}:4000"
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+      litellm-redis:
+        condition: service_healthy
+    healthcheck:
+      # Do not use /health: it calls configured models and can incur charges.
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/readiness',timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    stop_grace_period: 35s
+    networks: [proxy]
+
+  litellm-postgres:
+    <<: *service
+    profiles: [proxy, smoke]
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: ptr_litellm
+      POSTGRES_DB: ptr_litellm
+      POSTGRES_PASSWORD: ${PTR_LITELLM_DB_PASSWORD:?required}
+    volumes: [litellm_postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ptr_litellm -d ptr_litellm"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [proxy]
+
+  litellm-redis:
+    <<: *service
+    profiles: [proxy, smoke]
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    environment:
+      REDIS_PASSWORD: ${PTR_LITELLM_REDIS_PASSWORD:?required}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction']
+    volumes: [litellm_redis:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [proxy]
+
+  fake-engine:
+    <<: *service
+    profiles: [smoke]
+    image: python:3.12.10-slim-bookworm@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db
+    command: [python, /fixture/fake-engine.py]
+    environment:
+      PTR_SYNTHETIC_ENGINE_DELAY_MS: "100"
+    ports:
+      - "127.0.0.1:${PTR_FAKE_ENGINE_PORT:?required}:8000"
+    volumes:
+      - ./litellm/fake-engine.py:/fixture/fake-engine.py:ro
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [proxy]
+
+  guardrails:
+    <<: *service
+    profiles: [guardrails]
+    build:
+      context: ..
+      dockerfile: apps/guardrails/Dockerfile
+    environment:
+      GUARDRAILS_API_KEY: ${PTR_GUARDRAILS_TOKEN:?required}
+      GUARDRAILS_NO_TELEMETRY: "true"
+      OTEL_SDK_DISABLED: "true"
+      DO_NOT_TRACK: "1"
+    ports:
+      - "127.0.0.1:${PTR_GUARDRAILS_PORT:?required}:8000"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    stop_grace_period: 35s
+    networks: [validation]
+
+  langfuse-web:
+    <<: *service
+    profiles: [observability]
+    image: docker.langfuse.com/langfuse/langfuse:4.56.0@sha256:b1948c7c0931f277975b985e30e73536b1bca5822705ddd9a89ba7c1ed79b3ee
+    environment:
+      <<: *langfuse-environment
+      NEXTAUTH_SECRET: ${PTR_LANGFUSE_NEXTAUTH_SECRET:?required}
+      AUTH_DISABLE_SIGNUP: "true"
+      LANGFUSE_INIT_ORG_ID: ${PTR_LANGFUSE_ORG_ID:?required}
+      LANGFUSE_INIT_ORG_NAME: PTR isolated observability
+      LANGFUSE_INIT_PROJECT_ID: ${PTR_LANGFUSE_PROJECT_ID:?required}
+      LANGFUSE_INIT_PROJECT_NAME: Persona framework synthetic
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?required}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?required}
+      LANGFUSE_INIT_USER_EMAIL: ${PTR_LANGFUSE_USER_EMAIL:?required}
+      LANGFUSE_INIT_USER_NAME: Isolated operator
+      LANGFUSE_INIT_USER_PASSWORD: ${PTR_LANGFUSE_USER_PASSWORD:?required}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://127.0.0.1:${PTR_LANGFUSE_BLOB_PORT:?required}
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://langfuse-blob:9000
+    ports:
+      - "127.0.0.1:${PTR_LANGFUSE_PORT:?required}:3000"
+    depends_on: *langfuse-dependencies
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/public/health?failIfDatabaseUnavailable=true').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    stop_grace_period: 60s
+    networks: [observability, host-access]
+
+  langfuse-worker:
+    <<: *service
+    profiles: [observability]
+    image: docker.langfuse.com/langfuse/langfuse-worker:4.56.0@sha256:3f7571ff3a725ebdcdf4c35e06bdf8c3f8325770691c673793ad61b328265e13
+    environment: *langfuse-environment
+    depends_on: *langfuse-dependencies
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3030/api/health?failIfQueueConsumptionStuck=true').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    stop_grace_period: 60s
+    networks: [observability]
+
+  langfuse-postgres:
+    <<: *service
+    profiles: [observability]
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: ptr_langfuse
+      POSTGRES_DB: ptr_langfuse
+      POSTGRES_PASSWORD: ${PTR_LANGFUSE_DB_PASSWORD:?required}
+    volumes: [langfuse_postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ptr_langfuse -d ptr_langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [observability]
+
+  langfuse-clickhouse:
+    <<: *service
+    profiles: [observability]
+    image: clickhouse/clickhouse-server:25.12@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ptr_langfuse
+      CLICKHOUSE_PASSWORD: ${PTR_LANGFUSE_CLICKHOUSE_PASSWORD:?required}
+    volumes:
+      - langfuse_clickhouse:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: [CMD, wget, --no-verbose, --tries=1, --spider, http://127.0.0.1:8123/ping]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [observability]
+
+  langfuse-redis:
+    <<: *service
+    profiles: [observability]
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    environment:
+      REDIS_PASSWORD: ${PTR_LANGFUSE_REDIS_PASSWORD:?required}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction']
+    volumes: [langfuse_redis:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [observability]
+
+  langfuse-blob:
+    <<: *service
+    profiles: [observability]
+    image: cgr.dev/chainguard/minio:latest@sha256:7df55d002b698e4494a131b848dd553361bbe58b7e19f62d9623c29af1ba9ccf
+    entrypoint: [sh, -c]
+    command: ['mkdir -p /data/ptr-langfuse && exec minio server --address :9000 --console-address :9001 /data']
+    environment:
+      MINIO_ROOT_USER: ${PTR_LANGFUSE_BLOB_USER:?required}
+      MINIO_ROOT_PASSWORD: ${PTR_LANGFUSE_BLOB_PASSWORD:?required}
+    ports:
+      - "127.0.0.1:${PTR_LANGFUSE_BLOB_PORT:?required}:9000"
+    volumes: [langfuse_blob:/data]
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    networks: [observability, host-access]
+
+  langfuse-blob-init:
+    profiles: [observability]
+    image: cgr.dev/chainguard/minio:latest@sha256:7df55d002b698e4494a131b848dd553361bbe58b7e19f62d9623c29af1ba9ccf
+    entrypoint: [sh, /policy/init-blob.sh]
+    environment:
+      PTR_LANGFUSE_BLOB_USER: ${PTR_LANGFUSE_BLOB_USER:?required}
+      PTR_LANGFUSE_BLOB_PASSWORD: ${PTR_LANGFUSE_BLOB_PASSWORD:?required}
+    volumes:
+      - ./langfuse/init-blob.sh:/policy/init-blob.sh:ro
+      - ./langfuse/blob-lifecycle.json:/policy/blob-lifecycle.json:ro
+    depends_on:
+      langfuse-blob:
+        condition: service_healthy
+    networks: [observability]
+
+volumes:
+  framework_test_postgres:
+  framework_test_queue:
+  litellm_postgres:
+  litellm_redis:
+  langfuse_postgres:
+  langfuse_clickhouse:
+  langfuse_clickhouse_logs:
+  langfuse_redis:
+  langfuse_blob:
+
+networks:
+  runtime-test:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  proxy:
+  observability:
+    internal: true
+  validation:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  host-access:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

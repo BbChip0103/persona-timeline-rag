@@ -1,7 +1,5 @@
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
-import { FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
-import { BullMqTurnDelivery, MemoryGatewayRegistry } from '@ptr/messaging';
+import { FakeTextProvider, LatencyInjectedTextProvider, LiteLLMTextProvider } from '@ptr/providers';
+import { BullMqTurnDelivery } from '@ptr/messaging';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,70 +43,27 @@ test('turns always run through Redis workers: queue knobs are validated and the 
   for(const url of ['','redis://:x@10.0.0.5:56479/0','redis://127.0.0.1:56479/0'])
     expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:url})).toThrow();
 });
-test('PTR_CHAT_PROVIDER=selfhosted uses the loopback OpenAI-compatible engine and never the billable client',async()=>{
-  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'http://127.0.0.1:18000/v1',PTR_SELFHOSTED_MODEL:'gemma-4-e4b'});
-  expect(runtime.provider).toBeInstanceOf(OpenAICompatibleTextProvider);
-  expect(runtime.providerName).toBe('selfhosted');expect(runtime.model).toBe('selfhosted/gemma-4-e4b');
+const framework={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'litellm',
+  PTR_LITELLM_BASE_URL:'http://127.0.0.1:57460/v1',PTR_LITELLM_API_KEY:'synthetic_proxy_token_abcdefghij',
+  PTR_GUARDRAILS_URL:'http://127.0.0.1:57464',PTR_GUARDRAILS_TOKEN:'synthetic_guard_token_abcdefghij'};
+test('single framework route uses actual LangChain LiteLLM adapter, durable saver, Guardrails and execution fencing',async()=>{
+  const runtime=createRuntime(framework);
+  expect(runtime.provider).toBeInstanceOf(LiteLLMTextProvider);expect(runtime.executionStore).toBe(runtime.leases);
+  const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
+  expect(options.guardrails).toBeDefined();expect(options.agentCheckpoint).toBeDefined();expect(options.observeStage).toBeDefined();
+  expect(options.semanticSearch).toBe(false);await runtime.close?.();
+});
+test('legacy chat routes are rejected rather than retained as hidden parallel defaults',()=>{
+  for(const PTR_CHAT_PROVIDER of ['gateway','selfhosted','openrouter','unknown'])
+    expect(()=>createRuntime({...framework,PTR_CHAT_PROVIDER})).toThrow();
+  expect(()=>createRuntime({...framework,PTR_GUARDRAILS_TOKEN:undefined})).toThrow();
+  expect(()=>createRuntime({...framework,PTR_LITELLM_BILLABLE:'1'})).toThrow();
+  expect(()=>createRuntime({...framework,PTR_MODEL:'openrouter-primary'})).toThrow();
+});
+test('real vectors cannot be queried using synthetic hashes',async()=>{
+  const runtime=createRuntime(framework);
+  await expect(runtime.chat.createSession('owner_synthetic',{personId:'person_synthetic',personaId:'persona_synthetic',personaRevision:'v1',timezone:'UTC',retrievalMode:'semantic'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
   await runtime.close?.();
-  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'https://api.example.com/v1',PTR_SELFHOSTED_MODEL:'m'})).toThrow();
-  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'selfhosted'})).toThrow();
-});
-test('PTR_CHAT_PROVIDER=gateway sends every model call to the loopback LLM gateway with its token',async()=>{
-  const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'});
-  expect(runtime.provider).toBeInstanceOf(OpenAICompatibleTextProvider);expect(runtime.model).toBe('gateway');
-  await runtime.close?.();
-  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway'})).toThrow();
-  expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',PTR_GATEWAY_URL:'https://example.com/v1'})).toThrow();
-});
-test('gateway URLs: PTR_GATEWAY_URLS is a priority list (PTR_GATEWAY_URL a list of one); reset retries are configurable',async()=>{
-  const base={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'};
-  const optionsOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.provider as unknown as {options:{baseUrl:string[];resetRetries:number;retryMinRemainingMs:number}}).options;
-  const defaults=createRuntime(base);
-  expect(optionsOf(defaults)).toMatchObject({baseUrl:['http://127.0.0.1:56460/v1'],resetRetries:2,retryMinRemainingMs:5000});
-  await defaults.close?.();
-  const single=createRuntime({...base,PTR_GATEWAY_URL:'http://127.0.0.1:56461/v1'});
-  expect(optionsOf(single).baseUrl).toEqual(['http://127.0.0.1:56461/v1']);await single.close?.();
-  const pair=createRuntime({...base,PTR_GATEWAY_URLS:' http://127.0.0.1:56460/v1 , http://127.0.0.1:56461/v1',PTR_GATEWAY_RESET_RETRIES:'0',PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'8000'});
-  expect(optionsOf(pair)).toMatchObject({baseUrl:['http://127.0.0.1:56460/v1','http://127.0.0.1:56461/v1'],resetRetries:0,retryMinRemainingMs:8000});
-  await pair.close?.();
-  for(const extra of [{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,https://example.com/v1'},{PTR_GATEWAY_URLS:' , '},{PTR_GATEWAY_RESET_RETRIES:'-1'},{PTR_GATEWAY_RESET_RETRIES:''},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:' '},{PTR_GATEWAY_URLS:'http://127.0.0.1:56460/v1,http://127.0.0.1:56460/v1'},{PTR_GATEWAY_RESET_RETRIES:'11'},{PTR_GATEWAY_RETRY_MIN_REMAINING_MS:'x'}])
-    expect(()=>createRuntime({...base,...extra})).toThrow();
-});
-test('selfhosted and gateway chat have no real query embedder: semantic sessions are refused before any lookup (fake and openrouter keep semantic)',async()=>{
-  const session={personId:'person_synthetic',personaId:'persona_synthetic',personaRevision:'v1',timezone:'UTC',retrievalMode:'semantic' as const};
-  for(const env of [{PTR_CHAT_PROVIDER:'selfhosted',PTR_SELFHOSTED_BASE_URL:'http://127.0.0.1:18000/v1',PTR_SELFHOSTED_MODEL:'m'},
-    {PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij'}]) {
-    const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,...env});
-    await expect(runtime.chat.createSession('owner_synthetic',session)).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
-    // Wiring check only: a RAG condition alone must not default to the unavailable semantic mode. It then fails later on
-    // the persona lookup (PERSONA_UNAVAILABLE on a migrated database, a connection error on the dummy one); the exact
-    // lexical default is asserted in packages/core/tests/turn-worker.test.ts.
-    const {retrievalMode:_ignored,...noMode}=session;
-    await expect(runtime.chat.createSession('owner_synthetic',{...noMode,ragCondition:'caption'})).rejects.not.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
-    await runtime.close?.();
-  }
-});
-test('PTR_GATEWAY_DISCOVERY=redis: calls follow the gateway registry (leader first), with PTR_GATEWAY_URLS as the seed; PTR_GATEWAY_ALLOW is validated',async()=>{
-  const served:string[]=[];
-  const server=createServer((req,res)=>{req.resume();req.on('end',()=>{served.push(String(req.url));res.writeHead(200,{'Content-Type':'text/event-stream'});
-    res.end(`data: ${JSON.stringify({choices:[{delta:{content:'registry gateway'},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);});});
-  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
-  const port=(server.address() as AddressInfo).port;
-  const registry=new MemoryGatewayRegistry();
-  await registry.heartbeat({id:'gw-a',url:`http://127.0.0.1:${port}/v1`,maxQueue:256,state:'active',startedAt:1,seq:0},10000,5000);
-  const base={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'gateway',PTR_GATEWAY_TOKEN:'synthetic_gateway_token_abcdefghij',
-    PTR_GATEWAY_DISCOVERY:'redis',PTR_GATEWAY_ALLOW:`127.0.0.1:${port}`};
-  const runtime=createRuntime(base,{gatewayRegistry:registry});
-  try {
-    expect(runtime.gateways?.urls()).toEqual(['http://127.0.0.1:56460/v1']); // the seed until the first read
-    await runtime.gateways?.poll();
-    expect(runtime.gateways?.urls()).toEqual([`http://127.0.0.1:${port}/v1`,'http://127.0.0.1:56460/v1']);
-    expect(await runtime.provider.generate([{role:'user',content:'x'}],{signal:new AbortController().signal})).toBe('registry gateway');
-    expect(served).toEqual(['/v1/chat/completions']);
-  } finally {await runtime.close?.();await new Promise(resolve=>server.close(resolve));}
-  expect(()=>createRuntime({...base,PTR_GATEWAY_ALLOW:'localhost:1'},{gatewayRegistry:registry})).toThrow();
-  const statics=createRuntime({...base,PTR_GATEWAY_DISCOVERY:'static'});
-  expect(statics.gateways).toBeUndefined();await statics.close?.();
 });
 test('PTR_INTENT_CLASSIFIER=jev is off by default, needs the live gates, and validates its knobs',async()=>{
   const classifierOf=(runtime:ReturnType<typeof createRuntime>)=>(runtime.chat as unknown as {options:{intentClassifier?:{classifier:{name:string};minConfidence:number;timeoutMs:number}}}).options.intentClassifier;

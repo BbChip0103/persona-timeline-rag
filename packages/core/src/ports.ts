@@ -12,7 +12,9 @@ import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Perso
 export const PROVIDER_DEADLINE='PROVIDER_DEADLINE';
 export interface TextProvider { generate(messages:ProviderMessage[],options:{signal:AbortSignal;requestKey?:string;deadlineAt?:number;priority?:1|0|-1;
   /** Called once before a successful call returns, with the upstream that answered (e.g. the gateway's X-PTR-Upstream). */
-  onServed?:(upstream:string)=>void}):Promise<string> }
+  onServed?:(upstream:string)=>void;
+  /** Actual successful transport usage; absent counts remain unknown. */
+  onUsage?:(usage:{promptTokens:number|null;completionTokens:number|null})=>void}):Promise<string> }
 export interface Retrieval {
   search(query:TimelineQuery,trusted:{personId:string},options:{signal:AbortSignal;mode:'lexical'|'semantic';evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
   resolve?(references:EvidenceCard[],trusted:{personId:string},options:{signal:AbortSignal;evidenceScope?:'caption'|'caption_image'}):Promise<SourcePost[]>;
@@ -79,6 +81,19 @@ export interface TurnLeaseStore {
    * attempt may have reached a model). Compare-and-set on the state and the empty token, so a turn claimed at the same
    * moment is left alone and a failed one can no longer be claimed.
    */
+  expireQueued(maxQueueMs:number):Promise<{turnId:string;errorCode:'QUEUE_TIMEOUT'|'WORKER_LOST'}[]>;
+}
+/** Database-only execution fencing. Queue locks, renewal and stalled retries belong exclusively to BullMQ. */
+export interface ExecutionDispatch extends TurnDispatch { fence?:LeaseFence }
+export interface TurnExecutionStore {
+  /** Called only by a BullMQ lock holder; same-sequence stalled delivery advances the DB generation. */
+  claimExecution(dispatch:TurnDispatch,workerId:string,maxQueueMs:number,maxAttempts:number):Promise<QueuedTurn|undefined>;
+  /** Read-only cancellation/generation backstop; never renews a lease or changes queue recovery ownership. */
+  executionStatus(turnId:string,fence:LeaseFence):Promise<'current'|'cancelled'|'lost'>;
+  /** Durable outbox entries remain through running states until a terminal transaction removes them. */
+  executionDispatches(graceMs:number,limit:number):Promise<ExecutionDispatch[]>;
+  /** CAS recovery after the queue reports missing/completed/failed. Stale scan snapshots never fence a new claim. */
+  repairExecution(dispatch:ExecutionDispatch,maxAttempts:number,exhausted?:boolean):Promise<TurnDispatch|undefined>;
   expireQueued(maxQueueMs:number):Promise<{turnId:string;errorCode:'QUEUE_TIMEOUT'|'WORKER_LOST'}[]>;
 }
 /** Hands reserved turns to workers (BullMQ in production). Publishing the same dispatch twice must be harmless. */

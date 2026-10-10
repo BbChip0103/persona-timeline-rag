@@ -10,6 +10,8 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
+    "@langchain/core": "1.2.17",
+    "@langchain/openai": "1.6.2",
     "@ptr/contracts": "workspace:*",
     "@ptr/core": "workspace:*",
     "@ptr/storage": "workspace:*",

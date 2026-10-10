@@ -142,6 +142,10 @@ export const CreateSessionSchema = z.object({personId:id,personaId:id,personaRev
   return {...value,...result.data};
 });
 export type CreateSessionInput = z.input<typeof CreateSessionSchema>;
+/** Creative artifacts are not chat turns. A stable client id is required by billable runtimes. */
+export const DraftRequestSchema = z.object({brief:z.string().trim().min(1).max(2000),
+  clientRequestId:z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/).optional()}).strict();
+export type DraftRequest = z.infer<typeof DraftRequestSchema>;
 export const SendTurnSchema = z.object({sessionId:id,clientRequestId:id,text:z.string().trim().min(1).max(8000),
   intent:z.enum(['small_talk','timeline','clarification','unsupported']).optional(),
   timeline:z.object({query:z.string().trim().min(1).max(500).optional(),start:CalendarDateSchema.optional(),end:CalendarDateSchema.optional(),dateBasis:z.enum(['posted','event']),limit:z.number().int().min(1).max(100).default(5)}).strict().optional(),

@@ -1,8 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Queue, Worker } from 'bullmq';
-import { CapacityController, RedisCapacityStore } from '../src/capacity-controller';
 import { createRedisConnection } from '../src/redis';
-import { RedisUpstreamRegistry, parseUpstreamAllow } from '../src/upstream-registry';
 
 const url = process.env.PTR_REDIS_URL ?? '';
 const run = process.env.RUN_REDIS_TESTS === '1' ? describe : describe.skip;
@@ -12,7 +10,8 @@ const until = async (check: () => boolean, ms: number) => {
   throw new Error('condition not met');
 };
 
-// BullMQ 6.3.11 global concurrency, the capacity controller's actuator , on the real isolated Redis in
+// BullMQ global concurrency on isolated Redis; independent of the removed custom capacity controller.
+// Uses
 // a throwaway queue under the `ptrtest` prefix (never `ptr:turns`), obliterated afterwards.
 run('BullMQ global concurrency (opt-in RUN_REDIS_TESTS=1)', () => {
   it('caps active jobs across a worker; lowering never stops active jobs; raising is picked up within drainDelay', async () => {
@@ -60,26 +59,4 @@ run('BullMQ global concurrency (opt-in RUN_REDIS_TESTS=1)', () => {
     }
   }, 40000);
 
-  it('controller: one leader writes G to the real queue and the ptr:llm:cap status; the other takes over on release', async () => {
-    const run = randomUUID().replace(/-/g, '').slice(0, 12), prefix = `ptrtest:${run}:llm`;
-    const redis = createRedisConnection(url);
-    const queue = new Queue(`cap-${run}`, { connection: redis, prefix: 'ptrtest' });
-    const registry = new RedisUpstreamRegistry(redis, prefix), store = new RedisCapacityStore(redis, prefix);
-    const make = (id: string) => new CapacityController({ registry, queue, store, pool: 'm', allow: parseUpstreamAllow(undefined), id, q: 256, log: () => undefined });
-    try {
-      await registry.heartbeat({ pool: 'm', id: 'a', baseUrl: 'http://127.0.0.1:18000/v1', maxSeqs: 12, kvCapacityTokens: null, weight: 1, state: 'active', epoch: 'e', seq: 0 }, 60000);
-      const first = make('d1'), second = make('d2');
-      expect(await first.tick()).toMatchObject({ leader: true, g: 15, reason: 'init' });
-      expect(await second.tick()).toMatchObject({ leader: false, reason: 'not_leader' });
-      expect(await queue.getGlobalConcurrency()).toBe(15);
-      expect(await redis.hgetall(`${prefix}:cap`)).toMatchObject({ g: '15', sLive: '12', leader: 'd1', reason: 'init' });
-      await first.stop();
-      expect(await second.tick()).toMatchObject({ leader: true, g: 15, reason: 'hold' });
-      await second.stop();
-    } finally {
-      await queue.obliterate({ force: true }).catch(() => undefined); await queue.close();
-      for await (const keys of redis.scanStream({ match: `${prefix}:*`, count: 500 }) as AsyncIterable<string[]>) if (keys.length) await redis.del(...keys); // SCAN: KEYS is refused to ptr
-      redis.disconnect();
-    }
-  });
 });

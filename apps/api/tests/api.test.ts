@@ -258,7 +258,7 @@ test('draft briefs pass the input safety filter when it is on: refuse/support wi
   const deflected=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'INJECT_ME 초안'}});
   expect(deflected.status).toBe(201);expect(calls).toHaveLength(1);expect(JSON.stringify(calls[0])).toContain(SAFETY_DEFLECTION_NOTE);
   // The draft id seeds the check and names the artifact; the whole brief is checked.
-  expect(assess.mock.calls.at(-1)![0]).toMatchObject({seed:deflected.body.artifact.id,recentUserTurns:[],intent:false,text:'INJECT_ME 초안'});
+  expect(assess.mock.calls.at(-1)![0]).toMatchObject({seed:`draft:owner_synthetic_a:${deflected.body.artifact.id}`,recentUserTurns:[],intent:false,text:'INJECT_ME 초안'});
   expect(artifacts).toHaveLength(1);
   // Fail-open: an unavailable filter keeps drafting and is reported without text.
   assess.mockRejectedValueOnce(Object.assign(new Error('raw'),{code:'BUDGET_EXCEEDED'}));
@@ -266,11 +266,13 @@ test('draft briefs pass the input safety filter when it is on: refuse/support wi
   expect(onSafetyFallback).toHaveBeenCalledWith({scope:'draft',reason:'budget'});
 });
 
-test('draft cap applies only with the safety filter on; filter-off drafting is unchanged',async()=>{
+test('draft cap applies with the Jev classifier off as well',async()=>{
   await app.close();
   app=await createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:1});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const off=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
-  for(let i=0;i<3;i++) expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
+  expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
+  expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(503);
+  expect((runtime.provider as FakeTextProvider).calls).toBe(1);
 });
 test('with the safety filter on, draft requests are capped per owner per minute before any safety check or model call',async()=>{
   await app.close();

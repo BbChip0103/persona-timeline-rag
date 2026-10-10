@@ -1,0 +1,42 @@
+# This is a real LiteLLM Proxy with a local, synthetic OpenAI-compatible upstream.
+# It never configures an external provider. Enable the Compose smoke profile.
+model_list:
+  - model_name: primary
+    litellm_params:
+      model: openai/ptr-synthetic
+      api_base: http://fake-engine:8000/v1
+      api_key: synthetic-only
+      max_retries: 0
+      timeout: 5
+    model_info:
+      id: fake
+      mode: chat
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000001
+      disable_background_health_check: true
+router_settings:
+  num_retries: 0
+  max_fallbacks: 0
+  enable_weighted_failover: false
+  fallbacks: []
+  default_fallbacks: []
+  context_window_fallbacks: []
+  content_policy_fallbacks: []
+  redis_host: litellm-redis
+  redis_port: 6379
+  redis_password: os.environ/PTR_LITELLM_REDIS_PASSWORD
+litellm_settings:
+  num_retries: 0
+  request_timeout: 5
+  drop_params: false
+  set_verbose: false
+  max_budget: 1.0
+  budget_duration: 1d
+  success_callback: [prometheus]
+general_settings:
+  master_key: os.environ/PTR_LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  background_health_checks: false
+  allow_requests_on_db_unavailable: false
+  maximum_spend_logs_retention_period: 90d
+  disable_error_logs: true

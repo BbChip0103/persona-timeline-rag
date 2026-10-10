@@ -152,14 +152,15 @@ describe('additional safety gates',()=>{
 });
 
 test('startTurn exposes only pending/current state, supports immediate cancellation and safe replay',async()=>{
-  let resolve!:(value:string)=>void;
+  let resolve:((value:string)=>void)|undefined;
   const h=harness({generate:()=>new Promise<string>(r=>{resolve=r;})});const s=await h.create();
   const input={sessionId:s.id,clientRequestId:'async_start',text:'안녕'};
   const start=await h.service.startTurn('owner_synthetic_a',input);expect(start.reply).toBeUndefined();
   expect(['pending','generating']).toContain(start.state);
   const replay=await h.service.startTurn('owner_synthetic_a',input);expect(replay.id).toBe(start.id);
   await h.service.cancelTurn('owner_synthetic_a',start.id);
-  resolve('late');await tick();expect((await h.service.getTurn('owner_synthetic_a',start.id)).state).toBe('cancelled');
+  // The graph scheduler may not have started the model before an immediate cancellation.
+  resolve?.('late');await tick();expect((await h.service.getTurn('owner_synthetic_a',start.id)).state).toBe('cancelled');
   expect(await h.service.history('owner_synthetic_a',s.id)).toHaveLength(1);
   await expect(h.service.startTurn('owner_synthetic_b',input)).rejects.toMatchObject({code:'NOT_FOUND'});
 });

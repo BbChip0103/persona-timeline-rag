@@ -1,0 +1,13 @@
+{
+  "revision": "sensitive-pattern-v1",
+  "patterns": {
+    "SENSITIVE": {
+      "source": "phone number|home address|private address|real.time location|rumou?r|secret relationship|연락처|전화번호|집 주소|주거지|실시간 위치|사생활|루머|미성년",
+      "flags": "i"
+    },
+    "WHEREABOUTS": {
+      "source": "(?<!(?:사진|그림|이거|그거|저거|이곳|그곳|거기|여기|장소|가게|카페)[은는이가]?\\s*)지금\\s?어디\\s?(?:야|있|에\\s?있|예요|에요|세요|인지|쯤)|(?:지금|현재)\\s?위치|지금\\s?있는\\s?(?:곳|데|카페|장소|가게|식당|호텔|숙소)|어디\\s?(?:살아|사세요|사니|사는지|사냐)|(?:네가|너가|니가|너|당신)\\S{0,2}\\s?사는\\s?곳|사는\\s?곳(?:이|은)?\\s?어디|(?:지금|요즘|이번|오늘|현재)[^.?!\\n]{0,15}(?:집|숙소)\\s?(?:이|은|는)?\\s?어디|^(?![\\s\\S]*(?:때|작년|지난|여행|사진|었|였))[\\s\\S]*(?:집|숙소)\\s?(?:이|은|는)?\\s?어디|찾아\\s?갈게|(?:만나러|찾아)\\s?(?:갈게|갈께|가도\\s?(?:돼|될까))|(?:나|저|너|당신|널|날)\\S{0,2}\\s?(?:만나러|찾아)\\s?갈래|(?:직접|실제로)\\s?(?:만나자|만나러|만나고\\s?싶|만나도\\s?돼|만날래|만나볼래)|\\bwhere\\s+(?:are|r)\\s+(?:you|u)\\s+(?:right\\s+)?now\\b|\\bwhere\\s+you\\s+are\\s+(?:right\\s+)?now\\b|\\bwhere\\s+do\\s+you\\s+live\\b|\\bwhere\\s+are\\s+you\\s+(?:staying|living|based)\\b(?!\\s+in\\s+(?:that|this|the)\\s+(?:photo|picture|pic|post|video))|\\byour\\s+(?:home\\s+|current\\s+)?address\\b|\\b(?:are\\s+you|you're|you\\s+are)\\s+(?:nearby|near\\s+me|around\\s+here)\\b|\\b(?:come|go)\\s+(?:see|meet|visit)\\s+you\\b(?!\\s+(?:perform|play|sing|dance|speak|present|compete|race)\\w*)|\\bmeet\\s+(?:you\\s+)?in\\s+person\\b|\\bmeet\\s+up\\s+with\\s+you\\b|\\bvisit\\s+you\\b|\\b(?:stop|drop|come)\\s+by\\s+(?:your\\s+(?:place|home|house|hotel|cafe|room)\\b|(?:to|and)\\s+see\\s+you\\b)",
+      "flags": "i"
+    }
+  }
+}
