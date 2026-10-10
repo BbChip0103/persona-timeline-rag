@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { sql } from 'kysely';
 import type { Pool, QueryResultRow } from 'pg';
 import type { ChatMessage, ChatReply, ChatSession, ChatTurn, SendTurnInput, TurnState } from '@ptr/contracts';
 import { CoreError, type ConversationStore, type LeaseFence, type QueuedTurn, type TurnDispatch, type TurnLeaseStore, type TurnExecutionStore, type ExecutionDispatch } from '../../core/src/ports';
 import {turnTextFingerprint} from '../../core/src/request-fingerprint';
 import { transaction } from './pool.js';
+import { createConversationDatabase } from './database.js';
 
 const terminal = ['completed', 'failed', 'cancelled'];
 const active = ['pending', 'retrieving', 'generating', 'validating'];
@@ -28,35 +30,47 @@ function turn(row: QueryResultRow): ChatTurn {
 }
 
 export class PostgresConversationStore implements ConversationStore, TurnLeaseStore, TurnExecutionStore {
-  constructor(private readonly pool: Pool) {}
+  private readonly database;
+  constructor(private readonly pool: Pool) { this.database = createConversationDatabase(pool); }
   async create(session: ChatSession, greeting: ChatMessage): Promise<void> {
     if (greeting.sessionId !== session.id || greeting.turnId !== null || greeting.role !== 'assistant')
       throw new CoreError('INVALID_INPUT');
-    await transaction(this.pool, async client => {
-      await client.query('INSERT INTO sessions(id,owner_id,person_id,persona_id,persona_revision,document,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)',
-        [session.id, session.ownerId, session.personId, session.personaId, session.personaRevision, session, session.createdAt]);
-      await client.query('INSERT INTO messages(id,session_id,turn_id,role,content,created_at) VALUES($1,$2,NULL,$3,$4,$5)',
-        [greeting.id, session.id, greeting.role, greeting.content, greeting.createdAt]);
+    await this.database.transaction().execute(async database => {
+      await database.insertInto('sessions').values({
+        id: session.id, owner_id: session.ownerId, person_id: session.personId,
+        persona_id: session.personaId, persona_revision: session.personaRevision,
+        document: session, created_at: session.createdAt,
+      }).execute();
+      await database.insertInto('messages').values({
+        id: greeting.id, session_id: session.id, turn_id: null, role: greeting.role,
+        content: greeting.content, created_at: greeting.createdAt,
+      }).execute();
     });
   }
   async getOwnedSession(sessionId: string, ownerId: string): Promise<ChatSession | undefined> {
-    const result = await this.pool.query('SELECT document FROM sessions WHERE id=$1 AND owner_id=$2', [sessionId, ownerId]);
-    return result.rows[0]?.document;
+    const row = await this.database.selectFrom('sessions').select('document')
+      .where('id', '=', sessionId).where('owner_id', '=', ownerId).executeTakeFirst();
+    return row?.document;
   }
   async listOwnedSessions(ownerId: string): Promise<ChatSession[]> {
-    return (await this.pool.query('SELECT document FROM sessions WHERE owner_id=$1 ORDER BY created_at DESC,id', [ownerId])).rows.map(row => row.document);
+    const rows = await this.database.selectFrom('sessions').select('document')
+      .where('owner_id', '=', ownerId).orderBy('created_at', 'desc').orderBy('id').execute();
+    return rows.map(row => row.document);
   }
   async history(sessionId: string, ownerId: string): Promise<ChatMessage[]> {
-    const result = await this.pool.query(`SELECT m.* FROM messages m JOIN sessions s ON s.id=m.session_id
-      LEFT JOIN turns t ON t.id=m.turn_id WHERE s.id=$1 AND s.owner_id=$2
-      AND (m.turn_id IS NULL OR t.state='completed') ORDER BY m.ordinal`, [sessionId, ownerId]);
-    return result.rows.map(row => ({ id: row.id, sessionId: row.session_id, turnId: row.turn_id,
+    const rows = await this.database.selectFrom('messages as m')
+      .innerJoin('sessions as s', 's.id', 'm.session_id').leftJoin('turns as t', 't.id', 'm.turn_id')
+      .selectAll('m').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId)
+      .where(expression => expression.or([expression('m.turn_id', 'is', null), expression('t.state', '=', 'completed')]))
+      .orderBy('m.ordinal').execute();
+    return rows.map(row => ({ id: row.id, sessionId: row.session_id, turnId: row.turn_id,
       role: row.role, content: row.content, createdAt: new Date(row.created_at).toISOString() }));
   }
   async refusedTurnIds(sessionId: string, ownerId: string): Promise<string[]> {
-    const result = await this.pool.query(`SELECT t.id FROM turns t JOIN sessions s ON s.id=t.session_id
-      WHERE s.id=$1 AND s.owner_id=$2 AND t.state='completed' AND t.reply->'inputSafety'->>'action'='refuse'`, [sessionId, ownerId]);
-    return result.rows.map(row => String(row.id));
+    const rows = await this.database.selectFrom('turns as t').innerJoin('sessions as s', 's.id', 't.session_id')
+      .select('t.id').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId).where('t.state', '=', 'completed')
+      .where(sql<string>`${sql.ref('t.reply')}->'inputSafety'->>'action'`, '=', 'refuse').execute();
+    return rows.map(row => String(row.id));
   }
   async reserveTurn(sessionId: string, ownerId: string, clientRequestId: string, text: string, requestHash?: string, input?: SendTurnInput): Promise<{ turn: ChatTurn; created: boolean; dispatch?: TurnDispatch }> {
     const fingerprint=requestHash??turnTextFingerprint(text);
@@ -122,8 +136,9 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
     });
   }
   async getTurn(turnId: string, ownerId: string): Promise<ChatTurn | undefined> {
-    const result = await this.pool.query('SELECT t.* FROM turns t JOIN sessions s ON s.id=t.session_id WHERE t.id=$1 AND s.owner_id=$2', [turnId, ownerId]);
-    return result.rows[0] ? turn(result.rows[0]) : undefined;
+    const row = await this.database.selectFrom('turns as t').innerJoin('sessions as s', 's.id', 't.session_id')
+      .selectAll('t').where('t.id', '=', turnId).where('s.owner_id', '=', ownerId).executeTakeFirst();
+    return row ? turn(row) : undefined;
   }
   async cancelTurn(turnId: string, ownerId: string): Promise<boolean> {
     return transaction(this.pool, async client => {
@@ -157,8 +172,8 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
     });
   }
   async executionStatus(turnId: string, fence: LeaseFence): Promise<'current'|'cancelled'|'lost'> {
-    const result = await this.pool.query('SELECT state,lease_owner,attempts FROM turns WHERE id=$1', [turnId]);
-    const row = result.rows[0];
+    const row = await this.database.selectFrom('turns').select(['state', 'lease_owner', 'attempts'])
+      .where('id', '=', turnId).executeTakeFirst();
     if (row?.state === 'cancelled') return 'cancelled';
     return row && active.includes(row.state) && row.lease_owner === fence.workerId && row.attempts === fence.attempt ? 'current' : 'lost';
   }
