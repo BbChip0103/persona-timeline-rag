@@ -2,7 +2,8 @@
 
 import copy
 from contextlib import nullcontext
-from typing import Any, TypedDict
+from operator import add
+from typing import Annotated, Any, TypedDict
 
 import regex
 from langgraph.graph import END, START, StateGraph
@@ -19,8 +20,21 @@ AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
 AGENT_PROMPT_REVISION = "character-agent-context-v12-evidence-cap"
 
 
-class AgentState(TypedDict):
-    run: dict
+class AgentState(TypedDict, total=False):
+    iteration: Annotated[int, add]
+    variables: dict
+    transcript: Annotated[list[dict], add]
+    called: Annotated[list[str], add]
+    firstSeen: list[dict]
+    sources: list[dict]
+    steps: Annotated[list[dict], add]
+    modelCalls: Annotated[int, add]
+    toolCalls: Annotated[int, add]
+    upstreams: Annotated[list[str], add]
+    context: dict
+    response: dict
+    serviceLimitation: str | None
+    result: dict
 
 
 class AgentContext(TypedDict):
@@ -42,7 +56,7 @@ def _compiled_agent_graph():
     builder.add_edge("context", "generate")
     builder.add_conditional_edges(
         "generate",
-        lambda s: "tool" if s["run"]["response"].get("function") else "finalize",
+        lambda s: "tool" if s["response"].get("function") else "finalize",
         {"tool": "tool", "finalize": "finalize"},
     )
     builder.add_edge("tool", "context")
@@ -141,7 +155,7 @@ async def run_character_agent(
 
     async def context(state):
         check()
-        run = state["run"]
+        run = state
         safety = POLICY["EXPERIMENT_POLICY"].split("TIMELINE_JSON_REPLY:")[0]
         after = [
             {
@@ -187,11 +201,11 @@ async def run_character_agent(
         }
         if ctx["omittedSourceIds"]:
             step["omittedSourceIds"] = ctx["omittedSourceIds"]
-        return {"run": dict(run, context=ctx, steps=run["steps"] + [step])}
+        return {"context": ctx, "steps": [step]}
 
     async def generate(state):
         check()
-        run = state["run"]
+        run = state
         upstream = "unknown"
 
         def served(name):
@@ -239,26 +253,23 @@ async def run_character_agent(
             elif query in run["called"]:
                 raise CoreError("TURN_FAILED", "TOOL_REPEATED")
         return {
-            "run": dict(
-                run,
-                response=response,
-                serviceLimitation=limitation,
-                upstreams=run["upstreams"] + [upstream],
-                modelCalls=run["modelCalls"] + 1,
-                steps=run["steps"] + [{"phase": "model", "iteration": run["iteration"]}],
-            )
+            "response": response,
+            "serviceLimitation": limitation,
+            "upstreams": [upstream],
+            "modelCalls": 1,
+            "steps": [{"phase": "model", "iteration": run["iteration"]}],
         }
 
     async def tool(state):
         check()
-        run = state["run"]
+        run = state
         response = run["response"]
         query = response["function"]["arguments"]["query"]
         found = copy.deepcopy(await search(query))
         check()
         first = _remember(run["firstSeen"], found)
         selected = _candidates(first, found + run["sources"])
-        transcript = run["transcript"] + [
+        transcript = [
             {
                 "role": "assistant",
                 "content": dumps(
@@ -285,22 +296,18 @@ async def run_character_agent(
             },
         ]
         return {
-            "run": dict(
-                run,
-                firstSeen=first,
-                sources=selected,
-                transcript=transcript,
-                called=run["called"] + [query],
-                toolCalls=run["toolCalls"] + 1,
-                iteration=run["iteration"] + 1,
-                steps=run["steps"]
-                + [{"phase": "tool", "iteration": run["iteration"], "query": query}],
-            )
+            "firstSeen": first,
+            "sources": selected,
+            "transcript": transcript,
+            "called": [query],
+            "toolCalls": 1,
+            "iteration": 1,
+            "steps": [{"phase": "tool", "iteration": run["iteration"], "query": query}],
         }
 
     async def finalize(state):
         check()
-        run = state["run"]
+        run = state
         response = run["response"]
         agent = {
             "revision": AGENT_RUNTIME_REVISION,
@@ -328,7 +335,7 @@ async def run_character_agent(
         }
         if run.get("serviceLimitation"):
             result["serviceLimitation"] = run["serviceLimitation"]
-        return {"run": dict(run, result=result)}
+        return {"result": result}
 
     stages = {}
     for name, node in [
@@ -344,7 +351,7 @@ async def run_character_agent(
                     telemetry.observation(
                         "agent-" + stage_name,
                         as_type="generation" if stage_name == "generate" else "span",
-                        metadata={"iteration": state["run"]["iteration"]},
+                        metadata={"iteration": state["iteration"]},
                     )
                     if telemetry
                     else nullcontext()
@@ -355,10 +362,13 @@ async def run_character_agent(
             return invoke
 
         stages[name] = observed(node, name)
-    result = await _AGENT_GRAPH.ainvoke(
-        {"run": initial},
+    from .langchain import private_ainvoke
+
+    result = await private_ainvoke(
+        _AGENT_GRAPH,
+        initial,
         {"recursion_limit": 3 * (max_tool_rounds + 1) + 2},
         context={"stages": stages},
     )
     check()
-    return result["run"]["result"]
+    return result["result"]
