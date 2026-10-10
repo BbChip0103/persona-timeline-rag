@@ -403,6 +403,7 @@ class OpenRouterClient:
         request_key: str | None = None,
         on_usage: Any = None,
         on_served: Any = None,
+        on_cost: Any = None,
         max_output_tokens: int | None = None,
         deadline_at: float | None = None,
         **_: Any,
@@ -460,6 +461,8 @@ class OpenRouterClient:
             request_key=request_key,
             deadline_at=deadline_at,
         )
+        if on_cost:
+            on_cost(reported_cost(result))
         if result.get("model", self.model) != self.model:
             raise ProviderError("MODEL_MISMATCH")
         if not isinstance(result.get("choices"), list) or len(result["choices"]) != 1:

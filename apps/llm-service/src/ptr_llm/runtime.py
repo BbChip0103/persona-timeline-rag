@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import time
 from collections.abc import Mapping
+from contextvars import ContextVar
 from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -47,6 +49,75 @@ def _integer(env: Mapping[str, str], key: str, default: int, low: int, high: int
     return result
 
 
+_generation_span: ContextVar[Any] = ContextVar("ptr_model_accounting_span", default=None)
+
+
+def _count(value: Any) -> int | None:
+    return value if type(value) is int and 0 <= value <= 9007199254740991 else None
+
+
+def _observe_provider_metrics(metrics: dict[str, Any]) -> None:
+    """Accounting only; never export request text, headers or upstream identities."""
+    span = _generation_span.get()
+    if span is None:
+        return
+    metadata: dict[str, Any] = {"accounting": "reported-receipt"}
+    for key in ("attempts", "totalMs"):
+        count = _count(metrics.get(key))
+        if count is not None:
+            metadata[key] = count
+    cost = _count(metrics.get("costMicrousd"))
+    span.update(
+        metadata=metadata,
+        **({"cost_details": {"total": cost / 1_000_000}} if cost is not None else {}),
+    )
+
+
+class ObservedDecisions:
+    """Observe the existing ledgered Jev call, not another submission or retry."""
+
+    def __init__(self, client: Any, telemetry: Telemetry):
+        self.client, self.telemetry = client, telemetry
+
+    async def decide(self, request: dict[str, Any], **options: Any) -> dict[str, Any]:
+        from .providers.openrouter import DEFAULT_JEV_MODEL
+
+        model = request.get("model")
+        model = model if model == DEFAULT_JEV_MODEL else "unknown"
+        with self.telemetry.observation("jev", as_type="generation", model=model) as span:
+            started = time.perf_counter()
+            try:
+                result = await self.client.decide(request, **options)
+                usage = result.get("usage")
+                if isinstance(usage, dict):
+                    counts = {
+                        "input": _count(usage.get("input_tokens", usage.get("prompt_tokens"))),
+                        "output": _count(
+                            usage.get("output_tokens", usage.get("completion_tokens"))
+                        ),
+                    }
+                    details = {k: v for k, v in counts.items() if v is not None}
+                    cost = usage.get("cost")
+                    updates: dict[str, Any] = {"usage_details": details} if details else {}
+                    if (
+                        isinstance(cost, (int, float))
+                        and not isinstance(cost, bool)
+                        and math.isfinite(cost)
+                        and cost >= 0
+                    ):
+                        updates["cost_details"] = {"total": cost}
+                    span.update(**updates)
+                return result
+            finally:
+                span.update(
+                    metadata={
+                        "kind": "decision",
+                        "accounting": "reported-receipt",
+                        "totalMs": round((time.perf_counter() - started) * 1000),
+                    }
+                )
+
+
 class ObservedProvider:
     provider_name: str
 
@@ -75,7 +146,26 @@ class ObservedProvider:
                 if original:
                     original(value)
 
-            return await self.provider.generate(messages, **dict(options, on_usage=usage))
+            token = _generation_span.set(span)
+            try:
+                call_options = dict(options, on_usage=usage)
+                if isinstance(self.provider, OpenRouterClient):
+                    original_cost = options.get("on_cost")
+
+                    def cost(value: int | None) -> None:
+                        actual = _count(value)
+                        if actual is not None:
+                            span.update(
+                                metadata={"accounting": "reported-receipt"},
+                                cost_details={"total": actual / 1_000_000},
+                            )
+                        if original_cost:
+                            original_cost(value)
+
+                    call_options["on_cost"] = cost
+                return await self.provider.generate(messages, **call_options)
+            finally:
+                _generation_span.reset(token)
 
 
 class Runtime:
@@ -145,6 +235,30 @@ class Runtime:
 async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None) -> Runtime:
     env = os.environ if env is None else env
     assert_llm_database_url(settings.database_url)
+    # Paid proxy routes preserve the explicit live/data gates from the TS
+    # runtime. Validate before opening a pool or constructing any provider.
+    pricing = None
+    if env.get("PTR_LLM_PROVIDER", "fake") == "litellm":
+        billable = env.get("PTR_LLM_LITELLM_BILLABLE", "0")
+        if billable not in ("0", "1"):
+            raise ProviderError("INVALID_RUNTIME_CONFIG")
+        if billable == "0" and env.get("PTR_LLM_MODEL", "primary") != "primary":
+            raise ProviderError("UNAPPROVED_NONBILLABLE_ALIAS")
+        if billable == "1":
+            try:
+                pricing = {
+                    "prompt": float(env["PTR_LLM_PROMPT_USD_PER_M"]),
+                    "completion": float(env["PTR_LLM_COMPLETION_USD_PER_M"]),
+                }
+            except (KeyError, ValueError):
+                raise ProviderError("PRICING_UNVERIFIED") from None
+            if not all(math.isfinite(v) and v >= 0 for v in pricing.values()):
+                raise ProviderError("PRICING_UNVERIFIED")
+            if (
+                env.get("PTR_LLM_LIVE_ENABLED") != "1"
+                or env.get("PTR_LLM_ALLOW_EXTERNAL_DATA") != "1"
+            ):
+                raise ProviderError("LIVE_NOT_ENABLED")
     if settings.database_url.split("://", 1)[1].split(":", 1)[0] != "ptr_split_llm":
         raise ProviderError("RUNTIME_REQUIRES_LLM_ROLE")
     pool: AsyncConnectionPool[AsyncConnection[dict[str, Any]]] = AsyncConnectionPool(
@@ -188,7 +302,13 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         provider_name = env.get("PTR_LLM_PROVIDER", "fake")
         tokens = _integer(env, "PTR_LLM_MAX_OUTPUT_TOKENS", 512, 1, 4096)
         timeout_ms = _integer(env, "PTR_LLM_MODEL_TIMEOUT_MS", 30000, 100, 300000)
-        input_bytes = _integer(env, "PTR_LLM_INPUT_BYTES", 32768, 1, 1048576)
+        input_bytes = _integer(
+            env,
+            "PTR_LLM_INPUT_BYTES",
+            65536 if provider_name == "litellm" else 32768,
+            1,
+            1048576,
+        )
         selector_name = env.get("PTR_LLM_EVIDENCE_SELECTOR", "off")
         retrieval_index = env.get("PTR_LLM_RETRIEVAL_INDEX", "legacy")
         if (
@@ -228,19 +348,6 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         elif provider_name == "litellm":
             model = env.get("PTR_LLM_MODEL", "primary")
             billable = env.get("PTR_LLM_LITELLM_BILLABLE", "0")
-            if billable not in ("0", "1"):
-                raise ProviderError("INVALID_RUNTIME_CONFIG")
-            pricing = None
-            if billable == "1":
-                try:
-                    pricing = {
-                        "prompt": float(env["PTR_LLM_PROMPT_USD_PER_M"]),
-                        "completion": float(env["PTR_LLM_COMPLETION_USD_PER_M"]),
-                    }
-                except (KeyError, ValueError):
-                    raise ProviderError("PRICING_UNVERIFIED") from None
-                if not all(math.isfinite(v) and v >= 0 for v in pricing.values()):
-                    raise ProviderError("PRICING_UNVERIFIED")
             provider = LiteLLMTextProvider(
                 base_url=env.get("PTR_LLM_LITELLM_BASE_URL", ""),
                 model=model,
@@ -250,6 +357,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 input_bytes=input_bytes,
                 ledger=ledger if billable == "1" else None,
                 pricing_ceiling=pricing,
+                on_metrics=_observe_provider_metrics,
                 reservation_microusd=_integer(env, "PTR_LLM_MAX_CALL_MICROUSD", 100000, 1, 1000000),
             )
         elif provider_name == "openrouter" and client is not None:
@@ -282,17 +390,44 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         )
         if intent_name not in ("off", "jev") or safety_name not in ("off", "jev"):
             raise ProviderError("INVALID_RUNTIME_CONFIG")
+        from .core.routing import DEFAULT_SAFETY_THRESHOLDS
+
+        safety_thresholds = dict(DEFAULT_SAFETY_THRESHOLDS)
+        for category in safety_thresholds:
+            key = f"PTR_LLM_SAFETY_THRESHOLD_{category.upper()}"
+            try:
+                threshold = float(env.get(key, str(safety_thresholds[category])))
+            except ValueError:
+                raise ProviderError("INVALID_RUNTIME_CONFIG") from None
+            if not math.isfinite(threshold) or not 0 < threshold <= 1:
+                raise ProviderError("INVALID_RUNTIME_CONFIG")
+            safety_thresholds[category] = threshold
+        try:
+            min_confidence = float(env.get("PTR_LLM_JEV_MIN_CONFIDENCE", "0.6"))
+        except ValueError:
+            raise ProviderError("INVALID_RUNTIME_CONFIG") from None
+        if not math.isfinite(min_confidence) or not 0 < min_confidence <= 1:
+            raise ProviderError("INVALID_RUNTIME_CONFIG")
+        decision_client = ObservedDecisions(client, telemetry) if client is not None else None
         engine = LLMEngine(
             provider=provider,
             personas=personas,
             retrieval=retrieval,
             telemetry=telemetry,
             semantic_search=embedding is not None,
-            evidence_selector=JevEvidenceSelector(client, threshold=evidence_threshold)
+            evidence_selector=JevEvidenceSelector(decision_client, threshold=evidence_threshold)
             if selector_name == "jev"
             else None,
-            intent_classifier=JevIntentClassifier(client) if intent_name == "jev" else None,
-            input_safety=JevInputSafetyClassifier(client) if safety_name == "jev" else None,
+            intent_classifier=JevIntentClassifier(decision_client)
+            if intent_name == "jev"
+            else None,
+            input_safety=JevInputSafetyClassifier(decision_client)
+            if safety_name == "jev"
+            else None,
+            safety_thresholds=safety_thresholds,
+            min_intent_confidence=min_confidence,
+            classifier_timeout_ms=_integer(env, "PTR_LLM_JEV_TIMEOUT_MS", 1500, 50, 10000),
+            safety_timeout_ms=_integer(env, "PTR_LLM_SAFETY_TIMEOUT_MS", 2500, 50, 10000),
         )
         return Runtime(pool, personas, engine, results, provider, telemetry, provider_name, model)
     except BaseException:

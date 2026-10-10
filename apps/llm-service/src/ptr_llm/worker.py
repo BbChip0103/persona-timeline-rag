@@ -296,10 +296,85 @@ class WorkerRunner:
             # raw exceptions or configuration in queue failure reasons.
             raise ExecutionStopped("LLM_WORKER_FAILED") from None
 
+    async def _receipt_io(
+        self,
+        guard: ExecutionGuard,
+        work: Callable[[], Awaitable[Any]],
+        *,
+        terminal_delivery: bool = False,
+        committed: bool = False,
+    ) -> Any:
+        """Bound receipt DB waits and watch cancellation/ownership throughout.
+
+        A current holder can read/repost an immutable receipt after its model
+        deadline to recover a lost commit ACK. That exception never permits a
+        fresh model call; all receipt operations still have a bounded I/O budget.
+        """
+
+        async def check() -> None:
+            if committed:
+                # Complete already proved authoritative commit; status is now
+                # terminal, not 'current'. This is only bookkeeping, not a model.
+                await guard.ownership()
+                return
+            await guard.lease(terminal_delivery=terminal_delivery)
+            status = await self.control.status(guard.binding)
+            if status["status"] == "cancelled":
+                guard.stop("EXECUTION_CANCELLED")
+                raise ExecutionStopped(guard.reason)
+            if status["status"] != "current" and not (
+                terminal_delivery and deadline_seconds(guard.grant) <= 0
+            ):
+                guard.stop("EXECUTION_LOST")
+                raise ExecutionStopped(guard.reason)
+            await guard.lease(terminal_delivery=terminal_delivery)
+
+        # Avoid a redundant status RPC on ordinary fast receipt operations.
+        # The watcher below is the backstop for a stalled DB operation; the
+        # authoritative Complete CAS still checks cancellation and deadline.
+        await guard.lease(terminal_delivery=terminal_delivery)
+        remaining = deadline_seconds(guard.grant)
+        budget = self.settings.backend_timeout
+        if not terminal_delivery and remaining > 0:
+            budget = min(budget, remaining)
+        elif not terminal_delivery:
+            guard.stop("EXECUTION_TIMEOUT")
+            raise ExecutionStopped(guard.reason)
+
+        async def watch() -> None:
+            while True:
+                await asyncio.sleep(self.settings.status_interval)
+                await check()
+
+        async def execute() -> Any:
+            return await work()
+
+        operation = asyncio.create_task(execute())
+        monitor = asyncio.create_task(watch())
+        try:
+            async with asyncio.timeout(budget):
+                done, _ = await asyncio.wait(
+                    {operation, monitor}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if monitor in done:
+                    await monitor
+                return await operation
+        except TimeoutError:
+            if deadline_seconds(guard.grant) <= 0 and not terminal_delivery:
+                guard.stop("EXECUTION_TIMEOUT")
+                raise ExecutionStopped(guard.reason) from None
+            raise ControlUnavailable() from None
+        finally:
+            operation.cancel()
+            monitor.cancel()
+            await asyncio.gather(operation, monitor, return_exceptions=True)
+
     async def _execute(
         self, guard: ExecutionGuard, grant: dict[str, Any], binding: dict[str, Any], signal: Any
     ) -> dict[str, Any]:
-        result = await self.result_store.get_result(grant)
+        result = await self._receipt_io(
+            guard, lambda: self.result_store.get_result(grant), terminal_delivery=True
+        )
         if result is None:
             if deadline_seconds(grant) <= 0:
                 # Claim ACK itself may arrive late. Never restart a model just
@@ -324,7 +399,11 @@ class WorkerRunner:
             # expiry stops new models, not the current holder's failure CAS.
             # Cancellation/lost token/control uncertainty still fail closed.
             await guard.lease(terminal_delivery=result["kind"] == "failed")
-            result = await self.result_store.put_result(grant, result)
+            result = await self._receipt_io(
+                guard,
+                lambda: self.result_store.put_result(grant, result),
+                terminal_delivery=True,
+            )
         result = validate_wire("Result", result)
         # A committed success may have lost its ACK as the deadline elapsed.
         # Retry only the exact durable payload, for bounded transport time;
@@ -338,7 +417,12 @@ class WorkerRunner:
                 await asyncio.sleep(min(0.1, max(0, retry_until - time.monotonic())))
                 continue
             if ack["status"] in {"applied", "alreadyApplied"}:
-                await self.result_store.mark_result_ack(grant)
+                await self._receipt_io(
+                    guard,
+                    lambda: self.result_store.mark_result_ack(grant),
+                    terminal_delivery=True,
+                    committed=True,
+                )
                 return {"status": "committed"}
             if ack["status"] in {"lost", "cancelled"}:
                 return {"status": "obsolete"}
