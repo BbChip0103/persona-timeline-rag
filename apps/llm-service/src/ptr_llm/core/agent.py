@@ -15,6 +15,7 @@ from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
 from .protocol import parse_agent_response, variables
 from .safety import contains_credential, contains_internal_path
 from .texts import is_korean, speech_level, utterance_language, voice_text
+from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
 AGENT_PROMPT_REVISION = "character-agent-context-v12-evidence-cap"
@@ -265,7 +266,7 @@ async def run_character_agent(
         run = state
         response = run["response"]
         query = response["function"]["arguments"]["query"]
-        found = copy.deepcopy(await search(query))
+        found = copy.deepcopy(await timeline_tool(query, search, check))
         check()
         first = _remember(run["firstSeen"], found)
         selected = _candidates(first, found + run["sources"])
