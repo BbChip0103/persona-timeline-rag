@@ -2,6 +2,7 @@
  * Optional LiteLLM/Langfuse readiness probes never call models or transfer credentials.
  */
 import { parseExposition, type ParsedExposition } from '@ptr/ops';
+import {bounded as nativeBounded} from '../packages/ops/src/bounded';
 
 export const ROLE_TARGETS=[{role:'api',url:'http://127.0.0.1:56441/metrics/prom'},
   {role:'worker',url:'http://127.0.0.1:56442/metrics/prom'}] as const;
@@ -34,12 +35,7 @@ function targets(env:NodeJS.ProcessEnv) {
 }
 
 async function bounded<T>(work:(signal:AbortSignal)=>Promise<T>):Promise<T> {
-  const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;
-  try {
-    return await Promise.race([work(controller.signal),new Promise<never>((_,reject)=>{
-      timer=setTimeout(()=>{controller.abort();reject(new Error('status_timeout'));},2000);
-    })]);
-  } finally {clearTimeout(timer);controller.abort();}
+  return nativeBounded(work,2000);
 }
 async function scrape(deps:Deps,metrics:ReturnType<typeof targets>['metrics']):Promise<Scrape> {
   const entries=await Promise.all(metrics.map(async({role,url})=>{
