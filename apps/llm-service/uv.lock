@@ -1564,7 +1564,7 @@ requires-dist = [
     { name = "langchain-classic", specifier = "==1.0.8" },
     { name = "langchain-openai", specifier = ">=1.1,<2" },
     { name = "langfuse", specifier = "==4.17.0" },
-    { name = "langgraph", specifier = ">=1.0,<2" },
+    { name = "langgraph", specifier = ">=1.2,<2" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.0,<4" },
     { name = "persona-timeline-rag", editable = "../../" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2,<4" },

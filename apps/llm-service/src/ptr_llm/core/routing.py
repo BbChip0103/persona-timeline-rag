@@ -4,6 +4,7 @@ import asyncio
 
 import regex
 
+from .classifier_timeout import bounded
 from .context import is_post_memory
 from .policy import CATEGORIES, input_decision, js_search, rules_decision
 from .safety import is_biographical
@@ -101,27 +102,6 @@ def safety_windows(text):
         end = start + 4100
         windows.append(text[start:end])
     return windows
-
-
-async def bounded(work, timeout_ms, cancelled=None):
-    task = asyncio.create_task(work)
-    abort = asyncio.create_task(cancelled.wait()) if cancelled else None
-    try:
-        done, _ = await asyncio.wait(
-            [task] + ([abort] if abort else []),
-            timeout=timeout_ms / 1000,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if abort is not None and abort in done:
-            raise RuntimeError("aborted")
-        if task not in done:
-            raise TimeoutError()
-        return task.result()
-    finally:
-        # Cancel outstanding transport without holding this turn on a noncooperative provider.
-        for t in [task, abort]:
-            if t and not t.done():
-                t.cancel()
 
 
 async def route_intent(
