@@ -18,6 +18,14 @@ from psycopg_pool import AsyncConnectionPool
 from .billing import PostgresBudgetLedger, ProviderError
 from .config import Settings
 from .core.runtime import LLMEngine
+from .prompt_management import (
+    LOCAL_PROMPT_SNAPSHOT,
+    PromptManagementConfig,
+    PromptSnapshot,
+    applied_prompt,
+    load_prompt_snapshot,
+    prompt_scope,
+)
 from .providers import (
     CheckpointedTextProvider,
     FakeTextProvider,
@@ -121,8 +129,16 @@ class ObservedDecisions:
 class ObservedProvider:
     provider_name: str
 
-    def __init__(self, provider: Any, telemetry: Telemetry, model: str):
+    def __init__(
+        self,
+        provider: Any,
+        telemetry: Telemetry,
+        model: str,
+        *,
+        prompts: PromptSnapshot = LOCAL_PROMPT_SNAPSHOT,
+    ):
         self.provider, self.telemetry, self.model = provider, telemetry, model
+        self.prompts = prompts
 
     def request_fingerprint(self, *args: Any, **kwargs: Any) -> str:
         return self.provider.request_fingerprint(*args, **kwargs)
@@ -133,7 +149,14 @@ class ObservedProvider:
             await close()
 
     async def generate(self, messages: Any, **options: Any) -> str:
-        with self.telemetry.observation("model", as_type="generation", model=self.model) as span:
+        prompt = applied_prompt(self.prompts)
+        with self.telemetry.observation(
+            "model",
+            as_type="generation",
+            model=self.model,
+            metadata=self.prompts.metadata(),
+            **({"prompt": prompt} if prompt is not None else {}),
+        ) as span:
             original = options.get("on_usage")
 
             def usage(value: dict[str, Any]) -> None:
@@ -179,15 +202,19 @@ class Runtime:
         telemetry: Telemetry,
         provider_name: str,
         model: str,
+        *,
+        prompts: PromptSnapshot = LOCAL_PROMPT_SNAPSHOT,
     ):
         self.pool, self.personas, self.domain_engine = pool, personas, engine
         self.result_store, self.provider, self.telemetry = results, provider, telemetry
         self.provider_name, self.model = provider_name, model
+        self.prompts = prompts
         self.engine = self
 
     async def handle(self, grant: dict[str, Any], **options: Any) -> dict[str, Any]:
         # Domain engine owns the single root turn trace.
-        return await self.domain_engine.handle(grant, **options)
+        with prompt_scope(self.prompts):
+            return await self.domain_engine.handle(grant, **options)
 
     async def catalogue(self) -> list[dict[str, Any]]:
         from .core.persona import validate_persona
@@ -211,7 +238,8 @@ class Runtime:
 
     async def draft(self, body: dict[str, Any]) -> dict[str, Any]:
         # Use the configured domain engine, including the Jev fail-closed policy.
-        return await self.domain_engine.draft(body)
+        with prompt_scope(self.prompts):
+            return await self.domain_engine.draft(body)
 
     async def health(self) -> bool:
         try:
@@ -235,6 +263,7 @@ class Runtime:
 async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None) -> Runtime:
     env = os.environ if env is None else env
     assert_llm_database_url(settings.database_url)
+    prompt_config = PromptManagementConfig.from_env(env)
     # Paid proxy routes preserve the explicit live/data gates from the TS
     # runtime. Validate before opening a pool or constructing any provider.
     pricing = None
@@ -295,6 +324,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 or identity["cap"] != 1_000_000
             ):
                 raise ProviderError("RUNTIME_SCHEMA_NOT_READY")
+        prompts = await load_prompt_snapshot(prompt_config, telemetry.client)
         personas = PostgresPersonaRepository(pool, settings.database_url)
         sources = PostgresSourceRepository(pool, settings.database_url)
         results = ResultReceiptStore(pool, settings.database_url)
@@ -370,7 +400,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             and env.get("PTR_LLM_LITELLM_BILLABLE") == "1"
         ):
             provider = CheckpointedTextProvider(provider, AsyncPostgresSaver(pool))
-        provider = ObservedProvider(provider, telemetry, model)
+        provider = ObservedProvider(provider, telemetry, model, prompts=prompts)
         provider.provider_name = provider_name
         embedding = None
         revision = env.get("PTR_LLM_EMBEDDING_MODEL_REVISION")
@@ -429,7 +459,17 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             classifier_timeout_ms=_integer(env, "PTR_LLM_JEV_TIMEOUT_MS", 1500, 50, 10000),
             safety_timeout_ms=_integer(env, "PTR_LLM_SAFETY_TIMEOUT_MS", 2500, 50, 10000),
         )
-        return Runtime(pool, personas, engine, results, provider, telemetry, provider_name, model)
+        return Runtime(
+            pool,
+            personas,
+            engine,
+            results,
+            provider,
+            telemetry,
+            provider_name,
+            model,
+            prompts=prompts,
+        )
     except BaseException:
         try:
             close = getattr(provider, "aclose", None)

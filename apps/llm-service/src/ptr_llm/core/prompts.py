@@ -8,6 +8,7 @@ import regex
 from langchain_core.messages import ChatMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
+from ..prompt_management import current_prompt_snapshot, mark_prompt_applied
 from .errors import CoreError
 from .persona import dumps, render_persona_block, serialized_bytes
 
@@ -49,6 +50,7 @@ def _format_messages(policy, persona, history, text, evidence_json=None, **exten
     formatted = template.format_messages(
         policy=policy, text=text, evidence_json=evidence_json, **blocks
     )
+    mark_prompt_applied(policy)
     # Placeholder messages remain opaque wire values: retain roles, key order and
     # extension fields instead of exporting SDK defaults/metadata to providers.
     return [
@@ -103,7 +105,7 @@ def build_experiment_context(
             seen.add(source["id"])
     kept: list[dict] = []
     included: list[list[dict]] = []
-    policy_text = policy or POLICY["EXPERIMENT_POLICY"]
+    policy_text = policy or current_prompt_snapshot().experiment["EXPERIMENT_POLICY"]
     persona_messages = render_persona_block(persona)
     history_messages = [{"role": m["role"], "content": m["content"]} for m in history]
     notes = [{"role": "system", "content": policy_note}] if policy_note else []
@@ -198,7 +200,7 @@ def build_experiment_context(
 
 
 def build_prompt(persona, history, text, sources, timeline, policy_note=None):
-    policy = json.loads(Path(__file__).with_name("legacy_prompt_policy.json").read_text())
+    policy = current_prompt_snapshot().legacy
     definition = {
         k: persona[k]
         for k in [
