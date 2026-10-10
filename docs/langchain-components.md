@@ -41,6 +41,18 @@ while independent redacted application OTel remains untouched. Standard traced
 retriever/stream callbacks are not exposed by application APIs. Compatibility of
 the inherited SDK async hooks must be rechecked on dependency upgrades.
 
+Native ChatOpenAI and LangGraph turn, character, tool and receipt invocations use
+a separate task-local SDK scope: inherited Runnable configuration and registered
+callback ContextVars are detached and restored; LangSmith tracing is disabled for
+that scope, without changing independent redacted application OTel. ChatOpenAI
+also disables the ambient SDK cache, so it cannot introduce another raw-prompt
+store. Process-global SDK debug/verbose and environment-created callback handlers
+have no scoped opt-out in the pinned SDK and are unsupported: the call fails
+closed with `SDK_RAW_TRACING_FORBIDDEN`, before a text-provider paid reservation.
+Serving SDK/environment configuration must remain stable during an invocation;
+this does not promise suppression of arbitrary mid-call global mutations. Recheck
+the private configure-hook registry boundary on SDK upgrades.
+
 Prompt templates are cached and receive policy, evidence JSON and user text as
 values, not template source. Final messages are formatted once after the wire-native
 budget loop. Existing roles, extra extension fields and JSON key order are preserved;

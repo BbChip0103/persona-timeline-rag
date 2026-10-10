@@ -128,7 +128,10 @@ class CheckpointedTextProvider:
                     # Only the detached call exit is saved; its final receipt write
                     # is awaited before success. Nonbillable mid-call crashes may rerun.
                     # Existing pending sync/exit calls resume without another start.
-                    result = await graph.ainvoke(
+                    from ptr_llm.core.langchain import private_ainvoke
+
+                    result = await private_ainvoke(
+                        graph,
                         initial,
                         config,
                         context=context,
@@ -164,5 +167,14 @@ async def setup_call_checkpoints(owner_database_url: str) -> None:
     async with await AsyncConnection.connect(
         owner_database_url, autocommit=True, prepare_threshold=0, row_factory=dict_row
     ) as conn:
+        identity = await (
+            await conn.execute("SELECT current_user AS role,current_database() AS db")
+        ).fetchone()
+        if (
+            identity is None
+            or identity["role"] != "ptr_split_owner"
+            or identity["db"] != urlsplit(owner_database_url).path.lstrip("/")
+        ):
+            raise ProviderError("CHECKPOINT_SETUP_REQUIRES_OWNER")
         await conn.execute("SET search_path TO llm,public")
         await AsyncPostgresSaver(conn).setup()

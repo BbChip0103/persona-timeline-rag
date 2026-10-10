@@ -96,6 +96,7 @@ class LLMEngine:
         input_safety=None,
         safety_thresholds=None,
         classifier_timeout_ms=1000,
+        safety_timeout_ms=None,
         min_intent_confidence=0.7,
         max_tool_rounds=2,
         agent_validator=None,
@@ -110,6 +111,9 @@ class LLMEngine:
         self.input_safety = input_safety
         self.safety_thresholds = safety_thresholds or DEFAULT_SAFETY_THRESHOLDS
         self.classifier_timeout_ms = classifier_timeout_ms
+        self.safety_timeout_ms = (
+            classifier_timeout_ms if safety_timeout_ms is None else safety_timeout_ms
+        )
         self.min_intent_confidence = min_intent_confidence
         self.max_tool_rounds = max_tool_rounds
         self.agent_validator = agent_validator
@@ -326,7 +330,7 @@ class LLMEngine:
                         "seed": turn["id"],
                         "intent": snap["combined"],
                     },
-                    timeout_ms=self.classifier_timeout_ms,
+                    timeout_ms=self.safety_timeout_ms,
                     thresholds=self.safety_thresholds,
                     cancelled=cancelled,
                     rule=snap["rule"],
@@ -1078,7 +1082,10 @@ class LLMEngine:
             else nullcontext()
         )
         with trace:
-            result = await self._turn_graph.ainvoke(
+            from .langchain import private_ainvoke
+
+            result = await private_ainvoke(
+                self._turn_graph,
                 {"frame": {"sources": [], "memorySources": [], "served": []}},
                 {"recursion_limit": 32},
                 context={"stages": stages},
@@ -1152,7 +1159,7 @@ class LLMEngine:
                 safety, _ = await assess_safety(
                     self.input_safety,
                     {"text": brief, "recentUserTurns": [], "seed": key, "intent": False},
-                    timeout_ms=self.classifier_timeout_ms,
+                    timeout_ms=self.safety_timeout_ms,
                     thresholds=self.safety_thresholds,
                     cancelled=cancelled,
                     rule=rule,

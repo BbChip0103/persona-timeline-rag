@@ -145,6 +145,8 @@ class LiteLLMTextProvider:
                 max_retries=0,
                 streaming=False,
                 use_responses_api=False,
+                cache=False,
+                verbose=False,
                 http_async_client=self._client,
             )
             self._runnables["plain"] = self._sdk
@@ -208,8 +210,11 @@ class LiteLLMTextProvider:
         import httpx
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+        from ptr_llm.core.langchain import assert_private_sdk_configuration, private_ainvoke
+
         if self._closed:
             raise ProviderError("PROVIDER_CLOSED")
+        assert_private_sdk_configuration()
         check_cancel(signal)
         checked_messages(messages, self.input_bytes)
         if deadline_at is not None and (
@@ -396,7 +401,7 @@ class LiteLLMTextProvider:
             ]
             remaining = (effective_deadline - time.time() * 1000) / 1000
             raw = await bounded(
-                runnable.ainvoke(input_messages),
+                private_ainvoke(runnable, input_messages),
                 timeout=remaining,
                 signal=signal,
                 timeout_code=timeout_code,
