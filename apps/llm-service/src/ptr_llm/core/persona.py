@@ -6,10 +6,10 @@ import inspect
 import json
 import unicodedata
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 import regex
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .errors import CoreError
 from .policy import compile_js
@@ -32,21 +32,30 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+# Keep Python's original Unicode strip semantics; native string/list validators
+# own the subsequent strict type and code-point length bounds.
+TrimmedText = Annotated[str, AfterValidator(str.strip)]
+Text200 = Annotated[TrimmedText, Field(min_length=1, max_length=200)]
+Text300 = Annotated[TrimmedText, Field(min_length=1, max_length=300)]
+
+
 class Personality(Strict):
-    summary: str | None = None
-    traits: list[str] = Field(max_length=8)
-    values: list[str] = Field(max_length=6)
-    speechHabits: list[str] = Field(max_length=8)
+    summary: Text300 | None = None
+    traits: list[Annotated[TrimmedText, Field(min_length=1, max_length=40)]] = Field(max_length=8)
+    values: list[Annotated[TrimmedText, Field(min_length=1, max_length=60)]] = Field(max_length=6)
+    speechHabits: list[Annotated[TrimmedText, Field(min_length=1, max_length=80)]] = Field(
+        max_length=8
+    )
 
 
 class Background(Strict):
-    text: str
-    sourceRefs: list[str] = Field(min_length=1, max_length=20)
+    text: Annotated[TrimmedText, Field(min_length=1, max_length=500)]
+    sourceRefs: list[Text200] = Field(min_length=1, max_length=20)
 
 
 class DialogueTurn(Strict):
     speaker: Literal["user", "character"]
-    text: str
+    text: Text200
 
 
 class Dialogue(Strict):
@@ -54,100 +63,71 @@ class Dialogue(Strict):
 
 
 class Lore(Strict):
-    id: str
-    keys: list[str] = Field(min_length=1, max_length=8)
-    content: str
+    id: Text200
+    keys: list[Annotated[TrimmedText, Field(min_length=2, max_length=40)]] = Field(
+        min_length=1, max_length=8
+    )
+    content: Text300
     priority: int = Field(default=50, ge=0, le=100)
-    sourceRefs: list[str] = Field(min_length=1, max_length=10)
+    sourceRefs: list[Text200] = Field(min_length=1, max_length=10)
 
 
 class Meta(Strict):
-    tags: list[str] | None = Field(default=None, max_length=12)
-    creatorNotes: str | None = None
+    tags: list[Annotated[TrimmedText, Field(min_length=1, max_length=30)]] | None = Field(
+        default=None, max_length=12
+    )
+    creatorNotes: Annotated[TrimmedText, Field(min_length=1, max_length=2000)] | None = None
 
 
 class Persona(Strict):
-    id: str
-    personId: str
+    id: Text200
+    personId: Text200
     label: str
     language: str
-    revision: str
+    revision: Text200
     reviewStatus: Literal["synthetic", "silver", "human_reviewed"]
     identity: str
     concept: str
     style: list[str]
     boundaries: list[str]
-    sourceRefs: list[str]
+    sourceRefs: list[Text200]
     greeting: str
-    alternateGreetings: list[str] | None = Field(default=None, max_length=4)
+    alternateGreetings: list[Text300] | None = Field(default=None, max_length=4)
     personality: Personality | None = None
     background: Background | None = None
     exampleDialogues: list[Dialogue] | None = Field(default=None, max_length=3)
     lore: list[Lore] | None = Field(default=None, max_length=50)
     meta: Meta | None = None
 
-    @field_validator("id", "personId", "revision")
-    @classmethod
-    def identifier(cls, value):
-        value = value.strip()
-        if not 1 <= len(value) <= 200:
-            raise ValueError("identifier")
-        return value
-
     @field_validator("label", "language", "greeting")
     @classmethod
-    def required(cls, value):
+    def required(cls, value: str) -> str:
+        # Core string constraints reject escaped lone surrogates that the prior
+        # Python nonempty check accepted; keep that compatibility boundary.
         if not value:
             raise ValueError("required")
         return value
 
-
-def _text(value, max_length, min_length=1):
-    if not isinstance(value, str) or not min_length <= len(value.strip()) <= max_length:
-        raise ValueError("text")
-    return value.strip()
+    @field_validator(
+        "alternateGreetings",
+        "personality",
+        "background",
+        "exampleDialogues",
+        "lore",
+        "meta",
+        mode="before",
+    )
+    @classmethod
+    def optional_present(cls, value: Any) -> Any:
+        # Omitted defaults stay absent; explicit null is not an absent section.
+        if value is None:
+            raise ValueError("optional-null")
+        return value
 
 
 def validate_persona(document):
     try:
-        for optional in [
-            "alternateGreetings",
-            "personality",
-            "background",
-            "exampleDialogues",
-            "lore",
-            "meta",
-        ]:
-            if optional in document and document[optional] is None:
-                raise ValueError("optional-null")
-        p = Persona.model_validate(document).model_dump(exclude_none=True)
-        for path in ["sourceRefs"]:
-            p[path] = [_text(v, 200) for v in p[path]]
-        if "alternateGreetings" in p:
-            p["alternateGreetings"] = [_text(v, 300) for v in p["alternateGreetings"]]
-        if "personality" in p:
-            q = p["personality"]
-            if "summary" in q:
-                q["summary"] = _text(q["summary"], 300)
-            for key, cap in [("traits", 40), ("values", 60), ("speechHabits", 80)]:
-                q[key] = [_text(v, cap) for v in q[key]]
-        if "background" in p:
-            p["background"]["text"] = _text(p["background"]["text"], 500)
-            p["background"]["sourceRefs"] = [_text(v, 200) for v in p["background"]["sourceRefs"]]
-        for d in p.get("exampleDialogues", []):
-            for t in d["turns"]:
-                t["text"] = _text(t["text"], 200)
-        for item in p.get("lore", []):
-            item["id"] = _text(item["id"], 200)
-            item["content"] = _text(item["content"], 300)
-            item["keys"] = [_text(v, 40, 2) for v in item["keys"]]
-            item["sourceRefs"] = [_text(v, 200) for v in item["sourceRefs"]]
-        if "meta" in p:
-            if "tags" in p["meta"]:
-                p["meta"]["tags"] = [_text(v, 30) for v in p["meta"]["tags"]]
-            if "creatorNotes" in p["meta"]:
-                p["meta"]["creatorNotes"] = _text(p["meta"]["creatorNotes"], 2000)
-        return p
+        return Persona.model_validate(document).model_dump(exclude_none=True)
     except (ValidationError, ValueError, TypeError):
         raise CoreError("INVALID_INPUT") from None
 

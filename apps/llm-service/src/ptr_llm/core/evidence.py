@@ -2,10 +2,12 @@
 
 import json
 from datetime import date, datetime
+from typing import Any, Literal, Self
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import regex
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .errors import CoreError
 from .prompts import utf16_length
@@ -158,36 +160,59 @@ def formatted_quote(text, quote):
     }
 
 
+class _ModelReference(BaseModel):
+    """Internal model selection shape, not a second backend wire contract."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sourceId: str
+    quote: str
+    annotationId: Any = None  # Provenance/type policy stays in the binding layer.
+    start: int | None = Field(default=None, ge=0)
+    end: int | None = Field(default=None, gt=0)
+
+    @field_validator("sourceId", "quote")
+    @classmethod
+    def nonempty(cls, value: str) -> str:
+        # Native Rust string bounds impose an additional Unicode policy; plain
+        # strict strings plus Python nonempty preserve the existing decoder.
+        if not value:
+            raise ValueError("reference-empty")
+        return value
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def offset_present(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("offset-null")
+        return value
+
+    @model_validator(mode="after")
+    def paired_offsets(self) -> Self:
+        if ("start" in self.model_fields_set) != ("end" in self.model_fields_set):
+            raise ValueError("offset-pair")
+        return self
+
+
+class _ModelReply(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    status: Literal["answered", "insufficient_evidence", "needs_clarification", "out_of_scope"]
+    answer: str
+    evidenceRefs: list[_ModelReference] = Field(max_length=100)
+
+    @field_validator("answer")
+    @classmethod
+    def utf16_bound(cls, value: str) -> str:
+        if utf16_length(value) > 8000:
+            raise ValueError("answer-limit")
+        return value
+
+
 def _parse(raw):
+    # Keep the existing JSON decoder and original key ordering. Pydantic
+    # validates structure only; ownership, quote offsets and provenance remain
+    # fail-closed domain checks below, and shared wire schemas remain untouched.
     r = json.loads(raw)
-    if (
-        not isinstance(r, dict)
-        or set(r) != {"status", "answer", "evidenceRefs"}
-        or r["status"]
-        not in ("answered", "insufficient_evidence", "needs_clarification", "out_of_scope")
-        or (not isinstance(r["answer"], str))
-        or (utf16_length(r["answer"]) > 8000)
-        or (not isinstance(r["evidenceRefs"], list))
-        or (len(r["evidenceRefs"]) > 100)
-    ):
-        raise ValueError()
-    for ref in r["evidenceRefs"]:
-        if (
-            not isinstance(ref, dict)
-            or set(ref) - {"sourceId", "annotationId", "quote", "start", "end"}
-            or (not all(isinstance(ref.get(k), str) and ref[k] for k in ["sourceId", "quote"]))
-        ):
-            raise ValueError()
-        if ("start" in ref) != ("end" in ref) or (
-            "start" in ref
-            and (
-                type(ref["start"]) is not int
-                or type(ref["end"]) is not int
-                or ref["start"] < 0
-                or (ref["end"] <= 0)
-            )
-        ):
-            raise ValueError()
+    _ModelReply.model_validate(r)
     return r
 
 

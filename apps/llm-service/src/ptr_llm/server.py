@@ -8,7 +8,7 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .config import Settings
@@ -26,7 +26,7 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-    def authenticate(request: Request) -> None:
+    async def authenticate(request: Request) -> None:
         actual = request.headers.get("Authorization", "")
         if not hmac.compare_digest(
             actual.encode("utf-8"), f"Bearer {settings.control_token}".encode()
@@ -49,18 +49,16 @@ def create_app(
             {"status": "ready" if okay else "unavailable"}, status_code=200 if okay else 503
         )
 
-    @app.get("/internal/llm/personas")
-    async def personas(request: Request) -> dict[str, Any]:
-        authenticate(request)
+    @app.get("/internal/llm/personas", dependencies=[Depends(authenticate)])
+    async def personas() -> dict[str, Any]:
         try:
             result = {"contractVersion": 1, "personas": await catalogue()}
             return validate_wire("CatalogueResponse", result)
         except Exception:
             raise HTTPException(status_code=503, detail="CATALOGUE_UNAVAILABLE") from None
 
-    @app.post("/internal/llm/draft")
+    @app.post("/internal/llm/draft", dependencies=[Depends(authenticate)])
     async def make_draft(request: Request) -> dict[str, Any]:
-        authenticate(request)
         raw = bytearray()
         async for chunk in request.stream():
             raw.extend(chunk)
