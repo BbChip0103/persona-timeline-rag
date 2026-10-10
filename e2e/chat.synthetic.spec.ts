@@ -110,3 +110,38 @@ test('SYNTHETIC ONLY: unresolved provider submission shows safe notice, never au
   await expect(page.getByText('합성 응답입니다. 대화를 이어 가요.',{exact:true})).toBeVisible();
   expect(state.sentBodies).toHaveLength(2);expect(state.sentBodies[0].clientRequestId).not.toBe(state.sentBodies[1].clientRequestId);
 });
+
+for(const kind of ['session','draft'] as const)for(const status of [200,503]) {
+  test(`SYNTHETIC ONLY: delayed ${kind} ${status} after logout cannot revive owner cache, stale output or errors`,async({page})=>{
+    await fixtures(page);await login(page);if(kind==='draft'){await newSession(page);await page.getByText('가상 포스트 초안 · 실제 활동 근거 아님',{exact:true}).click();await page.getByLabel('창작 브리프').fill('합성 지연 브리프');}
+    let releaseWrite!:()=>void;let releaseLogout!:()=>void;const writeGate=new Promise<void>(resolve=>{releaseWrite=resolve;});const logoutGate=new Promise<void>(resolve=>{releaseLogout=resolve;});let writes=0;let staleHistoryReads=0;
+    page.on('request',request=>{if(request.method()==='GET'&&new URL(request.url()).pathname.includes('synthetic-stale-session'))staleHistoryReads++;});
+    const pattern=kind==='session'?'**/api/proxy/sessions':'**/api/proxy/sessions/*/drafts';
+    await page.route(pattern,async route=>{if(route.request().method()!=='POST'){await route.fallback();return;}writes++;await writeGate;await route.fulfill({status,json:status===503?{error:{code:'SYNTHETIC_LATE_ERROR'}}:kind==='session'?{session:{id:'synthetic-stale-session',personId:'synthetic-person-a',personaRevision:'synthetic-v1',retrievalMode:'off',ragCondition:'off',createdAt:'2026-01-01T00:00:00Z'}}:{artifact:{content:'synthetic stale draft must not render'},image:{code:'IMAGE_RUNNER_ONLY'}}});});
+    // Hold logout's transport response so the real component remains mounted after owner invalidation.
+    await page.route('**/api/auth',async route=>{if(route.request().method()!=='DELETE'){await route.fallback();return;}await logoutGate;await route.fulfill({json:{ok:true}});});
+    const writeStarted=page.waitForRequest(request=>request.method()==='POST'&&(kind==='session'?new URL(request.url()).pathname==='/api/proxy/sessions':new URL(request.url()).pathname.endsWith('/drafts')));
+    await page.getByRole('button',{name:kind==='session'?'새 대화 시작':'가상 초안 만들기',exact:true}).click();await writeStarted;
+    const logoutStarted=page.waitForRequest(request=>request.method()==='DELETE'&&new URL(request.url()).pathname==='/api/auth');await page.getByRole('button',{name:'로그아웃',exact:true}).click();await logoutStarted;
+    const writeFinished=page.waitForResponse(response=>response.request().method()==='POST'&&(kind==='session'?new URL(response.url()).pathname==='/api/proxy/sessions':new URL(response.url()).pathname.endsWith('/drafts')));releaseWrite();await writeFinished;await page.waitForTimeout(200);
+    await expect(page.locator('.session-button')).toHaveCount(0);await expect(page.locator('.message')).toHaveCount(0);if(kind==='draft')await expect(page.getByLabel('창작 브리프')).toHaveValue('');await expect(page.getByText('synthetic stale draft must not render')).toHaveCount(0);await expect(page.getByText('SYNTHETIC_LATE_ERROR',{exact:false})).toHaveCount(0);expect(staleHistoryReads).toBe(0);expect(writes).toBe(1);
+    releaseLogout();await page.waitForURL('**/login');
+  });
+}
+
+test('SYNTHETIC ONLY: terminal SSE plus failed history GET clears active lock, allows GET-only refresh and never resubmits generation',async({page})=>{
+  const state=await fixtures(page);await login(page);await newSession(page);let failed=true;let historyReads=0;
+  await page.route('**/api/proxy/sessions/*',async route=>{if(route.request().method()==='GET'&&/^\/api\/proxy\/sessions\/[^/]+$/.test(new URL(route.request().url()).pathname)){historyReads++;if(failed){await route.fulfill({status:503,json:{error:{code:'SYNTHETIC_HISTORY_UNAVAILABLE'}}});return;}}await route.fallback();});
+  await page.getByLabel('메시지',{exact:true}).fill('합성 마지막 상태');await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.getByText('SYNTHETIC_HISTORY_UNAVAILABLE',{exact:false})).toBeVisible();
+  await expect(page.getByRole('button',{name:'생성 취소',exact:true})).toHaveCount(0);await expect(page.getByLabel('메시지',{exact:true})).toBeEnabled();await expect(page.getByRole('button',{name:'새 대화 시작'})).toBeEnabled();expect(state.sentBodies).toHaveLength(1);await page.waitForTimeout(500);expect(state.sentBodies).toHaveLength(1);
+  failed=false;await page.getByRole('button',{name:'대화 내역 다시 확인'}).click();await expect(page.getByText('합성 응답입니다. 대화를 이어 가요.',{exact:true})).toBeVisible();expect(historyReads).toBe(2);expect(state.sentBodies).toHaveLength(1);
+});
+
+test('SYNTHETIC ONLY: immediate terminal POST plus history failure offers GET recovery, never same-ID generation POST retry',async({page})=>{
+  const state=await fixtures(page);await login(page);await newSession(page);let failed=true;let historyReads=0;
+  await page.route('**/api/proxy/sessions/*',async route=>{if(route.request().method()==='GET'&&/^\/api\/proxy\/sessions\/[^/]+$/.test(new URL(route.request().url()).pathname)){historyReads++;if(failed){await route.fulfill({status:503,json:{error:{code:'SYNTHETIC_HISTORY_UNAVAILABLE'}}});return;}}await route.fallback();});
+  state.failOnce('PROVIDER_REQUEST_UNRESOLVED');await page.getByLabel('메시지',{exact:true}).fill('합성 즉시 종료 요청');await page.getByRole('button',{name:'보내기',exact:true}).click();
+  await expect(page.getByText('SYNTHETIC_HISTORY_UNAVAILABLE',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'같은 요청 ID로 다시 확인'})).toHaveCount(0);await expect(page.getByLabel('메시지',{exact:true})).toHaveValue('');await expect(page.getByText('이전 외부 요청의 처리 결과가 미확정이라',{exact:false})).toBeVisible();
+  await page.waitForTimeout(500);expect(state.sentBodies).toHaveLength(1);failed=false;await page.getByRole('button',{name:'대화 내역 다시 확인'}).click();await expect(page.getByText('합성 즉시 종료 요청',{exact:true})).toBeVisible();expect(historyReads).toBe(2);expect(state.sentBodies).toHaveLength(1);
+  await page.getByLabel('메시지',{exact:true}).fill('새로운 합성 대화');await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.getByText('합성 응답입니다. 대화를 이어 가요.',{exact:true})).toBeVisible();expect(state.sentBodies).toHaveLength(2);expect(state.sentBodies[0]!.clientRequestId).not.toBe(state.sentBodies[1]!.clientRequestId);
+});
