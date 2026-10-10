@@ -800,7 +800,9 @@ def summarize(output: Path, reports: Path, batches: list[list[dict[str, Any]]],
     for number, batch in enumerate(batches):
         directory = effective_directory(batch_directory(output, number))
         state_path = directory / "state.json"
-        state = load_json(state_path) if state_path.exists() else {"status": "pending"}
+        state: dict[str, Any] = (
+            load_json(state_path) if state_path.exists() else {"status": "pending"}
+        )
         status = state["status"]
         counts[status] = counts.get(status, 0) + 1
         lane = lane_statistics[number % LANES]
