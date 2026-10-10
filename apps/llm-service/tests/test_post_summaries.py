@@ -6,7 +6,11 @@ import pytest
 
 from ptr_llm.billing import ProviderError
 from ptr_llm.core.errors import CoreError
-from ptr_llm.repositories.sources import PostgresSourceRepository, annotation_hash
+from ptr_llm.repositories.sources import (
+    PostgresRetrieval,
+    PostgresSourceRepository,
+    annotation_hash,
+)
 from ptr_llm.repositories.summaries import PostgresSummaryRepository, validate_summary
 
 URL = "postgresql://ptr_split_llm:synthetic@127.0.0.1:58432/ptr_split_test"
@@ -190,7 +194,13 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
             suffix = uuid.uuid4().hex
             first = {**POST, "id": "summary-test-a-" + suffix, "personId": "summary-test-" + suffix}
             second = {**first, "id": "summary-test-b-" + suffix}
-            await sources.import_posts([first, second], "licensed_source")
+            foreign = {**first, "id": "summary-test-foreign-" + suffix, "personId": "other-person"}
+            outside = {
+                **first,
+                "id": "summary-test-outside-" + suffix,
+                "postedAt": "2027-01-02T00:00:00Z",
+            }
+            await sources.import_posts([first, second, foreign, outside], "licensed_source")
             await sources.import_posts(
                 [{**first, "id": "summary-test-unsafe-" + suffix, "unsafe": True}],
                 "licensed_source",
@@ -200,7 +210,7 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
                 "synthetic_fixture",
             )
             records = await repo.list_sources()
-            assert len(records) == 2
+            assert len(records) == 4
             run = "summary-test-run-" + suffix
             await repo.start_run(
                 run,
@@ -218,7 +228,8 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
             for record in records:
                 await repo.import_summary(run, record, text, "fake-summary", "synthetic-v1")
                 await repo.import_summary(run, record, text, "fake-summary", "synthetic-v1")
-            await repo.import_vector(run, first["id"], "fake-embedding", [1] * 1536)
+            for post in (first, foreign, outside):
+                await repo.import_vector(run, post["id"], "fake-embedding", [1] * 1536)
             with pytest.raises(CoreError, match="SUMMARY_INDEX_INCOMPLETE"):
                 await repo.activate_run(run, "fake-embedding")
             with pytest.raises(CoreError, match="SUMMARY_INDEX_UNAVAILABLE"):
@@ -234,7 +245,59 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
                 "dateBasis": "posted",
                 "timezone": "UTC",
                 "limit": 20,
+                "start": "2026-01-01",
+                "end": "2026-01-03",
             }
+            embedded = []
+
+            async def embed(text, **options):
+                embedded.append(text)
+                return [1] * 1536
+
+            adapter = PostgresRetrieval(
+                sources, embed=embed, model_revision="fake-embedding", summary_index=True
+            )
+            paired_query = {**query, "query": "synthetic exhibition"}
+            found, summaries = await adapter.search_with_summaries(
+                paired_query, {"personId": first["personId"]}
+            )
+            assert {post["id"] for post in found} == {first["id"], second["id"]}
+            assert summaries == {first["id"]: text, second["id"]: text}
+            assert all(
+                post["caption"] == POST["caption"] and "summary" not in post for post in found
+            )
+            assert embedded == ["synthetic exhibition"]
+            # Switch the active pointer after child search: hydration stays on its pinned run.
+            alternate = "summary-test-alternate-" + suffix
+            alternate_text = "2026년 1월 2일, 다른 요약.\n가상 관찰.\n다른 사진 설명."
+            await repo.start_run(
+                alternate,
+                summary_model="fake-summary",
+                prompt_revision="synthetic-v1",
+                embedding_model_revision="fake-embedding",
+            )
+            for record in records:
+                await repo.import_summary(
+                    alternate, record, alternate_text, "fake-summary", "synthetic-v1"
+                )
+                await repo.import_vector(alternate, record["id"], "fake-embedding", [1] * 1536)
+            original_search = sources.search_summary_children
+
+            async def switch_after_search(*args, **options):
+                children = await original_search(*args, **options)
+                await repo.activate_run(alternate, "fake-embedding")
+                return children
+
+            sources.search_summary_children = switch_after_search
+            try:
+                pinned, pinned_summaries = await adapter.search_with_summaries(
+                    paired_query, {"personId": first["personId"]}
+                )
+                assert pinned == found and pinned_summaries == summaries
+                assert (await repo.active_run())["run_id"] == alternate
+            finally:
+                sources.search_summary_children = original_search
+                await repo.activate_run(run, "fake-embedding")
             hits = await sources.search_semantic(
                 query,
                 {"personId": first["personId"]},
@@ -296,6 +359,11 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
                 summary_index=True,
                 evidence_scope="caption_image",
             )
+            paired, paired_summaries = await adapter.search_with_summaries(
+                paired_query, {"personId": first["personId"]}, evidence_scope="caption_image"
+            )
+            assert paired == annotated
+            assert paired_summaries == {first["id"]: text, second["id"]: text}
             image_post = next(post for post in annotated if post["id"] == first["id"])
             assert image_post["imageAnnotations"][0]["text"] == annotation["text"]
             captions = await sources.search_semantic(
@@ -307,12 +375,20 @@ async def test_native_pg_summary_index_atomicity_freshness_and_original_evidence
                 evidence_scope="caption",
             )
             assert all("imageAnnotations" not in post for post in captions)
+            caption_parents, _ = await adapter.search_with_summaries(
+                paired_query, {"personId": first["personId"]}, evidence_scope="caption"
+            )
+            assert caption_parents == captions
             # New eligible parent invalidates active manifest, rather than falling back.
             await sources.import_posts(
                 [{**first, "id": "summary-test-new-" + suffix}], "licensed_source"
             )
             with pytest.raises(CoreError, match="SUMMARY_INDEX_UNAVAILABLE"):
                 await repo.active_run()
+            before = len(embedded)
+            with pytest.raises(CoreError, match="SUMMARY_INDEX_UNAVAILABLE"):
+                await adapter.search_with_summaries(paired_query, {"personId": first["personId"]})
+            assert len(embedded) == before
             with pytest.raises(CoreError, match="SUMMARY_INDEX_INCOMPLETE"):
                 await repo.activate_run(run, "fake-embedding")
     finally:

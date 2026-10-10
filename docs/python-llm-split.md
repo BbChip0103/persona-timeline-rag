@@ -134,6 +134,24 @@ than three posts. The provisional threshold is separately configurable with
 Size-bounded requests may require several Jev batches, each ownership/deadline fenced;
 an invalid/missing answer fails closed, not a partial selection or fallback to all posts.
 
+Summary-mode search uses the actual `langchain-classic` `MultiVectorRetriever`:
+read-only scoped `VectorStore` → summary child Documents → SDK ordered parent-ID
+deduplication → read-only `BaseStore.amget` → original caption/image Documents.
+The SDK owns this retrieval orchestration; existing PostgreSQL policy SQL and the
+metered query embedder remain custom. This is not a `PGVectorStore` collection
+migration: no runtime DDL, vector copying or re-embedding is required. The normalized
+summary/vector/parent tables do not directly map to its single-relation schema.
+Missing/stale parents fail closed instead of the SDK default of dropping missing
+entries. Invocation-local stores prevent concurrent person/run/filter leakage.
+
+A small private retriever subclass calls the SDK's unchanged async retrieval hook
+with a noop run manager. Its async entry point deliberately bypasses automatic SDK
+callback configuration: even `callbacks=[]` can inherit global tracing/debug/hooks
+and export original Documents. Standard raw-document callbacks/stream tracing are
+not supported at this internal boundary; independent redacted application OTel is
+unchanged. Ambient Runnable checkpoint/private metadata is detached and restored.
+This migration is framework reuse, not a measured latency or accuracy improvement.
+
 Candidate vectors and selector summaries are pinned to the same immutable run. Followups
 resolve trusted prior references before loading full current parent evidence. Tool
 searches also use selection. Off/creative/safety-deflected paths do not invoke it.

@@ -548,8 +548,23 @@ async def test_date_only_query_real_adapter_never_embeds_empty_string(monkeypatc
     class Sources:
         pool = SimpleNamespace(conninfo=URL)
 
-        async def search_semantic(self, query, trusted, vector, model, **options):
-            return retrieval.sources
+        async def search_summary_children(self, query, trusted, vector, model, **options):
+            return [
+                {
+                    "source_id": post["id"],
+                    "summary": "2020, blue sky.\nPainting.\nClouds.",
+                    "source_hash": post["hash"],
+                    "snapshot": post["snapshot"],
+                }
+                for post in retrieval.sources
+            ]
+
+        async def load_summary_parents(self, keys, trusted, **options):
+            return {
+                post["id"]: {"source": post, "summary": "2020, blue sky.\nPainting.\nClouds."}
+                for post in retrieval.sources
+                if post["id"] in keys
+            }
 
     adapter = PostgresRetrieval(
         Sources(), embed=embed, model_revision="synthetic-embedding", summary_index=True
