@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from typing import Any
 
 from langchain_openai import OpenAIEmbeddings
@@ -16,7 +18,6 @@ from .common import (
     bounded,
     check_cancel,
     checked_messages,
-    checked_text,
     count,
     fingerprint,
     js_json,
@@ -42,6 +43,28 @@ TEXT_MODELS: dict[str, dict[str, Any]] = {
         "agentSchema": True,
     },
 }
+
+
+class _NoCookies(DefaultCookiePolicy):
+    """Pooling must not introduce cross-request provider cookie state."""
+
+    def set_ok(self, cookie: Cookie, request: Any) -> bool:
+        return False
+
+    def return_ok(self, cookie: Cookie, request: Any) -> bool:
+        return False
+
+
+async def _drain(task: asyncio.Task[Any]) -> bool:
+    """Drain owned cleanup even after a second cancellation; report caller cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()  # Consume/propagate cleanup failure; never leave a late error unobserved.
+    return cancelled
 
 
 def _embedding_input_size(inputs: list[str], limit: int, signal: asyncio.Event | None) -> int:
@@ -115,6 +138,55 @@ class OpenRouterClient:
         self.ssl_context = (
             httpx.create_ssl_context(verify=True, trust_env=True) if transport is None else None
         )
+        self._http_client: httpx.AsyncClient | None = None
+        self._closed = False
+        self._closing: asyncio.Task[None] | None = None
+        self._active: set[asyncio.Task[Any]] = set()
+        self._owner: ContextVar[asyncio.Task[Any] | None] = ContextVar(
+            "openrouter_operation", default=None
+        )
+        self._chat: Any = None
+
+    async def _owned(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        if self._closed:
+            raise ProviderError("PROVIDER_CLOSED")
+        if self._owner.get() in self._active:
+            return await operation()
+
+        async def run() -> Any:
+            token = self._owner.set(asyncio.current_task())
+            try:
+                return await operation()
+            finally:
+                self._owner.reset(token)
+
+        task = asyncio.create_task(run())
+        self._active.add(task)
+        try:
+            return await task
+        finally:
+            self._active.discard(task)
+
+    async def aclose(self) -> None:
+        """Stop new work, drain cancellation/receipt settlement, then close the pool."""
+        if self._closing is None:
+            self._closed = True
+
+            async def close() -> None:
+                tasks = tuple(self._active)
+                for task in tasks:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    if self._http_client is not None:
+                        await self._http_client.aclose()
+
+            self._closing = asyncio.create_task(close())
+        # Cancellation of one shutdown waiter must not interrupt shared cleanup.
+        if await _drain(self._closing):
+            raise asyncio.CancelledError
 
     async def _fetch(
         self,
@@ -124,6 +196,25 @@ class OpenRouterClient:
         signal: asyncio.Event | None = None,
         authenticated: bool = False,
         deadline_at: float | None = None,
+    ) -> dict[str, Any]:
+        return await self._owned(
+            lambda: self._fetch_response(
+                path,
+                body=body,
+                signal=signal,
+                authenticated=authenticated,
+                deadline_at=deadline_at,
+            )
+        )
+
+    async def _fetch_response(
+        self,
+        path: str,
+        *,
+        body: dict[str, Any] | None,
+        signal: asyncio.Event | None,
+        authenticated: bool,
+        deadline_at: float | None,
     ) -> dict[str, Any]:
         import httpx
 
@@ -142,33 +233,35 @@ class OpenRouterClient:
 
             if body is not None and deadline_at is not None and time.time() * 1000 >= deadline_at:
                 raise ProviderError("PROVIDER_DEADLINE")
-            async with httpx.AsyncClient(
-                transport=LimitedTransport(self.transport, self.ssl_context),
-                follow_redirects=False,
-                timeout=self.timeout_ms / 1000,
-            ) as client:
-                async with client.stream(
-                    "POST" if body is not None else "GET",
-                    url,
-                    headers=headers,
-                    content=js_json(body).encode() if body is not None else None,
-                ) as response:
-                    if not response.is_success:
-                        raise ProviderError(f"PROVIDER_HTTP_{response.status_code}")
-                    if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
+            if self._http_client is None:
+                self._http_client = httpx.AsyncClient(
+                    transport=LimitedTransport(self.transport, self.ssl_context),
+                    follow_redirects=False,
+                    timeout=self.timeout_ms / 1000,
+                    cookies=CookieJar(policy=_NoCookies()),
+                )
+            async with self._http_client.stream(
+                "POST" if body is not None else "GET",
+                url,
+                headers=headers,
+                content=js_json(body).encode() if body is not None else None,
+            ) as response:
+                if not response.is_success:
+                    raise ProviderError(f"PROVIDER_HTTP_{response.status_code}")
+                if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
+                    raise ProviderError("PROVIDER_RESPONSE_LIMIT")
+                chunks = bytearray()
+                async for chunk in response.aiter_bytes():
+                    check_cancel(signal)
+                    chunks.extend(chunk)
+                    if len(chunks) > 2 * 1024 * 1024:
                         raise ProviderError("PROVIDER_RESPONSE_LIMIT")
-                    chunks = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        check_cancel(signal)
-                        chunks.extend(chunk)
-                        if len(chunks) > 2 * 1024 * 1024:
-                            raise ProviderError("PROVIDER_RESPONSE_LIMIT")
-                    import json
+                import json
 
-                    result = json.loads(chunks)
-                    if not isinstance(result, dict):
-                        raise ProviderError("INVALID_PROVIDER_RESPONSE")
-                    return result
+                result = json.loads(chunks)
+                if not isinstance(result, dict):
+                    raise ProviderError("INVALID_PROVIDER_RESPONSE")
+                return result
 
         try:
             return await bounded(run(), timeout=self.timeout_ms / 1000, signal=signal)
@@ -182,6 +275,9 @@ class OpenRouterClient:
             raise ProviderError("PROVIDER_TRANSPORT") from None
 
     async def verify_pricing(self, signal: asyncio.Event | None = None) -> None:
+        await self._owned(lambda: self._verify_pricing(signal))
+
+    async def _verify_pricing(self, signal: asyncio.Event | None = None) -> None:
         if self._text_verified:
             return
         catalog = await self._fetch("/api/v1/models", signal=signal)
@@ -337,7 +433,9 @@ class OpenRouterClient:
                 raise ProviderError("PROVIDER_COST_EXCEEDS_RESERVATION")
             return result
         except BaseException:
-            await asyncio.shield(self.ledger.finish(key, None, None, None))
+            # Signal/deadline cancellation can race runtime shutdown. Shielding
+            # alone permits a second cancellation to abandon the ledger write.
+            await _drain(asyncio.create_task(self.ledger.finish(key, None, None, None)))
             raise
 
     async def generate(
@@ -348,10 +446,12 @@ class OpenRouterClient:
         deadline_at: float | None = None,
         **options: Any,
     ) -> str:
-        return await self._deadline(
-            self._generate(messages, signal=signal, deadline_at=deadline_at, **options),
-            signal,
-            deadline_at,
+        return await self._owned(
+            lambda: self._deadline(
+                self._generate(messages, signal=signal, deadline_at=deadline_at, **options),
+                signal,
+                deadline_at,
+            )
         )
 
     async def decide(
@@ -362,10 +462,12 @@ class OpenRouterClient:
         deadline_at: float | None = None,
         **options: Any,
     ) -> dict[str, Any]:
-        return await self._deadline(
-            self._decide(request, signal=signal, deadline_at=deadline_at, **options),
-            signal,
-            deadline_at,
+        return await self._owned(
+            lambda: self._deadline(
+                self._decide(request, signal=signal, deadline_at=deadline_at, **options),
+                signal,
+                deadline_at,
+            )
         )
 
     async def _deadline(
@@ -453,21 +555,18 @@ class OpenRouterClient:
             (len(js_json(body).encode()) + len(messages) * 64 + 2048) * 2 * policy["prompt"]
             + output * policy["completion"]
         )
-        result = await self._request(
+        if self._chat is None:
+            from .openrouter_chat import OpenRouterChat
+
+            self._chat = OpenRouterChat(self)
+        text, result = await self._chat.generate(
             body,
-            "chat/completions",
             reservation,
             signal=signal,
             request_key=request_key,
             deadline_at=deadline_at,
+            on_cost=on_cost,
         )
-        if on_cost:
-            on_cost(reported_cost(result))
-        if result.get("model", self.model) != self.model:
-            raise ProviderError("MODEL_MISMATCH")
-        if not isinstance(result.get("choices"), list) or len(result["choices"]) != 1:
-            raise ProviderError("INVALID_PROVIDER_RESPONSE")
-        text = checked_text((result["choices"][0].get("message") or {}).get("content"))
         if on_usage and isinstance(result.get("usage"), dict):
             on_usage(
                 {
@@ -529,6 +628,11 @@ class OpenRouterClient:
     async def embed(
         self, inputs: list[str], *, signal: asyncio.Event | None = None
     ) -> list[list[float]]:
+        return await self._owned(lambda: self._embed(inputs, signal=signal))
+
+    async def _embed(
+        self, inputs: list[str], *, signal: asyncio.Event | None = None
+    ) -> list[list[float]]:
         size = _embedding_input_size(inputs, self.input_bytes, signal)
         body = {
             "model": EMBEDDING_MODEL,
@@ -562,6 +666,9 @@ class OpenRouterClient:
         return vectors
 
     async def reconcile(self, request_key: str, signal: asyncio.Event | None = None) -> None:
+        await self._owned(lambda: self._reconcile(request_key, signal))
+
+    async def _reconcile(self, request_key: str, signal: asyncio.Event | None = None) -> None:
         from urllib.parse import quote
 
         request = await self.ledger.get(request_key)

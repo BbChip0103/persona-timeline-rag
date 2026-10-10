@@ -511,19 +511,22 @@ async def execute_live(
         input_bytes=32768,
         timeout_ms=60000,
     )
-    await client.verify_pricing()
-    result = await build_index(
-        repository,
-        client,
-        run_id=args.run,
-        locations=tags,
-        concurrency=args.concurrency,
-        activate=args.activate,
-        progress=lambda counts: print(json.dumps(counts), flush=True),
-        authored_summaries=authored,
-        authored_source_bindings=authored_bindings,
-    )
-    return {**result, "newExposureMicrousd": await ledger.exposure()}
+    try:
+        await client.verify_pricing()
+        result = await build_index(
+            repository,
+            client,
+            run_id=args.run,
+            locations=tags,
+            concurrency=args.concurrency,
+            activate=args.activate,
+            progress=lambda counts: print(json.dumps(counts), flush=True),
+            authored_summaries=authored,
+            authored_source_bindings=authored_bindings,
+        )
+        return {**result, "newExposureMicrousd": await ledger.exposure()}
+    finally:
+        await client.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:

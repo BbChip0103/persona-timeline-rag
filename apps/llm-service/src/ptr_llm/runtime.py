@@ -204,11 +204,13 @@ class Runtime:
         model: str,
         *,
         prompts: PromptSnapshot = LOCAL_PROMPT_SNAPSHOT,
+        auxiliary_provider: Any = None,
     ):
         self.pool, self.personas, self.domain_engine = pool, personas, engine
         self.result_store, self.provider, self.telemetry = results, provider, telemetry
         self.provider_name, self.model = provider_name, model
         self.prompts = prompts
+        self.auxiliary_provider = auxiliary_provider
         self.engine = self
 
     async def handle(self, grant: dict[str, Any], **options: Any) -> dict[str, Any]:
@@ -255,9 +257,13 @@ class Runtime:
                 await close()
         finally:
             try:
-                await asyncio.to_thread(self.telemetry.shutdown)
+                if self.auxiliary_provider is not None:
+                    await self.auxiliary_provider.aclose()
             finally:
-                await self.pool.close()
+                try:
+                    await asyncio.to_thread(self.telemetry.shutdown)
+                finally:
+                    await self.pool.close()
 
 
 async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None) -> Runtime:
@@ -302,7 +308,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             "options": "-c search_path=llm,public",
         },
     )
-    telemetry = provider = None
+    telemetry = provider = client = None
     try:
         await pool.open(wait=True)
         telemetry = Telemetry(TelemetryConfig.from_env(env))
@@ -469,6 +475,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             provider_name,
             model,
             prompts=prompts,
+            auxiliary_provider=client if provider_name != "openrouter" else None,
         )
     except BaseException:
         try:
@@ -477,8 +484,12 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 await close()
         finally:
             try:
-                if telemetry is not None:
-                    await asyncio.to_thread(telemetry.shutdown)
+                if client is not None:
+                    await client.aclose()
             finally:
-                await pool.close()
+                try:
+                    if telemetry is not None:
+                        await asyncio.to_thread(telemetry.shutdown)
+                finally:
+                    await pool.close()
         raise
