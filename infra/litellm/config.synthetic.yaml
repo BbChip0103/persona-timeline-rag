@@ -14,6 +14,8 @@ model_list:
       input_cost_per_token: 0.000001
       output_cost_per_token: 0.000001
       disable_background_health_check: true
+      ptr_routing:
+        max_seqs: 32
 router_settings:
   num_retries: 0
   max_fallbacks: 0
@@ -26,6 +28,7 @@ router_settings:
   redis_port: 6379
   redis_password: os.environ/PTR_LITELLM_REDIS_PASSWORD
 litellm_settings:
+  callbacks: [ptr_routing.router]
   num_retries: 0
   request_timeout: 5
   drop_params: false

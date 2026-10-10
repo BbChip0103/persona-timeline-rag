@@ -1,6 +1,9 @@
 # Split runtime and non-destructive cutover
 
 The default application runtime is now Nest → Python → LiteLLM/model serving.
+The gateway's [engine routing](gateway-routing.md) preserves cache-affinity,
+selectable cost scoring and background vLLM overload filtering through a pinned
+LiteLLM Proxy extension; these policies do not live in the Python chat worker.
 The historical TS worker is explicit `PTR_LLM_SERVICE_MODE=legacy` and is not the
 Compose/default deployment. See `apps/llm-service/README.md` for native Python
 experiments, reviews, ingestion and persona commands.

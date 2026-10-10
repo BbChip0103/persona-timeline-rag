@@ -105,8 +105,11 @@ separate provider/data-transfer/cost approval. Model aliases are intentionally d
 When two approved vLLM engines are deployed, explicitly select
 `./litellm/config.dual-vllm.live.yaml` and set the additional
 `PTR_VLLM_SECONDARY_{MODEL,BASE_URL,API_KEY}` fields. The two `primary` deployments
-have stable IDs `primary`/`secondary` and are selected by LiteLLM's built-in
-`simple-shuffle` strategy. `x-litellm-model-id` identifies the chosen deployment;
+have stable IDs `primary`/`secondary`. The config-loaded custom selector chooses
+among native healthy candidates using shared credit, cache affinity and selectable
+least-inflight/scored policies; see [engine routing](gateway-routing.md).
+`simple-shuffle` is the native initialization strategy, not the effective primary
+selection policy after callback attachment. `x-litellm-model-id` identifies the chosen deployment;
 selection across healthy engines is different from retrying a failed submission.
 The synthetic fixture's ID is `fake`. All configurations leave retries/fallbacks off.
 

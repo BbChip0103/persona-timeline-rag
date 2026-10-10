@@ -14,6 +14,8 @@ model_list:
       id: primary
       mode: chat
       disable_background_health_check: true
+      ptr_routing:
+        max_seqs: 32
   - model_name: openrouter-primary
     litellm_params:
       model: os.environ/PTR_OPENROUTER_MODEL
@@ -36,6 +38,7 @@ router_settings:
   redis_port: 6379
   redis_password: os.environ/PTR_LITELLM_REDIS_PASSWORD
 litellm_settings:
+  callbacks: [ptr_routing.router]
   num_retries: 0
   request_timeout: 25
   drop_params: false

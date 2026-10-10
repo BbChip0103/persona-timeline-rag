@@ -109,6 +109,13 @@ services:
       LITELLM_TELEMETRY: "False"
       DO_NOT_TRACK: "1"
       DISABLE_ADMIN_UI: "true"
+      PTR_ROUTING_POLICY: ${PTR_ROUTING_POLICY:-least_inflight}
+      PTR_ROUTING_AFFINITY: ${PTR_ROUTING_AFFINITY:-on}
+      PTR_ROUTING_AFFINITY_MIN_TOKENS: ${PTR_ROUTING_AFFINITY_MIN_TOKENS:-256}
+      PTR_ROUTING_AFFINITY_SLACK: ${PTR_ROUTING_AFFINITY_SLACK:-0.5}
+      PTR_ROUTING_METRICS_INTERVAL_S: ${PTR_ROUTING_METRICS_INTERVAL_S:-1}
+      PTR_ROUTING_METRICS_TIMEOUT_S: ${PTR_ROUTING_METRICS_TIMEOUT_S:-0.5}
+      PTR_ROUTING_QUEUE_TIMEOUT_S: ${PTR_ROUTING_QUEUE_TIMEOUT_S:-10}
       PTR_VLLM_MODEL: ${PTR_VLLM_MODEL:-}
       PTR_VLLM_BASE_URL: ${PTR_VLLM_BASE_URL:-}
       PTR_VLLM_API_KEY: ${PTR_VLLM_API_KEY:-}
@@ -118,6 +125,9 @@ services:
       PTR_OPENROUTER_MODEL: ${PTR_OPENROUTER_MODEL:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
+      - ./litellm/ptr_routing.py:/app/ptr_routing.py:ro
+      - ./litellm/routing_state.py:/app/routing_state.py:ro
+      - ./litellm/routing_telemetry.py:/app/routing_telemetry.py:ro
       - type: bind
         source: ${PTR_LITELLM_CONFIG:-./litellm/config.synthetic.yaml}
         target: /app/ptr-config.yaml
