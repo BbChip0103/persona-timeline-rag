@@ -5,6 +5,7 @@ const ChatServiceGetTurn=ChatService.prototype.getTurn;
 import { FakeTextProvider } from '@ptr/providers';
 import { createApiApplication } from '../src/app';
 import type { ApiRuntime, CreativeArtifact } from '../src/runtime';
+import { ZodSchemaPipe } from '../src/schema-pipes';
 // Two owner spaces : the web's production token sends `local-<40 hex>` owners only; this harness token
 // (PTR_API_SYNTHETIC_TOKEN) sends synthetic owners only. Most tests use the harness token.
 const token='synthetic_api_token_abcdefghijklmnop';
@@ -26,6 +27,23 @@ beforeEach(async()=>{
   app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
 });
 afterEach(async()=>{await app.close();});
+test('Nest executes schema pipes after owner authorization; invalid owner stays 403 before schema errors',async()=>{
+  const pipe=jest.spyOn(ZodSchemaPipe.prototype,'transform');
+  try {
+    expect((await call('sessions',{method:'POST',owner:'../invalid',body:{bad:true}})).status).toBe(403);
+    expect(pipe).not.toHaveBeenCalled();
+    const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});
+    expect(created.status).toBe(201);expect(pipe).toHaveBeenCalled();
+    const count=pipe.mock.calls.length;
+    expect((await call(`sessions/${created.body.session.id}/drafts`,{method:'POST',owner:'../invalid',body:{bad:true}})).status).toBe(403);
+    expect(pipe).toHaveBeenCalledTimes(count);
+  } finally {pipe.mockRestore();}
+});
+test('Nest application shutdown owns runtime cleanup once even when app close is repeated',async()=>{
+  runtime.close=jest.fn(async()=>undefined);
+  await app.close();await app.close();
+  expect(runtime.close).toHaveBeenCalledTimes(1);
+});
 test('health safe; authentication required and invalid owner rejected',async()=>{
   expect((await call('health',{auth:'bad'})).body).toEqual({ok:true,service:'persona-timeline-rag',liveEnabled:false});
   expect((await call('personas',{auth:'Bearer wrong'})).status).toBe(403);
@@ -151,7 +169,7 @@ test('new API sessions default agent_loop; explicit legacy remains pinned; inter
 
 type SseEvent={event:string;data:{state?:string;id?:string;reply?:{content?:string};[key:string]:unknown}};
 /** Reads an SSE response to its end (or until limitMs) and parses `event:`/`data:` frames; comments are skipped. */
-async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promise<{status:number;type:string|null;events:SseEvent[];closed:boolean}> {
+async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promise<{status:number;type:string|null;events:SseEvent[];closed:boolean;wire:string}> {
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),limitMs);
   const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':owner},signal:controller.signal});
   const events:SseEvent[]=[];let closed=false;let text='';
@@ -165,7 +183,7 @@ async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promis
     }
   } else await response.text();
   clearTimeout(timer);
-  return {status:response.status,type:response.headers.get('content-type'),events,closed};
+  return {status:response.status,type:response.headers.get('content-type'),events,closed,wire:text};
 }
 function blockedProvider() {
   let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});
@@ -235,6 +253,51 @@ test('SSE: a client gone during the ownership check leaves no subscription behin
     const {events,closed}=await reading;
     expect(subscribes).toBe(1);expect(closed).toBe(true);expect(events.at(-1)!.data.state).toBe('completed');
   } finally {await app2.close();}
+});
+
+test('SSE: native transport emits exact ping comments, no IDs, and releases subscriptions at maximum duration',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  const chat=createLocalChat({store,personas:runtime.personas,provider});let active=0;
+  const eventSource={subscribe:async()=>{active++;return ()=>{active--;};}};
+  const app2=await createApiApplication({...runtime,chat,eventSource},productionToken,{syntheticToken:token,sse:{heartbeatMs:10,maxMs:65,recheckMs:20}});
+  await app2.listen(0,'127.0.0.1');
+  try {
+    const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
+    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_ping',text:'안녕'});
+    const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
+    expect(result.closed).toBe(true);expect(result.wire).toContain(': ping\n\n');expect(result.wire).not.toMatch(/^id:/m);
+    expect(active).toBe(0);
+  } finally {release();await app2.close();}
+});
+
+test('SSE: post-header store errors close safely without the native default Error.message event',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  const chat=createLocalChat({store,personas:runtime.personas,provider});let off=0;
+  const app2=await createApiApplication({...runtime,chat,eventSource:{subscribe:async()=>()=>{off++;}}},productionToken,{syntheticToken:token,sse:{recheckMs:10}});
+  await app2.listen(0,'127.0.0.1');
+  try {
+    const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
+    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_error',text:'안녕'});
+    let calls=0;jest.spyOn(chat,'getTurn').mockImplementation((owner,id)=>++calls<=2?ChatServiceGetTurn.call(chat,owner,id):Promise.reject(new Error('SYNTHETIC_PRIVATE_ERROR')));
+    const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
+    expect(result.closed).toBe(true);expect(result.events).toHaveLength(1);expect(result.wire).not.toContain('SYNTHETIC_PRIVATE_ERROR');expect(result.wire).not.toContain('event: error');expect(off).toBe(1);
+  } finally {release();await app2.close();}
+});
+
+test('SSE: a late subscription after its RxJS timeout is disposed once, not leaked',async()=>{
+  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
+  const chat=createLocalChat({store,personas:runtime.personas,provider});let off=0;
+  let resolveSubscription!:(off:()=>void)=>void;
+  const subscription=new Promise<()=>void>(resolve=>{resolveSubscription=resolve;});
+  const app2=await createApiApplication({...runtime,chat,eventSource:{subscribe:async()=>subscription}},productionToken,{syntheticToken:token,sse:{subscribeTimeoutMs:10,maxMs:30,recheckMs:10}});
+  await app2.listen(0,'127.0.0.1');
+  try {
+    const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
+    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_late',text:'안녕'});
+    const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
+    expect(result.closed).toBe(true);expect(off).toBe(0);
+    resolveSubscription(()=>{off++;});await new Promise<void>(resolve=>setImmediate(resolve));expect(off).toBe(1);
+  } finally {release();await app2.close();}
 });
 
 test('draft briefs pass the input safety filter when it is on: refuse/support without model or storage, deflect with the note',async()=>{

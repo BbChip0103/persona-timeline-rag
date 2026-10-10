@@ -21,8 +21,8 @@ async function main(): Promise<void> {
     });
     await app.listen(port, '127.0.0.1');
   } catch (error) {
-    await app?.close().catch(() => undefined);
-    await runtime.close().catch(() => undefined);
+    if(app) await app.close().catch(() => undefined);
+    else await runtime.close().catch(() => undefined);
     throw error;
   }
   process.stdout.write(`Local research API listening on 127.0.0.1:${port}\n`);
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   const shutdown = () => {
     if (closing) return;
     closing = true;
-    void app!.close().then(() => runtime.close()).then(
+    void app!.close().then(
       () => process.exit(0),
       () => process.exit(1),
     );

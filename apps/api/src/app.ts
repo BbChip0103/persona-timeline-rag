@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { Body, Catch, Controller, Get, HttpCode, HttpException, Inject, Module, Param, Post, Req, Res, type ArgumentsHost, type ExceptionFilter, type INestApplication } from '@nestjs/common';
+import { Body, Catch, Controller, Get, HttpCode, HttpException, Inject, Module, Param, Post, Req, Res, UseGuards, type ArgumentsHost, type CanActivate, type ExecutionContext, type ExceptionFilter, type INestApplication, type OnApplicationShutdown } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import {json,type Request,type Response,type NextFunction} from 'express';
@@ -16,7 +16,8 @@ import { publicTurn } from './public-turn';
 import { DEFAULT_SSE, streamTurn, type SseOptions } from './turn-sse';
 import type { ApiRuntime, CreativeArtifact } from './runtime';
 import type {SplitApiRuntime} from './split-runtime';
-import {validateWire,WireContractError,type StartRequest,type Binding,type CompleteRequest} from '../../../contracts/llm/v1/validate';
+import {WireContractError,type StartRequest,type Binding,type CompleteRequest} from '../../../contracts/llm/v1/validate';
+import { ZodSchemaPipe, WireSchemaPipe } from './schema-pipes';
 const RUNTIME=Symbol('API_RUNTIME');
 const SSE=Symbol('SSE_OPTIONS');
 const DRAFT_LIMIT=Symbol('DRAFT_LIMIT');
@@ -24,6 +25,8 @@ const METRICS=Symbol('API_METRICS');
 /** Per-owner draft requests per minute (in-process, every validator configuration): each draft costs up to two safety requests and one model call. */
 export const DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE=10;
 const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
+const sendBodySchema=SendTurnSchema.omit({sessionId:true});
+const cancelBodySchema=z.preprocess(value=>!value||typeof value==='object'&&Object.keys(value).length===0?{}:value,z.object({}).strict());
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
 const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason:'이 포스트 초안 요청은 이미지를 제출하지 않습니다. 무료 이미지 생성은 자격을 검증하는 별도 private runner에서 실행하며 완료 결과와 작업 상태를 별도로 기록합니다.'};
 /**
@@ -45,6 +48,10 @@ function owner(request:Request):string {
     throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
   }
   return value;
+}
+/** These routes previously authorized the owner before parsing their field schemas. */
+class RequestOwnerGuard implements CanActivate {
+  canActivate(context:ExecutionContext):boolean {owner(context.switchToHttp().getRequest<Request>());return true;}
 }
 function safeSession(session:ChatSession) { const {ownerId:_,...safe}=session;return safe; }
 const safeTurn=publicTurn;
@@ -96,8 +103,8 @@ class ApiController {
     return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'연구용 AI 시뮬레이션 · 비공식'}))};
   }
   @Get('sessions') async sessions(@Req() request:Request) {return {sessions:(await this.runtime.chat.listSessions(owner(request))).map(safeSession)};}
-  @Post('sessions') async createSession(@Req() request:Request,@Body() body:unknown) {
-    const caller=owner(request);const input=sessionSchema.parse(body);
+  @Post('sessions') @UseGuards(RequestOwnerGuard) async createSession(@Req() request:Request,@Body(new ZodSchemaPipe(sessionSchema)) input:z.output<typeof sessionSchema>) {
+    const caller=owner(request);
     const candidates=(await this.runtime.listPersonas()).filter(p=>p.personId===input.personId);
     if(candidates.length!==1) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=candidates[0]!;
@@ -107,10 +114,9 @@ class ApiController {
   @Get('sessions/:id') async session(@Req() request:Request,@Param('id') id:string) {
     const caller=owner(request);return {session:safeSession(await this.runtime.chat.getSession(caller,id)),history:await this.runtime.chat.history(caller,id)};
   }
-  @Post('sessions/:id/turns') async send(@Req() request:Request,@Param('id') id:string,@Body() body:unknown) {
+  @Post('sessions/:id/turns') @UseGuards(RequestOwnerGuard) async send(@Req() request:Request,@Param('id',new ZodSchemaPipe(SendTurnSchema.shape.sessionId)) id:string,@Body(new ZodSchemaPipe(sendBodySchema)) body:z.output<typeof sendBodySchema>) {
     const caller=owner(request);
-    if(!body || typeof body!=='object' || Array.isArray(body) || 'sessionId' in body) throw new CoreError('INVALID_INPUT');
-    const input=SendTurnSchema.parse({...body,sessionId:id});
+    const input={...body,sessionId:id};
     if(forbiddenSecret.test(input.text)) throw new CoreError('INVALID_INPUT');
     const {turn,created}=await this.runtime.chat.submitTurn(caller,input);
     if(created) {this.metrics.turnsCreated.inc();this.log('turn_created',{turnId:turn.id});}
@@ -122,12 +128,11 @@ class ApiController {
     this.metrics.sseOpen.inc();response.once('close',()=>{this.metrics.sseOpen.dec();});
     await streamTurn(this.runtime.chat,this.runtime.eventSource,owner(request),id,request,response,this.sse);
   }
-  @Post('turns/:id/cancel') async cancel(@Req() request:Request,@Param('id') id:string,@Body() body:unknown) {
-    if(body && (typeof body!=='object' || Object.keys(body).length)) throw new CoreError('INVALID_INPUT');
+  @Post('turns/:id/cancel') async cancel(@Req() request:Request,@Param('id') id:string,@Body(new ZodSchemaPipe(cancelBodySchema)) _body:z.output<typeof cancelBodySchema>) {
     return {cancelled:await this.runtime.chat.cancelTurn(owner(request),id)};
   }
-  @Post('sessions/:id/drafts') async draft(@Req() request:Request,@Param('id') id:string,@Body() body:unknown) {
-    const caller=owner(request);const {brief,clientRequestId}=DraftRequestSchema.parse(body);
+  @Post('sessions/:id/drafts') @UseGuards(RequestOwnerGuard) async draft(@Req() request:Request,@Param('id') id:string,@Body(new ZodSchemaPipe(DraftRequestSchema)) body:z.output<typeof DraftRequestSchema>) {
+    const caller=owner(request);const {brief,clientRequestId}=body;
     if(forbiddenSecret.test(brief) || this.runtime.billable&&!clientRequestId) throw new CoreError('INVALID_INPUT');
     const session=await this.runtime.chat.getSession(caller,id);
     this.admitDraft(caller);
@@ -193,11 +198,11 @@ class ApiController {
 class LlmControlController {
   constructor(@Inject(RUNTIME) private readonly runtime:ApiRuntime|SplitApiRuntime) {}
   private control() {if(this.runtime.kind!=='split')throw new HttpException({},404);return this.runtime;}
-  @Post('start') @HttpCode(200) start(@Body() body:unknown) {return this.control().control.start(validateWire<StartRequest>('StartRequest',body));}
-  @Post('snapshot') @HttpCode(200) snapshot(@Body() body:unknown) {return this.control().control.snapshot(validateWire<Binding>('SnapshotRequest',body));}
-  @Post('status') @HttpCode(200) status(@Body() body:unknown) {return this.control().control.status(validateWire<Binding>('StatusRequest',body));}
-  @Post('progress') @HttpCode(200) async progress(@Body() body:unknown) {const r=validateWire<Binding&{state:'retrieving'|'generating'|'validating'}>('ProgressRequest',body),runtime=this.control();const ack=await runtime.control.progress(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.state}).catch(()=>undefined);return ack;}
-  @Post('complete') @HttpCode(200) async complete(@Body() body:unknown) {const r=validateWire<CompleteRequest>('CompleteRequest',body),runtime=this.control();const ack=await runtime.control.complete(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.result.kind==='completed'?'completed':'failed',...(r.result.kind==='failed'?{errorCode:r.result.errorCode}:{})}).catch(()=>undefined);return ack;}
+  @Post('start') @HttpCode(200) start(@Body(new WireSchemaPipe<StartRequest>('StartRequest')) body:StartRequest) {return this.control().control.start(body);}
+  @Post('snapshot') @HttpCode(200) snapshot(@Body(new WireSchemaPipe<Binding>('SnapshotRequest')) body:Binding) {return this.control().control.snapshot(body);}
+  @Post('status') @HttpCode(200) status(@Body(new WireSchemaPipe<Binding>('StatusRequest')) body:Binding) {return this.control().control.status(body);}
+  @Post('progress') @HttpCode(200) async progress(@Body(new WireSchemaPipe<Binding&{state:'retrieving'|'generating'|'validating'}>('ProgressRequest')) r:Binding&{state:'retrieving'|'generating'|'validating'}) {const runtime=this.control();const ack=await runtime.control.progress(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.state}).catch(()=>undefined);return ack;}
+  @Post('complete') @HttpCode(200) async complete(@Body(new WireSchemaPipe<CompleteRequest>('CompleteRequest')) r:CompleteRequest) {const runtime=this.control();const ack=await runtime.control.complete(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.result.kind==='completed'?'completed':'failed',...(r.result.kind==='failed'?{errorCode:r.result.errorCode}:{})}).catch(()=>undefined);return ack;}
 }
 /** `syntheticToken`: the harness token (PTR_API_SYNTHETIC_TOKEN, demo layer); it must differ from the production token. */
 export async function createApiApplication(runtime:ApiRuntime|SplitApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string}={}):Promise<INestApplication> {
@@ -208,8 +213,12 @@ export async function createApiApplication(runtime:ApiRuntime|SplitApiRuntime,to
   const synthetic=options.syntheticToken;
   if(synthetic!==undefined && (!validToken(synthetic) || synthetic===token)) throw new CoreError('INVALID_INPUT');
   const metrics=new ApiMetrics();
+  class RuntimeLifecycle implements OnApplicationShutdown {
+    private closing?:Promise<void>;
+    onApplicationShutdown():Promise<void> {return this.closing??=Promise.resolve().then(()=>runtime.close?.());}
+  }
   @Module({controllers:[ApiController,LlmControlController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}},{provide:DRAFT_LIMIT,useValue:draftLimit},
-    {provide:METRICS,useValue:metrics}]})
+    {provide:METRICS,useValue:metrics},RuntimeLifecycle]})
   class ApiModule {}
   const app=await NestFactory.create<NestExpressApplication>(ApiModule,{logger:false,bodyParser:false});
   // Token middleware runs before body parsing so unauthenticated input has no effect.

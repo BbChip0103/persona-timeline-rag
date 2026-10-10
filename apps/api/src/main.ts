@@ -10,7 +10,7 @@ async function main() {
   await app.listen(port,'127.0.0.1');
   // No secrets, connection URLs, actual persona data or upstream errors in startup output.
   process.stdout.write(`Local research API listening on 127.0.0.1:${port}\n`);
-  const shutdown=()=>{void app.close().then(()=>runtime.close?.()).finally(()=>process.exit(0));};
+  const shutdown=()=>{void app.close().finally(()=>process.exit(0));};
   process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
 }
 // Only a bare error code (e.g. EADDRINUSE) is printed: messages can carry connection strings.
