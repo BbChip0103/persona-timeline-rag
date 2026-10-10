@@ -1,5 +1,7 @@
 # Framework synthetic functional and comparison gates
 
+> Historical TypeScript runtime reference: current API is split-only and the Node worker/legacy execution commands are retired. Reproduce these experiments from their archived reference checkout; use [current Python split](python-llm-split.md) and [native ownership](generic-framework-components.md) for current operation.
+
 ## Frozen protocol (before the first comparative measurement)
 
 The synthetic fixture is the same actual HTTP model server for both paths:

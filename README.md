@@ -17,6 +17,8 @@
 
 ## 현재 프레임워크 실행 경로
 
+범용 로그인·요청 제한·웹 캐시/SSE·로그·DB CRUD·재시도는 [네이티브 라이브러리 소유권과 남는 정책](docs/generic-framework-components.md)을 따른다. 기존 브라우저 cookie는 한 번 다시 로그인해야 하며 owner/history는 유지된다.
+
 Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker → LiteLLM/model serving**이 기본 경로입니다. Nest는 접수 outbox·DB fencing·최종 atomic commit/SSE를, Python은 LLM 처리·큰 호출 receipt·유료 장부·inline Guardrails/Jev·native Langfuse v4 평가/검수를 맡습니다. 코드/의존성/이미지/CI·app/llm DB 계정과 private env를 분리했습니다. [현재 분리 실행·자료이전 계약](docs/python-llm-split.md)과 [Python CLI](apps/llm-service/README.md)를 먼저 따르세요. [TS 프레임워크 실행](docs/framework-runtime.md)·[이전 배포](docs/framework-deployment.md)·[이전 평가](docs/framework-evaluation.md)는 명시적 legacy 재현 기록입니다. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
 
 ## 실행

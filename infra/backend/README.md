@@ -2,13 +2,13 @@
 
 The final root Docker image uses this **separate production manifest and frozen lock**. The historical workspace
 lock remains available for legacy CLI/tests and the disposable Next.js build stage; its dependencies are never
-copied into the runtime image. The profile selects already-locked versions, not new libraries.
+copied into the runtime image. The profile pins reviewed native web/session/query/logging/CRUD dependencies alongside existing versions.
 
 The final image contains only split API control/queue/storage code, shared wire contracts, narrow policy/log/config
 helpers, the compiled web application, and this production dependency closure. No LangChain, OpenAI or Langfuse
 SDK, provider implementations, Node LLM worker, Python package, private configuration, data or reports are included.
 `packaged-main.ts` always runs split mode and rejects `PTR_LLM_SERVICE_MODE=legacy` before any resource connection.
-Historical legacy commands run from the full development checkout, not this image.
+Historical comparison helpers require their archived reference checkout; retired serving/worker commands are not available in the current checkout.
 
 ```sh
 docker build -t ptr-backend:split .

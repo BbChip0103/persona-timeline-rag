@@ -8,6 +8,7 @@ Adapters are for application/provider contracts, not alternative RAG orchestrati
 
 | Function | Native component | Explicit adapter/policy boundary |
 | --- | --- | --- |
+| Direct OpenRouter standard chat | `ChatOpenAI` async/create+parse | Exact metered wire/body order, raw receipts/cost, no SDK retry or independent client |
 | Gateway text and guided output | `ChatOpenAI`, `with_structured_output` | Metered transport, model allowlist, receipts, cancellation |
 | Summary child → original parents | `MultiVectorRetriever` | Read-only normalized PostgreSQL stores, pinned run, current hashes/revisions |
 | Legacy caption/image semantic search | `VectorStoreRetriever` | Scoped cosine SQL, trusted person/date/timezone/evidence condition |
@@ -138,3 +139,6 @@ no model calls. New deployment/paid evaluation remains a separate action.
 - [ContextualCompressionRetriever](https://reference.langchain.com/python/langchain-classic/retrievers/contextual_compression/ContextualCompressionRetriever)
 - [MultiVector implementation](https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/retrievers/multi_vector.py)
 - [JSON parser implementation](https://github.com/langchain-ai/langchain/blob/master/libs/core/langchain_core/output_parsers/json.py)
+
+For generic web/storage/logging/HTTP libraries and explicitly retained compatibility boundaries, see
+[generic framework ownership](generic-framework-components.md).

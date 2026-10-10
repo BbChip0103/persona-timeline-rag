@@ -1,5 +1,7 @@
 # Current deployment: Python split
 
+> Historical TypeScript runtime reference: current API is split-only and the Node worker/legacy execution commands are retired. Reproduce these experiments from their archived reference checkout; use [current Python split](python-llm-split.md) and [native ownership](generic-framework-components.md) for current operation.
+
 The default worker is now the independent Python image. Use separate app/LLM roles
 and private env files; see [split cutover/runbook](python-llm-split.md). Historical
 framework instructions below describe the retained TS reference/runtime and must not

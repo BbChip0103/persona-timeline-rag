@@ -1,5 +1,7 @@
 # Framework deployment and isolated verification
 
+> Historical TypeScript runtime reference: current API is split-only and the Node worker/legacy execution commands are retired. Reproduce these experiments from their archived reference checkout; use [current Python split](python-llm-split.md) and [native ownership](generic-framework-components.md) for current operation.
+
 ## Boundaries and versions
 
 `infra/compose.framework.yml` is the new isolated infrastructure stack. It never loads
