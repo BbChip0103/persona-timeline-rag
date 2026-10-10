@@ -18,7 +18,14 @@ import psycopg
 from persona_timeline_rag.split_migration import read_environment
 
 
-async def run(roles: Path, serving: Path, output: Path):
+async def run(
+    roles: Path,
+    serving: Path,
+    output: Path,
+    *,
+    app_image: str = "ptr_app:split-final",
+    llm_image: str = "ptr_llm:split-final",
+):
     credentials = read_environment(roles)
     provider = read_environment(serving)
     output.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -61,8 +68,8 @@ async def run(roles: Path, serving: Path, output: Path):
     ownership = secrets.token_hex(16)
     try:
         for label, env, image in [
-            ("api", api, "ptr_app:split-final"),
-            ("worker", llm, "ptr_llm:split-final"),
+            ("api", api, app_image),
+            ("worker", llm, llm_image),
         ]:
             private = output / (label + ".env")
             private.write_text("\n".join(k + "=" + v for k, v in env.items()) + "\n")
@@ -236,14 +243,28 @@ async def run(roles: Path, serving: Path, output: Path):
             log.close()
 
 
-if __name__ == "__main__":
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--roles-env", type=Path, required=True)
     parser.add_argument("--serving-env", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument("--app-image", default="ptr_app:split-final")
+    parser.add_argument("--llm-image", default="ptr_llm:split-final")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
     try:
-        result = asyncio.run(run(args.roles_env, args.serving_env, args.output))
+        result = asyncio.run(
+            run(
+                args.roles_env,
+                args.serving_env,
+                args.output,
+                app_image=args.app_image,
+                llm_image=args.llm_image,
+            )
+        )
         raise SystemExit(0 if result["passed"] else 1)
     except Exception as error:
         raise SystemExit("LIVE_SPLIT_FAILED " + type(error).__name__) from None
