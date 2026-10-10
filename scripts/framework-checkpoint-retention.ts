@@ -20,6 +20,7 @@ export async function retainFrameworkCheckpoints(pool:Pool,options:CheckpointRet
   const cutoff=new Date(now.getTime()-days*86400000).toISOString();
   return transaction(pool,async client=>{
     const identity=await client.query('SELECT current_database() AS db,current_user AS username');
+    if(['ptr_split_test','ptr_split_research'].includes(identity.rows[0]?.db))throw new Error('SPLIT_RUNTIME_USE_PTR_LLM_RETENTION');
     if(!isIsolatedDatabaseIdentity(identity.rows[0]?.db,identity.rows[0]?.username))throw new Error('ISOLATED_DATABASE_REQUIRED');
     const candidates=await client.query(`SELECT t.id FROM turns t
       WHERE t.state IN ('completed','failed','cancelled') AND t.finished_at < $1::timestamptz
@@ -58,4 +59,4 @@ export async function checkpointRetentionMain(args:string[]=process.argv.slice(2
   } finally {await pool.end();}
 }
 if(process.argv[1]?.endsWith('framework-checkpoint-retention.ts'))
-  void checkpointRetentionMain().catch(()=>{process.stderr.write('CHECKPOINT_RETENTION_FAILED\n');process.exitCode=1;});
+  void checkpointRetentionMain().catch(error=>{process.stderr.write(error instanceof Error&&error.message==='SPLIT_RUNTIME_USE_PTR_LLM_RETENTION'?'SPLIT_RUNTIME_USE_PTR_LLM_RETENTION\n':'CHECKPOINT_RETENTION_FAILED\n');process.exitCode=1;});

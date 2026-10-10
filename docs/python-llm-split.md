@@ -258,3 +258,55 @@ adapter share measured functions, but that is not a claim that every future inst
 has already completed a full 10,000-job proof. Its instrumentation is outside the timed
 load protocol. Local numbers do not predict production GPU throughput. Actual paid/GPU and Langfuse
 checks must use narrowly selected approved endpoints, not unbounded corpus re-evaluation.
+
+## Explicit split maintenance and CI
+
+The Node `framework:checkpoints`, `framework:checkpoint-retention` and
+`framework:receipt-retention` commands are **legacy/public-schema only**. They reject
+split databases rather than operating on empty/wrong public tables. Use the native
+owner-only commands below with an explicitly selected
+`PTR_LLM_MAINTENANCE_DATABASE_URL` (loopback 58432, `ptr_split_owner`, exact split DB).
+Do not put the maintenance owner credential in either running service env.
+
+```sh
+# Run from a separate, approved private maintenance environment; no automatic DDL.
+uv run --project apps/llm-service ptr-llm checkpoint-setup
+# Read-only plan/counts by default. Explicit application requires exact DB confirmation.
+uv run --project apps/llm-service ptr-llm retention
+uv run --project apps/llm-service ptr-llm retention \
+  --apply --confirm-database ptr_split_test
+```
+
+Retention preserves provider accounting/idempotency tombstones and unresolved work;
+missing historical bindings are reported as deferred, never inferred from body hashes.
+It is an explicit maintenance operation, not a worker startup hook or an automatically
+installed daily schedule. Langfuse/public API retention and external backup expiry are
+separate boundaries; a local DB sweep does not prove erasure there.
+
+For a **new synthetic** `ptr_split_test` with preprovisioned isolated roles/pgvector,
+`scripts/split-bootstrap.py --roles-env /private/new-test-roles.env` applies the original
+schema, partitions it, applies split receipt/summary upgrades, creates the **native Python
+saver as owner**, then verifies runtime cross-schema/DDL denials. It rejects mismatched
+runtime targets before connecting the owner and refuses an existing target. It does
+not populate research data, activate a summary index, reset a ledger or repair an
+existing deployment. Do not call `pnpm framework:checkpoints` afterward.
+
+The `llm-service` workflow has a separate manual/main `split-integration` job. It creates
+fresh runner-only PG/Redis and owner/app/LLM roles, runs this bootstrap, actual Python
+PG/BullMQ suites, app-schema generation/fencing/ACK tests and Nest→Python cancellation,
+RAG-off and crash-recovery smoke. It uses fake generation and no corpus/provider secrets.
+Offline PR tests, two independent image builds and gateway routing qualification remain
+separate checks. A passed CI invocation is not a GPU performance or real-answer-quality
+qualification.
+
+Backend `/api/health` is dependency **liveness** (`SELECT 1` + Redis `PING`), not proof
+that all app migrations/permissions are ready. Python startup checks its role/schema/cap.
+Use the split integration/bootstrap gates for cutover readiness, not just a green backend
+health response.
+
+`ptr-llm ingest` reuses licensed download/normalization tooling; it is not a new-source
+DB importer. `prepare:research` and the historical TS preparation/index scripts remain
+legacy/public-schema research tools. Existing licensed data is copied by the explicit
+split migration. A future licensed-source preparation/import command must deliberately
+preserve source screening, authored persona protections and immutable provenance before
+it can replace those legacy scripts; do not point them at split runtime credentials.

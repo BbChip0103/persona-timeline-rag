@@ -25,6 +25,7 @@ export async function retainFrameworkReceipts(pool:Pool,options:ReceiptRetention
   return transaction(pool,async client=>{
     const identity=await client.query('SELECT current_database() AS db,current_user AS username');
     const db=identity.rows[0]?.db;
+    if(['ptr_split_test','ptr_split_research'].includes(db))throw new Error('SPLIT_RUNTIME_USE_PTR_LLM_RETENTION');
     if(!isIsolatedDatabaseIdentity(db,identity.rows[0]?.username))throw new Error('ISOLATED_DATABASE_REQUIRED');
     if(options.apply&&options.confirmDatabase!==db)throw new Error('RECEIPT_RETENTION_CONFIRMATION_REQUIRED');
     const deferred=await client.query(`SELECT
@@ -74,4 +75,4 @@ export async function receiptRetentionMain(args:string[]=process.argv.slice(2),e
   finally {await pool.end();}
 }
 if(process.argv[1]?.endsWith('framework-receipt-retention.ts'))
-  void receiptRetentionMain().catch(()=>{process.stderr.write('RECEIPT_RETENTION_FAILED\n');process.exitCode=1;});
+  void receiptRetentionMain().catch(error=>{process.stderr.write(error instanceof Error&&error.message==='SPLIT_RUNTIME_USE_PTR_LLM_RETENTION'?'SPLIT_RUNTIME_USE_PTR_LLM_RETENTION\n':'RECEIPT_RETENTION_FAILED\n');process.exitCode=1;});

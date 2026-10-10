@@ -1,9 +1,11 @@
 """Initialize a NEW synthetic database; never run against the research source."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg
 
@@ -19,8 +21,32 @@ def main():
     identity = validate_target(url)
     if identity["dbname"] != "ptr_split_test":
         raise RuntimeError("SYNTHETIC_TARGET_REQUIRED")
+    # Validate every runtime target before opening the owner connection. A typo
+    # must not turn synthetic permission probes into research/database access.
+    for role in ("APP", "LLM"):
+        target = urlsplit(env[f"PTR_SPLIT_TEST_{role}_DATABASE_URL"])
+        if not (
+            target.scheme in ("postgres", "postgresql")
+            and target.hostname == "127.0.0.1"
+            and target.port == 58432
+            and target.path == "/ptr_split_test"
+            and target.username == f"ptr_split_{role.lower()}"
+            and target.password
+            and not target.query
+            and not target.fragment
+        ):
+            raise RuntimeError("SYNTHETIC_RUNTIME_TARGET_REQUIRED")
     with psycopg.connect(url, autocommit=True) as db:
-        if db.execute("SELECT to_regclass('public.ptr_schema_migrations')").fetchone()[0]:
+        if db.execute("SELECT current_database(),current_user").fetchone() != (
+            "ptr_split_test",
+            "ptr_split_owner",
+        ):
+            raise RuntimeError("SYNTHETIC_OWNER_IDENTITY_REQUIRED")
+        tables = db.execute(
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname IN ('app','llm') "
+            "OR (schemaname='public' AND tablename<>'spatial_ref_sys')"
+        ).fetchone()
+        if tables is None or tables[0]:
             raise RuntimeError("EMPTY_TARGET_REQUIRED")
         for path in sorted(Path("supabase/migrations").glob("*.sql")):
             db.execute(path.read_text())
@@ -89,6 +115,14 @@ def main():
             ),
         )
         partition(db, Path("supabase/split/0001_owner_partition.sql"))
+        # Explicit synthetic owner setup, not DDL in worker startup. The owner
+        # partition supplies default privileges for subsequently created saver
+        # tables; runtime roles keep their existing no-DDL boundary.
+        for name in ("0002_receipt_scope.sql", "0003_post_summaries.sql"):
+            db.execute((Path("supabase/split") / name).read_text())
+    from ptr_llm.providers.checkpoints import setup_call_checkpoints
+
+    asyncio.run(setup_call_checkpoints(url))
     for role, schema, other, own, foreign in [
         ("APP", "app", "llm", "sessions", "personas"),
         ("LLM", "llm", "app", "personas", "sessions"),
@@ -105,7 +139,7 @@ def main():
                 except psycopg.errors.InsufficientPrivilege:
                     continue
                 raise RuntimeError("RUNTIME_PERMISSION_BOUNDARY_FAILED")
-    print("Synthetic bootstrap + 6 runtime permission denials PASS")
+    print("Synthetic bootstrap + native saver + 6 runtime permission denials PASS")
 
 
 if __name__ == "__main__":

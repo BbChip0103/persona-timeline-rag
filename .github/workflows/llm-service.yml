@@ -1,9 +1,9 @@
 name: llm-service
 on:
   push:
-    paths: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'pyproject.toml', 'contracts/**', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
+    paths: ['apps/llm-service/**', 'scripts/split-*.py', 'packages/storage/**', 'packages/core/**', 'packages/messaging/**', 'apps/api/**', 'infra/split/**', 'infra/compose.app.yml', 'Dockerfile', 'contracts/**', 'supabase/split/**', 'supabase/migrations/**', 'src/persona_timeline_rag/**', 'pyproject.toml', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
   pull_request:
-    paths: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'pyproject.toml', 'contracts/**', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
+    paths: ['apps/llm-service/**', 'scripts/split-*.py', 'packages/storage/**', 'packages/core/**', 'packages/messaging/**', 'apps/api/**', 'infra/split/**', 'infra/compose.app.yml', 'Dockerfile', 'contracts/**', 'supabase/split/**', 'supabase/migrations/**', 'src/persona_timeline_rag/**', 'pyproject.toml', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
   workflow_dispatch:
 permissions:
   contents: read
@@ -29,7 +29,7 @@ jobs:
         run: PYTHONPATH=src uv run --project apps/llm-service python -m unittest discover -s tests
       - name: Lint and syntax
         run: |
-          uv run --project apps/llm-service ruff check apps/llm-service/src apps/llm-service/tests scripts/split-memory-proof.py
+          uv run --project apps/llm-service ruff check apps/llm-service/src apps/llm-service/tests scripts/split-memory-proof.py scripts/split-bootstrap.py
           uv run --project apps/llm-service python -m compileall -q apps/llm-service/src scripts/split-memory-proof.py
       - name: Typecheck service modules
         run: |
@@ -41,3 +41,123 @@ jobs:
         run: |
           docker run --rm --entrypoint sh ptr-llm-ci:${{ github.sha }} -c 'test ! -d /app/node_modules && test ! -d /app/data && test ! -d /app/reports && ! command -v node'
           docker run --rm --entrypoint python ptr-llm-ci:${{ github.sha }} -c 'from ptr_llm.control import validate_wire; from ptr_llm.runtime import build_runtime; assert validate_wire("Dispatch", {"contractVersion":1,"turnId":"00000000-0000-4000-8000-000000000001","dispatchSeq":1})'
+
+  split-integration:
+    # Explicit manual runs and main cutovers qualify the actual migrated topology.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6
+        env:
+          POSTGRES_USER: ptr_ci_bootstrap
+          POSTGRES_DB: postgres
+          # Ephemeral runner-only bootstrap; generated runtime roles use passwords.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['127.0.0.1:58432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ptr_ci_bootstrap -d postgres"
+          --health-interval 3s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13.5'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.14.0
+      - run: corepack enable pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: python -m pip install uv==0.10.2
+      - run: uv sync --project apps/llm-service --locked
+      - name: Create owner-only synthetic role configuration
+        run: |
+          python - <<'PY'
+          import os, secrets, uuid
+          from pathlib import Path
+          owner, app, llm, redis, control = (secrets.token_hex(24) for _ in range(5))
+          token = uuid.uuid4().hex
+          roles = {
+              'PTR_SPLIT_TEST_OWNER_DATABASE_URL': f'postgresql://ptr_split_owner:{owner}@127.0.0.1:58432/ptr_split_test',
+              'PTR_SPLIT_TEST_APP_DATABASE_URL': f'postgresql://ptr_split_app:{app}@127.0.0.1:58432/ptr_split_test',
+              'PTR_SPLIT_TEST_LLM_DATABASE_URL': f'postgresql://ptr_split_llm:{llm}@127.0.0.1:58432/ptr_split_test',
+              'PTR_REDIS_URL': f'redis://:{redis}@127.0.0.1:58479/0',
+              'PTR_LLM_CONTROL_TOKEN': control,
+          }
+          path = Path(os.environ['RUNNER_TEMP']) / 'ptr-split-ci-roles.env'
+          with path.open('x') as file:
+              path.chmod(0o600)
+              file.writelines(f'{key}={value}\n' for key, value in roles.items())
+          exported = {
+              **roles,
+              'PTR_PROVIDER_PG_TEST_URL': roles['PTR_SPLIT_TEST_LLM_DATABASE_URL'],
+              'PTR_CI_OWNER_PASSWORD': owner, 'PTR_CI_APP_PASSWORD': app,
+              'PTR_CI_LLM_PASSWORD': llm, 'PTR_CI_REDIS_PASSWORD': redis,
+              'PTR_SPLIT_CI_REDIS_CONTAINER': 'ptr-split-ci-' + token,
+              'PTR_SPLIT_CI_OWNER_ID': token,
+          }
+          for value in (owner, app, llm, redis, control, *roles.values()):
+              print('::add-mask::' + value)
+          with open(os.environ['GITHUB_ENV'], 'a') as file:
+              file.writelines(f'{key}={value}\n' for key, value in exported.items())
+          PY
+      - name: Provision only the new service container database and roles
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec -i --env PTR_CI_OWNER_PASSWORD --env PTR_CI_APP_PASSWORD --env PTR_CI_LLM_PASSWORD "$PG_CONTAINER" \
+            psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --username ptr_ci_bootstrap --dbname postgres <<'SQL'
+          \getenv owner_password PTR_CI_OWNER_PASSWORD
+          \getenv app_password PTR_CI_APP_PASSWORD
+          \getenv llm_password PTR_CI_LLM_PASSWORD
+          SELECT format('CREATE ROLE ptr_split_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', :'owner_password') \gexec
+          SELECT format('CREATE ROLE ptr_split_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', :'app_password') \gexec
+          SELECT format('CREATE ROLE ptr_split_llm LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', :'llm_password') \gexec
+          CREATE DATABASE ptr_split_test OWNER ptr_split_owner;
+          REVOKE ALL ON DATABASE ptr_split_test FROM PUBLIC;
+          GRANT CONNECT ON DATABASE ptr_split_test TO ptr_split_app,ptr_split_llm;
+          \connect ptr_split_test
+          CREATE EXTENSION vector;
+          REVOKE ALL ON SCHEMA public FROM PUBLIC;
+          GRANT USAGE,CREATE ON SCHEMA public TO ptr_split_owner;
+          SQL
+      - name: Start only this job's authenticated queue
+        run: |
+          docker run -d --name "$PTR_SPLIT_CI_REDIS_CONTAINER" --label "ptr.split-ci-owner=$PTR_SPLIT_CI_OWNER_ID" \
+            -p 127.0.0.1:58479:6379 --env REDIS_PASSWORD="$PTR_CI_REDIS_PASSWORD" \
+            redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08 \
+            sh -c 'exec redis-server --appendonly yes --maxmemory-policy noeviction --requirepass "$REDIS_PASSWORD"'
+          for _ in $(seq 1 50); do
+            if docker exec "$PTR_SPLIT_CI_REDIS_CONTAINER" sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping' | grep -q PONG; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          exit 1
+      - name: Explicit synthetic owner bootstrap, native saver and role denials
+        run: uv run --project apps/llm-service python scripts/split-bootstrap.py --roles-env "$RUNNER_TEMP/ptr-split-ci-roles.env"
+      - name: Actual Python receipt, vector, checkpoint and BullMQ regressions
+        env:
+          PTR_LLM_QUEUE_INTEGRATION: '1'
+          PTR_RETENTION_INTEGRATION: '1'
+        run: |
+          # Give the disposable retention fixture a local tag for this exact pinned image.
+          docker tag pgvector/pgvector:0.8.1-pg15@sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6 pgvector/pgvector:0.8.1-pg15
+          uv run --project apps/llm-service pytest apps/llm-service/tests -q
+      - name: Actual app-schema generation, fencing and durable ACK regressions
+        run: pnpm exec jest --runInBand --runTestsByPath packages/storage/test/llm-control.integration.test.ts
+      - name: Actual Nest to Python wire, RAG-off, cancellation and crash recovery
+        run: uv run --project apps/llm-service python scripts/split-smoke.py --roles-env "$RUNNER_TEMP/ptr-split-ci-roles.env" --output "$RUNNER_TEMP/ptr-split-ci-smoke"
+      - name: Remove only this job's owned queue and private configuration
+        if: always()
+        run: |
+          if [ -n "${PTR_SPLIT_CI_REDIS_CONTAINER:-}" ]; then
+            actual_owner=$(docker inspect --format '{{ index .Config.Labels "ptr.split-ci-owner" }}' "$PTR_SPLIT_CI_REDIS_CONTAINER" 2>/dev/null || true)
+            if [ "$actual_owner" = "$PTR_SPLIT_CI_OWNER_ID" ]; then
+              docker rm -f -v "$PTR_SPLIT_CI_REDIS_CONTAINER"
+            fi
+          fi
+          rm -f "$RUNNER_TEMP/ptr-split-ci-roles.env"

@@ -131,3 +131,11 @@ Upstream interfaces verified against installed SDK and official docs:
 Full owner-role provisioning/copy/rollback and nonsecret env templates: [split runbook](../../docs/python-llm-split.md).
 Billable LiteLLM requires explicit trusted `PTR_LLM_PROMPT_USD_PER_M` and
 `PTR_LLM_COMPLETION_USD_PER_M` price ceilings; missing/nonfinite values fail startup.
+
+Native split owner operations are `ptr-llm checkpoint-setup` and `ptr-llm retention`.
+Select `PTR_LLM_MAINTENANCE_DATABASE_URL` in a separate private maintenance environment;
+never distribute an owner credential to a worker. Retention defaults to dry-run and
+requires `--apply --confirm-database <exact split database>` to change storage. Legacy
+Node checkpoint/receipt operations reject split targets. The [split maintenance and CI
+contract](../../docs/python-llm-split.md#explicit-split-maintenance-and-ci) describes scope,
+bootstrap, deferred historical bindings and actual opt-in PG/queue/Nest regression gates.

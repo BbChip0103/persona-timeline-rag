@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { PersonaSchema, SourcePostSchema, type Persona, type SourcePost } from '@ptr/contracts';
-import { createLocalPool, PostgresPersonaRepository, PostgresSourceRepository } from '@ptr/storage';
+import { assertLocalDatabaseUrl, createLocalPool, PostgresPersonaRepository, PostgresSourceRepository } from '@ptr/storage';
 import { parsePersonaList } from '@ptr/core';
 interface RawPost {person_id:string;post_id:string;caption:string;posted_at:string;source_url:string;event_date:string|null}
 interface Target {username:string;display_name:string;category:string;cohort:string}
@@ -77,7 +77,15 @@ export async function privateJson(path:string,value:unknown):Promise<void>{
   await mkdir(path.slice(0,path.lastIndexOf('/')),{recursive:true,mode:0o700});
   await writeFile(path,JSON.stringify(value,null,2)+'\n',{mode:0o600});
 }
+/** This legacy importer cannot address partitioned app/llm schemas. Check before private file reads. */
+export function assertPreparationDatabaseUrl(env:Readonly<Record<string,string|undefined>>):string {
+  const raw=env.DATABASE_URL??'';
+  let url:URL;try{url=new URL(raw);}catch{throw new Error('LEGACY_PREPARATION_DATABASE_REQUIRED');}
+  if(['ptr_split_test','ptr_split_research'].includes(url.pathname.slice(1)))throw new Error('SPLIT_RUNTIME_PREPARATION_NOT_MIGRATED');
+  return assertLocalDatabaseUrl(raw);
+}
 async function main():Promise<void>{
+  const databaseUrl=assertPreparationDatabaseUrl(process.env);
   const raw=(await readFile('data/processed/target_posts.jsonl','utf8')).trim().split('\n').map(line=>JSON.parse(line) as RawPost);
   const manifest=JSON.parse(await readFile('data/manifests/targets.json','utf8')) as {people:Target[]};
   const prepared=prepare(raw,manifest.people);
@@ -86,7 +94,7 @@ async function main():Promise<void>{
   await privateJson('data/research/split.json',prepared.split);
   // Read (and bind to DATABASE_URL) the authored list before anything is imported.
   const authored=await authoredPersonas(process.env,message=>console.warn(message));
-  const pool=createLocalPool(process.env.DATABASE_URL??'');
+  const pool=createLocalPool(databaseUrl);
   try {
     const imported=await new PostgresSourceRepository(pool).importPosts(prepared.sources,'licensed_source');
     const {importable,skipped}=importablePersonas(prepared.personas,authored);
@@ -100,4 +108,4 @@ async function main():Promise<void>{
     await privateJson('reports/preparation.json',counts);console.log(JSON.stringify(counts));
   }finally{await pool.end();}
 }
-if(require.main===module)void main().catch(()=>{console.error('Research preparation failed; details remain private.');process.exitCode=1;});
+if(require.main===module)void main().catch(error=>{console.error(error instanceof Error&&error.message==='SPLIT_RUNTIME_PREPARATION_NOT_MIGRATED'?'SPLIT_RUNTIME_PREPARATION_NOT_MIGRATED':'Research preparation failed; details remain private.');process.exitCode=1;});

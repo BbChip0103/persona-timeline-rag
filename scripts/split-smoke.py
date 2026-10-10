@@ -9,6 +9,7 @@ import os
 import secrets
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -87,7 +88,7 @@ async def smoke(
     try:
         for command, label in [
             (["node", "--import", "tsx", "apps/api/src/main.ts"], "api"),
-            (["apps/llm-service/.venv/bin/python", "-m", "ptr_llm", "worker"], "worker"),
+            ([sys.executable, "-m", "ptr_llm", "worker"], "worker"),
         ]:
             log = (output / (label + ".private.log")).open("wb")
             logs.append(log)
@@ -265,7 +266,7 @@ async def smoke(
             child.wait(timeout=5)
         for command, label in [
             (["node", "--import", "tsx", "apps/api/src/main.ts"], "api-restarted"),
-            (["apps/llm-service/.venv/bin/python", "-m", "ptr_llm", "worker"], "worker-restarted"),
+            ([sys.executable, "-m", "ptr_llm", "worker"], "worker-restarted"),
         ]:
             log = (output / (label + ".private.log")).open("wb")
             logs.append(log)
