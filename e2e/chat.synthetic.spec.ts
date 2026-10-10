@@ -88,6 +88,18 @@ test('SYNTHETIC ONLY: three condition controls persist and image provenance card
 });
 
 
+test('SYNTHETIC ONLY: RAG defaults to semantic, including after restoring an off session',async({page})=>{
+  await fixtures(page);await login(page);
+  await page.getByLabel('새 세션의 RAG 조건').selectOption('caption');
+  await expect(page.getByLabel('검색 알고리즘')).toHaveValue('semantic');
+  await newSession(page);await expect(page.getByTestId('session-mode')).toHaveText('본문만 · semantic');
+  await page.getByLabel('새 세션의 RAG 조건').selectOption('off');await newSession(page);
+  await page.reload();await expect(page.getByTestId('session-mode')).toHaveText('RAG 없음');
+  await page.getByLabel('새 세션의 RAG 조건').selectOption('caption_image');
+  await expect(page.getByLabel('검색 알고리즘')).toHaveValue('semantic');
+  await newSession(page);await expect(page.getByTestId('session-mode')).toHaveText('본문 + 이미지 설명 · semantic');
+});
+
 test('SYNTHETIC ONLY: unresolved provider submission shows safe notice, never auto-resends and next dialogue works',async({page})=>{
   const state=await fixtures(page);await login(page);await newSession(page);
   state.failOnce('PROVIDER_REQUEST_UNRESOLVED');

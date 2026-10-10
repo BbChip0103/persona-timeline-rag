@@ -54,6 +54,21 @@ bounded durable paid ledger as generation. Nonbillable self-host routes do not s
 fall back to paid APIs. Explicit billable LiteLLM additionally requires trusted
 `PTR_LLM_PROMPT_USD_PER_M` / `PTR_LLM_COMPLETION_USD_PER_M` ceilings matching selected routes.
 
+New RAG-enabled sessions and the UI search selector default to **semantic**.
+If the backend has no semantic capability, default or explicit semantic session
+creation fails with `SEMANTIC_UNAVAILABLE`; it never silently selects lexical.
+Explicit lexical and RAG-off sessions remain supported, and existing sessions keep
+their stored retrieval mode. RAG-off remains the initial experimental condition.
+The current query embedder calls OpenRouter with `openai/text-embedding-3-small`,
+explicitly requesting **1536 dimensions**, then compares against stored vectors with
+the matching model revision using pgvector cosine distance. No new embedder or corpus
+re-embedding is introduced. Approved runtime configuration requires
+`PTR_LLM_EMBEDDING_PROVIDER=openrouter`,
+`PTR_LLM_EMBEDDING_MODEL_REVISION=openai/text-embedding-3-small`, the existing OpenRouter
+credentials/live/data-consent/budget gates, and the matching backend capability flag.
+Example envs keep external calls disabled; changing the default does not enable paid
+requests, change private deployment envs, or migrate existing sessions.
+
 ## Migration / rollback
 
 1. Provision a **new** isolated target `ptr_split_research` on loopback 58432 and separate

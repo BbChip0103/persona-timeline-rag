@@ -11,8 +11,7 @@ export class SplitChatService {
   constructor(private readonly store:ConversationStore,private readonly catalogue:()=>Promise<PersonaProjection[]>,private readonly delivery:TurnDelivery,private readonly events:TurnEvents,private readonly maxQueueDepth=256,private readonly semanticSearch=true) {}
   async createSession(ownerId:string,input:CreateSessionInput):Promise<ChatSession> {
     if(!ownerId.trim())throw new CoreError('FORBIDDEN');
-    const defaulted=input.retrievalMode===undefined&&input.ragCondition&&input.ragCondition!=='off'&&!this.semanticSearch?{...input,retrievalMode:'lexical' as const}:input;
-    const value=CreateSessionSchema.parse(defaulted);if(value.retrievalMode==='semantic'&&!this.semanticSearch)throw new CoreError('SEMANTIC_UNAVAILABLE');
+    const value=CreateSessionSchema.parse(input);if(value.retrievalMode==='semantic'&&!this.semanticSearch)throw new CoreError('SEMANTIC_UNAVAILABLE');
     const persona=(await this.catalogue()).find(p=>p.id===value.personaId&&p.revision===value.personaRevision&&p.personId===value.personId);
     if(!persona)throw new CoreError('PERSONA_UNAVAILABLE');
     const greetings=[persona.greeting,...persona.alternateGreetings??[]];

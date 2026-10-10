@@ -43,8 +43,17 @@ test('public raw16KiB counts whitespace, while authenticated internal reply may 
  const reply={sessionId:request.turnId,turnId:request.turnId,messageId:request.executionId,personId:persona.personId,personaRevision:persona.revision,responseKind:'small_talk',status:'answered',content:'한'.repeat(6000),claims:[],evidence:[],limitations:[]};
  expect((await call('/internal/llm/complete',{...request,generation:1,result:{kind:'completed',reply}},controlToken)).status).toBe(200);expect(control.complete).toHaveBeenCalledTimes(1);
 });
-test('live split catalogue session policy preserves lexical default and rejects unavailable semantic capability',async()=>{
+test('split RAG sessions default to semantic when the capability is available',async()=>{
+ for(const ragCondition of ['caption','caption_image'] as const) {
+  const session=await call('/api/sessions',{personId:persona.personId,ragCondition});
+  expect(session.status).toBe(201);expect(session.body.session.retrievalMode).toBe('semantic');expect(session.body.session.ragCondition).toBe(ragCondition);
+ }
+});
+test('split semantic defaults fail explicitly without capability; lexical and RAG-off remain opt-in',async()=>{
  const store=new InMemoryConversationStore();const chat=new SplitChatService(store,async()=>[persona],{backlog:async()=>0,publish:async()=>undefined},{publish:async()=>undefined},256,false);
- const session=await chat.createSession('owner_synthetic_split',{personId:persona.personId,personaId:persona.id,personaRevision:persona.revision,ragCondition:'caption'});expect(session.retrievalMode).toBe('lexical');
+ const input={personId:persona.personId,personaId:persona.id,personaRevision:persona.revision};
+ for(const ragCondition of ['caption','caption_image'] as const)await expect(chat.createSession('owner_synthetic_split',{...input,ragCondition})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
+ const session=await chat.createSession('owner_synthetic_split',{...input,ragCondition:'caption',retrievalMode:'lexical'});expect(session.retrievalMode).toBe('lexical');
+ const off=await chat.createSession('owner_synthetic_split',{...input,ragCondition:'off'});expect(off.retrievalMode).toBe('off');
  await expect(chat.createSession('owner_synthetic_split',{personId:persona.personId,personaId:persona.id,personaRevision:persona.revision,retrievalMode:'semantic'})).rejects.toMatchObject({code:'SEMANTIC_UNAVAILABLE'});
 });
