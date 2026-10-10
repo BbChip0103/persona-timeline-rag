@@ -1,0 +1,277 @@
+[
+  {
+    "name": "valid_start",
+    "schema": "StartRequest",
+    "valid": true,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "valid_dispatch",
+    "schema": "Dispatch",
+    "valid": true,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0
+    }
+  },
+  {
+    "name": "unknown",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002",
+      "unknown": true
+    }
+  },
+  {
+    "name": "wrong_version",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 2,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "coerced_int",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": "0",
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "unsafe_integer",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 9007199254740992,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "uuid",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "not-a-uuid",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "utf8_bytes",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한한",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "empty",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "noncanonical_uppercase_uuid",
+    "schema": "StartRequest",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "AAAAAAAA-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  {
+    "name": "valid_reply",
+    "schema": "Reply",
+    "valid": true,
+    "value": {
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "messageId": "00000000-0000-4000-8000-000000000002",
+      "personId": "synthetic-person",
+      "personaRevision": "synthetic-v1",
+      "responseKind": "small_talk",
+      "status": "answered",
+      "content": "synthetic reply",
+      "claims": [],
+      "evidence": [],
+      "limitations": []
+    }
+  },
+  {
+    "name": "reply_unknown_private_payload",
+    "schema": "Reply",
+    "valid": false,
+    "value": {
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "messageId": "00000000-0000-4000-8000-000000000002",
+      "personId": "synthetic-person",
+      "personaRevision": "synthetic-v1",
+      "responseKind": "small_talk",
+      "status": "answered",
+      "content": "synthetic reply",
+      "claims": [],
+      "evidence": [],
+      "limitations": [],
+      "rawProviderBody": "not allowed"
+    }
+  },
+  {
+    "name": "valid_provider_failure",
+    "schema": "Result",
+    "valid": true,
+    "value": {
+      "kind": "failed",
+      "errorCode": "PROVIDER_REQUEST_UNRESOLVED"
+    }
+  },
+  {
+    "name": "raw_error_rejected",
+    "schema": "Result",
+    "valid": false,
+    "value": {
+      "kind": "failed",
+      "errorCode": "private upstream content"
+    }
+  },
+  {
+    "name": "valid_session",
+    "schema": "Session",
+    "valid": true,
+    "value": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "ownerId": "owner_synthetic_wire",
+      "personId": "synthetic-person",
+      "personaId": "synthetic-persona",
+      "personaRevision": "synthetic-v1",
+      "language": "ko",
+      "timezone": "UTC",
+      "retrievalMode": "off",
+      "createdAt": "2026-10-10T00:00:00Z"
+    }
+  },
+  {
+    "name": "invalid_timezone",
+    "schema": "Session",
+    "valid": false,
+    "value": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "ownerId": "owner_synthetic_wire",
+      "personId": "synthetic-person",
+      "personaId": "synthetic-persona",
+      "personaRevision": "synthetic-v1",
+      "language": "ko",
+      "timezone": "Mars/Synthetic",
+      "retrievalMode": "off",
+      "createdAt": "2026-10-10T00:00:00Z"
+    }
+  },
+  {
+    "name": "invalid_date",
+    "schema": "Session",
+    "valid": false,
+    "value": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "ownerId": "owner_synthetic_wire",
+      "personId": "synthetic-person",
+      "personaId": "synthetic-persona",
+      "personaRevision": "synthetic-v1",
+      "language": "ko",
+      "timezone": "UTC",
+      "retrievalMode": "off",
+      "createdAt": "2026-02-30T00:00:00Z"
+    }
+  },
+  {
+    "name": "date_without_offset",
+    "schema": "Session",
+    "valid": false,
+    "value": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "ownerId": "owner_synthetic_wire",
+      "personId": "synthetic-person",
+      "personaId": "synthetic-persona",
+      "personaRevision": "synthetic-v1",
+      "language": "ko",
+      "timezone": "UTC",
+      "retrievalMode": "off",
+      "createdAt": "2026-10-10T00:00:00"
+    }
+  },
+  {
+    "name": "negative_generation",
+    "schema": "Binding",
+    "valid": false,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002",
+      "generation": -1
+    }
+  },
+  {
+    "name": "valid_binding",
+    "schema": "Binding",
+    "valid": true,
+    "value": {
+      "contractVersion": 1,
+      "turnId": "00000000-0000-4000-8000-000000000001",
+      "dispatchSeq": 0,
+      "jobId": "t-00000000-0000-4000-8000-000000000001-0",
+      "lockToken": "synthetic-lock",
+      "executionId": "00000000-0000-4000-8000-000000000002",
+      "generation": 1
+    }
+  }
+]

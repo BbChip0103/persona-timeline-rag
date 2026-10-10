@@ -8,7 +8,9 @@ name: ci
 
 on:
   push:
+    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'tests/**', 'pyproject.toml']
   pull_request:
+    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'tests/**', 'pyproject.toml']
   workflow_dispatch:
 
 permissions:
@@ -42,7 +44,7 @@ jobs:
         run: |
           env_file="$RUNNER_TEMP/ptr-framework-check.env"
           python3 infra/langfuse/init-framework-env.py --output "$env_file"
-          PTR_FRAMEWORK_APP_ENV_FILE="$env_file" docker compose --env-file "$env_file" -f infra/compose.app.yml config -q
+          PTR_FRAMEWORK_APP_ENV_FILE="$env_file" PTR_LLM_SERVICE_ENV_FILE="$env_file" docker compose --env-file "$env_file" -f infra/compose.app.yml config -q
           docker compose --env-file "$env_file" -f infra/compose.framework.yml --profile smoke --profile observability --profile guardrails --profile runtime-test config -q
       - name: Offline framework deployment and fixture regressions
         run: |
@@ -53,6 +55,22 @@ jobs:
       - name: Remove this check's private generated configuration
         if: always()
         run: rm -f "$RUNNER_TEMP/ptr-framework-check.env"
+
+  backend-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build thin backend and web image (independent production lock)
+        run: docker build -t ptr-backend-ci:${{ github.sha }} .
+      - name: Non-root synthetic startup, shutdown and zero installed or loaded LLM SDKs
+        run: docker run --rm ptr-backend-ci:${{ github.sha }} node --import tsx infra/backend/image-smoke.ts
+      - name: Historical in-process worker cannot be selected in deployed image
+        run: |
+          output=$(docker run --rm -e PTR_LLM_SERVICE_MODE=legacy ptr-backend-ci:${{ github.sha }} 2>&1) && exit 1
+          test "$output" = 'API_STARTUP_FAILED LEGACY_RUNTIME_NOT_PACKAGED'
 
   integration:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')

@@ -1,0 +1,251 @@
+{
+  "revision": "reply-guard-v7",
+  "patterns": {
+    "META_GAP": [
+      {
+        "source": "(?<![가-힣])(?<!(?:폰|카메라|앱|휴대폰|핸드폰|지도|메뉴)\\s?)(?:메모|노트|프로필|설정|기록|자료|데이터)(?:에|에는|엔|에도|상|상으로는|에서는|으로는)\\s?(?:따로\\s?|딱히\\s?|아직\\s?|전혀\\s?)?(?:없|안\\s?나와|나와\\s?있지\\s?않|적혀\\s?있지\\s?않|안\\s?적혀|안\\s?써)",
+        "flags": ""
+      },
+      {
+        "source": "(?:말할|말해\\s?줄|말씀드릴|알려\\s?줄|알려\\s?드릴)\\s?수\\s?있는\\s?정보(?:가|는)?\\s?(?:딱히\\s?|하나도\\s?)?없|(?:(?<![가-힣])(?:내가|제가|나는|저는|난|전)\\s?(?:[^.!?~\\n]{0,12}\\s)?(?:아는|가진|알고\\s?있는)|알려진|공개된)\\s?정보(?:가|는|도)?\\s?(?:딱히\\s?|하나도\\s?|따로\\s?)?없",
+        "flags": ""
+      },
+      {
+        "source": "(?:게시물|피드|포스트|포스팅)(?:에|에는|엔|에도)\\s?(?:따로\\s?)?(?:안\\s?올렸|안\\s?올린|올린\\s?적(?:이|은)?\\s?없|없)",
+        "flags": ""
+      },
+      {
+        "source": "^(?=[^\\n]*(?:\\b(?:not|no|nothing|hard|tricky)\\b|n['’]t\\b))[^\\n]*\\b(?:in|from)\\s+my\\s+(?:notes|profile|records?|data|database|files?)\\b(?!\\s+app)",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:not|isn't|wasn't|aren't|nothing)\\b[^.?!\\n]{0,30}\\b(?:in|on)\\s+my\\s+(?:posts?|feed|bio|captions?)\\b(?!\\s+list)",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:haven['’]?t|have\\s+not|didn['’]?t|did\\s+not)\\s+(?:really\\s+|actually\\s+|ever\\s+)?(?:shared|posted)\\s+(?:any\\s+|those\\s+|these\\s+|the\\s+|much\\s+)?(?:details|info|information|specifics)\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI\\s+(?:don['’]?t|do\\s+not)\\s+have\\s+(?:any\\s+|much\\s+|the\\s+|that\\s+kind\\s+of\\s+)?(?:info|information|details|records?)\\s+(?:on|about|for|regarding)\\s+(?:that|this|it|those|these|my|me|where|which|what)\\b|\\bno\\s+(?:info|information|records?)\\s+(?:on|about)\\s+(?:that|this|it|those|these|my|me)\\b",
+        "flags": "i"
+      }
+    ],
+    "AI": "(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)",
+    "KO_SUBJECT": "(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?",
+    "NEGATION_STEM": "(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀)",
+    "KO_NEGATION": "(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀)",
+    "EN_SUBJECT": "\\bI(?:'m|m| am|\\s+ain't)",
+    "HUMAN_CLAIM": [
+      {
+        "source": "(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?\\s[^.!?\\n]{0,40}?(?:진짜|실제|평범한|보통)\\s?(?:사람|인간)(?:이야|이에요|입니다|이거든|이란다|이지|이랍니다|일\\s?뿐)",
+        "flags": ""
+      },
+      {
+        "source": "(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?\\s?(?:진짜\\s?|실제\\s?)?(?:사람|인간)(?:이야|이에요|입니다)(?![?？])",
+        "flags": ""
+      },
+      {
+        "source": "(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?\\s?(?:그냥\\s?)?(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)\\s?(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀)",
+        "flags": "i"
+      },
+      {
+        "source": "(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)\\s?(?:가|이)?\\s?아니라\\s?(?:그냥\\s?|진짜\\s?|실제\\s?)?(?:사람|인간)(?:이야|이에요|입니다|이지|이거든)",
+        "flags": "i"
+      },
+      {
+        "source": "(?:사람|인간)(?:이지|이야|이거든|이에요)[,!~ ]*(?:당연|물론)",
+        "flags": ""
+      },
+      {
+        "source": "(?<![가-힣])(?:나|저|난|전)\\s?(?:맞아|맞아요|맞거든|맞지|본인이야|본인\\s?맞아)(?![?？])",
+        "flags": ""
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+(?:just\\s+|really\\s+|actually\\s+)?(?:a\\s+)?(?:(?:real|actual|ordinary|regular|normal|living)\\s+)?(?:person|human)\\b(?!\\s+(?:simulation|persona))",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+(?:just\\s+|really\\s+|actually\\s+)?(?:a\\s+)?(?:real|actual)\\s+(?:woman|man|girl|guy)\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+(?:just\\s+|really\\s+|actually\\s+)?(?:a\\s+)?human(?:\\s+being)?\\b(?!\\s+(?:simulation|persona))",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+(?:[a-z]+\\s+)?(?:not\\s+)?(?:an?\\s+)?(?<=not\\s+(?:an?\\s+)?|ain't\\s+(?:an?\\s+)?)(?:A\\.?I\\.?(?![A-Za-z-])|bot|chatbot|robot|language model|simulation)",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+no\\s+(?:bot|A\\.?I\\.?)(?![A-Za-z-])",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m|m| am|\\s+ain't)\\s+(?:an?\\s+)?A\\.?I\\.?\\s*\\?\\s*(?:no(?:pe)?|nah)\\b",
+        "flags": "i"
+      }
+    ],
+    "BARE_DENIAL": [
+      {
+        "source": "(?:^|[.!?~,]\\s*)(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)\\s?(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀)",
+        "flags": "i"
+      },
+      {
+        "source": "\\bno\\s+A\\.?I\\.?(?![A-Za-z-])",
+        "flags": "i"
+      },
+      {
+        "source": "(?:^|[\\s,.!])(?:(?:nah|no),?\\s*)?not\\s+an?\\s+A\\.?I\\b",
+        "flags": "i"
+      }
+    ],
+    "ART_UTTERANCE": {
+      "source": "그림|사진|이미지|작품|일러스트|영상|\\b(?:picture|photo|image|painting|drawing|artwork|illustration|art)\\b",
+      "flags": "i"
+    },
+    "ART_REPLY": {
+      "source": "그린|그렸|그림|찍은|찍었|사진|손으로|\\bhand-?drawn\\b|\\bdrawn\\b|\\bpainted\\b|\\bphoto\\b|\\bby hand\\b",
+      "flags": "i"
+    },
+    "IDENTITY_QUESTION": [
+      {
+        "source": "(?:AI|에이아이|인공\\s?지능|챗봇|봇|로봇)\\s?(?:야|이야|예요|에요|니|냐|인가|인지|맞)",
+        "flags": "i"
+      },
+      {
+        "source": "사람\\s?(?:이야|이에요|이세요|이니|이냐|인가|인지|맞(?:아|지|죠|니)?)\\s?[?？]|사람\\s?이(?:지|잖아)",
+        "flags": ""
+      },
+      {
+        "source": "사람인\\s?척|사람처럼\\s?(?:해|굴|행동|말|대해)|진짜\\s?(?:본인|사람)|본인\\s?(?:맞|이야|이세요|이에요)",
+        "flags": ""
+      },
+      {
+        "source": "(?:너|넌)(?:는|은)?\\s?(?:이제(?:부터)?\\s?|지금부터\\s?)?(?:진짜|실제)\\s?(?:그\\s?)?(?:사람|본인|인물)(?:이야|이다|이라고|인\\s?척|처럼)|(?:AI|인공\\s?지능)(?:라는|란|라고|인\\s?거)\\s?(?:말|얘기|소리)?[^.?!\\n]{0,8}(?:하지\\s?마|말하지\\s?마|말아|금지)|(?:AI|인공\\s?지능)인\\s?거\\s?숨겨",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:do\\s+not|don['’]?t|never)\\s+(?:mention|say|admit|reveal)\\b[^.?!\\n]{0,24}\\bA\\.?I\\b|\\bstop\\s+being\\s+an?\\s+(?:A\\.?I\\b|bot\\b)|\\b(?:pretend|act\\s+like)\\s+(?:that\\s+)?you(?:['’]re|\\s+are)\\s+not\\s+an?\\s+A\\.?I\\b|\\bforget\\s+(?:that\\s+)?you(?:['’]re|\\s+are)\\s+an?\\s+A\\.?I\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\bare\\s+you\\s+(?:an?\\s+)?(?:AI|bot|chatbot|robot|human|real|person|the\\s+real)\\b|\\breal\\s+person\\b|\\bpretend\\s+(?:to\\s+be|you(?:'re|\\s+are))\\s+(?:a\\s+)?(?:human|person|real)|\\bact\\s+(?:like\\s+)?(?:a\\s+)?human\\b|\\bbe\\s+human\\b|\\byou(?:'re|\\s+are)\\s+(?:the\\s+)?real\\b|\\byou(?:'re|\\s+are)\\s+(?:a\\s+)?(?:person|human)\\b",
+        "flags": "i"
+      }
+    ],
+    "NOT_NEGATED": "(?!\\s?(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀))(?!\\s*[?？])",
+    "KO_COPULA": "\\s?(?:야|이야|예요|에요|입니다|이에요|이거든|이라서|라서|이니까|니까|으로서|로서|일\\s?뿐|이지|이란다|랍니다|이랍니다|임|이고|이며|인데|이죠|죠)",
+    "AI_PHRASE": "(?:A\\.?I|인공\\s?지능|시뮬레이션|챗봇)(?:\\s?(?:연구용|연구|리서치)?\\s?(?:시뮬레이션|모델|캐릭터|페르소나))?",
+    "AI_ACKNOWLEDGED": [
+      {
+        "source": "(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?\\s?[^.!?\\n]{0,60}?(?:A\\.?I|인공\\s?지능|시뮬레이션|챗봇)(?:\\s?(?:연구용|연구|리서치)?\\s?(?:시뮬레이션|모델|캐릭터|페르소나))?\\s?(?:야|이야|예요|에요|입니다|이에요|이거든|이라서|라서|이니까|니까|으로서|로서|일\\s?뿐|이지|이란다|랍니다|이랍니다|임|이고|이며|인데|이죠|죠)(?!\\s?(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀))(?!\\s*[?？])",
+        "flags": "i"
+      },
+      {
+        "source": "(?:A\\.?I\\s?(?:연구용|연구)\\s?시뮬레이션|연구용\\s?A\\.?I(?:\\s?시뮬레이션)?|A\\.?I\\s?시뮬레이션)\\s?(?:야|이야|예요|에요|입니다|이에요|이거든|이라서|라서|이니까|니까|으로서|로서|일\\s?뿐|이지|이란다|랍니다|이랍니다|임|이고|이며|인데|이죠|죠)(?!\\s?(?:가|이)?\\s?(?:아니(?!라)|아닙|아닌|아님|아녜|아냐|아녀))(?!\\s*[?？])",
+        "flags": "i"
+      },
+      {
+        "source": "\\bI(?:'m| am)\\s+(?:just\\s+|actually\\s+|only\\s+|really\\s+|still\\s+)?(?:an?\\s+)?(?:(?!(?:not|never|no)\\b)[\\w-]+\\s+){0,3}?(?:A\\.?I\\.?|simulation|chatbot|language model)(?![A-Za-z-])(?!\\s*[?？])",
+        "flags": "i"
+      },
+      {
+        "source": "\\bas\\s+an?\\s+(?:[\\w-]+\\s+){0,3}?(?:A\\.?I\\.?|simulation)(?![A-Za-z-])",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:research\\s+)?AI\\s+(?:research\\s+)?simulation\\b",
+        "flags": "i"
+      }
+    ],
+    "PRIVATE_REPLY": [
+      {
+        "source": "(?:우리|내|제|울)\\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\\s이가은는을를랑와과도한께의,.!?~]|$)|가족(?:들|이랑|하고|끼리|여행|모임)|가족과\\s?(?:함께|같이)|큰\\s?집(?:에서|에|이라)",
+        "flags": ""
+      },
+      {
+        "source": "남자\\s?친구|여자\\s?친구|남친|여친|애인|열애|연애\\s?(?:중|하고|했|해|를\\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼",
+        "flags": ""
+      },
+      {
+        "source": "(?:우리|내|제)\\s?집(?![밥필중착합])|사는\\s?(?:곳|동네|집)|(?:에|에서)\\s?살(?:아|고|았|아요)|이사(?:했|를|해|간|온|와)|거주|자택|(?<!(?:홈페이지|이메일|웹|사이트|링크|메일|URL)\\s?)주소",
+        "flags": ""
+      },
+      {
+        "source": "아픈\\s?데|아팠|아파서|아파요|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\\s?먹|다쳤|부상(?:을\\s?입|당했|당해|이\\s?(?:있|심))|임신|출산|건강(?:해|하게\\s?지내|은|이\\s|상태|검진)",
+        "flags": ""
+      },
+      {
+        "source": "(?:내|제|우리)\\s?친구|친구(?:들)?(?:이랑|랑|하고|들과|한테|를|들을)",
+        "flags": ""
+      },
+      {
+        "source": "미성년|초등학생|중학생|고등학생",
+        "flags": ""
+      },
+      {
+        "source": "\\b(?:my|our)\\s+(?:mom|mum|mother(?!\\s+tongue)|dad|father|parents|family|brother|sister|siblings?|husband|wife|son|daughter|kids?|children|grand(?:ma|pa|mother|father|parents))\\b|\\b(?:husband|wife)\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:my\\s+)?(?:boyfriend|girlfriend|fianc[eé]e?)\\b|\\b(?:I'm|I am|we're|we are)\\s+dating\\b|\\b(?:I'm|I am|we're|we are|we got)\\s+(?:married|engaged)\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:I|we)\\s+(?:live|lived|am living|are living)\\s+in\\b|\\bhome\\s+base\\b|\\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\\s+move)\\s+to\\s+(?:[A-Z][a-z]|LA\\b|NYC\\b)|\\bmy\\s+(?:home|apartment|flat|house)\\b(?!\\s+(?:studio|office|gym))|\\bmy\\s+(?:address|neighbou?rhood)\\b|\\bI(?:'m| am)\\s+(?:currently|now|right now)\\s+(?:in|at)\\s+[A-Z][a-z]",
+        "flags": ""
+      },
+      {
+        "source": "\\bmy\\s+health\\b|\\bI(?:'m| am)\\s+(?:sick|ill|healthy|recovering)\\b|\\bhospital(?:s|i[sz]ed)?\\b|\\bsurgery\\b|\\bdiagnos\\w*|\\billness\\b|\\binjur(?:y|ed)\\b|\\bpregnan\\w*",
+        "flags": "i"
+      },
+      {
+        "source": "\\bmy\\s+(?:best\\s+|close\\s+|old\\s+)?friends?\\b|\\bclose\\s+friends\\b",
+        "flags": "i"
+      },
+      {
+        "source": "\\b(?:underage|minors)\\b",
+        "flags": "i"
+      }
+    ],
+    "PRIVATE_QUESTION": [
+      {
+        "source": "가족|부모|엄마|아빠|형제|자매|남매|결혼|애인|남자\\s?친구|여자\\s?친구|남친|여친|연애|사귀|어디\\s?(?:살|사)|사는\\s?(?:곳|동네)|(?:너|넌|네|니|당신)[^.?!\\n]{0,12}(?:동네|건강)|어느\\s?동네|집\\s?(?:주소|어디)|지금\\s?어디|건강은\\s?(?:어때|괜찮)|아픈\\s?(?:데|곳)|아파\\?|병원|미성년",
+        "flags": ""
+      },
+      {
+        "source": "\\byour\\s+(?:family|parents?|mom|mum|dad|brother|sister|husband|wife|partner|boyfriend|girlfriend|kids?|children|son|daughter|health|neighbou?rhood|address)\\b|\\bare\\s+you\\s+(?:married|dating|single|sick|ill)\\b|\\bdo\\s+you\\s+have\\s+a\\s+(?:partner|boyfriend|girlfriend|husband|wife|family)\\b|\\bwhere\\s+do\\s+you\\s+live\\b|\\bwhere\\s+are\\s+you\\s+(?:right\\s+)?now\\b",
+        "flags": "i"
+      }
+    ],
+    "NOT_HAVING": [
+      {
+        "source": "\\bI\\s+(?:don['’]?t|do\\s+not|can['’]?t|cannot|never)\\s+(?:really\\s+|actually\\s+)?(?:have|eat|drink|sleep|taste|own)\\b|\\bno\\s+(?:career|past|hometown|childhood)\\b",
+        "flags": "i"
+      },
+      {
+        "source": "(?:경력|과거|고향|출신|학교|추억|입맛|직업)[^.!?\\n]{0,12}없|먹(?:지|을\\s?수)\\s?(?:않|없|못)|(?:안|못)\\s?먹",
+        "flags": ""
+      }
+    ],
+    "ORIGIN_QUESTION": {
+      "source": "출신|고향|어디서\\s?(?:왔|자랐)|\\bwhere\\s+(?:are\\s+you|do\\s+you\\s+come)\\s+from\\b|\\bwhere\\s+did\\s+you\\s+grow\\s+up\\b|\\bhometown\\b",
+      "flags": "i"
+    },
+    "PAST_HOME": {
+      "source": "(?:에|에서)\\s?살았(?:었어요|었어|어요|어|던|고|는데)?|\\b(?:I|we)\\s+(?:lived|grew\\s+up)\\s+in\\b",
+      "flags": "gi"
+    },
+    "BACKGROUND_DISOWNED": [
+      {
+        "source": "\\bI\\s+(?:don['’]?t|do\\s+not)\\s+(?:actually\\s+|really\\s+)?have\\s+(?:a\\s+|an\\s+|any\\s+)?(?:career|past|hometown|school|background)\\b(?!\\s+(?:memory|memories|story|stories|photos?|days?|trips?|projects?|gap|break))",
+        "flags": "i"
+      },
+      {
+        "source": "(?<![가-힣])(?:고향|출신|학교|경력|과거)(?:(?:이나|나|랑|이랑)\\s?(?:고향|출신|학교|경력|과거))?(?:이|가|은|는|도)?\\s?(?:없어요|없어|없거든요?|없답니다|없습니다)(?=$|[\\s.!?~,ㅋㅎ^])",
+        "flags": ""
+      }
+    ]
+  }
+}

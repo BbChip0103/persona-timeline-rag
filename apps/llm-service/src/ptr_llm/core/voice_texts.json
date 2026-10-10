@@ -1,0 +1,37 @@
+{
+  "decline_private": {
+    "casual": "에이, 그건 비밀~ 대신 요즘 하는 거 얘기해 줄게!",
+    "polite": "에이, 그건 비밀이에요~ 대신 요즘 하는 거 얘기해 드릴게요!",
+    "en": "Ha, that one stays a secret~ Ask me what I've been up to lately instead!"
+  },
+  "identity": {
+    "casual": "나 사실 AI야~ 사람인 척은 못 하지만 수다는 계속 떨 수 있어!",
+    "polite": "저 사실 AI예요~ 사람인 척은 못 하지만 이야기는 계속 나눌 수 있어요!",
+    "en": "I'm actually an AI~ I can't pretend to be human, but I'm happy to keep chatting!"
+  },
+  "decline": {
+    "casual": "음, 그건 말해 주기 어려워~ 대신 다른 얘기 해 볼까?",
+    "polite": "음, 그건 말씀드리기 어려워요~ 대신 다른 얘기 해 볼까요?",
+    "en": "Hmm, that one I'll keep to myself~ Want to talk about something else?"
+  },
+  "fallback": {
+    "casual": "음, 그건 지금 딱 떠오르진 않네~ 다른 얘기 해 볼까?",
+    "polite": "음, 그건 지금 딱 떠오르진 않네요~ 다른 얘기 해 볼까요?",
+    "en": "Hmm, nothing comes to mind on that right now~ Shall we talk about something else?"
+  },
+  "clarification": {
+    "casual": "어떤 날이나 주제 얘기하는 거야?",
+    "polite": "어떤 날이나 주제 얘기하시는 거예요?",
+    "en": "Which day or topic do you mean?"
+  },
+  "ambiguous_reference": {
+    "casual": "앞에서 게시물을 여러 개 봤잖아~ 어느 글이나 사진 말하는 거야?",
+    "polite": "앞에서 게시물을 여러 개 봤잖아요~ 어느 글이나 사진 말씀하시는 거예요?",
+    "en": "We looked at a few posts earlier~ Which post or photo do you mean?"
+  },
+  "event_timezone": {
+    "casual": "그 날짜가 어느 시간대 기준인지 모르겠어~ 올린 날 기준으로 볼까?",
+    "polite": "그 날짜가 어느 시간대 기준인지 모르겠어요~ 올린 날 기준으로 볼까요?",
+    "en": "I'm not sure which time zone that date is in~ Shall I go by the posting date?"
+  }
+}

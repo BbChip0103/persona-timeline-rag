@@ -23,7 +23,7 @@ const RANK:Record<ChatTurn['state'],number>={pending:0,retrieving:1,generating:2
  * Two store reads per normal turn instead of one per client poll. If the subscription fails or is slow (Redis
  * trouble), the stream degrades to frequent store re-checks instead of failing.
  */
-export async function streamTurn(chat:ChatService,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions):Promise<void> {
+export async function streamTurn(chat:Pick<ChatService,'getTurn'>,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions):Promise<void> {
   let finished=false;let lastRank=-1;let checking:Promise<void>|undefined;let again=false;
   const timers:ReturnType<typeof setInterval>[]=[];
   let unsubscribe:(()=>void)|undefined;

@@ -39,3 +39,5 @@ playwright-report
 .omx
 
 .venv-guardrails
+
+**/.venv

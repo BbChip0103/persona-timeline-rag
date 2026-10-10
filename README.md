@@ -4,7 +4,7 @@
 
 ## 현재 구현 범위
 
-- Python 승인 데이터 준비·검증 CLI 유지.
+- 독립 Python RAG·agent 서비스(`apps/llm-service`, uv/별도 이미지/CI): persona·검색·LangGraph/LangChain·inline Guardrails/Jev·Langfuse v4·평가/검수. 기존 승인 데이터 준비·검증 CLI도 직접 재사용한다.
 - TypeScript/pnpm workspace: NestJS API, Next.js/React 채팅, shared contracts/core/providers/storage.
 - 전용 **DB-only 로컬 Supabase PostgreSQL15 + pgvector**: Auth/Storage/Studio 전체 배포가 아니다. owner/person/revision 고정 세션, history/reload, idempotency/cancel, lexical substring baseline 및1536dim exact cosine 검색.
 - 명시적 fake/LiteLLM provider와 총 **US$2 / 10,000요청 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
@@ -17,11 +17,11 @@
 
 ## 현재 프레임워크 실행 경로
 
-API → Nest/BullMQ worker → LangGraph/LangChain → LiteLLM, 내부 Guardrails 검증 및 Langfuse v4 추적·평가·검수 경로로 전환했습니다. 별도 gateway·dispatcher·fleet scheduler는 기본 실행 경로에서 제거했습니다. [현재 실행 계약](docs/framework-runtime.md), [인프라 배포](docs/framework-deployment.md), [평가·검수](docs/framework-evaluation.md)를 먼저 따르세요. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
+Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker → LiteLLM/model serving**이 기본 경로입니다. Nest는 접수 outbox·DB fencing·최종 atomic commit/SSE를, Python은 LLM 처리·큰 호출 receipt·유료 장부·inline Guardrails/Jev·native Langfuse v4 평가/검수를 맡습니다. 코드/의존성/이미지/CI·app/llm DB 계정과 private env를 분리했습니다. [현재 분리 실행·자료이전 계약](docs/python-llm-split.md)과 [Python CLI](apps/llm-service/README.md)를 먼저 따르세요. [TS 프레임워크 실행](docs/framework-runtime.md)·[이전 배포](docs/framework-deployment.md)·[이전 평가](docs/framework-evaluation.md)는 명시적 legacy 재현 기록입니다. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
 
 ## 실행
 
-새 채팅/DB 구성은 [프레임워크 실행 계약](docs/framework-runtime.md)을 따른다. [기존 서비스 runbook](docs/runbook.md)은 이전 버전 재현 기록이다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.
+새 채팅/DB 구성은 [Python 분리 실행 계약](docs/python-llm-split.md)을 따른다. Python 검증은 `pnpm llm:check`와 기존 ingestion `make check`이며, 실제 DB/Redis·메모리/부하는 별도 opt-in proof다. [기존 서비스 runbook](docs/runbook.md)은 이전 버전 재현 기록이다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.
 
 
 ```bash
@@ -42,7 +42,7 @@ PYTHONPATH=src python -m persona_timeline_rag normalize
 PYTHONPATH=src python -m persona_timeline_rag audit
 ```
 
-선행 파일은 `data/manifests/candidates.json`, `archive_volumes.json` 및 `data/raw/instagram/`의 승인 자료입니다. 선택 계정은 최대 20명입니다. 배포 URL·Drive 파일 ID·실제 인물 후보·원본은 공개 예제에 포함하지 않습니다. `configs/research.example.json`은 연구 설정 예시이며 현재 CLI가 자동으로 읽는 설정 파일은 아닙니다. 서비스는 명시적으로 `node --env-file=.env.local --import tsx ...`로 설정을 로딩합니다. ingestion CLI는 자동 로딩하지 않습니다.
+선행 파일은 `data/manifests/candidates.json`, `archive_volumes.json` 및 `data/raw/instagram/`의 승인 자료입니다. 선택 계정은 최대 20명입니다. 배포 URL·Drive 파일 ID·실제 인물 후보·원본은 공개 예제에 포함하지 않습니다. `configs/research.example.json`은 연구 설정 예시이며 현재 CLI가 자동으로 읽는 설정 파일은 아닙니다. 새 서비스는 backend/Python의 서로 다른 private env를 명시적으로 선택합니다. 원래 all-in-one `.env.local`을 두 역할에 공통 전달하지 않습니다. `node --env-file=.env.local --import tsx ...`는 역사적 TS 실행 방식이며 ingestion CLI는 env를 자동 로딩하지 않습니다.
 
 현재 연구 타겟은 후보 중 4명입니다. 별도 `data/manifests/targets.json`과 `data/processed/target_posts.jsonl`에 실험 범위를 기록하며, 기존 20명 후보와 전체 정규화 코퍼스는 보존합니다. 데이터 준비 CLI는 기존 후보 manifest를 계속 사용하고, 연구 설정 예시는 4명 부분집합을 가리킵니다. 실제 대상과 수량은 비공개 `reports/targets4.md`에서 확인합니다.
 

@@ -1,9 +1,9 @@
-import { loadFrameworkConfig } from '@ptr/ops';
 import { createApiApplication } from './app';
-import { createRuntime } from './runtime';
+import {createSplitRuntime} from './split-runtime';
 async function main() {
-  loadFrameworkConfig('api',process.env);
-  const runtime=createRuntime();
+  if(process.env.PTR_LLM_SERVICE_MODE==='legacy')(await import('../../../packages/ops/src/framework-config')).loadFrameworkConfig('api',process.env);
+  else if(process.env.PTR_LLM_SERVICE_MODE!==undefined&&process.env.PTR_LLM_SERVICE_MODE!=='split')throw new Error('INVALID_SERVICE_MODE');
+  const runtime=process.env.PTR_LLM_SERVICE_MODE==='legacy'?(await import('./runtime')).createRuntime():createSplitRuntime();
   const app=await createApiApplication(runtime,process.env.PTR_API_TOKEN??'',{syntheticToken:process.env.PTR_API_SYNTHETIC_TOKEN||undefined});
   const port=Number(process.env.PTR_API_PORT??56441);
   if(!Number.isInteger(port) || port<1024 || port>65535) throw new Error('INVALID_PORT');

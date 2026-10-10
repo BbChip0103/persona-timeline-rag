@@ -22,6 +22,8 @@ export const ENV_REGISTRY:Readonly<Record<string,EnvEntry>>={
   ...each(SAFETY_CATEGORIES.map(category=>`PTR_SAFETY_THRESHOLD_${category.toUpperCase()}`),runtime),
   ...each(['PTR_WORKER_CONCURRENCY','PTR_WORKER_ID','PTR_QUEUE_LOCK_MS','PTR_MAX_ATTEMPTS','PTR_DISPATCH_GRACE_MS',
     'PTR_DISPATCH_INTERVAL_MS','PTR_METRICS_PORT'],production('worker')),
+  ...each(['PTR_APP_DATABASE_URL','PTR_LLM_SERVICE_URL','PTR_LLM_CONTROL_TOKEN','PTR_BACKEND_MAINTENANCE','PTR_LLM_SEMANTIC_SEARCH'],production('api')),
+  PTR_LLM_SERVICE_MODE:production('api','worker'),
   PTR_API_PORT:production('api'),PTR_API_TOKEN:production('api','worker','web'),
   PTR_API_SYNTHETIC_TOKEN:production('api'),PTR_SESSION_SECRET:production('web'),PTR_UI_PASSWORD:production('web'),
   ...each(['PTR_SYNTHETIC_UI','PTR_FAKE_LATENCY','RUN_REDIS_TESTS','RUN_STORAGE_DB_TESTS','GOAL1_TEST_DATABASE_URL',

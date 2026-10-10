@@ -1,0 +1,43 @@
+name: llm-service
+on:
+  push:
+    paths: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'pyproject.toml', 'contracts/**', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
+  pull_request:
+    paths: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'pyproject.toml', 'contracts/**', 'tests/**', '.github/workflows/llm-service.yml', '.dockerignore']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: llm-service-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13.5'
+      - run: python -m pip install uv==0.10.2
+      - run: uv sync --project apps/llm-service --locked
+      - name: Offline synthetic service tests
+        run: uv run --project apps/llm-service pytest apps/llm-service/tests
+      - name: Existing ingestion regressions (same package, no copied implementation)
+        run: PYTHONPATH=src uv run --project apps/llm-service python -m unittest discover -s tests
+      - name: Lint and syntax
+        run: |
+          uv run --project apps/llm-service ruff check apps/llm-service/src apps/llm-service/tests scripts/split-memory-proof.py
+          uv run --project apps/llm-service python -m compileall -q apps/llm-service/src scripts/split-memory-proof.py
+      - name: Typecheck service modules
+        run: |
+          uv run --project apps/llm-service mypy apps/llm-service/src --ignore-missing-imports
+          uv run --project apps/llm-service mypy scripts/split-memory-proof.py --follow-imports=silent
+      - name: Build only the independent Python image
+        run: docker build -f apps/llm-service/Dockerfile -t ptr-llm-ci:${{ github.sha }} .
+      - name: Confirm no Node dependencies or private files in worker image
+        run: |
+          docker run --rm --entrypoint sh ptr-llm-ci:${{ github.sha }} -c 'test ! -d /app/node_modules && test ! -d /app/data && test ! -d /app/reports && ! command -v node'
+          docker run --rm --entrypoint python ptr-llm-ci:${{ github.sha }} -c 'from ptr_llm.control import validate_wire; from ptr_llm.runtime import build_runtime; assert validate_wire("Dispatch", {"contractVersion":1,"turnId":"00000000-0000-4000-8000-000000000001","dispatchSeq":1})'

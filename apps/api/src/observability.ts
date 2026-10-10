@@ -1,6 +1,7 @@
 import type { ChatReply } from '@ptr/contracts';
 import type { TurnDispatcherEvent } from '@ptr/core';
-import { type Registry, Counter, Gauge, Histogram, TURN_SECONDS_BUCKETS, createMetricsRegistry, createLog } from '@ptr/ops';
+import {type Registry,Counter,Gauge,Histogram,TURN_SECONDS_BUCKETS,createMetricsRegistry} from '../../../packages/ops/src/metrics';
+import {createLog} from '../../../packages/ops/src/log';
 
 /**
  * Metrics and JSON log events of the api and worker roles . Labels are fixed enums or

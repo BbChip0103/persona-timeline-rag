@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, QueryResultRow } from 'pg';
 import type { ChatMessage, ChatReply, ChatSession, ChatTurn, SendTurnInput, TurnState } from '@ptr/contracts';
-import { CoreError, turnTextFingerprint, type ConversationStore, type LeaseFence, type QueuedTurn, type TurnDispatch, type TurnLeaseStore, type TurnExecutionStore, type ExecutionDispatch } from '@ptr/core';
+import { CoreError, type ConversationStore, type LeaseFence, type QueuedTurn, type TurnDispatch, type TurnLeaseStore, type TurnExecutionStore, type ExecutionDispatch } from '../../core/src/ports';
+import {turnTextFingerprint} from '../../core/src/request-fingerprint';
 import { transaction } from './pool.js';
 
 const terminal = ['completed', 'failed', 'cancelled'];

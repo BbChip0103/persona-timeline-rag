@@ -71,7 +71,7 @@ export function frameworkEnvironment(source:NodeJS.ProcessEnv,appKey:NodeJS.Proc
   assertSyntheticTargets(databaseUrl,redisUrl);
   demand(source.PTR_LITELLM_PORT&&source.PTR_GUARDRAILS_PORT,'GENERATED_SERVICE_PORTS_REQUIRED');
   demand(source.LANGFUSE_BASE_URL&&source.LANGFUSE_PUBLIC_KEY&&source.LANGFUSE_SECRET_KEY,'GENERATED_LANGFUSE_REQUIRED');
-  return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',LANGSMITH_TRACING:'false',LANGCHAIN_TRACING_V2:'false',
+  return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_LLM_SERVICE_MODE:'legacy',LANGSMITH_TRACING:'false',LANGCHAIN_TRACING_V2:'false',
     DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'litellm',PTR_MODEL:'primary',PTR_LITELLM_BILLABLE:'0',
     PTR_LITELLM_BASE_URL:loopback(`http://127.0.0.1:${source.PTR_LITELLM_PORT}/v1`),PTR_LITELLM_API_KEY:appKey.PTR_LITELLM_API_KEY,
     PTR_GUARDRAILS_URL:loopback(`http://127.0.0.1:${source.PTR_GUARDRAILS_PORT}`),PTR_GUARDRAILS_TOKEN:source.PTR_GUARDRAILS_TOKEN,

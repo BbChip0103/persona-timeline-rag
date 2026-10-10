@@ -15,6 +15,8 @@ function integer(name:string,fallback:number,min:number,max:number):number {
   return value;
 }
 async function main() {
+  // Retained only for frozen TypeScript baseline comparisons; production jobs belong to Python.
+  if(process.env.PTR_LLM_SERVICE_MODE!=='legacy')throw new Error('LEGACY_WORKER_DISABLED');
   loadFrameworkConfig('worker',process.env);
   let active=()=>0;
   const observed=workerObservability({activeTurns:()=>active()});

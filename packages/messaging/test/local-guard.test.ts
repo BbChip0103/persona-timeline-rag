@@ -4,6 +4,7 @@ describe('assertLocalRedisUrl', () => {
   it('accepts only the isolated loopback Redis with a password', () => {
     expect(assertLocalRedisUrl('redis://:s3cret@127.0.0.1:56479/0')).toBe('redis://:s3cret@127.0.0.1:56479/0');
   });
+  it('accepts the independently owned split proof Redis only on its exact guarded port',()=>{expect(assertLocalRedisUrl('redis://:synthetic-password@127.0.0.1:58479/0')).toContain(':58479/0');expect(()=>assertLocalRedisUrl('redis://:synthetic-password@127.0.0.1:58478/0')).toThrow();});
   it.each([
     ['other host', 'redis://:s3cret@10.0.0.5:56479/0'],
     ['localhost name', 'redis://:s3cret@localhost:56479/0'],

@@ -1,12 +1,13 @@
-# Production profile : one image (../Dockerfile), API, Nest BullMQ worker and Next web only, TypeScript through tsx.
+# Split deployment: independent backend/web Node image and Python orchestration image.
 # Host network: the roles keep their loopback-only guards and fixed 127.0.0.1 ports (Linux only). Postgres and Redis
 # use separately provisioned isolated services; a role started before them keeps reconnecting,
 # and the api reports unhealthy until both answer. Synthetic targets are in compose.framework.yml.
 #
-#   PTR_FRAMEWORK_APP_ENV_FILE=<new-framework-app-env> docker compose --env-file <new-framework-app-env> -f infra/compose.app.yml up -d
+#   PTR_FRAMEWORK_APP_ENV_FILE=<private-backend-env> PTR_LLM_SERVICE_ENV_FILE=<private-llm-env> \
+#     docker compose -f infra/compose.app.yml up -d
 #
 # `--env-file` lets Compose read PTR_UID / PTR_GID values for the
-# mounts below; PTR_FRAMEWORK_APP_ENV_FILE explicitly selects the new file to the roles. Procedures: docs/framework-runtime.md.
+# mounts below; each runtime explicitly selects its separate private file. Procedures: docs/python-llm-split.md.
 name: ptr_app
 
 x-role: &role
@@ -26,15 +27,10 @@ x-role: &role
       max-size: 10m
       max-file: "5"
 
-# Personas are read from data/ (repo-relative paths, `ops:check-env` path_not_repo_relative); generated drafts are the
-# only writes. Neither directory is created by Compose: a missing one stops `up` instead of appearing root-owned.
+# Nest needs only generated drafts, never the private source/persona corpus. Python receives
+# the corpus read-only in its own mount below. Missing host directories fail rather than
+# silently creating root-owned storage.
 x-data: &data
-  - type: bind
-    source: ../data
-    target: /app/data
-    read_only: true
-    bind:
-      create_host_path: false
   - type: bind
     source: ../data/generated
     target: /app/data/generated
@@ -44,7 +40,7 @@ x-data: &data
 services:
   api:
     <<: *role
-    command: [node, --import, tsx, apps/api/src/main.ts]
+    command: [node, --import, tsx, apps/api/src/packaged-main.ts]
     volumes: *data
     healthcheck:
       # D23: 200 only when the database answers SELECT 1 and Redis PING.
@@ -55,13 +51,34 @@ services:
       start_period: 60s
 
   worker:
-    <<: *role
-    command: [node, --import, tsx, apps/api/src/worker.ts]
-    volumes: *data
+    image: ptr_llm:local
+    build:
+      context: ..
+      dockerfile: apps/llm-service/Dockerfile
+    network_mode: host
+    user: "${PTR_UID:-900}:${PTR_GID:-2000}"
+    init: true
+    env_file:
+      - path: ${PTR_LLM_SERVICE_ENV_FILE:?select a separate private llm-only environment}
+        required: true
+    command: [python, -m, ptr_llm, worker]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    volumes:
+      - type: bind
+        source: ../data
+        target: /app/data
+        read_only: true
+        bind:
+          create_host_path: false
     # A running turn has a 30 s deadline; SIGTERM lets the worker finish it before the stop.
     stop_grace_period: 35s
     healthcheck:
-      test: [CMD, node, -e, "fetch('http://127.0.0.1:56442/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      test: [CMD, python, -c, "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('PTR_LLM_PORT','58442')+'/health/ready', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -70,7 +87,7 @@ services:
   web:
     <<: *role
     working_dir: /app/apps/web
-    command: [node, node_modules/next/dist/bin/next, start, --hostname, 127.0.0.1, --port, "56440"]
+    command: [node, /app/node_modules/next/dist/bin/next, start, --hostname, 127.0.0.1, --port, "56440"]
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:56440/login').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s

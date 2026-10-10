@@ -16,6 +16,7 @@ export interface CreativeArtifact {
   promptRevision:string;provider:string;model:string;createdAt:string;
 }
 export interface ApiRuntime {
+  kind?:'legacy';
   chat:ChatService;personas:PersonaRepository;provider:TextProvider;
   /** Queued execution: the API reserves and publishes; worker processes execute; the worker maintains the durable outbox. */
   leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;eventSource:TurnEventSource;

@@ -1,3 +1,10 @@
+# Current deployment: Python split
+
+The default worker is now the independent Python image. Use separate app/LLM roles
+and private env files; see [split cutover/runbook](python-llm-split.md). Historical
+framework instructions below describe the retained TS reference/runtime and must not
+be used to give Python the old all-in-one credentials.
+
 # Framework runtime: current serving path
 
 The default application has exactly three TypeScript processes: NestJS API, a Nest

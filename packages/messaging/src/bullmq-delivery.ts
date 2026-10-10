@@ -21,9 +21,10 @@ export class BullMqTurnDelivery implements TurnDelivery {
   private opened?: Queue;
   private connection?: Redis;
   private readonly queueName: string;
+  private readonly splitWire:boolean;
   /** Validates the target at once; connects on first use, so composing a runtime opens no connection. */
-  constructor(private readonly url: string, options: { queueName?: string } = {}) {
-    assertLocalRedisUrl(url); this.queueName = options.queueName ?? TURN_QUEUE;
+  constructor(private readonly url: string, options: { queueName?: string; splitWire?:boolean } = {}) {
+    assertLocalRedisUrl(url); this.queueName = options.queueName ?? TURN_QUEUE;this.splitWire=options.splitWire??false;
   }
   private get queue(): Queue {
     // BullMQ does not close a connection it was given, so this class owns and closes it.
@@ -35,7 +36,7 @@ export class BullMqTurnDelivery implements TurnDelivery {
     // outbox entry is still pending: replace it, or the re-publish would be a silent no-op until retention expires.
     const state = await this.queue.getJobState(turnJobId(dispatch));
     if (state === 'completed' || state === 'failed') await this.queue.remove(turnJobId(dispatch)).catch(() => undefined);
-    await this.queue.add('turn', { turnId: dispatch.turnId, seq: dispatch.seq }, {
+    await this.queue.add('turn', this.splitWire?{contractVersion:1,turnId:dispatch.turnId,dispatchSeq:dispatch.seq}:{turnId:dispatch.turnId,seq:dispatch.seq}, {
       jobId: turnJobId(dispatch), attempts: 1,
       removeOnComplete: { age: 3600 }, removeOnFail: { age: 24 * 3600 },
     });
