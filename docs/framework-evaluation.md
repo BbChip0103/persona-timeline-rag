@@ -199,7 +199,7 @@ References: [Score configs](https://langfuse.com/docs/evaluation/score-configs),
 ## 90-day deletion (OSS)
 
 Automatic project Data Retention is **Enterprise Edition** for self-hosted,
-not an OSS switch. This repo instead provides a scheduled, dry-run-first CLI
+not an OSS switch. This repo instead provides a schedulable, dry-run-first CLI
 using supported OSS public APIs. Run separately for each managed environment
 (including the SDK experiment environment) and explicitly named datasets/queues.
 The start is the beginning of managed history, not a guessed empty-month bound.
@@ -208,12 +208,17 @@ The start is the beginning of managed history, not a guessed empty-month bound.
 pnpm exec tsx scripts/framework-retention.ts \
   --environment synthetic --from 2025-01-01T00:00:00.000Z \
   --dataset exact-managed-dataset --queue exact-managed-queue-id
-# After scope review, scheduled invocation uses project-specific confirmation:
+# After scope review, trace/queue cleanup uses project-specific confirmation:
 pnpm exec tsx scripts/framework-retention.ts \
   --environment synthetic --from 2025-01-01T00:00:00.000Z \
-  --dataset exact-managed-dataset --queue exact-managed-queue-id \
+  --queue exact-managed-queue-id \
   --apply --confirm-project exact-project-id
 ```
+
+If an apply inventory includes expired dataset items, the CLI stops before any
+mutation unless `--allow-logical-dataset-deletion` is also explicitly selected.
+That opt-in only permits version tombstones, not historical erasure. A recurring
+job still needs separate deployment; these examples do not install a scheduler.
 
 A single project-scoped credential is mandatory. Default dry-run is GET-only;
 apply requires exact project ID confirmation. Minimum retention is 90 days.
