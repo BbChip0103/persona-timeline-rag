@@ -2,13 +2,14 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { INestApplication } from '@nestjs/common';
 import type { Persona } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, TurnWorker, createLocalChat, type TextProvider } from '@ptr/core';
-import { FakeTextProvider, LiteLLMTextProvider } from '@ptr/providers';
+import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, TurnWorker, type TextProvider } from '@ptr/core';
+import { LiteLLMTextProvider } from '@ptr/providers';
 import { parseExposition, PROM_CONTENT_TYPE } from '@ptr/ops';
 import { createApiApplication } from '../src/app';
 import { workerMaintenanceObservability, workerObservability } from '../src/observability';
 import { publicTurn } from '../src/public-turn';
-import type { ApiRuntime } from '../src/runtime';
+import type {SplitApiRuntime} from '../src/split-runtime';
+import {splitRuntimeFixture} from './split-runtime-fixture';
 
 // : exact /metrics/prom names per role (plus the common pair).
 const COMMON=['ptr_build_info','process_start_time_seconds'];
@@ -27,17 +28,12 @@ const value=(text:string,name:string,labels:Record<string,string>={})=>parseExpo
 const until=async(check:()=>boolean|Promise<boolean>,ms=3000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
 
 describe('api /metrics/prom and health ',()=>{
-  let app:INestApplication;let base:string;let runtime:ApiRuntime;let health:{database:boolean;redis:boolean};let hold=false;
+  let app:INestApplication;let base:string;let runtime:SplitApiRuntime;let health:{database:boolean;redis:boolean};let fixture:ReturnType<typeof splitRuntimeFixture>;
   beforeEach(async()=>{
-    const store=new InMemoryConversationStore(), personas=new InMemoryPersonaRepository([persona]), fake=new FakeTextProvider();hold=false;
-    const provider:TextProvider={generate:(messages,options)=>hold?new Promise<string>((_,reject)=>options.signal.addEventListener('abort',()=>reject(new Error('aborted')),{once:true}))
-      :fake.generate(messages,options)};
-    const chat=createLocalChat({store,personas,provider});health={database:true,redis:true};
-    runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',
-      listPersonas:async()=>[persona],saveArtifact:async()=>undefined,health:async()=>health};
+    fixture=splitRuntimeFixture(persona);runtime=fixture.runtime;health={database:true,redis:true};runtime.health=async()=>health;
     app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   });
-  afterEach(async()=>{await (runtime.chat as ReturnType<typeof createLocalChat>).stop();await app.close();});
+  afterEach(async()=>{await app.close();});
   const call=(path:string,options:{method?:string;body?:unknown;owner?:string;auth?:string}={})=>fetch(`${base}/api/${path}`,{method:options.method??'GET',
     headers:{Authorization:options.auth??`Bearer ${token}`,'X-PTR-Owner':options.owner??'lt-obs','Content-Type':'application/json'},...(options.body===undefined?{}:{body:JSON.stringify(options.body)})});
   const scrape=async()=>{const response=await fetch(`${base}/metrics/prom`);expect(response.status).toBe(200);expect(response.headers.get('content-type')).toBe(PROM_CONTENT_TYPE);return response.text();};
@@ -63,7 +59,7 @@ describe('api /metrics/prom and health ',()=>{
   });
   test('SSE streams open are a gauge that falls back when the client leaves',async()=>{
     const session=await (await call('sessions',{method:'POST',body:{personId:persona.personId}})).json() as {session:{id:string}};
-    hold=true; // the model call waits until the turn is cancelled, so the stream stays open
+    fixture.hold=true; // Synthetic Python job waits, so the stream stays open
     const sent=await (await call(`sessions/${session.session.id}/turns`,{method:'POST',body:{clientRequestId:'c2',text:'안녕'}})).json() as {turn:{id:string}};
     const controller=new AbortController();
     const stream=await fetch(`${base}/api/turns/${sent.turn.id}/events`,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':'lt-obs'},signal:controller.signal});

@@ -5,7 +5,7 @@ import {createApiApplication} from '../src/app';
 import {SplitChatService} from '../src/split-chat';
 import type {SplitApiRuntime} from '../src/split-runtime';
 import type {PostgresLlmControl} from '@ptr/storage';
-import type {CreativeArtifact} from '../src/runtime';
+import type {CreativeArtifact} from '../src/creative-artifact';
 const production='synthetic-production-token-1234567890',synthetic='synthetic-owner-token-1234567890123',controlToken='synthetic-control-token-12345678901';
 const persona={id:'synthetic-persona',personId:'synthetic-person',revision:'synthetic-v1',label:'Synthetic',language:'ko',reviewStatus:'synthetic' as const,greeting:'synthetic greeting'};
 let app:INestApplication,base:string,runtime:SplitApiRuntime;let artifacts:CreativeArtifact[],control:{start:jest.Mock;status:jest.Mock;progress:jest.Mock;complete:jest.Mock};

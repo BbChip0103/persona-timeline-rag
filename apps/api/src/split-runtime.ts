@@ -11,8 +11,9 @@ import {RedisTurnEvents,RedisTurnEventSource} from '../../../packages/messaging/
 import {createRedisConnection,REDIS_PREFIX} from '../../../packages/messaging/src/redis';
 import type {ChatSession} from '@ptr/contracts';
 import {validateWire,type PersonaProjection,type StartRequest} from '../../../contracts/llm/v1/validate';
-import type {CreativeArtifact} from './runtime';
+import type {CreativeArtifact} from './creative-artifact';
 import {SplitChatService} from './split-chat';
+import {bounded} from '../../../packages/ops/src/bounded';
 export interface SplitApiRuntime {
   kind:'split';chat:SplitChatService;control:PostgresLlmControl;controlToken:string;
   executionStore:TurnExecutionStore;delivery:BullMqTurnDelivery;events:RedisTurnEvents;eventSource:RedisTurnEventSource;
@@ -56,7 +57,7 @@ export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRu
   return {kind:'split',chat,control,controlToken,executionStore:store,delivery,events,eventSource,providerName:env.PTR_CHAT_PROVIDER??'fake',model:env.PTR_MODEL??'synthetic/fake-text-v1',billable:env.PTR_LITELLM_BILLABLE==='1',listPersonas,
     async draftRemote(session,brief,requestKey,deadlineAt,signal) {const payload=validateWire('DraftRequest',{contractVersion:1,session,brief,requestKey,deadlineAt});const result=await rpc('DraftResponse','/internal/llm/draft',payload,signal);const {contractVersion:_,...reply}=result;return reply as {content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}};},
     async saveArtifact(artifact) {const directory=join(process.cwd(),'data','generated');await mkdir(directory,{recursive:true,mode:0o700});await writeFile(join(directory,`${artifact.id}.json`),JSON.stringify(artifact,null,2),{flag:'wx',mode:0o600});},
-    async health() {const check=async(work:()=>Promise<unknown>)=>{let timer:ReturnType<typeof setTimeout>|undefined;try{await Promise.race([work(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DEPENDENCY_TIMEOUT')),1000);})]);return true;}catch{return false;}finally{clearTimeout(timer);}};const [database,redisOkay]=await Promise.all([check(()=>pool.query('SELECT 1')),check(()=>redis().ping())]);return {database,redis:redisOkay};},
+    async health() {const check=async(work:()=>Promise<unknown>)=>{try{await bounded(work,1000);return true;}catch{return false;}};const [database,redisOkay]=await Promise.all([check(()=>pool.query('SELECT 1')),check(()=>redis().ping())]);return {database,redis:redisOkay};},
     async close(){await maintenance.stop();await Promise.allSettled([delivery.close(),events.close(),eventSource.close(),queue?.close()]);connection?.disconnect();await pool.end();},
   };
 }

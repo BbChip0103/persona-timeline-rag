@@ -11,10 +11,12 @@ async function main() {
   for (const path of ['data', 'reports', 'packages/providers', 'apps/llm-service', 'apps/api/src/runtime.ts', 'apps/api/src/worker.ts']) {
     assert.equal(existsSync(`/app/${path}`), false, `unexpected image path: ${path}`);
   }
+  let closed = 0;
   const runtime = {
     kind: 'split', providerName: 'synthetic', model: 'synthetic/no-provider', billable: false,
     controlToken: 'synthetic-control-token-000000000000',
     health: async () => ({ database: true, redis: true }), listPersonas: async () => [],
+    close: async () => { closed++; },
   } as unknown as SplitApiRuntime;
   const app = await createApiApplication(runtime, 'synthetic-public-token-000000000000');
   try {
@@ -27,6 +29,7 @@ async function main() {
   } finally {
     await app.close();
   }
+  assert.equal(closed, 1);
   console.log(JSON.stringify({ status: 'PASS', uid: 900, llmSdkInstalled: 0, llmSdkLoaded: 0, httpStartupShutdown: true }));
 }
 void main().catch(() => { console.error('BACKEND_IMAGE_SMOKE_FAILED'); process.exitCode = 1; });

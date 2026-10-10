@@ -3,8 +3,10 @@ import type { MessageEvent } from '@nestjs/common';
 import { SseStream } from '@nestjs/core/router/sse-stream';
 import { EMPTY, Observable, Subject, Subscription, catchError, concatMap, firstValueFrom, from, fromEvent, interval, take, timeout, timer } from 'rxjs';
 import type { ChatTurn } from '@ptr/contracts';
-import type { ChatService, TurnEventSource } from '@ptr/core';
+import type {TurnEventSource} from '../../../packages/core/src/ports';
 import { publicTurn } from './public-turn';
+
+export interface TurnReader {getTurn(ownerId:string,id:string):Promise<ChatTurn>}
 
 export interface SseOptions {
   /** Store re-check interval: covers pub/sub notices lost in transit (Redis pub/sub does not store them). */
@@ -39,7 +41,7 @@ export class ExactTurnSseStream extends SseStream {
  * Two store reads per normal turn instead of one per client poll. If the subscription fails or is slow (Redis
  * trouble), the stream degrades to frequent store re-checks instead of failing.
  */
-export async function streamTurn(chat:Pick<ChatService,'getTurn'>,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions):Promise<void> {
+export async function streamTurn(chat:TurnReader,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions):Promise<void> {
   let finished=false;let lastRank=-1;let checking:Promise<void>|undefined;let again=false;
   const clocks=new Subscription(),lifetime=new Subscription();
   const frames=new Subject<TurnFrame>();

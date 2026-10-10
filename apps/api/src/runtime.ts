@@ -1,3 +1,4 @@
+/** Historical research/test composition only. API serving is split-only; this module is not a startup option. */
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -10,11 +11,8 @@ import { createLog, FrameworkTelemetry, frameworkTelemetryConfig, type Framework
 import { CheckpointedTextProvider, GuardrailsClient, AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, REPLY_GUARD_REVISION } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
 import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, LiteLLMTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
-export interface CreativeArtifact {
-  id:string;ownerId:string;personId:string;personaRevision:string;sessionId:string;
-  kind:'post_draft';origin:'generated';fictional:true;status:'draft';content:string;
-  promptRevision:string;provider:string;model:string;createdAt:string;
-}
+import type {CreativeArtifact} from './creative-artifact';
+export type {CreativeArtifact} from './creative-artifact';
 export interface ApiRuntime {
   kind?:'legacy';
   chat:ChatService;personas:PersonaRepository;provider:TextProvider;

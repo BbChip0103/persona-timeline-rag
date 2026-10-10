@@ -1,18 +1,20 @@
 import type { INestApplication } from '@nestjs/common';
 import type { Persona, ChatSession, ChatTurn, ChatMessage } from '@ptr/contracts';
-import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, createLocalChat, safetyReply, type SafetyAssessInput, type SafetyScores, type TurnEvent } from '@ptr/core';
-const ChatServiceGetTurn=ChatService.prototype.getTurn;
-import { FakeTextProvider } from '@ptr/providers';
-import { createApiApplication } from '../src/app';
-import type { ApiRuntime, CreativeArtifact } from '../src/runtime';
-import { ZodSchemaPipe } from '../src/schema-pipes';
+import type {TurnEvent} from '../../../packages/core/src/ports';
+import {createApiApplication} from '../src/app';
+import {SplitChatService} from '../src/split-chat';
+import type {SplitApiRuntime} from '../src/split-runtime';
+import type {CreativeArtifact} from '../src/creative-artifact';
+import {splitRuntimeFixture} from './split-runtime-fixture';
+import {ZodSchemaPipe} from '../src/schema-pipes';
+const ChatServiceGetTurn=SplitChatService.prototype.getTurn;
 // Two owner spaces : the web's production token sends `local-<40 hex>` owners only; this harness token
 // (PTR_API_SYNTHETIC_TOKEN) sends synthetic owners only. Most tests use the harness token.
 const token='synthetic_api_token_abcdefghijklmnop';
 const productionToken='production_api_token_abcdefghijklmnop';
 const webOwner='local-0123456789abcdef0123456789abcdef01234567';
 const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',label:'Synthetic Painter',language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Synthetic conversation',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
-let app:INestApplication;let base:string;let runtime:ApiRuntime;let artifacts:CreativeArtifact[];
+let app:INestApplication;let base:string;let runtime:SplitApiRuntime;let fixture:ReturnType<typeof splitRuntimeFixture>;let artifacts:CreativeArtifact[];
 async function call(path:string,options:{method?:string;body?:unknown;owner?:string;auth?:string}={}) {
   const response=await fetch(`${base}/api/${path}`,{method:options.method??'GET',headers:{Authorization:options.auth??`Bearer ${token}`,'X-PTR-Owner':options.owner??'owner_synthetic_a','Content-Type':'application/json'},...(options.body===undefined?{}:{body:JSON.stringify(options.body)})});
   return {status:response.status,body:await response.json() as {session:ChatSession;turn:ChatTurn;personas:(Persona & {aiDisclosure:string})[];history:ChatMessage[];sessions:ChatSession[];artifact:CreativeArtifact;image:{code:string};cancelled:boolean}};
@@ -22,8 +24,7 @@ async function waitTurn(id:string):Promise<ChatTurn> {
   throw new Error('Synthetic turn did not settle');
 }
 beforeEach(async()=>{
-  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();artifacts=[];
-  const chat=createLocalChat({store,personas,provider});runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[persona],saveArtifact:async artifact=>{artifacts.push(artifact);}};
+  fixture=splitRuntimeFixture(persona);runtime=fixture.runtime;artifacts=fixture.artifacts;
   app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
 });
 afterEach(async()=>{await app.close();});
@@ -45,10 +46,17 @@ test('Nest application shutdown owns runtime cleanup once even when app close is
   expect(runtime.close).toHaveBeenCalledTimes(1);
 });
 test('health safe; authentication required and invalid owner rejected',async()=>{
-  expect((await call('health',{auth:'bad'})).body).toEqual({ok:true,service:'persona-timeline-rag',liveEnabled:false});
+  expect((await call('health',{auth:'bad'})).body).toEqual({ok:true,service:'persona-timeline-rag',liveEnabled:false,checks:{database:'ok',redis:'ok'}});
   expect((await call('personas',{auth:'Bearer wrong'})).status).toBe(403);
   expect((await call('personas',{owner:'../unsafe'})).status).toBe(403);
   const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toContain('AI');expect(listed.body.personas[0].identity).toBeUndefined();
+});
+test('authentication runs before malformed or oversized JSON parsing',async()=>{
+  for(const body of ['{bad json',' '.repeat(20000)+'{}']) {
+    const response=await fetch(`${base}/api/sessions`,{method:'POST',headers:{Authorization:'Bearer wrong','Content-Type':'application/json','X-PTR-Owner':'owner_synthetic_a'},body});
+    expect(response.status).toBe(403);expect(await response.json()).toEqual({error:{code:'UNAUTHORIZED'}});
+  }
+  expect(fixture.dispatches).toHaveLength(0);expect(runtime.draftRemote).not.toHaveBeenCalled();
 });
 test('owner spaces: the production token takes only web owners, the harness token only synthetic owners ',async()=>{
   const production=`Bearer ${productionToken}`;
@@ -86,14 +94,16 @@ test('owner/person/revision spoofing and invalid range reject without provider c
   expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'x',text:'hi',sessionId:'other'}})).status).toBe(400);
   expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'x',text:'hi',ownerId:'other'}})).status).toBe(400);
   expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'x',text:'게시',timeline:{dateBasis:'posted',start:'2020-02-30',end:'2020-03-01'}}})).status).toBe(400);
-  expect((runtime.provider as FakeTextProvider).calls).toBe(0);
+  expect(fixture.dispatches).toHaveLength(0);expect(runtime.draftRemote).not.toHaveBeenCalled();
 });
-test('off factual query abstains without provider; turn and cancelled terminal state projection',async()=>{
+test('remote factual abstention and completed cancellation are projected without backend model work',async()=>{
+  fixture.reply={status:'insufficient_evidence',responseKind:'timeline',content:'근거가 부족합니다.'};
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,executionProfile:'legacy'}});const id=created.body.session.id;
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'x',text:'2020년 어디 여행했어?'}});
-  const final=await waitTurn(sent.body.turn.id);expect(final.reply?.status).toBe('insufficient_evidence');expect((runtime.provider as FakeTextProvider).calls).toBe(0);
+  const final=await waitTurn(sent.body.turn.id);expect(final.reply?.status).toBe('insufficient_evidence');expect(fixture.dispatches).toHaveLength(1);
   expect((await call(`turns/${sent.body.turn.id}/cancel`,{method:'POST',body:{}})).body.cancelled).toBe(false);
 });
+
 test('fictional draft saved outside source corpus, private owner omitted; no image calls',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   const drafted=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 전시 소개'}});
@@ -107,23 +117,22 @@ test('malformed/oversize body and provider errors do not reveal raw data',async(
   const huge=await call('sessions',{method:'POST',body:{personId:'a'.repeat(20000)}});expect(huge.status).toBe(413);expect(JSON.stringify(huge.body)).not.toContain('aaaa');
   runtime.listPersonas=async()=>{throw new Error('postgres://private credentials raw');};const failed=await call('personas');expect(failed.status).toBe(500);expect(failed.body).toEqual({error:{code:'INTERNAL_ERROR'}});
 });
-test('pending-start API supports poll/cancel, and late provider output never reaches history',async()=>{
-  let resolve!:(value:string)=>void;let signal!:AbortSignal;
-  const provider={generate:(_messages:unknown,_options:{signal:AbortSignal})=>{signal=_options.signal;return new Promise<string>(r=>{resolve=r;});}};
-  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
-  const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
+test('pending split job supports poll/cancel, and late remote output never reaches history',async()=>{
+  fixture.hold=true;
+  const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
   const pending=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'pending_synthetic',text:'안녕'}});
   expect(['pending','generating']).toContain(pending.body.turn.state);expect(pending.body.turn.reply).toBeUndefined();
-  expect((await call(`turns/${pending.body.turn.id}/cancel`,{method:'POST',body:{}})).body.cancelled).toBe(true);expect(signal.aborted).toBe(true);
-  resolve('late result');await new Promise(r=>setTimeout(r,5));
+  expect((await call(`turns/${pending.body.turn.id}/cancel`,{method:'POST',body:{}})).body.cancelled).toBe(true);
+  await fixture.complete(pending.body.turn.id,{content:'late result'});
   expect((await call(`turns/${pending.body.turn.id}`)).body.turn.state).toBe('cancelled');expect((await call(`sessions/${id}`)).body.history).toHaveLength(1);
 });
+
 test('draft provider failure is sanitized 502; credential-like input rejected before storage/model',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'secret',text:'api_key=synthetic_secret'}})).status).toBe(400);
   expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'api_key=synthetic_secret'}})).status).toBe(400);
-  expect((runtime.provider as FakeTextProvider).calls).toBe(0);
-  runtime.provider={generate:async()=>{throw new Error('sk-synthetic_secret_do_not_expose');}};
+  expect(fixture.dispatches).toHaveLength(0);expect(runtime.draftRemote).not.toHaveBeenCalled();
+  runtime.draftRemote=jest.fn(async()=>{throw new Error('sk-synthetic_secret_do_not_expose');});
   const failed=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 이야기'}});expect(failed.status).toBe(502);expect(failed.body).toEqual({error:{code:'TURN_FAILED'}});expect(artifacts).toEqual([]);
 });
 
@@ -137,22 +146,18 @@ test('explicit conditions persist, default algorithm consistently, reject contra
   }
   for(const body of [{ragCondition:'off',retrievalMode:'semantic'},{ragCondition:'caption',retrievalMode:'off'},{ragCondition:'caption_image',retrievalMode:'off'}]) expect((await call('sessions',{method:'POST',body:{personId:persona.personId,...body}})).status).toBe(400);
 });
-test('explicit off invokes provider for factual comparison and exposes unverified actual answer without evidence',async()=>{
-  const provider={generate:jest.fn(async()=>JSON.stringify({status:'answered',answer:'이 모델 응답은 실제 방문 사실로 검증되지 않았습니다.',evidenceRefs:[]}))};
-  const retrieval={search:jest.fn(async()=>[])};
-  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider,retrieval});
+test('explicit off pins the remote job condition and exposes unverified answer projection without evidence',async()=>{
+  fixture.reply={responseKind:'timeline',content:'이 모델 응답은 실제 방문 사실로 검증되지 않았습니다.',grounding:'unverified_model'};
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'off',executionProfile:'legacy'}});const id=created.body.session.id;
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'experiment-off',text:'2020년 어디 여행했어?'}});
   const final=await waitTurn(sent.body.turn.id);
-  expect(final.reply?.content).toContain('이 모델 응답');expect(final.reply?.grounding).toBe('unverified_model');expect(final.reply?.evidence).toEqual([]);expect(final.reply?.claims).toEqual([]);
-  expect(provider.generate).toHaveBeenCalledTimes(1);expect(retrieval.search).not.toHaveBeenCalled();
+  expect(final.reply?.content).toContain('이 모델 응답');expect(final.reply?.grounding).toBe('unverified_model');expect(final.reply?.evidence).toEqual([]);expect(final.reply?.claims).toEqual([]);expect(fixture.dispatches).toHaveLength(1);
   expect((await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'override',text:'hello',ragCondition:'caption_image'}})).status).toBe(400);
 });
 
 test('new API sessions default agent_loop; explicit legacy remains pinned; internal agent fields never leave poll/replay/history',async()=>{
   const secretSummary='synthetic-internal-summary';const privateTopic='synthetic-internal-topic';
-  const provider={generate:async()=>JSON.stringify({status:'answered',message:'안녕! 편하게 이야기해요.',evidenceRefs:[],reasoning:secretSummary,variableUpdates:{conversationTopic:privateTopic,tone:'warm'}})};
-  runtime.chat=createLocalChat({store:new InMemoryConversationStore(),personas:runtime.personas,provider});
+  fixture.reply={agent:{revision:'synthetic',promptRevision:'synthetic',modelCalls:1,toolCalls:0,validator:'accepted',decisionSummary:secretSummary,variables:{conversationTopic:privateTopic,tone:'warm'},steps:[]}};
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'off'}});
   expect(created.body.session.executionProfile).toBe('agent_loop');const sessionId=created.body.session.id;
   const input={clientRequestId:'internal-fields',text:'안녕'};
@@ -185,16 +190,13 @@ async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promis
   clearTimeout(timer);
   return {status:response.status,type:response.headers.get('content-type'),events,closed,wire:text};
 }
-function blockedProvider() {
-  let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});
-  return {provider:{generate:async()=>{await gate;return '반가워요.';}},release};
-}
-function useChat(chat:ReturnType<typeof createLocalChat>,store:InMemoryConversationStore) {
-  Object.assign(runtime,{chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events});
+function heldSplit() {
+  const held=splitRuntimeFixture(persona,{hold:true});
+  const release=()=>{for(const dispatch of held.dispatches)void held.complete(dispatch.turnId);};
+  return {held,chat:held.runtime.chat,release};
 }
 test('SSE: a turn streams its state changes and the final public turn, then the server closes the stream',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  useChat(createLocalChat({store,personas:runtime.personas,provider}),store);
+  const {held,release}=heldSplit();Object.assign(runtime,held.runtime);
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId,executionProfile:'legacy'}});const id=created.body.session.id;
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'sse_1',text:'안녕'}});
   const reading=readSse(`${base}/api/turns/${sent.body.turn.id}/events`);
@@ -216,13 +218,12 @@ test('SSE: an already ended turn yields one snapshot and closes; another owner g
   expect(other.status).toBe(404);expect(other.type).toMatch(/^application\/json/);
 });
 test('SSE: if pub/sub notices are lost, the periodic store re-check still delivers the end of the turn',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  const chat=createLocalChat({store,personas:runtime.personas,provider});
-  const silent:ApiRuntime={...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:{subscribe:async()=>()=>undefined}};
+  const {held,chat,release}=heldSplit();
+  const silent={...held.runtime,eventSource:{subscribe:async()=>()=>undefined}} as unknown as SplitApiRuntime;
   const quiet=await createApiApplication(silent,productionToken,{syntheticToken:token,sse:{recheckMs:50}});await quiet.listen(0,'127.0.0.1');const quietBase=await quiet.getUrl();
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
-    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_3',text:'안녕'});
+    const {turn}=await chat.submitTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_3',text:'안녕'});
     const reading=readSse(`${quietBase}/api/turns/${turn.id}/events`);
     await new Promise(r=>setTimeout(r,30));release();
     const {events,closed}=await reading;
@@ -231,17 +232,16 @@ test('SSE: if pub/sub notices are lost, the periodic store re-check still delive
 });
 
 test('SSE: a client gone during the ownership check leaves no subscription behind; a failing subscribe still streams via store re-checks',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  const chat=createLocalChat({store,personas:runtime.personas,provider});
+  const {held,chat,release}=heldSplit();
   let active=0,subscribes=0;let failSubscribe=false;
   const counting={subscribe:async(turnId:string,listener:(e:TurnEvent)=>void)=>{
-    subscribes++;if(failSubscribe)throw new Error('redis down');active++;const off=await chat.events.subscribe(turnId,listener);return ()=>{active--;off();};}};
-  const app2=await createApiApplication({...runtime,chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:counting},productionToken,{syntheticToken:token,sse:{recheckMs:40}});
+    subscribes++;if(failSubscribe)throw new Error('redis down');active++;const off=await held.events.subscribe(turnId,listener);return ()=>{active--;off();};}};
+  const app2=await createApiApplication({...held.runtime,eventSource:counting} as unknown as SplitApiRuntime,productionToken,{syntheticToken:token,sse:{recheckMs:40}});
   await app2.listen(0,'127.0.0.1');const base2=await app2.getUrl();
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
-    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_gone',text:'안녕'});
-    const slow=jest.spyOn(chat,'getTurn');slow.mockImplementationOnce(async(owner,id)=>{await new Promise(r=>setTimeout(r,150));return ChatServiceGetTurn.call(chat,owner,id);});
+    const {turn}=await chat.submitTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_gone',text:'안녕'});
+    const slow=jest.spyOn(chat,'getTurn');slow.mockImplementationOnce(async(owner:string,id:string)=>{await new Promise(r=>setTimeout(r,150));return ChatServiceGetTurn.call(chat,owner,id);});
     const controller=new AbortController();
     const gone=fetch(`${base2}/api/turns/${turn.id}/events`,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':'owner_synthetic_a'},signal:controller.signal}).catch(()=>undefined);
     await new Promise(r=>setTimeout(r,30));controller.abort();await gone;
@@ -256,14 +256,13 @@ test('SSE: a client gone during the ownership check leaves no subscription behin
 });
 
 test('SSE: native transport emits exact ping comments, no IDs, and releases subscriptions at maximum duration',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  const chat=createLocalChat({store,personas:runtime.personas,provider});let active=0;
+  const {held,chat,release}=heldSplit();let active=0;
   const eventSource={subscribe:async()=>{active++;return ()=>{active--;};}};
-  const app2=await createApiApplication({...runtime,chat,eventSource},productionToken,{syntheticToken:token,sse:{heartbeatMs:10,maxMs:65,recheckMs:20}});
+  const app2=await createApiApplication({...held.runtime,eventSource} as unknown as SplitApiRuntime,productionToken,{syntheticToken:token,sse:{heartbeatMs:10,maxMs:65,recheckMs:20}});
   await app2.listen(0,'127.0.0.1');
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
-    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_ping',text:'안녕'});
+    const {turn}=await chat.submitTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_ping',text:'안녕'});
     const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
     expect(result.closed).toBe(true);expect(result.wire).toContain(': ping\n\n');expect(result.wire).not.toMatch(/^id:/m);
     expect(active).toBe(0);
@@ -271,62 +270,42 @@ test('SSE: native transport emits exact ping comments, no IDs, and releases subs
 });
 
 test('SSE: post-header store errors close safely without the native default Error.message event',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  const chat=createLocalChat({store,personas:runtime.personas,provider});let off=0;
-  const app2=await createApiApplication({...runtime,chat,eventSource:{subscribe:async()=>()=>{off++;}}},productionToken,{syntheticToken:token,sse:{recheckMs:10}});
+  const {held,chat,release}=heldSplit();let off=0;
+  const app2=await createApiApplication({...held.runtime,eventSource:{subscribe:async()=>()=>{off++;}}} as unknown as SplitApiRuntime,productionToken,{syntheticToken:token,sse:{recheckMs:10}});
   await app2.listen(0,'127.0.0.1');
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
-    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_error',text:'안녕'});
-    let calls=0;jest.spyOn(chat,'getTurn').mockImplementation((owner,id)=>++calls<=2?ChatServiceGetTurn.call(chat,owner,id):Promise.reject(new Error('SYNTHETIC_PRIVATE_ERROR')));
+    const {turn}=await chat.submitTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_error',text:'안녕'});
+    let calls=0;jest.spyOn(chat,'getTurn').mockImplementation((owner:string,id:string)=>++calls<=2?ChatServiceGetTurn.call(chat,owner,id):Promise.reject(new Error('SYNTHETIC_PRIVATE_ERROR')));
     const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
     expect(result.closed).toBe(true);expect(result.events).toHaveLength(1);expect(result.wire).not.toContain('SYNTHETIC_PRIVATE_ERROR');expect(result.wire).not.toContain('event: error');expect(off).toBe(1);
   } finally {release();await app2.close();}
 });
 
 test('SSE: a late subscription after its RxJS timeout is disposed once, not leaked',async()=>{
-  const store=new InMemoryConversationStore();const {provider,release}=blockedProvider();
-  const chat=createLocalChat({store,personas:runtime.personas,provider});let off=0;
+  const {held,chat,release}=heldSplit();let off=0;
   let resolveSubscription!:(off:()=>void)=>void;
   const subscription=new Promise<()=>void>(resolve=>{resolveSubscription=resolve;});
-  const app2=await createApiApplication({...runtime,chat,eventSource:{subscribe:async()=>subscription}},productionToken,{syntheticToken:token,sse:{subscribeTimeoutMs:10,maxMs:30,recheckMs:10}});
+  const app2=await createApiApplication({...held.runtime,eventSource:{subscribe:async()=>subscription}} as unknown as SplitApiRuntime,productionToken,{syntheticToken:token,sse:{subscribeTimeoutMs:10,maxMs:30,recheckMs:10}});
   await app2.listen(0,'127.0.0.1');
   try {
     const session=await chat.createSession('owner_synthetic_a',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC',executionProfile:'legacy'});
-    const turn=await chat.startTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_late',text:'안녕'});
+    const {turn}=await chat.submitTurn('owner_synthetic_a',{sessionId:session.id,clientRequestId:'sse_late',text:'안녕'});
     const result=await readSse(`${await app2.getUrl()}/api/turns/${turn.id}/events`);
     expect(result.closed).toBe(true);expect(off).toBe(0);
     resolveSubscription(()=>{off++;});await new Promise<void>(resolve=>setImmediate(resolve));expect(off).toBe(1);
   } finally {release();await app2.close();}
 });
 
-test('draft briefs pass the input safety filter when it is on: refuse/support without model or storage, deflect with the note',async()=>{
-  await app.close();
-  const score=(text:string):Partial<SafetyScores>=>Object.fromEntries(SAFETY_CATEGORIES.map(category=>[category,
-    category==='sexual'&&text.includes('REFUSE_ME')||category==='self_harm'&&text.includes('SUPPORT_ME')||category==='prompt_injection'&&text.includes('INJECT_ME')?0.95:0.01]));
-  const assess=jest.fn(async(input:SafetyAssessInput)=>({safety:score(input.text)}));
-  const onSafetyFallback=jest.fn();
-  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);
-  const calls:unknown[]=[];const provider={generate:async(messages:unknown)=>{calls.push(messages);return '합성 초안';}};
-  const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200},onSafetyFallback});
-  runtime={...runtime,chat,personas,provider};
-  app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+test('remote safety notices pass through without artifact writes; successful remote drafts remain fictional',async()=>{
+  const remote=jest.fn(async(_session:ChatSession,brief:string)=>brief.startsWith('REFUSE')?{notice:{status:'out_of_scope' as const,content:'안전한 안내',limitations:[]}}:brief.startsWith('SUPPORT')?{notice:{status:'out_of_scope' as const,content:'도움을 요청해 주세요.',limitations:['SAFETY_SUPPORT']}}:{content:'합성 초안',provider:'fake',model:'synthetic'});
+  runtime.draftRemote=remote;
   const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
-  const refused=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'REFUSE_ME 초안'}});
-  expect(refused.status).toBe(201);expect(refused.body).toMatchObject({notice:{status:'out_of_scope',content:safetyReply('sexual','ko'),limitations:[]},image:{code:'IMAGE_RUNNER_ONLY'}});
-  expect(Object.keys(refused.body).sort()).toEqual(['image','notice']);expect(JSON.stringify(refused.body)).not.toMatch(/sexual|probabilit|synthetic\/safety/);
-  const support=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'SUPPORT_ME'}});
-  expect(support.body).toMatchObject({notice:{content:safetyReply('self_harm','ko'),limitations:['SAFETY_SUPPORT']}});
-  expect(calls).toHaveLength(0);expect(artifacts).toHaveLength(0);
-  const deflected=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'INJECT_ME 초안'}});
-  expect(deflected.status).toBe(201);expect(calls).toHaveLength(1);expect(JSON.stringify(calls[0])).toContain(SAFETY_DEFLECTION_NOTE);
-  // The draft id seeds the check and names the artifact; the whole brief is checked.
-  expect(assess.mock.calls.at(-1)![0]).toMatchObject({seed:`draft:owner_synthetic_a:${deflected.body.artifact.id}`,recentUserTurns:[],intent:false,text:'INJECT_ME 초안'});
-  expect(artifacts).toHaveLength(1);
-  // Fail-open: an unavailable filter keeps drafting and is reported without text.
-  assess.mockRejectedValueOnce(Object.assign(new Error('raw'),{code:'BUDGET_EXCEEDED'}));
-  expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'평범한 초안'}})).status).toBe(201);
-  expect(onSafetyFallback).toHaveBeenCalledWith({scope:'draft',reason:'budget'});
+  for(const brief of ['REFUSE_ME 초안','SUPPORT_ME']){
+    const result=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief}});expect(result.status).toBe(201);expect(Object.keys(result.body).sort()).toEqual(['image','notice']);expect(artifacts).toHaveLength(0);
+  }
+  const drafted=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'INJECT_ME 초안'}});expect(drafted.status).toBe(201);expect(artifacts).toHaveLength(1);
+  expect(remote.mock.calls.map(call=>call[1])).toEqual(['REFUSE_ME 초안','SUPPORT_ME','INJECT_ME 초안']);
 });
 
 test('draft cap applies with the Jev classifier off as well',async()=>{
@@ -335,37 +314,35 @@ test('draft cap applies with the Jev classifier off as well',async()=>{
   const off=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
   expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
   expect((await call(`sessions/${off}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(503);
-  expect((runtime.provider as FakeTextProvider).calls).toBe(1);
+  expect(runtime.draftRemote).toHaveBeenCalledTimes(1);
 });
-test('with the safety filter on, draft requests are capped per owner per minute before any safety check or model call',async()=>{
+test('foreign session draft attempts do not consume the authorized owner quota',async()=>{
+  await app.close();fixture=splitRuntimeFixture(persona);runtime=fixture.runtime;
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:1});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const foreign=(await call('sessions',{method:'POST',owner:'owner_synthetic_b',body:{personId:persona.personId}})).body.session.id;
+  expect((await call(`sessions/${foreign}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(404);
+  expect(runtime.draftRemote).not.toHaveBeenCalled();
+  const own=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
+  expect((await call(`sessions/${own}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
+  expect(runtime.draftRemote).toHaveBeenCalledTimes(1);
+});
+test('remote draft requests are capped independently per owner before the service call',async()=>{
   await app.close();
-  const assess=jest.fn(async(input:SafetyAssessInput)=>({safety:Object.fromEntries(input.categories.map(category=>[category,0.01]))}));
-  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([persona]);const provider=new FakeTextProvider();
-  const chat=createLocalChat({store,personas,provider,inputSafety:{classifier:{name:'synthetic/safety-v1',assess},thresholds:{prompt_injection:0.5,sexual:0.5,violence_gore:0.5,self_harm:0.2,hate_harassment:0.5,illegal_dangerous:0.6,private_info:0.5},timeoutMs:200}});
-  runtime={...runtime,chat,personas,provider};
+  fixture=splitRuntimeFixture(persona);runtime=fixture.runtime;
   app=await createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:2});await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const id=(await call('sessions',{method:'POST',body:{personId:persona.personId}})).body.session.id;
-  for(let i=0;i<2;i++) expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}})).status).toBe(201);
-  const calls=(runtime.provider as FakeTextProvider).calls;
-  const limited=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}});
-  expect(limited.status).toBe(503);expect(limited.body).toEqual({error:{code:'QUEUE_FULL'}});expect((runtime.provider as FakeTextProvider).calls).toBe(calls);expect(assess).toHaveBeenCalledTimes(2);
+  for(let i=0;i<2;i++)expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'合成 초안'}})).status).toBe(201);
+  const limited=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 초안'}});expect(limited.status).toBe(503);expect(limited.body).toEqual({error:{code:'QUEUE_FULL'}});expect(runtime.draftRemote).toHaveBeenCalledTimes(2);
   const other=(await call('sessions',{method:'POST',owner:'owner_synthetic_b',body:{personId:persona.personId}})).body.session.id;
   expect((await call(`sessions/${other}/drafts`,{method:'POST',owner:'owner_synthetic_b',body:{brief:'합성 초안'}})).status).toBe(201);
   await expect(createApiApplication(runtime,productionToken,{syntheticToken:token,draftsPerOwnerPerMinute:0})).rejects.toThrow();
 });
-test(': the fictional draft path renders the same four persona fields for a persona card (no new field reaches it)',async()=>{
-  await app.close();
-  const card:Persona={...persona,alternateGreetings:['다른 인사'],personality:{summary:'UNIQUE-PERSONALITY',traits:[],values:[],speechHabits:[]},
-    background:{text:'UNIQUE-BACKGROUND',sourceRefs:['web:1']},exampleDialogues:[{turns:[{speaker:'user',text:'UNIQUE-EXAMPLE'},{speaker:'character',text:'b'}]}],
-    lore:[{id:'UNIQUE-LORE',keys:['그림'],content:'UNIQUE-LORE-CONTENT',priority:50,sourceRefs:['web:1']}],meta:{creatorNotes:'UNIQUE-META'}};
-  const store=new InMemoryConversationStore();const personas=new InMemoryPersonaRepository([card]);const provider=new FakeTextProvider();
-  const generate=jest.spyOn(provider,'generate');
-  const chat=createLocalChat({store,personas,provider});
-  runtime={chat,leases:store,delivery:chat.delivery,events:chat.events,eventSource:chat.events,personas,provider,providerName:'fake',model:'synthetic/fake',listPersonas:async()=>[card],saveArtifact:async()=>undefined};
-  app=await createApiApplication(runtime,productionToken,{syntheticToken:token});await app.listen(0,'127.0.0.1');base=await app.getUrl();
-  const id=(await call('sessions',{method:'POST',body:{personId:card.personId}})).body.session.id;
+
+test('draft RPC sends pinned session projection and brief, not backend-rendered persona prompts',async()=>{
+  const remote=jest.spyOn(runtime,'draftRemote');
+  const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   expect((await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 전시 소개'}})).status).toBe(201);
-  const messages=generate.mock.calls[0]![0];
-  expect(messages[1]).toEqual({role:'system',content:JSON.stringify({language:persona.language,concept:persona.concept,style:persona.style,boundaries:persona.boundaries})});
-  expect(JSON.stringify(messages)).not.toMatch(/UNIQUE-|다른 인사/);
+  expect(remote).toHaveBeenCalledTimes(1);expect(remote.mock.calls[0]![0]).toMatchObject({personaId:persona.id,personaRevision:persona.revision,personId:persona.personId});
+  expect(remote.mock.calls[0]![0]).not.toHaveProperty('identity');expect(remote.mock.calls[0]![0]).not.toHaveProperty('style');
+  expect(remote.mock.calls[0]![1]).toBe('합성 그림 전시 소개');
 });

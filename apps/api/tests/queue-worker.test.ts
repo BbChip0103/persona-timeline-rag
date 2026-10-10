@@ -1,17 +1,18 @@
 import 'reflect-metadata';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { TurnQueueProcessor } from '../src/queue-worker';
 import { FrameworkTurnWorker } from '@ptr/core';
 import type { Job } from 'bullmq';
 describe('Nest WorkerHost turn processor',()=>{
-  test('default entrypoint owns maintenance/metrics in the Nest worker, never starts legacy dispatcher',()=>{
-    const source=readFileSync(resolve(__dirname,'../src/worker.ts'),'utf8');
+  test('Python owns the worker entrypoint; the split backend owns native outbox maintenance',()=>{
+    expect(existsSync(resolve(__dirname,'../src/worker.ts'))).toBe(false);
+    const source=readFileSync(resolve(__dirname,'../src/split-runtime.ts'),'utf8');
     const manifest=JSON.parse(readFileSync(resolve(__dirname,'../../../package.json'),'utf8'));
-    expect(source).toContain('NestFactory.createApplicationContext(turnWorkerModule(');
-    expect(source).toContain('new WorkerOutboxMaintenance(');expect(source).toContain('workerMaintenanceObservability(observed.registry');
-    expect(source).toContain('onEvent:maintenanceObserved.onEvent');expect(source).toContain('render:observed.render');
-    expect(source).not.toMatch(/\bTurnDispatcher\b|\bnew Worker\(/);expect(manifest.scripts).not.toHaveProperty('dev:dispatcher');
+    expect(manifest.scripts['dev:worker']).toBe('uv run --project apps/llm-service ptr-llm worker');
+    for(const retired of ['framework:smoke','framework:loadtest','harness:smoke','dev:worker:legacy','evaluate:legacy'])expect(manifest.scripts).not.toHaveProperty(retired);
+    expect(source).toContain('new WorkerOutboxMaintenance(');expect(source).toContain('maintenance.start()');
+    expect(source).not.toMatch(/\bTurnDispatcher\b|\bnew Worker\(|createRuntime|provider\.generate/);expect(manifest.scripts).not.toHaveProperty('dev:dispatcher');
   });
   test('forwards framework lock token and ignores malformed jobs',async()=>{
     const turns={handle:jest.fn(async()=>undefined),loseLock:jest.fn()} as unknown as FrameworkTurnWorker;const processor=new TurnQueueProcessor(turns);

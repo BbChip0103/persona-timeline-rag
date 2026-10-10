@@ -2,6 +2,7 @@ import type { ChatReply } from '@ptr/contracts';
 import type { TurnDispatcherEvent } from '@ptr/core';
 import {type Registry,Counter,Gauge,Histogram,TURN_SECONDS_BUCKETS,createMetricsRegistry} from '../../../packages/ops/src/metrics';
 import {createLog} from '../../../packages/ops/src/log';
+import {bounded} from '../../../packages/ops/src/bounded';
 
 /**
  * Metrics and JSON log events of the api and worker roles . Labels are fixed enums or
@@ -69,10 +70,8 @@ export function workerObservability(options:{activeTurns:()=>number;write?:(line
 
 /** A gauge read at scrape time; a failing or slow source (1 s) leaves the sample out. */
 async function reading(read:()=>Promise<number>):Promise<number|undefined> {
-  let timer:ReturnType<typeof setTimeout>|undefined;
-  try {return await Promise.race([read(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('timeout')),1000);})]);}
+  try {return await bounded(read,1000);}
   catch {return undefined;}
-  finally {clearTimeout(timer);}
 }
 /** Worker-local outbox maintenance hook, collected on the worker's shared /metrics/prom registry. */
 export function workerMaintenanceObservability(registry:Registry,options:{queueWaiting:()=>Promise<number>;oldestPendingAgeSeconds:()=>Promise<number>;write?:(line:string)=>void}) {
