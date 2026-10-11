@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import weakref
 from dataclasses import dataclass
@@ -78,14 +79,27 @@ class CheckpointedTextProvider:
             await close()
 
     def request_fingerprint(
-        self, messages: list[dict[str, str]], request_key: str | None = None
+        self,
+        messages: list[dict[str, str]],
+        request_key: str | None = None,
+        *,
+        response_schema: dict[str, Any] | None = None,
     ) -> str:
         method = getattr(self.provider, "request_fingerprint", None)
         return (
-            method(messages, request_key)
+            method(
+                messages,
+                request_key,
+                **({"response_schema": response_schema} if response_schema is not None else {}),
+            )
             if method
             else fingerprint(
-                {"revision": "python-fake-call-v1", "messages": messages, "requestKey": request_key}
+                {
+                    "revision": "python-fake-call-v1",
+                    "messages": messages,
+                    "requestKey": request_key,
+                    **({"responseSchema": response_schema} if response_schema is not None else {}),
+                }
             )
         )
 
@@ -102,7 +116,11 @@ class CheckpointedTextProvider:
         from langchain_core.runnables.config import RunnableConfig, var_child_runnable_config
 
         check_cancel(signal)
-        fp = self.request_fingerprint(messages, request_key)
+        if "response_schema" in options:
+            options["response_schema"] = copy.deepcopy(options["response_schema"])
+        fp = self.request_fingerprint(
+            messages, request_key, response_schema=options.get("response_schema")
+        )
         scope = hashlib.sha256((request_key or "").encode()).hexdigest()
         thread_id = f"python-call-v1:{scope}:{fp}"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}

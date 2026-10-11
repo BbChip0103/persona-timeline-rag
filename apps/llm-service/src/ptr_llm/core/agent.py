@@ -12,7 +12,7 @@ from langgraph.runtime import Runtime
 from .errors import CoreError
 from .persona import dumps
 from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
-from .protocol import parse_agent_response, variables
+from .protocol import agent_response_schema, parse_agent_response, variables
 from .safety import contains_credential, contains_internal_path
 from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
@@ -223,6 +223,7 @@ async def run_character_agent(
             deadline_at=deadline_at,
             priority=1 if run["iteration"] else 0,
             on_served=served,
+            response_schema=agent_response_schema(run["context"]["sources"]),
         )
         check()
         limitation = None

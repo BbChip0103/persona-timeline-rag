@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import math
 import time
 from contextvars import ContextVar
@@ -21,7 +23,7 @@ from .common import (
     fingerprint,
     js_json,
 )
-from .control_tokens import neutralize_messages
+from .control_tokens import neutralize_json_strings, neutralize_messages
 from .transport import LimitedTransport
 
 
@@ -120,7 +122,7 @@ class LiteLLMTextProvider:
             raise ProviderError("PROVIDER_CONTEXT_REQUIRED")
         await hooks[1](response)
 
-    def _runnable(self, mode: str) -> Any:
+    def _runnable(self, mode: str, response_schema: dict[str, Any] | None = None) -> Any:
         import httpx
         from langchain_openai import ChatOpenAI
         from pydantic import SecretStr
@@ -150,6 +152,14 @@ class LiteLLMTextProvider:
                 http_async_client=self._client,
             )
             self._runnables["plain"] = self._sdk
+        if response_schema is not None:
+            # Reuse the transport, not a private per-turn schema/runnable cache.
+            return self._sdk.with_structured_output(
+                {"title": "agent_reply", **response_schema},
+                method="json_schema",
+                strict=False,
+                include_raw=True,
+            )
         if mode not in self._runnables:
             if mode == "agent":
                 from ptr_llm.core.protocol import AGENT_RESPONSE_JSON_SCHEMA
@@ -176,7 +186,11 @@ class LiteLLMTextProvider:
                 await self._client.aclose()
 
     def request_fingerprint(
-        self, messages: list[dict[str, str]], request_key: str | None = None
+        self,
+        messages: list[dict[str, str]],
+        request_key: str | None = None,
+        *,
+        response_schema: dict[str, Any] | None = None,
     ) -> str:
         return fingerprint(
             {
@@ -193,6 +207,11 @@ class LiteLLMTextProvider:
                     for m in messages
                 ),
                 "requestKey": request_key,
+                **(
+                    {"responseSchema": neutralize_json_strings(response_schema)}
+                    if response_schema is not None
+                    else {}
+                ),
             }
         )
 
@@ -206,6 +225,7 @@ class LiteLLMTextProvider:
         priority: int = 0,
         on_served: Any = None,
         on_usage: Any = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> str:
         import httpx
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -217,6 +237,44 @@ class LiteLLMTextProvider:
         assert_private_sdk_configuration()
         check_cancel(signal)
         checked_messages(messages, self.input_bytes)
+        if response_schema is not None:
+            if not isinstance(response_schema, dict):
+                raise ProviderError("INVALID_INPUT")
+            response_schema = neutralize_json_strings(copy.deepcopy(response_schema))
+            if not any(
+                m["role"] == "system" and "AGENT_JSON_REPLY" in m["content"] for m in messages
+            ):
+                raise ProviderError("INVALID_INPUT")
+            from jsonschema import Draft202012Validator
+
+            try:
+                Draft202012Validator.check_schema(response_schema)
+            except Exception:
+                raise ProviderError("INVALID_INPUT") from None
+            # The finite schema repeats quotes/IDs: budget the whole request, not messages alone.
+            if (
+                len(
+                    js_json(
+                        {
+                            "messages": neutralize_messages(messages),
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "agent_reply",
+                                    "schema": {"title": "agent_reply", **response_schema},
+                                    "strict": False,
+                                },
+                            },
+                            "model": self.model,
+                            "max_completion_tokens": self.max_output_tokens,
+                            "temperature": 0,
+                            "stream": False,
+                        }
+                    ).encode()
+                )
+                > self.input_bytes
+            ):
+                raise ProviderError("INPUT_LIMIT")
         if deadline_at is not None and (
             type(deadline_at) not in (int, float) or not math.isfinite(deadline_at)
         ):
@@ -236,7 +294,7 @@ class LiteLLMTextProvider:
         upstream, cost, generation_id = "litellm", None, None
         submitted = finished = False
         transport_error_code: str | None = None
-        key = self.request_fingerprint(messages, request_key)
+        key = self.request_fingerprint(messages, request_key, response_schema=response_schema)
         if self.ledger:
             safe_body: dict[str, Any] = {
                 "model": self.model,
@@ -252,7 +310,10 @@ class LiteLLMTextProvider:
                     "type": "json_schema",
                     "json_schema": {
                         "name": "agent_reply",
-                        "schema": {"title": "agent_reply", **AGENT_RESPONSE_JSON_SCHEMA},
+                        "schema": {
+                            "title": "agent_reply",
+                            **(response_schema or AGENT_RESPONSE_JSON_SCHEMA),
+                        },
                         "strict": False,
                     },
                 }
@@ -388,7 +449,9 @@ class LiteLLMTextProvider:
             timeline = any(
                 m["role"] == "system" and "TIMELINE_JSON_REPLY" in m["content"] for m in messages
             )
-            runnable = self._runnable("agent" if agent else "timeline" if timeline else "plain")
+            runnable = self._runnable(
+                "agent" if agent else "timeline" if timeline else "plain", response_schema
+            )
             input_messages = [
                 (
                     SystemMessage
@@ -409,6 +472,13 @@ class LiteLLMTextProvider:
             if agent:
                 if not isinstance(raw, dict) or raw.get("parsed") is None:
                     raise ProviderError("INVALID_PROVIDER_RESPONSE")
+                if response_schema is not None:
+                    try:
+                        Draft202012Validator(response_schema).validate(
+                            json.loads(raw["raw"].content)
+                        )
+                    except Exception:
+                        raise ProviderError("INVALID_PROVIDER_RESPONSE") from None
                 raw = raw["raw"]
             check_cancel(signal)
             usage = {

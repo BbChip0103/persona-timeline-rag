@@ -83,6 +83,11 @@ def short_unique_quote(text, preferred=None):
     return quote if quote and start >= 0 and text.find(quote, start + 1) < 0 else ""
 
 
+def image_quote_candidate(annotation):
+    visual = regex.search(r"(?:^|\n)Visual description: ([^\n]+)", annotation["text"])
+    return short_unique_quote(annotation["text"], visual[1] if visual else annotation["text"])
+
+
 def build_experiment_context(
     persona,
     history,
@@ -125,14 +130,11 @@ def build_experiment_context(
                 item["annotationOmittedCount"] = len(s["imageAnnotations"]) - len(included[index])
                 item["imageAnnotations"] = []
                 for a in included[index]:
-                    visual = regex.search(r"(?:^|\n)Visual description: ([^\n]+)", a["text"])
                     item["imageAnnotations"].append(
                         {
                             "annotationId": a["id"],
                             "text": a["text"],
-                            "quoteCandidate": short_unique_quote(
-                                a["text"], visual[1] if visual else a["text"]
-                            ),
+                            "quoteCandidate": image_quote_candidate(a),
                             "humanReviewed": False,
                             "origin": "ai_image_annotation",
                         }

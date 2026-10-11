@@ -1,9 +1,11 @@
 """Strict JSON-action schema shared with engine guided decoding."""
 
+import copy
 import json
+from typing import Any
 
 from .errors import CoreError
-from .prompts import utf16_length
+from .prompts import image_quote_candidate, short_unique_quote, utf16_length
 from .safety import contains_credential
 
 AGENT_MESSAGE_MAX_CODE_POINTS = 400
@@ -56,6 +58,48 @@ AGENT_RESPONSE_JSON_SCHEMA = {
         },
     },
 }
+
+
+def agent_response_schema(sources):
+    """Finite complete references from the trusted, budgeted context, never message prefixes.
+
+    Native decoding selects a full reference instead of recombining identifiers and
+    quote text. Historical parsing and the final exact provenance validator stay intact.
+    """
+    schema: dict[str, Any] = copy.deepcopy(AGENT_RESPONSE_JSON_SCHEMA)
+    choices = []
+    seen = set()
+    for source in sources:
+        if source.get("unsafe"):
+            continue
+        candidates = [{"sourceId": source["id"], "quote": short_unique_quote(source["caption"])}]
+        candidates.extend(
+            {"sourceId": source["id"], "annotationId": a["id"], "quote": image_quote_candidate(a)}
+            for a in source.get("imageAnnotations", [])
+            if a.get("humanReviewed") is False
+        )
+        for ref in candidates:
+            if not ref["quote"] or any(
+                utf16_length(v) > (96 if k == "quote" else 200) for k, v in ref.items()
+            ):
+                continue
+            key = tuple(ref.items())
+            if key not in seen:
+                seen.add(key)
+                choices.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": list(ref),
+                        "properties": {k: {"type": "string", "const": v} for k, v in ref.items()},
+                    }
+                )
+    field = schema["properties"]["evidenceRefs"]
+    if choices:
+        field["items"] = {"anyOf": choices}
+    else:
+        field["maxItems"] = 0
+    return schema
 
 
 def variables(value=None):
