@@ -1,0 +1,125 @@
+# Override infra/compose.app.yml; all relative paths resolve from its infra/ directory.
+# Existing approved split PG/queue are external prerequisites, not recreated here.
+name: ${PTR_OPERATIONAL_PROJECT:?select the owned operational project}
+
+x-supervised: &supervised
+  restart: unless-stopped
+  init: true
+  labels:
+    ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?explicit owned deployment nonce}
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  api:
+    image: ${PTR_OPERATIONAL_BACKEND_IMAGE:?select the verified backend image}
+    depends_on:
+      model-gateway:
+        condition: service_healthy
+    labels:
+      ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
+  web:
+    image: ${PTR_OPERATIONAL_BACKEND_IMAGE:?required}
+    env_file: !override
+      - path: ${PTR_OPERATIONAL_WEB_ENV_FILE:?private web-only environment}
+        required: true
+    volumes: !reset []
+    depends_on:
+      api:
+        condition: service_healthy
+    labels:
+      ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
+  worker:
+    image: ${PTR_OPERATIONAL_WORKER_IMAGE:?select the verified Python image}
+    # Publish only the verified database-bound snapshot; never expose all imported
+    # historical/synthetic cards or mount the operator credential directory.
+    volumes: !override
+      - type: bind
+        source: ${PTR_OPERATIONAL_PUBLISHED_PERSONAS_FILE:?private approved publication snapshot}
+        target: /app/published-personas.private.json
+        read_only: true
+        bind:
+          create_host_path: false
+    # Native BullMQ waits accepted processors; keep backend/gateway alive during drain.
+    stop_grace_period: 90s
+    depends_on:
+      api:
+        condition: service_healthy
+      model-gateway:
+        condition: service_healthy
+    labels:
+      ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
+
+  model-gateway:
+    <<: *supervised
+    image: ghcr.io/berriai/litellm:main-stable@sha256:3d88bd757134a00e8c00237b85a021ab1f6d54abb9c1df750f411dbe7256a500
+    network_mode: host
+    env_file:
+      - path: ${PTR_OPERATIONAL_GATEWAY_ENV_FILE:?private gateway-only environment}
+        required: true
+    command: [--config, /app/ptr-config.yaml, --host, 127.0.0.1, --port, "${PTR_OPERATIONAL_GATEWAY_PORT:?private loopback port}"]
+    volumes:
+      - ./litellm/ptr_routing.py:/app/ptr_routing.py:ro
+      - ./litellm/routing_state.py:/app/routing_state.py:ro
+      - ./litellm/routing_telemetry.py:/app/routing_telemetry.py:ro
+      - type: bind
+        source: ${PTR_OPERATIONAL_GATEWAY_CONFIG:?private single-primary configuration}
+        target: /app/ptr-config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      model-gateway-db:
+        condition: service_healthy
+      model-gateway-redis:
+        condition: service_healthy
+    healthcheck:
+      # Never invoke /health: it can generate model traffic.
+      test: [CMD, python, -c, "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ['PTR_OPERATIONAL_GATEWAY_PORT']+'/health/readiness',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    stop_grace_period: 35s
+
+  model-gateway-db:
+    <<: *supervised
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    env_file:
+      - path: ${PTR_OPERATIONAL_GATEWAY_DB_ENV_FILE:?private gateway database environment}
+        required: true
+    ports: ["127.0.0.1:${PTR_OPERATIONAL_GATEWAY_DB_PORT:?private loopback port}:5432"]
+    command: [postgres, -c, log_statement=none, -c, log_min_error_statement=panic]
+    volumes: [model_gateway_postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ptr_runtime_proxy -d ptr_runtime_proxy"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  model-gateway-redis:
+    <<: *supervised
+    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    env_file:
+      - path: ${PTR_OPERATIONAL_GATEWAY_REDIS_ENV_FILE:?private gateway Redis environment}
+        required: true
+    ports: ["127.0.0.1:${PTR_OPERATIONAL_GATEWAY_REDIS_PORT:?private loopback port}:6379"]
+    # Password stays in a private environment; argv/config contains only its SHA256.
+    command: [sh, -c, 'umask 077; hash=$$(printf %s "$$REDIS_PASSWORD" | sha256sum | cut -d " " -f 1); printf "user default on #%s ~* &* +@all\nappendonly yes\nmaxmemory-policy noeviction\nprotected-mode yes\n" "$$hash" > /tmp/redis.conf; exec redis-server /tmp/redis.conf']
+    volumes: [model_gateway_redis:/data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  model_gateway_postgres:
+    labels:
+      ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
+  model_gateway_redis:
+    labels:
+      ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
