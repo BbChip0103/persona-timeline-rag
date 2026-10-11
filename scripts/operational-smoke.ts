@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve, dirname, join } from 'node:path';
 import { Pool } from 'pg';
+import { replyText, utteranceLanguage } from '../packages/core/src/reply-texts';
 import { assertLocalDatabaseUrl } from '../packages/storage/src/local-guard';
 const runFile=promisify(execFile);
 const OUTPUT='/tmp/ptr-operational-cutover-20261011/e2e';
@@ -29,6 +30,11 @@ export function operationalConfig(env:NodeJS.ProcessEnv,execute=false,nonce?:str
     appDatabase:db('APP_DATABASE_URL','ptr_split_app'),llmDatabase:db('LLM_DATABASE_URL','ptr_split_llm')};
 }
 type Config=ReturnType<typeof operationalConfig>;
+export function validRagOffLimitations(value:unknown,language:string,syntheticFixture=false){
+  if(!Array.isArray(value))return false;if(value.length===0)return syntheticFixture;
+  const benign=['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language),replyText('limitation_posted_date',language)];
+  return value.length===benign.length&&new Set(value).size===benign.length&&value.every(item=>typeof item==='string'&&benign.includes(item));
+}
 export function privateMetadata(id:string,content:string,nonce:string){const digest=(v:string)=>createHmac('sha256',nonce).update(v).digest('hex');return {reference:digest(id),contentDigest:digest(content),bytes:Buffer.byteLength(content)};}
 export function parseNativeMetrics(text:string){
   const values=new Map<string,number>();
@@ -81,11 +87,11 @@ export async function operationalSmoke(config:Config,dependencies:SmokeDependenc
     report.preflight={ownedThreeTiers:true,exactResearchRoles:true,readiness:true,unauthenticatedDenied:true};
     if(!config.execute){report.passed=true;return report;}
     // Catalogue is read once into memory; neither IDs nor labels/revisions are saved or logged.
-    const catalogue=await api('personas');check(Array.isArray(catalogue.personas),'CATALOGUE_INVALID');const candidate=catalogue.personas.map(record).find(row=>['synthetic','silver','human_reviewed'].includes(String(row.reviewStatus)));check(candidate,'PUBLISHED_PERSONA_REQUIRED');const personId=string(candidate.personId);
+    const catalogue=await api('personas');check(Array.isArray(catalogue.personas),'CATALOGUE_INVALID');const candidate=catalogue.personas.map(record).find(row=>['synthetic','silver','human_reviewed'].includes(String(row.reviewStatus)));check(candidate,'PUBLISHED_PERSONA_REQUIRED');const personId=string(candidate.personId),query='짧게 인사만 해 주세요.',replyLanguage=utteranceLanguage(query,string(candidate.language));
     const paidBefore=await paid();
     const session=async()=>string(record((await api('sessions','POST',{personId,retrievalMode:'off',executionProfile:'agent_loop'})).session).id);
-    const submit=async(sessionId:string,clientRequestId:string,reserve=true)=>{if(reserve)budget.reserve();const turn=record((await api(`sessions/${encodeURIComponent(sessionId)}/turns`,'POST',{clientRequestId,text:'짧게 인사만 해 주세요.',intent:'small_talk'})).turn);return string(turn.id);};
-    const finish=async(id:string)=>{const deadline=Date.now()+180000;let metadata:unknown;while(Date.now()<deadline){const turn=record((await api(`turns/${encodeURIComponent(id)}`)).turn);check(!['failed','cancelled'].includes(string(turn.state)),'TURN_DID_NOT_COMPLETE');if(turn.state==='completed'){const reply=record(turn.reply);check(reply.status==='answered'&&typeof reply.content==='string'&&reply.content.trim().length>0,'INVALID_PUBLIC_REPLY');check(Array.isArray(reply.evidence)&&reply.evidence.length===0&&!('agent'in reply)&&!('sourceContext'in reply),'PUBLIC_REPLY_PRIVATE_OR_RAG_FIELDS');check(Array.isArray(reply.limitations)&&reply.limitations.length===0,'PUBLIC_REPLY_POLICY_FALLBACK');metadata=privateMetadata(id,reply.content,config.ownerNonce);const receipt=await proof(id);if(completedProof(receipt))return {metadata,proof:receipt};}await sleep(300);}throw new Error('TURN_ACK_DEADLINE');};
+    const submit=async(sessionId:string,clientRequestId:string,reserve=true)=>{if(reserve)budget.reserve();const turn=record((await api(`sessions/${encodeURIComponent(sessionId)}/turns`,'POST',{clientRequestId,text:query,intent:'small_talk'})).turn);return string(turn.id);};
+    const finish=async(id:string)=>{const deadline=Date.now()+180000;let metadata:unknown;while(Date.now()<deadline){const turn=record((await api(`turns/${encodeURIComponent(id)}`)).turn);check(!['failed','cancelled'].includes(string(turn.state)),'TURN_DID_NOT_COMPLETE');if(turn.state==='completed'){const reply=record(turn.reply);check(reply.status==='answered'&&typeof reply.content==='string'&&reply.content.trim().length>0,'INVALID_PUBLIC_REPLY');check(Array.isArray(reply.evidence)&&reply.evidence.length===0&&!('agent'in reply)&&!('sourceContext'in reply),'PUBLIC_REPLY_PRIVATE_OR_RAG_FIELDS');check(validRagOffLimitations(reply.limitations,replyLanguage),'PUBLIC_REPLY_POLICY_FALLBACK');metadata=privateMetadata(id,reply.content,config.ownerNonce);const receipt=await proof(id);if(completedProof(receipt))return {metadata,proof:receipt};}await sleep(300);}throw new Error('TURN_ACK_DEADLINE');};
     const sid=await session(),id=await submit(sid,'ops_complete');
     const denied=await request(`${config.backend}/api/turns/${encodeURIComponent(id)}`,'GET',undefined,alien);check(denied.status===404,'OWNER_ISOLATION_FAILED');await denied.body?.cancel();
     const deniedCancel=await request(`${config.backend}/api/turns/${encodeURIComponent(id)}/cancel`,'POST',{},alien);check(deniedCancel.status===404,'OWNER_CANCEL_ISOLATION_FAILED');await deniedCancel.body?.cancel();

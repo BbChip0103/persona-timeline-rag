@@ -1,4 +1,5 @@
-import { operationalConfig, parseNativeMetrics, privateMetadata, validateManifest, validateSignal, completedProof, AdmissionBudget, validateModelPolicy } from './operational-smoke';
+import { replyText } from '../packages/core/src/reply-texts';
+import { operationalConfig, parseNativeMetrics, privateMetadata, validateManifest, validateSignal, completedProof, AdmissionBudget, validateModelPolicy, validRagOffLimitations } from './operational-smoke';
 const env = {
   PTR_OPERATIONAL_OWNER_NONCE:'synthetic-owner-20261011', PTR_OPERATIONAL_BACKEND_URL:'http://127.0.0.1:56441',
   PTR_OPERATIONAL_WORKER_URL:'http://127.0.0.1:58442', PTR_OPERATIONAL_GATEWAY_URL:'http://127.0.0.1:59990',
@@ -76,10 +77,10 @@ async function syntheticProtocol(providerRowsAfter=0){
   const fake:typeof fetch=async(input,options)=>{
     const url=new URL(String(input)),headers=new Headers(options?.headers);const actor=headers.get('X-PTR-Owner')??'';let body:unknown={};let status=200;
     if(url.pathname==='/metrics')return new Response(`vllm:request_success_total ${successes}\nvllm:num_requests_running 0\nvllm:num_requests_waiting 0`);
-    if(url.pathname==='/api/personas'){if(!headers.has('Authorization'))return new Response('{}',{status:403});firstOwner=actor;body={personas:[{personId:'synthetic-published-person',reviewStatus:'human_reviewed'}]};}
+    if(url.pathname==='/api/personas'){if(!headers.has('Authorization'))return new Response('{}',{status:403});firstOwner=actor;body={personas:[{personId:'synthetic-published-person',reviewStatus:'human_reviewed',language:'ko'}]};}
     else if(url.pathname==='/api/sessions')body={session:{id:'synthetic-session'}};
     else if(url.pathname.endsWith('/turns')){const data=JSON.parse(String(options?.body)) as {clientRequestId:string};let turn=turns.find(t=>t.client===data.clientRequestId);if(!turn){turn={id:`synthetic-turn-${turns.length}`,client:data.clientRequestId,state:paused?'pending':'completed'};turns.push(turn);if(!paused)successes++;}body={turn};}
-    else if(url.pathname.includes('/api/turns/')){const id=url.pathname.split('/')[3],turn=turns.find(t=>t.id===id)!;if(actor!==firstOwner)status=404;else if(url.pathname.endsWith('/cancel')){turn.state='cancelled';body={cancelled:true};}else body={turn:{...turn,...(turn.state==='completed'?{reply:{status:'answered',content:'synthetic reply only',evidence:[],limitations:[]}}:{})}};}
+    else if(url.pathname.includes('/api/turns/')){const id=url.pathname.split('/')[3],turn=turns.find(t=>t.id===id)!;if(actor!==firstOwner)status=404;else if(url.pathname.endsWith('/cancel')){turn.state='cancelled';body={cancelled:true};}else body={turn:{...turn,...(turn.state==='completed'?{reply:{status:'answered',content:'synthetic reply only',evidence:[],limitations:['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','ko'),replyText('limitation_posted_date','ko')]}}:{})}};}
     return new Response(JSON.stringify(body),{status});
   };
   const report=await operationalSmoke(operationalConfig(env,true,env.PTR_OPERATIONAL_OWNER_NONCE),{app,llm,fetch:fake,verifyOwnership:async()=>undefined,persist:async(_path,body)=>{artifacts.push(body);},delay:async()=>undefined,parentSignal:async(phase,requestNonce)=>{if(phase==='worker-paused')paused=true;if(phase==='worker-resumed'){paused=false;for(const t of turns)if(t.state==='pending'){t.state='completed';successes++;}}return {ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase,requestNonce};}});
@@ -106,4 +107,14 @@ it('forbids a fourth distinct turn and proves 3 bounded model attempts with no g
   const policy={qualificationCallCap:12,providerAdmissionHardCap:null,maxOutputTokens:512,primaryOnly:true,automaticRetries:0,maxModelAttemptsPerTurn:3,gatewayRetries:0};
   expect(validateModelPolicy(policy,12,512)).toBe(true);
   for(const patch of [{maxModelAttemptsPerTurn:4},{gatewayRetries:1},{automaticRetries:1},{maxModelAttemptsPerTurn:undefined}])expect(()=>validateModelPolicy({...policy,...patch},12,512)).toThrow('DEPLOYMENT_MODEL_POLICY_PROOF_REQUIRED');
+});
+
+it('accepts only the native benign RAG-off disclosures (or explicitly synthetic empty fixture)',()=>{
+  for(const language of ['ko','en']){
+    const expected=['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language),replyText('limitation_posted_date',language)];
+    expect(validRagOffLimitations(expected,language)).toBe(true);expect(validRagOffLimitations([...expected].reverse(),language)).toBe(true);
+    for(const extra of ['INVALID_MODEL_EVIDENCE','GUARDRAILS_INPUT_UNAVAILABLE','AGENT_TOOL_UNAVAILABLE','MODEL_FALLBACK','arbitrary limitation'])expect(validRagOffLimitations([...expected,extra],language)).toBe(false);
+    expect(validRagOffLimitations(expected.slice(1),language)).toBe(false);expect(validRagOffLimitations([...expected,expected[0]],language)).toBe(false);expect(validRagOffLimitations(expected,language==='ko'?'en':'ko')).toBe(false);
+  }
+  expect(validRagOffLimitations([],'ko',true)).toBe(true);expect(validRagOffLimitations([],'ko')).toBe(false);expect(validRagOffLimitations('RETRIEVAL_OFF','ko')).toBe(false);
 });
