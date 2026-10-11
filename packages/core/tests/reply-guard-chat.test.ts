@@ -22,7 +22,7 @@ function setup(reply:(messages:ProviderMessage[])=>string) {
 const agent={ragCondition:'caption',executionProfile:'agent_loop'}, experiment={ragCondition:'caption'};
 
 test('revisions: agent v12, experiment v15; the identity/privacy policy reaches both prompts',async()=>{
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v12-evidence-cap');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
   const h=setup(messages=>messages.some(m=>m.content.includes('AGENT_JSON_REPLY'))?agentReply('응'):experimentReply('응'));
   await h.turn(synthetic,'안녕',agent);await h.turn(synthetic,'안녕',experiment);
   for(const [messages] of h.provider.generate.mock.calls) expect(messages[0]!.content).toContain(IDENTITY_PRIVACY_POLICY);

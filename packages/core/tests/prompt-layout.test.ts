@@ -203,11 +203,11 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const lorePresent=(messages:readonly ProviderMessage[])=>at(messages,'UNTRUSTED_PERSONA_LORE_JSON_DATA')>=0;
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
-  test('revisions: agent v12 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v12-evidence-cap');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+  test('revisions: agent v13 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
-  test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with four pinned rewordings are the only change from v4/v7',async()=>{
+  test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with pinned rewordings plus the origin rule are the only change from v4/v7',async()=>{
     const added=`${PERSONA_CARD_POLICY} ${IDENTITY_PRIVACY_POLICY} ${REPLY_VOICE_POLICY} `;
     const experiment=buildExperimentContext(v1Persona,[],'x',[]).messages[0]!.content;
     expect(experiment).toContain(`${added}TIMELINE_JSON_REPLY:`);
@@ -227,7 +227,10 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
     let agentPolicy='';
     await runCharacterAgent({provider:{generate:async messages=>{agentPolicy=messages[0]!.content;return agentReply();}},persona:card,history:[],text:'x',sources:[],signal:new AbortController().signal});
     expect(agentPolicy).toContain(added);
-    expect(sha(v7Wording(agentPolicy.replace(added,'')))).toBe(V4_AGENT_POLICY_SHA);
+    // Agent v13 adds the origin binding rule; keep the older policy golden unchanged.
+    const originRule='Omit annotationId for caption quotes; use the exact parent sourceId and annotationId for AI image annotation quotes. Never attach an image annotationId to a caption quote; the quote must come from that referenced annotation when annotationId is present. ';
+    expect(agentPolicy).toContain(originRule);
+    expect(sha(v7Wording(agentPolicy.replace(added,'').replace(originRule,'')))).toBe(V4_AGENT_POLICY_SHA);
     // Legacy buildPrompt policy is not touched.
     for(const timeline of [false,true]) {
       expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(PERSONA_CARD_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(IDENTITY_PRIVACY_POLICY);expect(buildPrompt(card,[],'x',[],timeline)[0]!.content).not.toContain(REPLY_VOICE_POLICY);

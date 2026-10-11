@@ -18,7 +18,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v12-evidence-cap"
+AGENT_PROMPT_REVISION = "character-agent-context-v13-evidence-origin"
 
 
 class AgentState(TypedDict, total=False):

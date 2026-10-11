@@ -20,11 +20,15 @@ test.each(['off','caption','caption_image'] as const)('recollection voice reache
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v12-evidence-cap');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
   expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('handle it as IDENTITY_AND_PRIVACY says for something you do not know');
   expect(policy).toContain('NOT the actual person');expect(policy).toContain('History is conversation context, NEVER factual evidence');
+  expect(policy).toContain('Omit annotationId for caption quotes');
+  expect(policy).toContain('exact parent sourceId and annotationId for AI image annotation quotes');
+  expect(policy).toContain('Never attach an image annotationId to a caption quote');
+  expect(policy).toContain('quote must come from that referenced annotation');
   expect(policy).toContain('Technical validation failures are service errors');expect(policy).toContain('AGENT_JSON_REPLY');
   expect(messages.at(-1)).toEqual({role:'user',content:'그 합성 그림 기억나?'});
 });
@@ -34,6 +38,22 @@ test('supported first-person message is preserved with exact refs, without a pro
   const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'}),turn=await send(h,session.id,'그 그림 얘기해줘');
   expect(turn.reply?.content).toBe(message);expect(turn.reply?.evidence[0].sourceId).toBe(source.id);
   expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(turn.reply?.agent?.promptRevision).toBe(AGENT_PROMPT_REVISION);
+});
+test.each(['caption','image','caption_with_image_id'] as const)('reference agent loop %s reference keeps exact origin binding without repair or extra generation',async origin=>{
+  const annotation=source.imageAnnotations![0];
+  const ref={sourceId:source.id,quote:origin==='image'?annotation.text:source.caption,...(origin==='caption'?{}:{annotationId:annotation.id})};
+  const h=setup([final({message:'합성 숲 이야기예요.',evidenceRefs:[ref]})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption_image'});
+  const turn=await send(h,session.id,'그 합성 그림 이야기해줘');
+  expect(turn.state).toBe('completed');expect(h.provider.generate).toHaveBeenCalledTimes(1);
+  if(origin==='caption_with_image_id') {
+    expect(turn.reply).toMatchObject({grounding:'unverified_model',evidence:[],claims:[]});
+    expect(turn.reply?.limitations).toContain('INVALID_MODEL_EVIDENCE');
+  } else {
+    expect(turn.reply?.grounding).toBe('source_bound_quotes');
+    expect(turn.reply?.claims[0].evidenceRefs[0]).toMatchObject(ref);
+    expect(turn.reply?.claims[0].evidenceRefs[0].annotationId).toBe(origin==='image'?annotation.id:undefined);
+  }
 });
 test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs keep the model text unverified, without citations ',async()=>{
   const h=setup([final({status:'insufficient_evidence',message:'그건 잘 기억 안 나. 어느 그림 말하는 거야?'}),final({message:'아 기억나!',evidenceRefs:[{sourceId:'invented',quote:'invented'}]})]);
