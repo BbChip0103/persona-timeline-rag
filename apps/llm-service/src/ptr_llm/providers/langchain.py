@@ -12,6 +12,8 @@ from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
 
+from persona_timeline_rag.gateway_budget import HEADER, sign_request
+
 from ptr_llm.billing import ProviderError, provider_request_scope
 
 from .common import (
@@ -47,9 +49,18 @@ class LiteLLMTextProvider:
         transport: Any = None,
         on_metrics: Any = None,
         pricing_ceiling: dict[str, float] | None = None,
+        capacity_spillover_key: str | None = None,
     ):
         import httpx
 
+        if capacity_spillover_key is not None and (
+            ledger is None
+            or pricing_ceiling is None
+            or model != "primary"
+            or len(capacity_spillover_key.encode()) < 32
+        ):
+            raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
+        self.capacity_spillover_key = capacity_spillover_key
         try:
             if not isinstance(base_url, str):
                 raise ValueError
@@ -95,6 +106,10 @@ class LiteLLMTextProvider:
                 type(value) not in (int, float) or not math.isfinite(value) or value < 0
                 for value in pricing_ceiling.values()
             )
+        ):
+            raise ProviderError("PRICING_UNVERIFIED")
+        if capacity_spillover_key is not None and (
+            pricing_ceiling is None or any(v <= 0 for v in pricing_ceiling.values())
         ):
             raise ProviderError("PRICING_UNVERIFIED")
         # CA loading is synchronous. Do it once at provider startup, not once
@@ -207,6 +222,7 @@ class LiteLLMTextProvider:
                     for m in messages
                 ),
                 "requestKey": request_key,
+                **({"capacitySpillover": "budgeted-v1"} if self.capacity_spillover_key else {}),
                 **(
                     {"responseSchema": neutralize_json_strings(response_schema)}
                     if response_schema is not None
@@ -365,13 +381,23 @@ class LiteLLMTextProvider:
             report(True)
             return text
 
-        async def observe_request(_: httpx.Request) -> None:
+        async def observe_request(request: httpx.Request) -> None:
             nonlocal attempts, transport_error_code
             if (signal is not None and signal.is_set()) or time.time() * 1000 >= effective_deadline:
                 transport_error_code = (
                     "CANCELLED" if signal is not None and signal.is_set() else timeout_code
                 )
                 raise ProviderError(transport_error_code)
+            if self.capacity_spillover_key is not None:
+                if not submitted:
+                    raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
+                request.headers[HEADER] = sign_request(
+                    json.loads(request.content),
+                    self.capacity_spillover_key,
+                    key,
+                    int(min(effective_deadline, time.time() * 1000 + 25000)),
+                    self.reservation_microusd,
+                )
             attempts += 1
 
         async def observe_response(response: httpx.Response) -> None:
@@ -379,7 +405,7 @@ class LiteLLMTextProvider:
             served = response.headers.get("x-litellm-model-id") or response.headers.get(
                 "x-ptr-upstream"
             )
-            if served in ("primary", "secondary", "fake"):
+            if served in ("primary", "secondary", "fake", "openrouter-primary"):
                 upstream = served
             if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
                 raise ProviderError("PROVIDER_RESPONSE_LIMIT")
@@ -400,6 +426,13 @@ class LiteLLMTextProvider:
                         "completionTokens": count(billed_usage.get("completion_tokens")),
                     }
                     value: Any = billed_usage.get("cost")
+                    if self.capacity_spillover_key and served == "openrouter-primary":
+                        authoritative = response.headers.get("llm_provider-x-litellm-response-cost")
+                        if authoritative is not None:
+                            try:
+                                value = float(authoritative)
+                            except ValueError:
+                                value = None
                     if (
                         type(value) in (float, int)
                         and math.isfinite(value)
@@ -409,6 +442,9 @@ class LiteLLMTextProvider:
                         cost = math.ceil(value * 1_000_000)
                 except (ValueError, AttributeError, TypeError):
                     raise ProviderError("INVALID_PROVIDER_RESPONSE") from None
+
+            if self.capacity_spillover_key and served in ("primary", "secondary"):
+                cost = 0  # Trusted owned gateway selected a nonbillable local deployment.
 
         token = self._hook_context.set((observe_request, observe_response))
         task = asyncio.current_task()

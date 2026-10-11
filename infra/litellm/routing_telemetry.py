@@ -9,6 +9,7 @@ _FAMILIES = {
     "vllm:kv_cache_usage_perc": "kv",
     "vllm:gpu_cache_usage_perc": "kv",
     "vllm:num_requests_waiting": "waiting",
+    "vllm:num_requests_running": "running",
     "process_start_time_seconds": "start",
 }
 
@@ -43,14 +44,14 @@ def _sample_value(tail: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def parse_metrics(text: str) -> tuple[float | None, float | None, float | None]:
+def _parse_metrics(text: str) -> tuple[float | None, float | None, float | None, float | None]:
     """Return KV maximum, waiting sum and unambiguous process start time.
 
     Invalid samples invalidate their entire metric family, not just that label
     set: a partial sum or maximum would understate engine pressure. Unknown
     families and timestamp/exemplar suffixes are ignored. No input is logged.
     """
-    samples: dict[str, list[float]] = {"kv": [], "waiting": [], "start": []}
+    samples: dict[str, list[float]] = {"kv": [], "waiting": [], "start": [], "running": []}
     invalid: set[str] = set()
     for raw in text.splitlines():
         line = raw.strip()
@@ -77,7 +78,25 @@ def parse_metrics(text: str) -> tuple[float | None, float | None, float | None]:
             waiting = total
     starts = set(samples["start"])
     start = next(iter(starts)) if len(starts) == 1 and "start" not in invalid else None
-    return kv, waiting, start
+    running = None
+    if samples["running"] and "running" not in invalid:
+        try:
+            total = math.fsum(samples["running"])
+        except OverflowError:
+            total = math.inf
+        if math.isfinite(total):
+            running = total
+    return kv, waiting, start, running
+
+
+def parse_metrics(text: str) -> tuple[float | None, float | None, float | None]:
+    return _parse_metrics(text)[:3]
+
+
+def parse_capacity_metrics(
+    text: str,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    return _parse_metrics(text)
 
 
 def metrics_url(api_base: str) -> str:

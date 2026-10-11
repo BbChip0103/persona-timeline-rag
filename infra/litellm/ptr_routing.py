@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import time
 import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -19,12 +21,16 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.router import CustomRoutingStrategyBase
 from redis.asyncio import Redis
 from routing_state import RoutingState
-from routing_telemetry import metrics_url, parse_metrics
+from routing_telemetry import metrics_url, parse_capacity_metrics
+
+from persona_timeline_rag.gateway_budget import HEADER, verify_request
 
 TOKEN = "_ptr_routing_reservation"
 REQUEST = "_ptr_routing_request"
 DEADLINE = "_ptr_routing_deadline"
 PREFILLED = "_ptr_routing_prefilled"
+BUDGET = "_ptr_budget_authorized"
+SPILLOVER_MODEL = "openrouter-primary"
 _native_filter_scope: ContextVar[bool] = ContextVar("ptr_native_filter_scope", default=False)
 MODEL_GROUP = "primary"
 PINNED_VERSION = "1.104.2"
@@ -74,7 +80,7 @@ def reservation(data: Mapping[str, Any], *, reserved_only: bool = False) -> str 
             metadata = carrier.get(name)
             if not isinstance(metadata, Mapping):
                 continue
-            for key in ((TOKEN,) if reserved_only else (TOKEN, REQUEST)):
+            for key in (TOKEN,) if reserved_only else (TOKEN, REQUEST):
                 value = metadata.get(key)
                 if isinstance(value, str) and len(value) == 32:
                     return value
@@ -220,6 +226,18 @@ class Strategy(CustomRoutingStrategyBase):
                     await self.owner.state.release(token, success=False)
                     raise
                 return selected
+            if self.owner.spillover:
+                if not (request_kwargs.get("metadata") or {}).get(BUDGET):
+                    raise HTTPException(403, "PTR_ROUTING_BUDGET_REQUIRED")
+                # Native selection of the dedicated alias occurs BEFORE any model
+                # submission. Never call another model after a transport failure.
+                return await self.native_async(
+                    model=SPILLOVER_MODEL,
+                    messages=messages,
+                    input=None,
+                    specific_deployment=False,
+                    request_kwargs=request_kwargs,
+                )
             if time.monotonic() >= until:
                 raise HTTPException(503, "PTR_ROUTING_NO_CREDIT")
             await asyncio.sleep(0.025)
@@ -242,6 +260,14 @@ class RoutingCallback(CustomLogger):
             "telemetry_poll_s": number("PTR_ROUTING_METRICS_INTERVAL_S", 1, 0.1, 60),
             "lease_s": 35,
         }
+        enabled = os.environ.get("PTR_ROUTING_CAPACITY_SPILLOVER", "0")
+        if enabled not in ("0", "1"):
+            raise ValueError("INVALID_ROUTING_CONFIG")
+        self.spillover = enabled == "1"
+        self.budget_key = os.environ.get("PTR_LLM_CAPACITY_SPILLOVER_KEY", "")
+        if self.spillover and len(self.budget_key.encode()) < 32:
+            raise ValueError("PTR_ROUTING_BUDGET_AUTHORITY_REQUIRED")
+        self.options["allow_overloaded_idle"] = not self.spillover
         self.queue_timeout = number("PTR_ROUTING_QUEUE_TIMEOUT_S", 10, 0, 10)
         self.metrics_timeout = number("PTR_ROUTING_METRICS_TIMEOUT_S", 0.5, 0.1, 2)
         self._redis: Any = None
@@ -276,9 +302,36 @@ class RoutingCallback(CustomLogger):
             or getattr(router, "routing_plugins", None)
         ):
             raise HTTPException(503, "PTR_ROUTING_INCOMPATIBLE_ROUTER_CONFIG")
+        if self.spillover:
+            paid = [d for d in router.model_list if d.get("model_name") == SPILLOVER_MODEL]
+            if (
+                len(paid) != 1
+                or (paid[0].get("model_info") or {}).get("id") != SPILLOVER_MODEL
+                or not str(paid[0]["litellm_params"].get("model", "")).startswith("openrouter/")
+            ):
+                raise HTTPException(503, "PTR_ROUTING_PAID_DEPLOYMENT_REQUIRED")
+        if self.spillover:
+            params = paid[0]["litellm_params"]
+            preferences = (params.get("extra_body") or {}).get("provider") or {}
+            prices = preferences.get("max_price") or {}
+            if (
+                params.get("max_retries") != 0
+                or preferences.get("allow_fallbacks") is not False
+                or preferences.get("require_parameters") is not True
+                or len(preferences.get("order") or []) != 1
+                or not all(
+                    type(prices.get(k)) in (float, int)
+                    and math.isfinite(prices[k])
+                    and prices[k] > 0
+                    for k in ("prompt", "completion")
+                )
+            ):
+                raise HTTPException(503, "PTR_ROUTING_PAID_POLICY_REQUIRED")
         for deployment in router.model_list:
             if deployment.get("model_name") == MODEL_GROUP:
-                candidate(deployment)
+                item = candidate(deployment)
+                if self.spillover and item["id"] not in ("primary", "secondary"):
+                    raise HTTPException(503, "PTR_ROUTING_LOCAL_ID_REQUIRED")
         strategy = self._strategy
         if strategy is None or strategy.router is not router:
             strategy = Strategy(router, self)
@@ -309,6 +362,54 @@ class RoutingCallback(CustomLogger):
                 data[field].pop(REQUEST, None)
                 data[field].pop(DEADLINE, None)
                 data[field].pop(PREFILLED, None)
+                data[field].pop(BUDGET, None)
+        expires = None
+        if self.spillover and data.get("model") == SPILLOVER_MODEL:
+            raise HTTPException(403, "PTR_ROUTING_DIRECT_PAID_ALIAS_REJECTED")
+        if self.spillover and data.get("model") == MODEL_GROUP:
+            original = data.get("proxy_server_request") or {}
+            headers = original.get("headers") or {}
+            header = headers.pop(HEADER, None)
+            for name in ("extra_headers", "headers"):
+                if isinstance(data.get(name), dict):
+                    data[name].pop(HEADER, None)
+            if (
+                call_type not in ("completion", "acompletion")
+                or urlsplit(original.get("url", "")).path
+                not in ("/v1/chat/completions", "/chat/completions")
+                or original.get("method", "POST") != "POST"
+            ):
+                raise HTTPException(400, "PTR_ROUTING_CHAT_REQUIRED")
+            # These unsigned generation overrides cannot change a committed budget.
+            if any(
+                k in data
+                for k in (
+                    "n",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                    "stop",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "logit_bias",
+                    "modalities",
+                    "audio",
+                    "provider",
+                    "reasoning",
+                )
+            ):
+                raise HTTPException(400, "PTR_ROUTING_REQUEST_OVERRIDE_REJECTED")
+            try:
+                nonce, expires, _ = verify_request(data, header, self.budget_key)
+            except (ValueError, TypeError):
+                raise HTTPException(403, "PTR_ROUTING_BUDGET_REQUIRED") from None
+            try:
+                claimed = await self.state.claim_budget(nonce)
+            except Exception:
+                raise HTTPException(503, "PTR_ROUTING_STORE_UNAVAILABLE") from None
+            if not claimed:
+                raise HTTPException(409, "PTR_ROUTING_NO_RESUBMISSION")
+            data.setdefault("metadata", {})[BUDGET] = True
         if data.get("model") == MODEL_GROUP:
             # The pinned Proxy passes its async route name, unlike older docs.
             if call_type not in ("completion", "acompletion"):
@@ -325,6 +426,9 @@ class RoutingCallback(CustomLogger):
                 "extra_body",
                 "model_list",
                 "routing_strategy",
+                "mock_response",
+                "mock_testing_rate_limit_error",
+                "headers",
             )
             if any(name in data for name in forbidden):
                 raise HTTPException(400, "PTR_ROUTING_REQUEST_OVERRIDE_REJECTED")
@@ -334,7 +438,11 @@ class RoutingCallback(CustomLogger):
             if not isinstance(metadata, dict):
                 raise HTTPException(400, "PTR_ROUTING_INVALID_METADATA")
             metadata[REQUEST] = uuid.uuid4().hex
-            metadata[DEADLINE] = time.monotonic() + 25
+            metadata[DEADLINE] = (
+                time.monotonic() + min(25, (expires - time.time() * 1000) / 1000)
+                if expires is not None
+                else time.monotonic() + 25
+            )
             data["num_retries"] = 0
             data["max_retries"] = 0
             data["disable_fallbacks"] = True
@@ -386,9 +494,16 @@ class RoutingCallback(CustomLogger):
                                     body.extend(chunk)
                                     if len(body) > 1024 * 1024:
                                         return
-                        kv, waiting, start = parse_metrics(body.decode("utf-8", "strict"))
+                        kv, waiting, start, running = parse_capacity_metrics(
+                            body.decode("utf-8", "strict")
+                        )
                         await self.state.update_telemetry(
-                            item["id"], kv, waiting, start, identity=item["identity"]
+                            item["id"],
+                            kv,
+                            waiting,
+                            start,
+                            identity=item["identity"],
+                            running=running,
                         )
                     except Exception:
                         # Preserve previous good samples until stale. No URLs,
@@ -485,9 +600,7 @@ class RoutingCallback(CustomLogger):
                     # ProxyLogging is the canonical Proxy streaming boundary;
                     # SDK deployment hooks do not cover every Proxy callback path.
                     # Do not rely on their registration/metadata for prefill.
-                    await self.async_post_call_streaming_deployment_hook(
-                        request_data, item, None
-                    )
+                    await self.async_post_call_streaming_deployment_hook(request_data, item, None)
                 if time.monotonic() >= until:
                     raise TimeoutError("PTR_ROUTING_TOTAL_DEADLINE")
                 yield item

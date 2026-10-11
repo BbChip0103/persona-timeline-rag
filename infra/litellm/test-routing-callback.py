@@ -170,6 +170,94 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_capacity_spillover_selects_paid_before_submission_only(self):
+        await self.prehook({"model": MODEL_GROUP})
+        self.callback.spillover = True
+        self.state.choice = None
+        selected = await self.select({"metadata": {"_ptr_budget_authorized": True}})
+        self.assertEqual(selected, "native-other-alias")
+        self.assertEqual(self.router.native_calls[0][1]["model"], "openrouter-primary")
+        self.assertEqual(self.state.active, set())
+        self.state.error = ConnectionError("synthetic-store")
+        with self.assertRaises(HTTPException):
+            await self.select({"metadata": {"_ptr_budget_authorized": True}})
+        self.assertEqual(len(self.router.native_calls), 1)
+
+    async def test_capacity_admission_requires_signed_body_and_consumes_nonce_once(self):
+        import time
+
+        from persona_timeline_rag.gateway_budget import HEADER, sign_request
+
+        self.callback.spillover = True
+        self.callback.budget_key = "synthetic-budget-key-at-least-32-characters"
+        for i, deployment in enumerate(self.router.model_list):
+            deployment["model_info"]["id"] = ("primary", "secondary")[i]
+        self.router.model_list.append(
+            {
+                "model_name": "openrouter-primary",
+                "model_info": {"id": "openrouter-primary"},
+                "litellm_params": {
+                    "model": "openrouter/synthetic",
+                    "api_key": "synthetic",
+                    "max_retries": 0,
+                    "extra_body": {
+                        "provider": {
+                            "allow_fallbacks": False,
+                            "require_parameters": True,
+                            "order": ["DeepInfra"],
+                            "max_price": {"prompt": 0.1, "completion": 0.5},
+                        }
+                    },
+                },
+            }
+        )
+        claimed = set()
+
+        async def claim(nonce):
+            if nonce in claimed:
+                return False
+            claimed.add(nonce)
+            return True
+
+        self.state.claim_budget = claim
+        body = {
+            "model": MODEL_GROUP,
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "max_completion_tokens": 512,
+        }
+
+        def request():
+            data = copy.deepcopy(body)
+            data["proxy_server_request"] = {
+                "url": "http://127.0.0.1/v1/chat/completions",
+                "method": "POST",
+                "headers": {
+                    HEADER: sign_request(
+                        body,
+                        self.callback.budget_key,
+                        "a" * 64,
+                        int(time.time() * 1000) + 25000,
+                        20000,
+                    )
+                },
+            }
+            return data
+
+        approved = await self.prehook(request())
+        self.assertTrue(approved["metadata"]["_ptr_budget_authorized"])
+        self.assertNotIn(HEADER, approved["proxy_server_request"]["headers"])
+        with self.assertRaises(HTTPException) as failure:
+            await self.prehook(request())
+        self.assertEqual(failure.exception.status_code, 409)
+        with self.assertRaises(HTTPException):
+            await self.prehook({"model": "openrouter-primary"})
+        bad = request()
+        bad["messages"] = []
+        with self.assertRaises(HTTPException) as failure:
+            await self.prehook(bad)
+        self.assertEqual(failure.exception.status_code, 403)
+        self.assertEqual(len(claimed), 1)
+
     async def test_real_strategy_attachment_and_same_router_reset_no_recursion(self):
         await self.prehook({"model": MODEL_GROUP})
         strategy = self.router.async_get_available_deployment.__self__

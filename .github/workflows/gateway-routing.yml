@@ -1,9 +1,9 @@
 name: gateway-routing
 on:
   push:
-    paths: ['infra/litellm/**', 'infra/compose.framework.yml', 'infra/langfuse/init-framework-env.py', 'apps/llm-service/uv.lock', '.github/workflows/gateway-routing.yml']
+    paths: ['infra/litellm/**', 'src/persona_timeline_rag/gateway_budget.py', 'infra/compose.framework.yml', 'infra/langfuse/init-framework-env.py', 'apps/llm-service/uv.lock', '.github/workflows/gateway-routing.yml']
   pull_request:
-    paths: ['infra/litellm/**', 'infra/compose.framework.yml', 'infra/langfuse/init-framework-env.py', 'apps/llm-service/uv.lock', '.github/workflows/gateway-routing.yml']
+    paths: ['infra/litellm/**', 'src/persona_timeline_rag/gateway_budget.py', 'infra/compose.framework.yml', 'infra/langfuse/init-framework-env.py', 'apps/llm-service/uv.lock', '.github/workflows/gateway-routing.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -40,4 +40,6 @@ jobs:
           uv run --project apps/llm-service python infra/litellm/test-routing-state.py
           uv run --project apps/llm-service python infra/litellm/test-routing-callback.py
       - name: Two real pinned Proxies, isolated synthetic engines and shared credit
-        run: uv run --project apps/llm-service python infra/litellm/routing-smoke.py
+        run: |
+          uv run --project apps/llm-service python infra/litellm/routing-smoke.py
+          uv run --project apps/llm-service python infra/litellm/capacity-smoke.py

@@ -360,6 +360,14 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
     # Paid proxy routes preserve the explicit live/data gates from the TS
     # runtime. Validate before opening a pool or constructing any provider.
     pricing = None
+    spillover_key = env.get("PTR_LLM_CAPACITY_SPILLOVER_KEY")
+    if spillover_key is not None and (
+        len(spillover_key.encode()) < 32
+        or env.get("PTR_LLM_PROVIDER") != "litellm"
+        or env.get("PTR_LLM_LITELLM_BILLABLE") != "1"
+        or env.get("PTR_LLM_MODEL", "primary") != "primary"
+    ):
+        raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
     if env.get("PTR_LLM_PROVIDER", "fake") == "litellm":
         billable = env.get("PTR_LLM_LITELLM_BILLABLE", "0")
         if billable not in ("0", "1"):
@@ -374,7 +382,9 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 }
             except (KeyError, ValueError):
                 raise ProviderError("PRICING_UNVERIFIED") from None
-            if not all(math.isfinite(v) and v >= 0 for v in pricing.values()):
+            if not all(
+                math.isfinite(v) and (v > 0 if spillover_key else v >= 0) for v in pricing.values()
+            ):
                 raise ProviderError("PRICING_UNVERIFIED")
             if (
                 env.get("PTR_LLM_LIVE_ENABLED") != "1"
@@ -474,6 +484,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 input_bytes=input_bytes,
                 ledger=ledger if billable == "1" else None,
                 pricing_ceiling=pricing,
+                capacity_spillover_key=spillover_key,
                 on_metrics=_observe_provider_metrics,
                 reservation_microusd=_integer(env, "PTR_LLM_MAX_CALL_MICROUSD", 100000, 1, 1000000),
             )

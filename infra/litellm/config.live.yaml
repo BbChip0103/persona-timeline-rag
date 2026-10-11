@@ -1,5 +1,6 @@
 # Explicit deployment-only config. Never used by the synthetic profile.
-# Distinct aliases are deliberate: no failover from self-hosted to billable calls.
+# Dedicated paid alias is selectable only by optional budget-authorized pre-admission spillover.
+# No post-submission failover or provider retry.
 model_list:
   - model_name: primary
     litellm_params:
@@ -22,6 +23,12 @@ model_list:
       api_key: os.environ/OPENROUTER_API_KEY
       max_retries: 0
       timeout: 25
+      extra_body:
+        provider:
+          order: [DeepInfra]
+          allow_fallbacks: false
+          require_parameters: true
+          max_price: {prompt: 0.1, completion: 0.5}
     model_info:
       id: openrouter-primary
       mode: chat

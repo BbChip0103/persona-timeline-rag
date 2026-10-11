@@ -22,7 +22,8 @@ aliases retain native selection; primary overload never switches to them.
   `PTR_ROUTING_METRICS_INTERVAL_S` (1 second). Fresh KV usage >= 0.95 or waiting
   requests > 2 exclude an engine; these delayed gauges are **filters, not score
   inputs**. Stale/invalid/absent metrics fail open to gateway-owned credit.
-  If no ordinary engine fits, a blocked idle engine may admit only one request.
+  If capacity spillover is disabled, a blocked idle engine may admit only one request.
+  When enabled, a blocked idle engine is not selected; the budget-authorized paid route is preferred. Fresh running requests at the configured sequence capacity also block local admission.
 
 Metrics use the configured engine's same origin `/metrics`, never a client-provided
 URL. Redirects, malformed origins and responses over 1 MiB are rejected. Polling
@@ -70,7 +71,7 @@ disconnect/crash/callback failures on the next ledger operation; expiry is not a
 exactly-once billing mechanism. A server-issued deadline bounds the complete
 request, including credit waiting and continuously emitting streams, to 25 seconds; the lease is
 35 seconds. A per-read HTTP timeout alone is not this wall-time guarantee.
-Retried submissions and automatic/provider fallbacks remain disabled. Client credentials/base URL, mirroring, provider fallback and routing
+Retried submissions and post-submission/provider fallbacks remain disabled. Optional capacity spillover is a first-attempt destination choice, not a retry. Client credentials/base URL, mirroring, provider fallback and routing
 overrides are rejected for the controlled pool. Client-supplied reservation/request
 IDs, deadlines and prefill markers are removed before routing. The server mints the request ID/deadline before the
 Proxy and Router split their metadata, so both lifecycles use the same credit.
@@ -116,3 +117,52 @@ replicas during a rollout. Changing a YAML file alone does not install the Pytho
 References: [custom Router selection](https://docs.litellm.ai/docs/routing),
 [Proxy callback loading](https://docs.litellm.ai/docs/proxy/logging),
 [per-attempt callback lifecycle](https://docs.litellm.ai/docs/observability/custom_callback).
+
+## Optional capacity spillover (local-first, no retries)
+
+Set gateway `PTR_ROUTING_CAPACITY_SPILLOVER=1` and the same private >=32-byte
+`PTR_LLM_CAPACITY_SPILLOVER_KEY` on the gateway and worker. Configure the dedicated
+`openrouter-primary` deployment (ID also `openrouter-primary`); local deployment
+IDs remain `primary`/`secondary`. Worker must use `PTR_LLM_LITELLM_BILLABLE=1`,
+explicit live/external-data consent and verified price ceilings. Invalid worker
+configuration fails before DB/provider startup; enabled gateway requires its
+signature key and paid deployment. Existing defaults remain local-only.
+
+The native local candidate filters and atomic Redis cache/scored selector remain
+first. If none fits shared sequence/KV/prefill credit, or all are overloaded by
+fresh KV>=0.95, waiting>2, or running>=configured sequence limit, select the paid
+alias immediately **before any local upstream request**. No speculative pair,
+local-started-error fallback, timeout/unknown reroute or SDK/provider retry occurs.
+Native access/filter errors and Redis errors fail closed. Stale/invalid metrics
+still defer to gateway-owned credit, not guessed overload. Thresholds are capacity
+heuristics, not TTFT/latency guarantees. Existing input/evidence schema is retained.
+
+Every spillover-capable primary call reserves worst-case paid cost in the existing
+cumulative global ledger before submission, including calls ultimately served
+locally. The HTTPX hook signs the actual generation fields in the SDK request,
+provider fingerprint nonce, expiry and reserved amount. Gateway verifies the
+request and supported chat endpoint, removes the grant header, and atomically
+consumes its nonce in shared Redis (35s TTL covers <=30s validity). Client metadata
+cannot authorize a paid call; direct paid alias calls are rejected. This small
+shared helper is cost authority, not a second DB or dispatcher. Gateway receives
+no application/worker DB credentials. Existing no-schema/no-spillover fingerprints
+remain unchanged. The private key is not retained in traces or Redis.
+
+Trusted `x-litellm-model-id` identifies the actual **configured deployment**, not
+JSON response model/alias. Verified local IDs settle at zero; paid invoices use
+usage.cost or the OpenRouter cost header preserved by LiteLLM. Missing/invalid
+cost stays conservatively reserved/unknown, with no resubmission. Gateway's
+resetting daily spend limit is only a secondary guard; the worker ledger's
+cumulative US$1 cap and prior unknown charges remain authoritative.
+
+The deployed paid model retains the existing approved Gemma model, pins DeepInfra,
+requires supported parameters, disables provider fallbacks and bounds price at
+US$0.1/0.5 per million input/output tokens. Prices and availability must be checked
+before changing this configuration. See [OpenRouter provider preferences](https://openrouter.ai/docs/guides/routing/provider-selection)
+and [model endpoints/prices](https://openrouter.ai/api/v1/models/google/gemma-4-26b-a4b-it/endpoints).
+
+`infra/litellm/capacity-smoke.py` uses two real pinned Proxies and isolated fake
+local/paid engines, with Internet masquerading disabled. It proves local-first,
+fresh overload→simulated OpenRouter with no local submission, one-use budget
+admission, tamper/direct-alias refusal, no retry on paid failure and no grant
+header forwarded. It does not prove real OpenRouter availability or answer quality.

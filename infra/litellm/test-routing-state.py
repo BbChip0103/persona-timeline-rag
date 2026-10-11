@@ -209,6 +209,25 @@ class RedisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.state.select([candidate], MESSAGES, 1, "prefill"))
         self.assertIsNone(await self.state.select([candidate], MESSAGES, 1, "gated"))
 
+    async def test_external_running_sequence_capacity_blocks_before_wait_queue(self):
+        await self.state.update_telemetry(self.a["id"], 0.1, 0, 100, running=self.a["max_seqs"])
+        self.assertIsNone(
+            await self.state.select(
+                [self.a], MESSAGES, 1, "external-full", options={"allow_overloaded_idle": False}
+            )
+        )
+
+    async def test_paid_spillover_does_not_admit_overloaded_idle_engine(self):
+        await self.state.update_telemetry(self.a["id"], 0.96, 4, 100)
+        self.assertIsNone(
+            await self.state.select(
+                [self.a], MESSAGES, 1, "paid-first", options={"allow_overloaded_idle": False}
+            )
+        )
+        self.assertEqual((await self.server(self.a))["n"], 0)
+        self.assertTrue(await self.state.claim_budget("synthetic-budget-nonce"))
+        self.assertFalse(await self.peer.claim_budget("synthetic-budget-nonce"))
+
     async def test_telemetry_filter_fallback_stale_and_malformed(self):
         await self.state.update_telemetry(self.a["id"], 0.96, 0, 100)
         self.assertEqual(

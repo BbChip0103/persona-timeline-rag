@@ -86,7 +86,7 @@ elseif cmd=='telemetry' then
   if s.identity and s.identity~=data.identity then return '' end
   s.identity=data.identity
  end
- s.telemetry={seen=now,kv=data.kv,waiting=data.waiting}
+ s.telemetry={seen=now,kv=data.kv,waiting=data.waiting,running=data.running}
  local start=data.start~=cjson.null and data.start or nil
  if start then
   s.start_missing=false
@@ -154,7 +154,9 @@ elseif cmd=='select' then
    local t=s.telemetry; local overload=false
    if t and now-t.seen<=3*data.poll_s then
     overload=(t.kv~=cjson.null and t.kv and t.kv>=.95)
-     or (t.waiting~=cjson.null and t.waiting and t.waiting>2) or false
+     or (t.waiting~=cjson.null and t.waiting and t.waiting>2)
+     or (not data.allow_overloaded_idle and t.running~=cjson.null
+         and t.running and t.running>=c.limit) or false
    end
    local cost=(s.u+uncached)/((rate or c.weight*10000)*data.max_prefill_s)+(s.n+1)/c.limit
    local member={id=c.id,s=s,cost=cost,matched=matched,u=uncached,kv=kv,tie=c.tie}
@@ -164,7 +166,7 @@ elseif cmd=='select' then
    end
    save(c.id,s)
   end
-  if #fitting==0 then fitting=blocked end
+  if #fitting==0 and data.allow_overloaded_idle then fitting=blocked end
   if #fitting>0 then
    local cheapest=math.huge; local bestgain=-math.huge
    for _,m in ipairs(fitting) do
@@ -333,6 +335,8 @@ class RoutingState:
             raise ValueError("affinity must be a boolean")
         if policy not in ("least_inflight", "scored"):
             raise ValueError("unsupported routing policy")
+        if not isinstance(options.get("allow_overloaded_idle", True), bool):
+            raise ValueError("allow_overloaded_idle must be a boolean")
         estimate = self._estimate(messages)
         normalized, ids = [], {}
         for c in candidates:
@@ -379,6 +383,7 @@ class RoutingState:
             request=self._hash("request", request_id),
             max_tokens=max_tokens,
             policy=policy,
+            allow_overloaded_idle=options.get("allow_overloaded_idle", True),
             affinity=bool(options.get("affinity", True)),
             min_tokens=min_tokens,
             slack=slack,
@@ -390,6 +395,14 @@ class RoutingState:
         if isinstance(selected, bytes):
             selected = selected.decode()
         return ids.get(selected)
+
+    async def claim_budget(self, nonce: str) -> bool:
+        """One-use authority across Proxy replicas, covering the full <=30s validity."""
+        return bool(
+            await self.redis.set(
+                self.keys[0] + ":budget:" + self._hash("budget", nonce), "1", nx=True, ex=35
+            )
+        )
 
     async def release(self, request_id: str, success: bool) -> None:
         """Idempotently release credit; only completed successes learn prefixes."""
@@ -417,6 +430,7 @@ class RoutingState:
         process_start: Any = None,
         *,
         identity: str | None = None,
+        running: float | None = None,
     ) -> None:
         """Malformed/stale gauges fail open; two later start samples clear cache.
 
@@ -442,6 +456,7 @@ class RoutingState:
                 "id": self._hash("candidate", candidate_id),
                 "kv": gauge(kv_usage, 1),
                 "waiting": gauge(waiting),
+                "running": gauge(running),
                 "start": start if start else None,
                 "identity": self._hash("identity", identity) if identity else None,
             },

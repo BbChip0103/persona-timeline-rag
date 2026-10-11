@@ -26,6 +26,7 @@ STATE = {
     "max_active": 0,
     "metrics_calls": 0,
     "metrics_active": 0,
+    "budget_header_leaks": 0,
 }
 START = int(time.time())
 
@@ -77,6 +78,9 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.headers.get("x-ptr-budget-authorization"):
+            with LOCK:
+                STATE["budget_header_leaks"] += 1
         if not self.authorized():
             return self.reply(401, {"error": "synthetic_auth_required"})
         length = int(self.headers.get("Content-Length", "0"))

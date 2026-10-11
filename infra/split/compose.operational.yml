@@ -65,6 +65,7 @@ services:
       - ./litellm/ptr_routing.py:/app/ptr_routing.py:ro
       - ./litellm/routing_state.py:/app/routing_state.py:ro
       - ./litellm/routing_telemetry.py:/app/routing_telemetry.py:ro
+      - ../src/persona_timeline_rag/gateway_budget.py:/app/persona_timeline_rag/gateway_budget.py:ro
       - type: bind
         source: ${PTR_OPERATIONAL_GATEWAY_CONFIG:?private single-primary configuration}
         target: /app/ptr-config.yaml

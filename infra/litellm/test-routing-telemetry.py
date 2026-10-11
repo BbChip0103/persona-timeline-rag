@@ -15,6 +15,14 @@ metrics_url = module.metrics_url
 
 
 class ParseMetricsTests(unittest.TestCase):
+    def test_capacity_running_sum_invalid_family_and_legacy_tuple(self):
+        text = 'vllm:num_requests_running{engine="a"} 4\nvllm:num_requests_running{engine="b"} 4\n'
+        self.assertEqual(module.parse_capacity_metrics(text), (None, None, None, 8))
+        self.assertEqual(parse_metrics(text), (None, None, None))
+        self.assertEqual(
+            module.parse_capacity_metrics(text + "vllm:num_requests_running NaN")[3], None
+        )
+
     def test_modern_kv_max_waiting_sum_and_start(self):
         self.assertEqual(
             parse_metrics(
