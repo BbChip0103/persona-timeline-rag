@@ -56,7 +56,7 @@ export function splitChildEnvironment(env:NodeJS.ProcessEnv,kind:'node'|'python'
   return Object.fromEntries(Object.entries(env).filter(([key])=>common.has(key)||(kind==='node'?backend.has(key):
     !key.includes('OWNER')&&(!key.includes('DATABASE_URL')||key==='PTR_LLM_DATABASE_URL')&&(key.startsWith('PTR_LLM_')||key.startsWith('LANGFUSE_')||key.startsWith('OPENROUTER_')||key==='FRAMEWORK_RELEASE'))));
 }
-async function rolesEnvironment(path:string):Promise<NodeJS.ProcessEnv> {
+export async function rolesEnvironment(path:string):Promise<NodeJS.ProcessEnv> {
   demand(resolve(path)==='/tmp/ptr-python-split-1791653132/roles.env','ISOLATED_ROLES_ENV_REQUIRED');const info=await stat(path);demand((info.mode&0o777)===0o600,'PRIVATE_ROLES_ENV_REQUIRED');const env:NodeJS.ProcessEnv={};
   for(const line of (await readFile(path,'utf8')).split('\n')){if(!line||line.startsWith('#'))continue;const match=/^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);demand(match,'INVALID_ROLES_ENV');env[match[1]!]=match[2]!;}
   for(const [key,user] of [['PTR_SPLIT_TEST_APP_DATABASE_URL','ptr_split_app'],['PTR_SPLIT_TEST_LLM_DATABASE_URL','ptr_split_llm']] as const){const url=new URL(env[key]??'');demand(url.hostname==='127.0.0.1'&&url.port==='58432'&&url.pathname==='/ptr_split_test'&&url.username===user&&url.password&&!url.search&&!url.hash,'SYNTHETIC_SPLIT_TARGET_REQUIRED');}
@@ -67,11 +67,11 @@ async function linkDependencies(target:string,from:string):Promise<void> {
     const path=join(from,relative);if((await stat(path).catch(()=>undefined))?.isDirectory()){await symlink(path,join(target,relative),'dir');}
   }
 }
-async function sourceHash(root:string):Promise<string> {
+export async function sourceHash(root:string,includePythonDependencies=false):Promise<string> {
   const hash=createHash('sha256');async function walk(path:string){for(const item of (await readdir(path,{withFileTypes:true})).sort((a,b)=>a.name.localeCompare(b.name))){if(['node_modules','.venv','__pycache__'].includes(item.name)||item.name.endsWith('.pyc'))continue;const full=join(path,item.name);if(item.isDirectory())await walk(full);else if(item.isFile()){hash.update(full.slice(root.length));hash.update(await readFile(full));}}}
-  for(const name of ['apps/api','packages','apps/llm-service/src','contracts'])if((await stat(join(root,name)).catch(()=>undefined))?.isDirectory())await walk(join(root,name));return hash.digest('hex');
+  for(const name of ['apps/api','packages','apps/llm-service/src','contracts',...(includePythonDependencies?['src']:[])])if((await stat(join(root,name)).catch(()=>undefined))?.isDirectory())await walk(join(root,name));return hash.digest('hex');
 }
-async function prepareSources(directory:string):Promise<Record<Kind,{root:string;code:string;runtimeSourceHash:string;preparationStartedAt:string;preparationCompletedAt:string}>> {
+export async function prepareSources(directory:string):Promise<Record<Kind,{root:string;code:string;runtimeSourceHash:string;preparationStartedAt:string;preparationCompletedAt:string}>> {
   const source=resolve('.'),roots={} as Record<Kind,{root:string;code:string;runtimeSourceHash:string;preparationStartedAt:string;preparationCompletedAt:string}>;
   for(const kind of ['O','C'] as const){const preparationStartedAt=new Date().toISOString(),root=join(directory,kind);await mkdir(root,{mode:0o700});const tar=join(directory,`${kind}.tar`);const archive=await runFile('git',['archive','--format=tar',REFS[kind]],{cwd:source,encoding:'buffer',maxBuffer:64*1024*1024});await writeFile(tar,archive.stdout,{mode:0o600});await runFile('tar',['-xf',tar,'-C',root]);
     if(kind==='O'){for(const [file,oldPort,newPort] of [['packages/storage/src/local-guard.ts','56432','57433'],['packages/messaging/src/local-guard.ts','56479','57480']]){const path=join(root,file!),text=await readFile(path,'utf8');demand(text.includes(`'${oldPort}'`),'BASELINE_GUARD_MISMATCH');await writeFile(path,text.replace(`'${oldPort}'`,`'${newPort}'`));}}
@@ -82,7 +82,7 @@ async function prepareSources(directory:string):Promise<Record<Kind,{root:string
   await linkDependencies(root,source);roots.P={root,code:`3dc6ff8+working:${await sourceHash(root)}`,runtimeSourceHash:await sourceHash(root),preparationStartedAt,preparationCompletedAt:new Date().toISOString()};
   return roots;
 }
-class PythonFleet extends FrameworkFleet {
+export class PythonFleet extends FrameworkFleet {
   constructor(root:string,env:NodeJS.ProcessEnv,directory:string,private readonly pythonEnvironment:NodeJS.ProcessEnv){super(root,env,directory);}
   async startPython(sourceRoot:string):Promise<void>{const log=openSync(join(this.directory,'python-worker.private.log'),'a',0o600),port=Number(this.pythonEnvironment.PTR_LLM_PORT);
     const child=spawn(join(sourceRoot,'apps/llm-service/.venv/bin/python'),['-m','ptr_llm','worker'],{cwd:this.root,env:{...this.pythonEnvironment,PYTHONPATH:`${join(this.root,'apps/llm-service/src')}:${join(this.root,'src')}`},stdio:['ignore',log,log]});closeSync(log);this.children.push(child);this.worker=child;this.workerMetricsBase=`http://127.0.0.1:${port}`;
@@ -117,7 +117,7 @@ async function startFleet(kind:Kind,round:number,ctx:RuntimeContext):Promise<{fl
     return {fleet,personId:data.personas[0]!.personId,pool,ports:{api:Number(new URL(fleet.apiBase).port),worker:Number(new URL(fleet.workerMetricsBase).port)}};
   }catch(error){await fleet?.close();await pool?.end();throw error;}
 }
-async function queueIdle(fleet:FrameworkFleet):Promise<void>{const target=new URL(fleet.env.PTR_REDIS_URL!),queue=new Queue(fleet.env.PTR_TURN_QUEUE!,{connection:{host:'127.0.0.1',port:Number(target.port),username:decodeURIComponent(target.username)||undefined,password:decodeURIComponent(target.password),db:0,maxRetriesPerRequest:1,commandTimeout:3000},prefix:REDIS_PREFIX});try{await waitFor(async()=>{const counts=await queue.getJobCounts('active','wait','delayed');return Object.values(counts).every(n=>n===0);},10000,'OWN_QUEUE_DRAIN_TIMEOUT');}finally{await queue.close();}}
+export async function queueIdle(fleet:FrameworkFleet):Promise<void>{const target=new URL(fleet.env.PTR_REDIS_URL!),queue=new Queue(fleet.env.PTR_TURN_QUEUE!,{connection:{host:'127.0.0.1',port:Number(target.port),username:decodeURIComponent(target.username)||undefined,password:decodeURIComponent(target.password),db:0,maxRetriesPerRequest:1,commandTimeout:3000},prefix:REDIS_PREFIX});try{await waitFor(async()=>{const counts=await queue.getJobCounts('active','wait','delayed');return Object.values(counts).every(n=>n===0);},10000,'OWN_QUEUE_DRAIN_TIMEOUT');}finally{await queue.close();}}
 async function measure(fleet:FrameworkFleet,source:NodeJS.ProcessEnv,personId:string,pool:Pool,kind:Kind,turns:number,concurrency:number):Promise<{summary:Summary;raw:SplitLoadLeg['raw']}> {
   const sessions:string[]=[];for(let i=0;i<turns;i++)sessions.push(await createSession(fleet,personId));
   const before=await engineCounts(source);demand(before.effective_delay_ms===100&&before.prompt_tokens===16&&before.completion_tokens===12,'FIXED_SYNTHETIC_ENGINE_CHANGED');
