@@ -12,7 +12,7 @@ Adapters are for application/provider contracts, not alternative RAG orchestrati
 | Gateway text and guided output | `ChatOpenAI`, `with_structured_output` | Metered transport, model allowlist, receipts, cancellation |
 | Summary child → original parents | `MultiVectorRetriever` | Read-only normalized PostgreSQL stores, pinned run, current hashes/revisions |
 | Legacy caption/image semantic search | `VectorStoreRetriever` | Scoped cosine SQL, trusted person/date/timezone/evidence condition |
-| Search → answer-evidence filtering | `ContextualCompressionRetriever` | JEV `BaseDocumentCompressor`, variable count/probability threshold, guarded batches |
+| Search → answer evidence | Existing native retriever, similarity top 3 | Trusted filters, original parent hydration, no retrieval-stage JEV decision |
 | Query and summary-index batch embeddings | `OpenAIEmbeddings.aembed_query/aembed_documents` | Metered OpenRouter client bridge, ordered validated vectors,1536/raw float |
 | Final prompt assembly | `ChatPromptTemplate`, `MessagesPlaceholder` | Exact wire roles/content/order;30KB whole-post/image budget and omission accounting |
 | Agent flow and receipt-only checkpoints | LangGraph, PostgreSQL saver | Turn ownership/state lifecycle and no raw outer-state persistence |
@@ -33,12 +33,12 @@ pricing/reservation/settlement and invalid/unknown receipt validation are retain
 The bridge uses a per-invocation cancellation context, restored on every exit.
 Summary-index ingestion uses this same SDK path without changing saved batch identity.
 
-JEV is not replaced with `LLMListwiseRerank` or `LLMChainFilter`: those change its
-non-chat decisions protocol or variable evidence-count semantics. Native contextual
-compression owns retrieve/empty-result skip/compress sequencing; the provider-specific
-compressor returns selected original Documents, never summary quotations. Remembered
-references are validated first and then use the same compressor. Tool searches share
-this pipeline; off/creative/safety-deflected paths do not invoke it.
+Retrieval uses at most three original posts in vector similarity order, without JEV
+selection, reranking or contextual compression. Initial retrieval and agent tool
+searches share the same three-post cap; original-post byte budgeting still applies.
+Owned follow-up references can reuse their pinned sources without a new search or
+JEV selection. JEV safety/intent settings, answer guardrails and costly-call receipt
+handling are unchanged; removing the search judge does not disable those controls.
 
 Native retrievers share an internal asynchronous invocation boundary that bypasses
 SDK automatic callback configuration. Even `callbacks=[]` can inherit global raw

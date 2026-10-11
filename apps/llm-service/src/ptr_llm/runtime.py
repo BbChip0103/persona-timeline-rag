@@ -35,7 +35,6 @@ from .prompt_management import (
 from .providers import (
     CheckpointedTextProvider,
     FakeTextProvider,
-    JevEvidenceSelector,
     JevInputSafetyClassifier,
     JevIntentClassifier,
     LiteLLMTextProvider,
@@ -439,19 +438,8 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             1,
             1048576,
         )
-        selector_name = env.get("PTR_LLM_EVIDENCE_SELECTOR", "off")
         retrieval_index = env.get("PTR_LLM_RETRIEVAL_INDEX", "legacy")
-        if (
-            selector_name not in ("off", "jev")
-            or retrieval_index not in ("legacy", "summary")
-            or (selector_name == "jev") != (retrieval_index == "summary")
-        ):
-            raise ProviderError("INVALID_RUNTIME_CONFIG")
-        try:
-            evidence_threshold = float(env.get("PTR_LLM_EVIDENCE_THRESHOLD", "0.7"))
-        except ValueError:
-            raise ProviderError("INVALID_RUNTIME_CONFIG") from None
-        if not math.isfinite(evidence_threshold) or not 0 < evidence_threshold <= 1:
+        if retrieval_index not in ("legacy", "summary"):
             raise ProviderError("INVALID_RUNTIME_CONFIG")
         client = None
         need_openrouter = (
@@ -459,7 +447,6 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             or env.get("PTR_LLM_INTENT_CLASSIFIER", "off") == "jev"
             or env.get("PTR_LLM_SAFETY_FILTER", "off") == "jev"
             or env.get("PTR_LLM_EMBEDDING_PROVIDER", "off") == "openrouter"
-            or selector_name == "jev"
         )
         if need_openrouter:
             client = OpenRouterClient(
@@ -545,9 +532,6 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             retrieval=retrieval,
             telemetry=telemetry,
             semantic_search=embedding is not None,
-            evidence_selector=JevEvidenceSelector(decision_client, threshold=evidence_threshold)
-            if selector_name == "jev"
-            else None,
             intent_classifier=JevIntentClassifier(decision_client)
             if intent_name == "jev"
             else None,

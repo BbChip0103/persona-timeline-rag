@@ -102,7 +102,6 @@ class LLMEngine:
         agent_validator=None,
         telemetry=None,
         semantic_search=True,
-        evidence_selector=None,
     ):
         self.provider = provider
         self.personas = personas
@@ -119,7 +118,6 @@ class LLMEngine:
         self.agent_validator = agent_validator
         self.telemetry = telemetry
         self.semantic_search = semantic_search
-        self.evidence_selector = evidence_selector
         self._turn_graph = _compiled_turn_graph()
 
     async def handle(self, grant, *, before_costly, cancelled):
@@ -416,100 +414,37 @@ class LLMEngine:
                 safetyCategory=category,
             )
 
-        async def selection_documents(sources, summaries=None):
-            from .retrieval_pipeline import source_documents
-
-            if not sources:
-                return []
-            check()
-            if summaries is None and (
-                not self.retrieval or not hasattr(self.retrieval, "summaries")
-            ):
-                raise CoreError("TURN_FAILED", "SUMMARY_UNAVAILABLE")
-            if len(sources) > 20 or len({s["id"] for s in sources}) != len(sources):
-                raise CoreError("TURN_FAILED", "EVIDENCE_SELECTION_INVALID")
-            if summaries is None:
-                summaries = await self.retrieval.summaries(
-                    sources, {"personId": session["personId"]}, signal=cancelled
-                )
-            check()
-            return source_documents(sources, summaries)
-
-        def evidence_compressor():
-            from .retrieval_pipeline import JevDocumentCompressor
-
-            return JevDocumentCompressor(
-                selector=self.evidence_selector,
-                seed=turn["id"],
-                signal=cancelled,
-                deadline_at=deadline,
-                before_costly=guarded,
-                check=check,
-            )
-
-        async def select_evidence(sources, query, summaries=None):
-            if not self.evidence_selector or not sources:
-                return sources
-            documents = await selection_documents(sources, summaries)
-            selected = await evidence_compressor().acompress_documents(
-                documents,
-                query.get("query") or text[:500],
-            )
-            return [doc.metadata["source"] for doc in selected]
-
         async def search(query):
             if self.retrieval is None:
                 raise CoreError("TURN_FAILED", "RETRIEVAL_UNAVAILABLE")
             scoped = validate_query(query, session["personId"])
-            if self.evidence_selector:
-                scoped["limit"] = min(20, max(10, scoped["limit"]))
-                if not scoped.get("query"):
-                    scoped["query"] = text[:500]
-            options = {
-                "signal": cancelled,
-                "mode": session["retrievalMode"],
-                "evidence_scope": session.get("ragCondition")
+            scoped["limit"] = min(EVIDENCE_POST_LIMIT, scoped["limit"])
+            if session["retrievalMode"] == "semantic" and not scoped.get("query"):
+                scoped["query"] = text[:500]
+            # Query embeddings remain ownership/deadline fenced without a reranker.
+            # Lexical SQL is not a costly provider call.
+            if session["retrievalMode"] == "semantic":
+                await guarded()
+            else:
+                check()
+            found = await self.retrieval.search(
+                scoped,
+                {"personId": session["personId"]},
+                signal=cancelled,
+                mode=session["retrievalMode"],
+                evidence_scope=session.get("ragCondition")
                 if session.get("ragCondition") in ("caption", "caption_image")
                 else "caption",
-            }
-
-            async def load_sources():
-                summaries = None
-                if self.evidence_selector:
-                    # External query embedding remains ownership/deadline fenced.
-                    await guarded()
-                if self.evidence_selector and hasattr(self.retrieval, "search_with_summaries"):
-                    found, summaries = await self.retrieval.search_with_summaries(
-                        scoped, {"personId": session["personId"]}, **options
-                    )
-                else:
-                    found = await self.retrieval.search(
-                        scoped, {"personId": session["personId"]}, **options
-                    )
-                return filter_evidence(found, scoped, session["personId"]), summaries
-
-            if self.evidence_selector:
-                from .langchain import private_retrieve
-                from .retrieval_pipeline import PrivateCompressionRetriever, ScopedSourceRetriever
-
-                async def load_documents():
-                    found, summaries = await load_sources()
-                    return await selection_documents(found, summaries)
-
-                native = PrivateCompressionRetriever(
-                    base_retriever=ScopedSourceRetriever(
-                        load=load_documents, query=scoped["query"]
-                    ),
-                    base_compressor=evidence_compressor(),
-                )
-                documents = await private_retrieve(native, scoped["query"])
-                sources = [doc.metadata["source"] for doc in documents]
-            else:
-                sources, _ = await load_sources()
+            )
+            check()
+            sources = filter_evidence(found, scoped, session["personId"])
             return (
                 sources
                 if session.get("ragCondition") == "caption_image"
-                else [{k: v for k, v in s.items() if k != "imageAnnotations"} for s in sources]
+                else [
+                    {k: v for k, v in source.items() if k != "imageAnnotations"}
+                    for source in sources
+                ]
             )
 
         async def retrieve(frame):
@@ -566,7 +501,7 @@ class LLMEngine:
                         ["AMBIGUOUS_SOURCE_REFERENCE"],
                     ),
                 )
-            q = snap["query"]
+            q = dict(snap["query"], limit=min(EVIDENCE_POST_LIMIT, snap["query"]["limit"]))
             if (
                 intent == "timeline"
                 and session["retrievalMode"] != "off"
@@ -603,13 +538,13 @@ class LLMEngine:
             if (
                 refs
                 and self.retrieval
-                and self.evidence_selector
+                and getattr(self.retrieval, "summary_index", False)
                 and hasattr(self.retrieval, "resolve_with_summaries")
             ):
                 # This capability validates the old owned references before
                 # hydrating their same parents and full current photos from one
                 # pinned summary run. Do not narrow those photos back to old refs.
-                resolved, summaries = await self.retrieval.resolve_with_summaries(
+                resolved, _ = await self.retrieval.resolve_with_summaries(
                     refs,
                     {"personId": session["personId"]},
                     signal=cancelled,
@@ -629,8 +564,6 @@ class LLMEngine:
                     )
                 ]
                 sources = filter_evidence(pinned, q, session["personId"])
-                if sources:
-                    sources = await select_evidence(sources, q, summaries)
                 if sources:
                     trace = dict(trace, action="reuse", reusedSourceIds=[s["id"] for s in sources])
             elif refs and self.retrieval and hasattr(self.retrieval, "resolve"):
@@ -686,8 +619,6 @@ class LLMEngine:
                         )
                     )
                 sources = filter_evidence(pinned, q, session["personId"])
-                if sources:
-                    sources = await select_evidence(sources, q)
                 if sources:
                     trace = dict(trace, action="reuse", reusedSourceIds=[s["id"] for s in sources])
             if not sources:
@@ -761,7 +692,6 @@ class LLMEngine:
                     deadline_at=deadline,
                     before_costly=guarded,
                     telemetry=self.telemetry,
-                    max_sources=20 if self.evidence_selector else EVIDENCE_POST_LIMIT,
                 )
                 return dict(
                     frame,
@@ -779,7 +709,6 @@ class LLMEngine:
                     frame["sources"],
                     policy_note=note,
                     after_history=[lore] if lore else [],
-                    max_sources=20 if self.evidence_selector else EVIDENCE_POST_LIMIT,
                 )
                 messages = experiment["messages"]
             else:

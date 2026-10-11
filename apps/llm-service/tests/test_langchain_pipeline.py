@@ -1,13 +1,10 @@
-"""Native legacy retrieval and retrieve/compress orchestration, synthetic only."""
+"""Native vector retrieval and private callback boundaries, synthetic only."""
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
-from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain_core.vectorstores import VectorStoreRetriever
-from test_evidence_selection import Retrieval, Selector, run
 from test_post_summaries import POST, URL
 
 from ptr_llm.billing import ProviderError
@@ -86,77 +83,12 @@ async def test_legacy_invalid_scope_is_prepaid(fault):
     assert not embedded and not sources.calls
 
 
-@pytest.mark.parametrize("ids", [[], ["post-1"], ["post-2", "post-0", "post-1"]])
-async def test_actual_contextual_compression_drives_search_and_judge(monkeypatch, ids):
-    calls = []
-    original = ContextualCompressionRetriever._aget_relevant_documents
-
-    async def spy(self, *args, **kwargs):
-        calls.append(self)
-        return await original(self, *args, **kwargs)
-
-    monkeypatch.setattr(ContextualCompressionRetriever, "_aget_relevant_documents", spy)
-    retrieval, selector = Retrieval(3), Selector(ids)
-    result, provider = await run(retrieval, selector)
-    assert result["kind"] == "completed" and len(calls) == 1
-    assert len(retrieval.searches) == len(selector.calls) == 1
-    cards = next(
-        m["content"].split(" ", 1)[1]
-        for m in provider.messages[0]
-        if m["content"].startswith("UNTRUSTED_EVIDENCE_JSON_DATA ")
-    )
-    assert [card["sourceId"] for card in json.loads(cards)] == ids
-    assert all("caption" not in c for c in selector.calls[0][0]["candidates"])
-
-
-async def test_native_compression_empty_hits_skip_judge(monkeypatch):
-    calls = []
-    original = ContextualCompressionRetriever._aget_relevant_documents
-
-    async def spy(self, *args, **kwargs):
-        calls.append(1)
-        return await original(self, *args, **kwargs)
-
-    monkeypatch.setattr(ContextualCompressionRetriever, "_aget_relevant_documents", spy)
-    retrieval, selector = Retrieval(0), Selector([])
-    result, _ = await run(retrieval, selector)
-    assert result["kind"] == "completed" and calls == [1]
-    assert not selector.calls and not retrieval.summary_calls
-
-
-@pytest.mark.parametrize(
-    "mode,text",
-    [
-        ("off", "Tell me about your sky post."),
-        ("semantic", "Hello!"),
-        ("semantic", "Imagine a fictional adventure."),
-    ],
-)
-async def test_native_compression_off_and_nonfactual_paths_have_zero_calls(monkeypatch, mode, text):
-    async def forbidden(*args, **kwargs):
-        raise AssertionError("native retrieval must not run")
-
-    monkeypatch.setattr(ContextualCompressionRetriever, "_aget_relevant_documents", forbidden)
-    retrieval, selector = Retrieval(), Selector(["post-0"])
-    result, _ = await run(retrieval, selector, mode=mode, text=text)
-    assert result["kind"] == "completed"
-    assert not retrieval.searches and not selector.calls
-
-
-async def test_compression_and_legacy_do_not_export_to_ambient_sdk_traces(monkeypatch, capsys):
+async def test_legacy_retrieval_does_not_export_to_ambient_sdk_traces(monkeypatch, capsys):
     import httpx
     import requests
     from langchain_core import globals as lc_globals
     from langchain_core.tracers.context import collect_runs
     from langsmith import tracing_context
-
-    from ptr_llm.core.langchain import private_retrieve
-    from ptr_llm.core.retrieval_pipeline import (
-        JevDocumentCompressor,
-        PrivateCompressionRetriever,
-        ScopedSourceRetriever,
-        source_documents,
-    )
 
     network = []
 
@@ -176,29 +108,11 @@ async def test_compression_and_legacy_do_not_export_to_ambient_sdk_traces(monkey
     async def embed(*args, **kwargs):
         return [1] * 1536
 
-    async def load():
-        return source_documents([POST], {POST["id"]: "Synthetic date.\nEvent.\nImage."})
-
-    async def guarded():
-        return None
-
     adapter = PostgresRetrieval(sources, embed=embed, model_revision="fake-embedding")
-    native = PrivateCompressionRetriever(
-        base_retriever=ScopedSourceRetriever(load=load, query="q"),
-        base_compressor=JevDocumentCompressor(
-            selector=Selector([POST["id"]]),
-            seed="synthetic-turn",
-            signal=asyncio.Event(),
-            deadline_at=9999999999999.0,
-            before_costly=guarded,
-            check=lambda: None,
-        ),
-    )
     # Exercise only new native boundaries, not an outer application graph with tracing enabled.
     with collect_runs() as collected, tracing_context(enabled=True):
         found = await adapter.search(QUERY, {"personId": POST["personId"]}, mode="semantic")
-        documents = await private_retrieve(native, "q")
-    assert found == [POST] and documents[0].metadata["source"] == POST
+    assert found == [POST]
     assert not collected.traced_runs and not network
     assert "[retriever/" not in capsys.readouterr().out
 
@@ -207,7 +121,14 @@ async def test_internal_callback_config_accepts_only_empty_noop_manager():
     from langchain_core.callbacks import AsyncCallbackManager
     from langchain_core.callbacks.base import BaseCallbackHandler
 
-    from ptr_llm.core.retrieval_pipeline import ScopedSourceRetriever
+    from ptr_llm.core.langchain import PrivateAsyncRetriever
+
+    class ScopedSourceRetriever(PrivateAsyncRetriever):
+        def _get_relevant_documents(self, query, *, run_manager):
+            raise NotImplementedError("private async retrieval only")
+
+        async def _aget_relevant_documents(self, query, *, run_manager):
+            return await load()
 
     calls = []
 
@@ -215,7 +136,7 @@ async def test_internal_callback_config_accepts_only_empty_noop_manager():
         calls.append(1)
         return []
 
-    retriever = ScopedSourceRetriever(load=load, query="q")
+    retriever = ScopedSourceRetriever()
     manager = AsyncCallbackManager(handlers=[])
     assert await retriever.ainvoke("q", {"callbacks": manager}) == []
     for config in (

@@ -35,5 +35,5 @@
 
 - 범용 LLM/RAG 기능은 공식 LangChain/LangGraph 구성요소를 먼저 확인하고 사용한다. 이미 직접 구현했더라도 동등한 계약을 지원하면 네이티브 구현으로 이관하고 중복 흐름을 제거한다.
 - 단순 Runnable 래퍼를 붙인 것을 알고리즘 이관이라고 보고하지 않는다. 실제 SDK가 담당하는 기능과 남는 custom adapter/정책을 구분한다([현재 경계](docs/langchain-components.md)).
-- 인물/기간/라이선스/원문·이미지 provenance, 삭제/소유권/deadline, 비용·unknown receipt/재제출 금지, 엄격한 JSON/바이트 제한은 유지한다. 기본 파서의 자동 보정·token split/extra batch/retry·고정top-N·두 번째 memory DB로 계약을 바꾸지 않는다.
+- 인물/기간/라이선스/원문·이미지 provenance, 삭제/소유권/deadline, 비용·unknown receipt/재제출 금지, 엄격한 JSON/바이트 제한은 유지한다. 사용자가 요청하지 않은 기본 파서의 자동 보정·token split/extra batch/retry·고정top-N·두 번째 memory DB로 계약을 바꾸지 않는다.
 - SDK raw-document 자동 tracing은 차단하고 기존 redacted application telemetry만 유지한다. 의존성 업그레이드 시 private async hook/클라이언트 bridge 및 데이터·과금 동등성을 회귀 검증한다.

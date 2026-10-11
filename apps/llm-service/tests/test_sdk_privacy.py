@@ -12,7 +12,7 @@ from langchain_core.tracers.context import collect_runs, register_configure_hook
 from langgraph.checkpoint.memory import InMemorySaver
 from langsmith import Client as LangSmithClient
 from langsmith import tracing_context
-from test_evidence_selection import Retrieval, Selector, run
+from test_evidence_selection import Retrieval, run
 from test_providers_billing import response
 
 from ptr_llm.providers import CheckpointedTextProvider, FakeTextProvider, LiteLLMTextProvider
@@ -87,7 +87,7 @@ async def test_all_native_sdk_entrypoints_keep_ambient_callbacks_private(kind, m
     try:
         with collect_runs() as runs, tracing_context(enabled=True, client=trace_client):
             if kind == "turn":
-                result, raw = await run(Retrieval(1), Selector(["post-0"]))
+                result, raw = await run(Retrieval(1))
                 assert result["kind"] == "completed" and len(raw.messages) == 1
             elif kind == "receipt":
                 raw = FakeTextProvider()

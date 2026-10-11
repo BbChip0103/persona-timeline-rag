@@ -153,20 +153,21 @@ fail before paid work. A resumed run without its existing budget record is rejec
 never silently rebased. The initial manifest membership must match exactly; per-source freshness is checked during import.
 Direct-summary execution permits an embedding cap of at most US$1. Without that
 option, the separately authorized provider-summary path uses the approved Gemma model.
-Both paths use `openai/text-embedding-3-small` for vectors; runtime selection uses
-`typesafe/jev-1.13`. An embedding authorization does not authorize paid Jev evaluation.
+Both paths use `openai/text-embedding-3-small` for vectors. Retrieval has no JEV
+selection call; existing JEV safety/intent uses `typesafe/jev-1.13` when enabled.
+An embedding authorization does not authorize paid Jev evaluation.
 Exact three-line/date/location/length checks are structural guards, not factual-quality
 certification. Do not start a new run/record to bypass a spent cap or unresolved request.
 
-Enable the paired Python settings only after index validation:
-`PTR_LLM_RETRIEVAL_INDEX=summary`, `PTR_LLM_EVIDENCE_SELECTOR=jev`, and the existing
-approved OpenRouter query-embedding settings. Search gathers 10–20 candidates. Jev
-judges which posts supply necessary/useful answer evidence, independently of a fixed
-quota, and orders selected posts by relevance. Selection can return zero, one or more
-than three posts. The provisional threshold is separately configurable with
-`PTR_LLM_EVIDENCE_THRESHOLD` (default `0.7`); it is not a calibrated accuracy claim.
-Size-bounded requests may require several Jev batches, each ownership/deadline fenced;
-an invalid/missing answer fails closed, not a partial selection or fallback to all posts.
+Enable `PTR_LLM_RETRIEVAL_INDEX=summary` only after index validation, with the
+existing approved OpenRouter query-embedding settings. Search takes the three most
+similar eligible summary vectors and hydrates their original posts in that order.
+It returns fewer if fewer eligible posts exist; the whole-post prompt-byte budget can
+further limit supplied evidence. There is no 20-candidate JEV selection/reranking step.
+`PTR_LLM_EVIDENCE_SELECTOR` and `PTR_LLM_EVIDENCE_THRESHOLD` are retired and unused,
+including when left in an older private env file. JEV safety/intent flags and answer
+guardrails remain independent and unchanged. Scoped pinned follow-up references can
+reuse original posts without an extra search or selector call.
 
 Summary-mode search uses the actual `langchain-classic` `MultiVectorRetriever`:
 read-only scoped `VectorStore` → summary child Documents → SDK ordered parent-ID
