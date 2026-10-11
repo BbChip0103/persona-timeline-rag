@@ -62,7 +62,7 @@ it('rejects a stale parent marker even when deployment owner matches',()=>{
   expect(()=>validateSignal({ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase:'worker-paused',requestNonce:'old'},env.PTR_OPERATIONAL_OWNER_NONCE,'worker-paused','fresh')).toThrow('PARENT_SIGNAL_MISMATCH');
 });
 async function syntheticProtocol(providerRowsAfter=0){
-  type Turn={id:string;state:string;client:string};const turns:Turn[]=[];let paused=false,successes=0,firstOwner='';const artifacts:unknown[]=[];
+  type Turn={id:string;state:string;client:string};const turns:Turn[]=[];let paused=false,successes=0,firstOwner='',sessions=0,sessionCountAtPause=0;const artifacts:unknown[]=[];
   const app={query:async(sql:string,args?:string[])=>{
     if(sql.startsWith('SELECT current_database'))return {rows:[{db:'ptr_split_research',role:'ptr_split_app'}]};
     const turn=turns.find(t=>t.id===args?.[0])!;
@@ -78,16 +78,17 @@ async function syntheticProtocol(providerRowsAfter=0){
     const url=new URL(String(input)),headers=new Headers(options?.headers);const actor=headers.get('X-PTR-Owner')??'';let body:unknown={};let status=200;
     if(url.pathname==='/metrics')return new Response(`vllm:request_success_total ${successes}\nvllm:num_requests_running 0\nvllm:num_requests_waiting 0`);
     if(url.pathname==='/api/personas'){if(!headers.has('Authorization'))return new Response('{}',{status:403});firstOwner=actor;body={personas:[{personId:'synthetic-published-person',reviewStatus:'human_reviewed',language:'ko'}]};}
-    else if(url.pathname==='/api/sessions')body={session:{id:'synthetic-session'}};
+    else if(url.pathname==='/api/sessions'){if(paused)return new Response('{}',{status:503});body={session:{id:`synthetic-session-${++sessions}`}};}
     else if(url.pathname.endsWith('/turns')){const data=JSON.parse(String(options?.body)) as {clientRequestId:string};let turn=turns.find(t=>t.client===data.clientRequestId);if(!turn){turn={id:`synthetic-turn-${turns.length}`,client:data.clientRequestId,state:paused?'pending':'completed'};turns.push(turn);if(!paused)successes++;}body={turn};}
     else if(url.pathname.includes('/api/turns/')){const id=url.pathname.split('/')[3],turn=turns.find(t=>t.id===id)!;if(actor!==firstOwner)status=404;else if(url.pathname.endsWith('/cancel')){turn.state='cancelled';body={cancelled:true};}else body={turn:{...turn,...(turn.state==='completed'?{reply:{status:'answered',content:'synthetic reply only',evidence:[],limitations:['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','ko'),replyText('limitation_posted_date','ko')]}}:{})}};}
     return new Response(JSON.stringify(body),{status});
   };
-  const report=await operationalSmoke(operationalConfig(env,true,env.PTR_OPERATIONAL_OWNER_NONCE),{app,llm,fetch:fake,verifyOwnership:async()=>undefined,persist:async(_path,body)=>{artifacts.push(body);},delay:async()=>undefined,parentSignal:async(phase,requestNonce)=>{if(phase==='worker-paused')paused=true;if(phase==='worker-resumed'){paused=false;for(const t of turns)if(t.state==='pending'){t.state='completed';successes++;}}return {ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase,requestNonce};}});
-  return {report,turns,artifacts};
+  const report=await operationalSmoke(operationalConfig(env,true,env.PTR_OPERATIONAL_OWNER_NONCE),{app,llm,fetch:fake,verifyOwnership:async()=>undefined,persist:async(_path,body)=>{artifacts.push(body);},delay:async()=>undefined,parentSignal:async(phase,requestNonce)=>{if(phase==='worker-paused'){sessionCountAtPause=sessions;paused=true;}if(phase==='worker-resumed'){paused=false;for(const t of turns)if(t.state==='pending'){t.state='completed';successes++;}}return {ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase,requestNonce};}});
+  return {report,turns,artifacts,sessionCountAtPause,sessions};
 }
 it('runs the complete synthetic protocol with exactly-once ACK, owner denial, idempotence and staged recovery',async()=>{
-  const {report,turns,artifacts}=await syntheticProtocol();
+  const {report,turns,artifacts,sessionCountAtPause,sessions}=await syntheticProtocol();
+  expect(sessionCountAtPause).toBe(3);expect(sessions).toBe(3);
   expect(report).toMatchObject({passed:true,localDistinctTurnSubmissions:3,modelCallCreditsReserved:9,paid:{embeddingRowsDelta:0,committedMicrousdDelta:0},nativeCounters:{successDelta:2,admissions:null,errorDelta:null}});
   expect(turns).toHaveLength(3);expect((report.stages as unknown[])).toHaveLength(4);expect(JSON.stringify(artifacts)).not.toMatch(/synthetic-published-person|synthetic reply only|synthetic-turn-/);
 });
