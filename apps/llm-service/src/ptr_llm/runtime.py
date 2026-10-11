@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import math
 import os
 import time
 from collections.abc import Mapping
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import AsyncConnection
@@ -17,6 +21,8 @@ from psycopg_pool import AsyncConnectionPool
 
 from .billing import PostgresBudgetLedger, ProviderError
 from .config import Settings
+from .core.errors import CoreError
+from .core.persona import validate_persona
 from .core.runtime import LLMEngine
 from .prompt_management import (
     LOCAL_PROMPT_SNAPSHOT,
@@ -45,6 +51,85 @@ from .repositories import (
 )
 from .telemetry import FrameworkTelemetry as Telemetry
 from .telemetry import TelemetryConfig
+
+
+def _load_publication(
+    env: Mapping[str, str], database_url: str
+) -> tuple[dict[str, Any], ...] | None:
+    """Snapshot approved selection; never infer publication from imported DB variants."""
+    database = urlsplit(database_url).path.removeprefix("/")
+
+    def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("ambiguous publication")
+            result[key] = value
+        return result
+
+    def read(path: str, *, bound: bool = False, authored: bool = False) -> list[dict[str, Any]]:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique_keys)
+        if bound or (authored and isinstance(raw, dict)):
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {"database", "personas"}
+                or raw["database"] != database
+            ):
+                raise ProviderError("PERSONA_UNAVAILABLE")
+            raw = raw["personas"]
+        if not isinstance(raw, list):
+            raise ProviderError("PERSONA_UNAVAILABLE")
+        cards = [validate_persona(item) for item in raw]
+        if any(len({card[key] for card in cards}) != len(cards) for key in ("personId", "id")):
+            raise ProviderError("PERSONA_UNAVAILABLE")
+        return cards
+
+    try:
+        if "PTR_LLM_PUBLISHED_PERSONAS_FILE" in env:
+            selected = read(env["PTR_LLM_PUBLISHED_PERSONAS_FILE"], bound=True)
+        else:
+            # Retain isolated fake fixtures without discovering private files.
+            if env.get("PTR_LLM_PROVIDER", "fake") == "fake" and not any(
+                key in env for key in ("PTR_PERSONAS_FILE", "PTR_AUTHORED_PERSONAS_FILE")
+            ):
+                return None
+            generated = read(env.get("PTR_PERSONAS_FILE", "data/research/personas.json"))
+            authored = (
+                read(env["PTR_AUTHORED_PERSONAS_FILE"], authored=True)
+                if "PTR_AUTHORED_PERSONAS_FILE" in env
+                else []
+            )
+            overrides = {card["personId"]: card for card in authored}
+            generated_people = {card["personId"] for card in generated}
+            selected = [overrides.get(card["personId"], card) for card in generated]
+            selected.extend(card for card in authored if card["personId"] not in generated_people)
+        if len({card["id"] for card in selected}) != len(selected):
+            raise ProviderError("PERSONA_UNAVAILABLE")
+        return tuple(selected)
+    except (OSError, ValueError, CoreError, TypeError):
+        raise ProviderError("PERSONA_UNAVAILABLE") from None
+
+
+def _published_cards(
+    documents: list[dict[str, Any]], publication: tuple[dict[str, Any], ...] | None
+) -> list[dict[str, Any]]:
+    try:
+        current = [validate_persona(document) for document in documents]
+        if publication is None:
+            return current
+        by_id = {card["id"]: card for card in current}
+        if len(by_id) != len(current):
+            raise ProviderError("PERSONA_UNAVAILABLE")
+        selected = []
+        for approved in publication:
+            canonical = by_id.get(approved["id"])
+            # Full normalized document equality includes person, revision and content.
+            if canonical != approved:
+                raise ProviderError("PERSONA_UNAVAILABLE")
+            selected.append(canonical)
+        return selected
+    except CoreError:
+        raise ProviderError("PERSONA_UNAVAILABLE") from None
 
 
 def _integer(env: Mapping[str, str], key: str, default: int, low: int, high: int) -> int:
@@ -205,12 +290,14 @@ class Runtime:
         *,
         prompts: PromptSnapshot = LOCAL_PROMPT_SNAPSHOT,
         auxiliary_provider: Any = None,
+        publication: tuple[dict[str, Any], ...] | None = None,
     ):
         self.pool, self.personas, self.domain_engine = pool, personas, engine
         self.result_store, self.provider, self.telemetry = results, provider, telemetry
         self.provider_name, self.model = provider_name, model
         self.prompts = prompts
         self.auxiliary_provider = auxiliary_provider
+        self.publication = copy.deepcopy(publication)
         self.engine = self
 
     async def handle(self, grant: dict[str, Any], **options: Any) -> dict[str, Any]:
@@ -219,8 +306,6 @@ class Runtime:
             return await self.domain_engine.handle(grant, **options)
 
     async def catalogue(self) -> list[dict[str, Any]]:
-        from .core.persona import validate_persona
-
         fields = (
             "id",
             "personId",
@@ -232,10 +317,13 @@ class Runtime:
             "alternateGreetings",
         )
         # Only the approved public projection crosses the owner boundary.
-        personas = await self.personas.list()
+        try:
+            personas = await self.personas.list()
+        except CoreError:
+            raise ProviderError("PERSONA_UNAVAILABLE") from None
         return [
             {key: persona[key] for key in fields if key in persona}
-            for persona in (validate_persona(p) for p in personas)
+            for persona in _published_cards(personas, self.publication)
         ]
 
     async def draft(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -332,6 +420,12 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 raise ProviderError("RUNTIME_SCHEMA_NOT_READY")
         prompts = await load_prompt_snapshot(prompt_config, telemetry.client)
         personas = PostgresPersonaRepository(pool, settings.database_url)
+        publication = _load_publication(env, settings.database_url)
+        if publication:
+            try:
+                _published_cards(await personas.list(), publication)
+            except CoreError:
+                raise ProviderError("PERSONA_UNAVAILABLE") from None
         sources = PostgresSourceRepository(pool, settings.database_url)
         results = ResultReceiptStore(pool, settings.database_url)
         ledger = PostgresBudgetLedger(pool, settings.database_url)
@@ -476,6 +570,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             model,
             prompts=prompts,
             auxiliary_provider=client if provider_name != "openrouter" else None,
+            publication=publication,
         )
     except BaseException:
         try:

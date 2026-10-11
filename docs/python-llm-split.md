@@ -4,8 +4,8 @@ The default application runtime is now Nest → Python → LiteLLM/model serving
 The gateway's [engine routing](gateway-routing.md) preserves cache-affinity,
 selectable cost scoring and background vLLM overload filtering through a pinned
 LiteLLM Proxy extension; these policies do not live in the Python chat worker.
-The historical TS worker is explicit `PTR_LLM_SERVICE_MODE=legacy` and is not the
-Compose/default deployment. See `apps/llm-service/README.md` for native Python
+The historical TS worker is retired; the API rejects `PTR_LLM_SERVICE_MODE=legacy`.
+See `apps/llm-service/README.md` for native Python
 experiments, reviews, ingestion and persona commands.
 
 ## Ownership
@@ -26,6 +26,37 @@ becomes terminal `TURN_TIMEOUT`, without publishing a reply or redispatching a m
 Cancellation/lost tokens cannot publish. Delivery is at-least-once, not provider
 exactly-once. Queue global concurrency is rejected; use local concurrency and replica
 sizing. More than 100 prior messages fails `CONTEXT_LIMIT`, never silently truncates.
+
+## Approved current persona publication
+
+Set `PTR_LLM_PUBLISHED_PERSONAS_FILE` in the Python worker to an explicitly approved,
+read-only JSON snapshot with exactly `{ "database": "ptr_split_research", "personas": [...] }`
+(use `ptr_split_test` for an isolated test target). The database must match the worker
+URL. This setting is exclusive: it does not load generated/authored defaults or choose
+the latest imported variant. Mount only that file, not its private parent directory.
+
+Without that setting, native Python preserves the historical registry merge:
+`PTR_PERSONAS_FILE` (default `data/research/personas.json`) supplies a generated array;
+only an explicitly set `PTR_AUTHORED_PERSONAS_FILE` adds an authored array or a strict
+database-bound wrapper. Authored cards override the same `personId` in generated order;
+authored-only people append in authored order. An existing default authored artifact is
+not discovered automatically. Duplicate people/IDs within an input or conflicting IDs
+in the merged selection fail closed.
+
+At startup and on catalogue reads, selected cards must equal the canonical current DB
+documents, including ID, person, revision and full normalized content. Missing/stale
+cards, binding/content drift, malformed files and ambiguous JSON keys fail with sanitized
+`PERSONA_UNAVAILABLE`; no partial catalogue, pointer repointing, DB imports or deletions
+occur. Other imported variants stay stored but are not advertised. Changing the approval
+file requires a worker restart; DB-current drift is checked again on each catalogue read.
+Only the existing public projection crosses to the application backend.
+
+This is a current catalogue/new-session admission policy, **not** an execution allowlist
+for historical sessions. Existing sessions retain their pinned persona/revision lookup,
+including variants no longer advertised. For isolated fake/synthetic compatibility only,
+`PTR_LLM_PROVIDER=fake` (also the default) with all three registry settings unset retains
+the existing DB catalogue behavior. Explicit empty registries publish no cards and never
+fall back to imported variants. Real model providers do not use the fake unset exception.
 
 ## Environments and images
 
