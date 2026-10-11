@@ -118,7 +118,11 @@ def main():
         # Explicit synthetic owner setup, not DDL in worker startup. The owner
         # partition supplies default privileges for subsequently created saver
         # tables; runtime roles keep their existing no-DDL boundary.
-        for name in ("0002_receipt_scope.sql", "0003_post_summaries.sql"):
+        for name in (
+            "0002_receipt_scope.sql",
+            "0003_post_summaries.sql",
+            "0004_cumulative_budget_cap.sql",
+        ):
             db.execute((Path("supabase/split") / name).read_text())
     from ptr_llm.providers.checkpoints import setup_call_checkpoints
 

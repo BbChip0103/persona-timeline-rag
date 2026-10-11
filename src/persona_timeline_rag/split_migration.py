@@ -287,6 +287,12 @@ def migrate(source_url: str, target_url: str, directory: Path, sql_path: Path) -
         scope_upgrade = sql_path.with_name("0002_receipt_scope.sql")
         if scope_upgrade.exists():
             target.execute(scope_upgrade.read_text())
+        # Preserve the baseline/requests but impose the user's cumulative cap.
+        # This explicit owner upgrade is never DDL in serving startup.
+        budget_upgrade = sql_path.with_name("0004_cumulative_budget_cap.sql")
+        if not budget_upgrade.is_file():
+            raise MigrationError("CUMULATIVE_BUDGET_UPGRADE_REQUIRED")
+        target.execute(budget_upgrade.read_text())
         # A new transaction detects source writes that raced after the exported snapshot.
         with driver.connect(**source_config) as source:
             source.execute("SET TRANSACTION READ ONLY")
@@ -302,6 +308,8 @@ def migrate(source_url: str, target_url: str, directory: Path, sql_path: Path) -
         "extraApiCapMicrousd": 1_000_000,
         "runpodExcluded": True,
         "additiveReceiptScopeUpgrade": scope_upgrade.exists(),
+        "cumulativeProviderCapMaximumMicrousd": 1_000_000,
+        "additiveCumulativeBudgetUpgrade": True,
     }
     manifest = directory / "migration-summary.private.json"
     manifest.write_text(json.dumps(report, indent=2) + "\n")

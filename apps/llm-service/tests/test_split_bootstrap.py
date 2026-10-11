@@ -76,10 +76,13 @@ def test_bootstrap_applies_split_upgrades_then_native_saver_before_runtime_probe
     native_at = events.index("native-saver-setup")
     scope_at = next(i for i, sql in enumerate(events) if "split/0002_receipt_scope.sql" in sql)
     summary_at = next(i for i, sql in enumerate(events) if "split/0003_post_summaries.sql" in sql)
+    budget_at = next(
+        i for i, sql in enumerate(events) if "split/0004_cumulative_budget_cap.sql" in sql
+    )
     runtime_at = next(
         i for i, sql in enumerate(events) if "SELECT COUNT(*) FROM app.sessions" in sql
     )
-    assert partition_at < scope_at < summary_at < native_at < runtime_at
+    assert partition_at < scope_at < summary_at < budget_at < native_at < runtime_at
 
 
 @pytest.mark.parametrize(
