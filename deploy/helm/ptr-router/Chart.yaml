@@ -1,0 +1,10 @@
+apiVersion: v2
+name: ptr-router
+description: Pinned standalone llm-d router for the ptr-inference namespace
+type: application
+version: 0.1.0
+appVersion: "v0.11.0"
+dependencies:
+  - name: llm-d-router-standalone
+    version: v0.11.0
+    repository: "" # Vendored charts/ archive only; no remote source for dependency build.

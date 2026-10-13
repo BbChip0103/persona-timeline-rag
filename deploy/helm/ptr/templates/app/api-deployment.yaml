@@ -43,8 +43,15 @@ spec:
               while time.monotonic() < deadline:
                   try:
                       with psycopg.connect(os.environ["PTR_APP_DATABASE_URL"], connect_timeout=3) as db:
-                          row = db.execute("SELECT to_regclass('app.generated_artifacts')").fetchone()
-                          if row and row[0] is not None:
+                          row = db.execute("""
+                              SELECT EXISTS (
+                                  SELECT 1 FROM pg_catalog.pg_class c
+                                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                                  WHERE n.nspname = 'llm' AND c.relname = 'checkpoints'
+                                    AND c.relkind = 'r'
+                              )
+                          """).fetchone()
+                          if row and row[0]:
                               sys.exit(0)
                   except psycopg.Error:
                       pass

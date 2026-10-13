@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
 from persona_timeline_rag.split_migration import (  # noqa: E402
+    KIND_SYNTHETIC_BOOTSTRAP_PROFILE,
     LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
-    SplitBootstrapProfile,
     bootstrap_synthetic_split_database,
 )
 
@@ -161,20 +161,6 @@ def test_bootstrap_rejects_connected_owner_identity_before_ddl(configured):
 
 def test_kind_profile_requires_the_pinned_service_target(configured):
     env, _, sql_root, setup = configured
-    profile = SplitBootstrapProfile(
-        name="kind",
-        allowed_hosts=frozenset(
-            {"ptr-postgres.ptr-data.svc", "ptr-postgres.ptr-data.svc.cluster.local"}
-        ),
-        port=5432,
-        database="ptr_split_test",
-        users={
-            "OWNER": "ptr_split_owner",
-            "APP": "ptr_split_app",
-            "LLM": "ptr_split_llm",
-        },
-        target_error="SYNTHETIC_CLUSTER_TARGET_REQUIRED",
-    )
     env["PTR_SPLIT_TEST_OWNER_DATABASE_URL"] = (
         "postgresql://ptr_split_owner:synthetic@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
     )
@@ -188,7 +174,7 @@ def test_kind_profile_requires_the_pinned_service_target(configured):
         bootstrap_synthetic_split_database(
             env,
             sql_root=sql_root,
-            profile=profile,
+            profile=KIND_SYNTHETIC_BOOTSTRAP_PROFILE,
             connect=lambda *a, **k: pytest.fail("DB opened"),
             driver=FakeDriver,
             setup_checkpoints=setup,

@@ -28,3 +28,35 @@ policy:
     redis:
       # Documentation placeholder only: TEST-NET-2, replace with managed Redis CIDRs.
       cidrs: ["198.51.100.0/24"]
+inference:
+  engine:
+    kind: vllm
+    # Rolling updates with maxUnavailable=0 need one spare GPU above steady state.
+    replicas: 2
+    rollout:
+      maxSurge: 1
+      maxUnavailable: 0
+    model: Qwen/Qwen3-8B
+    modelPath: /models/qwen3-8b
+    maxNumSeqs: 8
+    dtype: bfloat16
+    enforceEager: true
+    maxModelLen: 16384
+    weights:
+      existingClaim: ptr-qwen3-8b
+      mountPath: /models
+      shmSizeLimit: 8Gi
+    image:
+      repository: vllm/vllm-openai
+      tag: v0.18.0
+      digest: sha256:c32358ebfc115d56ade2acfdbcd00df5b115417dbd6006547c88f07e2b39de06
+      pullPolicy: IfNotPresent
+    nodeSelector:
+      ptr.io/gpu-pool: "true"
+    tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+    resources:
+      requests: {cpu: "4", memory: 16Gi}
+      limits: {memory: 32Gi}
+  apiServerCIDRs: ["192.0.2.1/32"] # Replace with the cluster API endpoint CIDR before installing.
+  apiServerPort: 443 # Use 6443 for direct kube-apiserver endpoints.

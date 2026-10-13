@@ -4,3 +4,12 @@ app:
   web: {replicas: 2}
   api: {replicas: 2}
   worker: {replicas: 2}
+inference:
+  engine:
+    kind: sim
+    replicas: 2
+    maxNumSeqs: 2
+    mode: random
+  testClient:
+    enabled: true
+  apiServerCIDRs: ["10.96.0.1/32"]

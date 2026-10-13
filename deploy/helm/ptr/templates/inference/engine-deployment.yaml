@@ -1,0 +1,126 @@
+{{- if .Values.inference.enabled }}
+{{- $engine := .Values.inference.engine }}
+{{- if not (has $engine.kind (list "sim" "vllm")) }}{{ fail "inference.engine.kind must be sim or vllm" }}{{- end }}
+{{- $image := printf "%s:%s" $engine.image.repository $engine.image.tag }}
+{{- if $engine.image.digest }}{{- $image = printf "%s@%s" $image $engine.image.digest }}{{- end }}
+{{- if eq $engine.kind "vllm" }}
+{{- $_ := required "inference.engine.weights.existingClaim is required when inference.engine.kind=vllm" $engine.weights.existingClaim }}
+{{- $_ = required "inference.engine.modelPath is required when inference.engine.kind=vllm" $engine.modelPath }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptr-{{ $engine.kind }}
+  namespace: {{ .Values.namespaces.inference }}
+spec:
+  replicas: {{ $engine.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $engine.rollout.maxSurge }}
+      maxUnavailable: {{ $engine.rollout.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: inference-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: inference-engine
+        pool: {{ .Values.inference.pool }}
+        llm-d.ai/model: {{ $engine.model | quote }}
+    spec:
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+{{ toYaml $engine.nodeSelector | indent 8 }}
+      tolerations:
+{{ toYaml $engine.tolerations | indent 8 }}
+      containers:
+        - name: {{ $engine.kind }}
+          image: {{ $image }}
+          imagePullPolicy: {{ $engine.image.pullPolicy }}
+          {{- if eq $engine.kind "sim" }}
+          args:
+            - --model={{ $engine.model }}
+            - --served-model-name={{ $engine.model }}
+            - --port=8000
+            - --max-num-seqs={{ $engine.maxNumSeqs }}
+            - --mode={{ default "echo" $engine.mode }}
+            - --latency-calculator=constant
+            - --time-to-first-token={{ $engine.timeToFirstToken }}
+            - --time-to-first-token-std-dev=0s
+            - --inter-token-latency={{ $engine.interTokenLatency }}
+            - --inter-token-latency-std-dev=0s
+          {{- else }}
+          args:
+            - --model
+            - {{ $engine.modelPath }}
+            - --served-model-name
+            - {{ $engine.model }}
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --max-num-seqs
+            - {{ $engine.maxNumSeqs | quote }}
+            {{- if $engine.dtype }}
+            - --dtype
+            - {{ $engine.dtype | quote }}
+            {{- end }}
+            {{- if $engine.enforceEager }}
+            - --enforce-eager
+            {{- end }}
+            {{- if gt (int $engine.maxModelLen) 0 }}
+            - --max-model-len
+            - {{ $engine.maxModelLen | quote }}
+            {{- end }}
+          env:
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            - {name: TRANSFORMERS_OFFLINE, value: "1"}
+          volumeMounts:
+            - {name: model-weights, mountPath: {{ $engine.weights.mountPath }}, readOnly: true}
+            - {name: dshm, mountPath: /dev/shm}
+          {{- end }}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests:
+{{ toYaml $engine.resources.requests | indent 14 }}
+              nvidia.com/gpu: "1"
+            limits:
+{{ toYaml $engine.resources.limits | indent 14 }}
+              nvidia.com/gpu: "1"
+          {{- if eq $engine.kind "vllm" }}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 120
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 15
+          {{- else }}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+          {{- end }}
+      {{- if eq $engine.kind "vllm" }}
+      volumes:
+        - name: model-weights
+          persistentVolumeClaim:
+            claimName: {{ $engine.weights.existingClaim }}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $engine.weights.shmSizeLimit }}
+      {{- end }}
+{{- end }}

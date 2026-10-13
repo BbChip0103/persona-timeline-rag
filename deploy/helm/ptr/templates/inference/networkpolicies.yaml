@@ -1,0 +1,120 @@
+{{- if and .Values.inference.enabled (ne .Values.policy.enabled false) }}
+{{- $ns := .Values.namespaces.inference }}
+{{- $apiServerPort := .Values.inference.apiServerPort }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-default-deny
+  namespace: {{ $ns }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-dns
+  namespace: {{ $ns }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-router-ingress
+  namespace: {{ $ns }}
+spec:
+  podSelector:
+    matchLabels:
+      llm-d-router-standalone: {{ .Values.inference.routerService }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ptr-gateway
+        {{- if .Values.inference.testClient.enabled }}
+        - podSelector:
+            matchLabels:
+              {{ .Values.inference.testClient.label }}: "true"
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8081}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-engine-ingress
+  namespace: {{ $ns }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: inference-engine
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              llm-d-router-standalone: {{ .Values.inference.routerService }}
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-router-egress
+  namespace: {{ $ns }}
+spec:
+  podSelector:
+    matchLabels:
+      llm-d-router-standalone: {{ .Values.inference.routerService }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: inference-engine
+      ports:
+        - {protocol: TCP, port: 8000}
+    {{- range .Values.inference.apiServerCIDRs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $apiServerPort }}}
+    {{- end }}
+{{- if .Values.inference.testClient.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-test-client-egress
+  namespace: {{ $ns }}
+spec:
+  podSelector:
+    matchLabels:
+      {{ .Values.inference.testClient.label }}: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              llm-d-router-standalone: {{ .Values.inference.routerService }}
+      ports:
+        - {protocol: TCP, port: 8081}
+{{- end }}
+{{- end }}

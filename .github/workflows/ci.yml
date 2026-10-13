@@ -92,8 +92,11 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
       - name: Helm lint
         run: |
+          (cd deploy/helm/ptr-router && sha256sum -c llm-d-router-standalone.sha256)
           helm lint deploy/helm/ptr --values deploy/helm/ptr/values-kind.yaml
           helm lint deploy/helm/ptr --values deploy/helm/ptr/values-prod.yaml
+          helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-kind.yaml
+          helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-prod.yaml
       - name: Synthetic bootstrap SQL matches the source migrations
         run: |
           set -euo pipefail
@@ -104,8 +107,11 @@ jobs:
       - name: Kubernetes schema validation
         run: |
           set -euo pipefail
-          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml | kubeconform -strict -summary
-          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-prod.yaml | kubeconform -strict -summary
+          inference_schema="file://$PWD/deploy/helm/ptr/schemas/InferencePool-v1.json"
+          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml | kubeconform -strict -summary -schema-location default -schema-location "$inference_schema"
+          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-prod.yaml | kubeconform -strict -summary -schema-location default -schema-location "$inference_schema"
+          helm template chat-primary deploy/helm/ptr-router --namespace ptr-inference --values deploy/helm/ptr-router/values-kind.yaml | kubeconform -strict -summary
+          helm template chat-primary deploy/helm/ptr-router --namespace ptr-inference --values deploy/helm/ptr-router/values-prod.yaml | kubeconform -strict -summary
 
   integration:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')

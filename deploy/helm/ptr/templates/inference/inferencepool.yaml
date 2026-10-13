@@ -1,0 +1,18 @@
+{{- if .Values.inference.enabled }}
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: {{ .Values.inference.pool }}
+  namespace: {{ .Values.namespaces.inference }}
+spec:
+  selector:
+    matchLabels:
+      pool: {{ .Values.inference.pool }}
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: {{ .Values.inference.routerService }}
+    port:
+      number: 9002
+    failureMode: FailOpen
+{{- end }}

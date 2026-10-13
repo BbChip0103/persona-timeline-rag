@@ -63,6 +63,21 @@ if ! "$kind_bin" get clusters | grep -Fxq "$cluster_name"; then
   "$kind_bin" create cluster --config "$script_dir/cluster.yaml" --name "$cluster_name"
 fi
 
+# Gateway API Inference Extension v1.6.0 release asset (InferencePool v1 CRD only).
+gie_version="v1.6.0"
+gie_sha256="8f8fd05fa7369abbe99fd149d8ff3995bfa4aa87455003e78dc144201ec8f1c8"
+gie_manifest="$(mktemp)"
+trap 'rm -f -- "$gie_manifest"' EXIT
+curl -fsSL --retry 3 "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${gie_version}/v1-manifests.yaml" -o "$gie_manifest"
+printf '%s  %s\n' "$gie_sha256" "$gie_manifest" | sha256sum -c - >/dev/null
+"${kubectl_cmd[@]}" apply --server-side -f "$gie_manifest" >/dev/null
+"${kubectl_cmd[@]}" wait --for=condition=Established --timeout=60s crd/inferencepools.inference.networking.k8s.io >/dev/null
+"${kubectl_cmd[@]}" get crd inferencepools.inference.networking.k8s.io -o json |
+  jq -e '.spec.versions[] | select(.name == "v1" and .served == true)' >/dev/null
+"${kubectl_cmd[@]}" create namespace ptr-inference --dry-run=client -o yaml |
+  "${kubectl_cmd[@]}" label --local -f - ptr.io/namespace=inference -o yaml |
+  "${kubectl_cmd[@]}" apply -f - >/dev/null
+
 stamp="$(date -u +%Y%m%d%H%M%S%N)-$(openssl rand -hex 4)"
 git_rev="$(git -C "$repo_root" rev-parse --short=12 HEAD 2>/dev/null || printf 'nogit')"
 backend_tag="k2-${git_rev}-${stamp}"
@@ -80,8 +95,9 @@ prune_old_images "$backend_image" "$worker_image"
 gpu_nodes=("${cluster_name}-worker2" "${cluster_name}-worker3")
 for node in "${gpu_nodes[@]}"; do
   "${kubectl_cmd[@]}" label node "$node" ptr.io/fake-gpu=true accelerator=fake-gpu --overwrite >/dev/null
+  "${kubectl_cmd[@]}" taint node "$node" nvidia.com/gpu=synthetic:NoSchedule --overwrite >/dev/null
   "${kubectl_cmd[@]}" patch node "$node" --subresource=status --type=merge \
-    -p='{"status":{"capacity":{"ptr.io/fake-gpu":"1"},"allocatable":{"ptr.io/fake-gpu":"1"}}}' >/dev/null
+    -p='{"status":{"capacity":{"ptr.io/fake-gpu":"1","nvidia.com/gpu":"1"},"allocatable":{"ptr.io/fake-gpu":"1","nvidia.com/gpu":"1"}}}' >/dev/null
 done
 
 cat <<EOF

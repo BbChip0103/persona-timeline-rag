@@ -1,0 +1,57 @@
+llm-d-router-standalone:
+  router:
+    inferencePool:
+      create: false # The ptr chart owns InferencePool; standalone EPP discovers labelled pods.
+    modelServers:
+      type: vllm
+      protocol: http
+      matchLabels: {pool: chat-primary}
+      targetPorts: [{number: 8000}]
+    monitoring:
+      prometheus:
+        auth:
+          enabled: false # Metrics remain protected by ptr-inference NetworkPolicy.
+    epp:
+      replicas: 1
+      tolerations:
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 30}
+      image:
+        registry: ghcr.io/llm-d
+        repository: llm-d-router-endpoint-picker
+        tag: v0.11.0@sha256:39257d24552d16d8f215d3de25cc734fd44af3b282b67032db01aff900c610cf
+        pullPolicy: IfNotPresent
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "1", memory: 1Gi}
+      pluginsConfig:
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        featureGates: [flowControl]
+        plugins:
+          - {type: queue-scorer}
+          - {type: kv-cache-utilization-scorer}
+          - {type: prefix-cache-scorer}
+          - {type: metrics-data-source, parameters: {scheme: http, path: /metrics, insecureSkipVerify: true}}
+          - {type: core-metrics-extractor}
+          - {type: concurrency-detector, parameters: {maxConcurrency: 2, concurrencyMode: requests, headroom: 0.0}}
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - {pluginRef: queue-scorer, weight: 2}
+              - {pluginRef: kv-cache-utilization-scorer, weight: 2}
+              - {pluginRef: prefix-cache-scorer, weight: 3}
+        flowControl:
+          saturationDetector: {pluginRef: concurrency-detector}
+          # Maximum engine replicas (2) × 4 queued requests per replica.
+          maxRequests: "8"
+          defaultRequestTTL: 2s
+    proxy:
+      enabled: true
+      proxyType: envoy
+      mode: sidecar
+      failOpen: true
+      image: docker.io/envoyproxy/envoy:distroless-v1.33.2@sha256:85500e28ed088ec39ff0adc1be3d358a8ad062926aaa62c36b28bde00919e4e8
+      resources:
+        requests: {cpu: 100m, memory: 128Mi}
+        limits: {cpu: "1", memory: 512Mi}
