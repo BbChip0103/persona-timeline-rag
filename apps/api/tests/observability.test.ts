@@ -77,6 +77,18 @@ describe('api /metrics/prom and health ',()=>{
     health={database:true,redis:false};
     expect((await call('health')).status).toBe(503);
   });
+  test('livez ignores dependencies while readyz uses the existing health checks',async()=>{
+    const check=jest.spyOn(runtime,'health');
+    health={database:false,redis:true};
+    const live=await fetch(`${base}/api/livez`);
+    expect(live.status).toBe(200);
+    expect(check).not.toHaveBeenCalled();
+    const ready=await fetch(`${base}/api/readyz`);
+    const compatible=await fetch(`${base}/api/health`);
+    expect(ready.status).toBe(503);
+    expect(await ready.json()).toEqual(await compatible.json());
+    expect(check).toHaveBeenCalledTimes(2);
+  });
   test.each([true,false])('health reports the actual LiteLLM billable flag (%s), not the retired provider route',async billable=>{
     runtime.providerName='litellm';runtime.billable=billable;
     expect((await (await call('health')).json()).liveEnabled).toBe(billable);

@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -23,8 +24,9 @@ def create_app(
     draft: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
     runner: WorkerRunner | None = None,
     health: Callable[[], Awaitable[bool]] | None = None,
+    lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
     async def authenticate(request: Request) -> None:
         actual = request.headers.get("Authorization", "")

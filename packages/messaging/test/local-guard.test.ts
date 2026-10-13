@@ -20,4 +20,33 @@ describe('assertLocalRedisUrl', () => {
   it('never echoes the URL (it carries the password) in the error', () => {
     expect(() => assertLocalRedisUrl('redis://:leakme@10.0.0.5:56479/0')).toThrow(expect.objectContaining({ message: expect.not.stringContaining('leakme') }));
   });
+  describe('cluster mode allowlist',()=>{
+    const clusterEnv={PTR_NETWORK_MODE:'cluster',KUBERNETES_SERVICE_HOST:'10.0.0.1',PTR_CLUSTER_REDIS_URL_ALLOWLIST:'rediss://redis.example.internal:6380'};
+    const cluster='rediss://:s3cret@redis.example.internal:6380/0';
+    it('accepts a configured rediss target only inside Kubernetes cluster mode',()=>{
+      expect(assertLocalRedisUrl(cluster,clusterEnv)).toBe(cluster);
+      expect(()=>assertLocalRedisUrl(cluster,{...clusterEnv,KUBERNETES_SERVICE_HOST:''})).toThrow();
+      expect(()=>assertLocalRedisUrl(cluster,{...clusterEnv,PTR_NETWORK_MODE:'local'})).toThrow();
+    });
+    it.each([
+      ['unlisted host',cluster.replace('redis.example.internal','redis.other.internal')],
+      ['unlisted scheme',cluster.replace('rediss://','redis://')],
+      ['default Redis port',cluster.replace('6380','6379')],
+      ['query string',`${cluster}?family=6`],
+      ['no password','rediss://redis.example.internal:6380/0'],
+    ])('rejects cluster %s',(_label,url)=>expect(()=>assertLocalRedisUrl(url,clusterEnv)).toThrow('Redis target must match the cluster Redis allowlist and transport policy'));
+    it('allows an ACL username when the allowlist key carries the same username without a password',()=>{
+      const acl='rediss://ptr:synthetic-password@redis.example.internal:6380/0';
+      expect(assertLocalRedisUrl(acl,{...clusterEnv,PTR_CLUSTER_REDIS_URL_ALLOWLIST:'rediss://ptr@redis.example.internal:6380'})).toBe(acl);
+      expect(()=>assertLocalRedisUrl(acl,clusterEnv)).toThrow();
+      expect(()=>assertLocalRedisUrl(acl,{...clusterEnv,PTR_CLUSTER_REDIS_URL_ALLOWLIST:'rediss://other@redis.example.internal:6380'})).toThrow();
+      expect(()=>assertLocalRedisUrl(acl,{...clusterEnv,PTR_CLUSTER_REDIS_URL_ALLOWLIST:'rediss://ptr:synthetic-password@redis.example.internal:6380'})).toThrow();
+    });
+    it('requires TLS for off-cluster Redis but permits service DNS without TLS',()=>{
+      const plain='redis://:synthetic-password@redis.example.internal:6380/0';
+      expect(()=>assertLocalRedisUrl(plain,{...clusterEnv,PTR_CLUSTER_REDIS_URL_ALLOWLIST:'redis://redis.example.internal:6380'})).toThrow();
+      const service='redis://ptr:synthetic-password@redis.ptr-data.svc:6379/0';
+      expect(assertLocalRedisUrl(service,{...clusterEnv,PTR_CLUSTER_REDIS_URL_ALLOWLIST:'redis://ptr@redis.ptr-data.svc:6379'})).toBe(service);
+    });
+  });
 });

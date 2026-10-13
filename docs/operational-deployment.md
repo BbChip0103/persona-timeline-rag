@@ -47,6 +47,10 @@ runtime cannot raise or delete/recreate the global cap. Preserve existing ledger
 immutable migration baseline and unknown reservations. GPU qualification call
 limits and gateway-key budgets are **not** this monetary cap.
 
+Apply `supabase/split/0005_generated_artifacts.sql` before deploying the new API;
+draft requests fail without its table. No backfill of old `data/generated/*.json`
+is needed because `loadArtifact` has no caller; leave those files in place.
+
 ## Bounded acceptance and recovery
 
 `scripts/operational-smoke.ts` requires explicit private configuration and an

@@ -87,7 +87,7 @@ services:
   web:
     <<: *role
     working_dir: /app/apps/web
-    command: [node, /app/node_modules/next/dist/bin/next, start, --hostname, 127.0.0.1, --port, "56440"]
+    command: [node, /app/node_modules/next/dist/bin/next, start, --hostname, "${PTR_WEB_HOST:-127.0.0.1}", --port, "56440"]
     healthcheck:
       test: [CMD, node, -e, "fetch('http://127.0.0.1:56440/login').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s

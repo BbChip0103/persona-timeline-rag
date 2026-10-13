@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 class ConfigurationError(ValueError):
     """Allowlisted, credential-free startup error."""
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_POSTGRES_SSLMODES = {"require", "verify-ca", "verify-full"}
 
 
 def _url(value: str, schemes: set[str], code: str) -> str:
@@ -22,6 +27,55 @@ def _url(value: str, schemes: set[str], code: str) -> str:
     if parsed.scheme not in schemes or not parsed.hostname or parsed.fragment or port == 0:
         raise ConfigurationError(code)
     return value
+
+
+def _cluster_network(env: Mapping[str, str]) -> bool:
+    return env.get("PTR_NETWORK_MODE") == "cluster" and bool(env.get("KUBERNETES_SERVICE_HOST"))
+
+
+def _svc_host(hostname: str | None) -> bool:
+    host = (hostname or "").lower()
+    return host.endswith(".svc") or host.endswith(".svc.cluster.local")
+
+
+def _hostport_url(parsed) -> str:
+    if parsed.port is None:
+        raise ValueError
+    host = (parsed.hostname or "").lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{parsed.port}"
+
+
+def _redis_identity_url(parsed) -> str:
+    base = _hostport_url(parsed)
+    if parsed.username:
+        return base.replace("://", f"://{parsed.username}@", 1)
+    return base
+
+
+def _database_identity_url(parsed) -> str:
+    if not parsed.username or parsed.password is None or not parsed.path or parsed.path == "/":
+        raise ValueError
+    return f"{_hostport_url(parsed).replace('://', f'://{parsed.username}@', 1)}{parsed.path}"
+
+
+def _allowlist(env: Mapping[str, str], name: str) -> set[str]:
+    return {entry.strip() for entry in env.get(name, "").split(",") if entry.strip()}
+
+
+def _only_pg_sslmode(query: str) -> bool:
+    if not query:
+        return False
+    try:
+        pairs = parse_qsl(query, strict_parsing=True, keep_blank_values=False)
+    except ValueError:
+        return False
+    return (
+        len(pairs) == 1
+        and pairs[0][0] == "sslmode"
+        and pairs[0][1] in _POSTGRES_SSLMODES
+    )
 
 
 def _number(env: Mapping[str, str], name: str, default: float, low: float, high: float) -> float:
@@ -59,6 +113,39 @@ class Settings:
             {"redis", "rediss"},
             "INVALID_REDIS_URL",
         )
+        cluster_network = _cluster_network(env)
+        if cluster_network:
+            try:
+                redis_parsed = urlsplit(redis_url)
+                redis_id = _redis_identity_url(redis_parsed)
+            except ValueError:
+                raise ConfigurationError("INVALID_REDIS_URL") from None
+            if (
+                not redis_parsed.password
+                or not re.fullmatch(r"/(?:[0-9]|1[0-5])", redis_parsed.path)
+                or redis_parsed.query
+                or redis_parsed.fragment
+            ):
+                raise ConfigurationError("INVALID_REDIS_URL")
+            if redis_parsed.scheme == "redis" and not _svc_host(redis_parsed.hostname):
+                raise ConfigurationError("INVALID_REDIS_URL")
+            redis_allowlist = set()
+            for entry in _allowlist(env, "PTR_LLM_REDIS_URL_ALLOWLIST"):
+                try:
+                    allowed = urlsplit(entry)
+                    if (
+                        allowed.scheme in {"redis", "rediss"}
+                        and allowed.password is None
+                        and allowed.path in {"", "/"}
+                        and not allowed.query
+                        and not allowed.fragment
+                        and allowed.port is not None
+                    ):
+                        redis_allowlist.add(_redis_identity_url(allowed))
+                except ValueError:
+                    pass
+            if redis_id not in redis_allowlist:
+                raise ConfigurationError("REDIS_URL_NOT_ALLOWED")
         backend_url = _url(
             env.get("PTR_LLM_BACKEND_URL", "http://127.0.0.1:56441"),
             {"http", "https"},
@@ -73,19 +160,46 @@ class Settings:
             or backend.path not in {"", "/"}
         ):
             raise ConfigurationError("INVALID_BACKEND_URL")
-        if backend.scheme == "http" and backend.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        if cluster_network:
+            try:
+                backend_id = _hostport_url(backend)
+            except ValueError:
+                raise ConfigurationError("INVALID_BACKEND_URL") from None
+            if backend_id not in _allowlist(env, "PTR_LLM_BACKEND_URL_ALLOWLIST"):
+                raise ConfigurationError("BACKEND_URL_NOT_ALLOWED")
+            if backend.scheme == "http" and not _svc_host(backend.hostname):
+                raise ConfigurationError("BACKEND_REQUIRES_HTTPS")
+        elif backend.scheme == "http" and backend.hostname not in _LOOPBACK_HOSTS:
             raise ConfigurationError("BACKEND_REQUIRES_HTTPS")
         db = _url(
             env.get("PTR_LLM_DATABASE_URL", ""), {"postgresql", "postgres"}, "INVALID_DATABASE_URL"
         )
-        allowed = {"127.0.0.1", "localhost", "::1"}
-        allowed.update(
-            x.strip()
-            for x in env.get("PTR_LLM_DATABASE_HOST_ALLOWLIST", "").split(",")
-            if x.strip()
-        )
-        if urlsplit(db).hostname not in allowed:
-            raise ConfigurationError("DATABASE_HOST_NOT_ALLOWED")
+        db_parsed = urlsplit(db)
+        if cluster_network:
+            if (
+                not _svc_host(db_parsed.hostname)
+                and not _only_pg_sslmode(db_parsed.query)
+            ) or (
+                _svc_host(db_parsed.hostname)
+                and db_parsed.query
+                and not _only_pg_sslmode(db_parsed.query)
+            ):
+                raise ConfigurationError("INVALID_DATABASE_URL")
+            try:
+                db_id = _database_identity_url(db_parsed)
+            except ValueError:
+                raise ConfigurationError("INVALID_DATABASE_URL") from None
+            if db_id not in _allowlist(env, "PTR_LLM_DATABASE_URL_ALLOWLIST"):
+                raise ConfigurationError("DATABASE_URL_NOT_ALLOWED")
+        else:
+            allowed = set(_LOOPBACK_HOSTS)
+            allowed.update(
+                x.strip()
+                for x in env.get("PTR_LLM_DATABASE_HOST_ALLOWLIST", "").split(",")
+                if x.strip()
+            )
+            if db_parsed.hostname not in allowed:
+                raise ConfigurationError("DATABASE_HOST_NOT_ALLOWED")
         token = env.get("PTR_LLM_CONTROL_TOKEN", env.get("PTR_LLM_INTERNAL_TOKEN", ""))
         if len(token) < 24 or len(token) > 512 or any(ord(c) < 33 or ord(c) > 126 for c in token):
             raise ConfigurationError("INVALID_CONTROL_TOKEN")

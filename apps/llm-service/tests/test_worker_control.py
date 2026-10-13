@@ -296,6 +296,207 @@ def test_config_host_is_loopback_or_explicit_container_allowlist_secrets_hidden(
     assert conf.database_url
 
 
+def test_worker_bind_host_accepts_explicit_pod_listener():
+    env = {
+        "PTR_LLM_DATABASE_URL": "postgresql://llm:synthetic@localhost/research",
+        "PTR_LLM_CONTROL_TOKEN": "synthetic-control-token-v1",
+    }
+    assert Settings.from_env(env).host == "127.0.0.1"
+    assert Settings.from_env({**env, "PTR_LLM_HOST": "0.0.0.0"}).host == "0.0.0.0"
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        (
+            {
+                "PTR_LLM_REDIS_URL": "redis://:synthetic@redis.ptr-data.svc:6379/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://redis.ptr-data.svc:6379",
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "rediss://acl:synthetic@managed-redis.example.com:6380/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "rediss://managed-redis.example.com:6380",
+            },
+            "REDIS_URL_NOT_ALLOWED",
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "rediss://acl:synthetic@managed-redis.example.com:6380/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "rediss://acl@managed-redis.example.com:6380",
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "redis://:synthetic@managed-redis.example.com:6380/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://managed-redis.example.com:6380",
+            },
+            "INVALID_REDIS_URL",
+        ),
+        (
+            {
+                "PTR_LLM_BACKEND_URL": "http://api.ptr-app.svc:3000",
+                "PTR_LLM_BACKEND_URL_ALLOWLIST": "http://api.ptr-app.svc:3000",
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_BACKEND_URL": "http://api.ptr-app.svc.cluster.local:3000",
+                "PTR_LLM_BACKEND_URL_ALLOWLIST": "http://api.ptr-app.svc.cluster.local:3000",
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_BACKEND_URL": "http://api.internal.example.com:3000",
+                "PTR_LLM_BACKEND_URL_ALLOWLIST": "http://api.internal.example.com:3000",
+            },
+            "BACKEND_REQUIRES_HTTPS",
+        ),
+        (
+            {
+                "PTR_LLM_BACKEND_URL": "https://api.internal.example.com:443",
+                "PTR_LLM_BACKEND_URL_ALLOWLIST": "https://api.internal.example.com:443",
+            },
+            None,
+        ),
+        (
+            {"PTR_LLM_REDIS_URL": "redis://redis.ptr-data.svc:6379/0"},
+            "INVALID_REDIS_URL",
+        ),
+        (
+            {"PTR_LLM_REDIS_URL": "redis://:synthetic@redis.ptr-data.svc:6379/16"},
+            "INVALID_REDIS_URL",
+        ),
+        (
+            {"PTR_LLM_REDIS_URL": "redis://:synthetic@redis.ptr-data.svc:6379/0?family=6"},
+            "INVALID_REDIS_URL",
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "redis://user:synthetic@redis.ptr-data.svc:6379/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://user@redis.ptr-data.svc:6379",
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "redis://user:synthetic@redis.ptr-data.svc:6379/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://user:synthetic@redis.ptr-data.svc:6379",
+            },
+            "REDIS_URL_NOT_ALLOWED",
+        ),
+        (
+            {
+                "PTR_LLM_REDIS_URL": "redis://user:synthetic@redis.ptr-data.svc:6379/0",
+                "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://user@redis.ptr-data.svc:6379/0",
+            },
+            "REDIS_URL_NOT_ALLOWED",
+        ),
+        (
+            {
+                "PTR_LLM_DATABASE_URL": (
+                    "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+                    "ptr_split_research"
+                ),
+                "PTR_LLM_DATABASE_URL_ALLOWLIST": (
+                    "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research"
+                ),
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_DATABASE_URL": (
+                    "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+                    "ptr_split_research?sslmode=require"
+                ),
+                "PTR_LLM_DATABASE_URL_ALLOWLIST": (
+                    "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research"
+                ),
+            },
+            None,
+        ),
+        (
+            {
+                "PTR_LLM_DATABASE_URL": (
+                    "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+                    "ptr_split_research?sslmode=disable"
+                ),
+            },
+            "INVALID_DATABASE_URL",
+        ),
+        (
+            {
+                "PTR_LLM_DATABASE_URL": (
+                    "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+                    "ptr_split_research?connect_timeout=1"
+                ),
+                "PTR_LLM_DATABASE_URL_ALLOWLIST": (
+                    "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research"
+                ),
+            },
+            "INVALID_DATABASE_URL",
+        ),
+        (
+            {
+                "PTR_LLM_DATABASE_URL": (
+                    "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+                    "ptr_split_research?sslmode=require"
+                ),
+                "PTR_LLM_DATABASE_URL_ALLOWLIST": "",
+            },
+            "DATABASE_URL_NOT_ALLOWED",
+        ),
+    ],
+)
+def test_cluster_network_mode_requires_explicit_scheme_host_port_allowlists(changes, error):
+    env = {
+        "PTR_NETWORK_MODE": "cluster",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        "PTR_LLM_REDIS_URL": "redis://:synthetic@redis.ptr-data.svc:6379/0",
+        "PTR_LLM_REDIS_URL_ALLOWLIST": "redis://redis.ptr-data.svc:6379",
+        "PTR_LLM_BACKEND_URL": "http://api.ptr-app.svc:3000",
+        "PTR_LLM_BACKEND_URL_ALLOWLIST": "http://api.ptr-app.svc:3000",
+        "PTR_LLM_DATABASE_URL": (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research?sslmode=require"
+        ),
+        "PTR_LLM_DATABASE_URL_ALLOWLIST": (
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research"
+        ),
+        "PTR_LLM_CONTROL_TOKEN": "synthetic-control-token-v1",
+    }
+    env.update(changes)
+    if error:
+        with pytest.raises(ConfigurationError, match=error):
+            Settings.from_env(env)
+    else:
+        conf = Settings.from_env(env)
+        assert conf.redis_url == env["PTR_LLM_REDIS_URL"]
+        assert conf.backend_url == env["PTR_LLM_BACKEND_URL"].rstrip("/")
+        assert conf.database_url == env["PTR_LLM_DATABASE_URL"]
+
+
+def test_cluster_network_mode_requires_kubernetes_service_host():
+    env = {
+        "PTR_NETWORK_MODE": "cluster",
+        "PTR_LLM_DATABASE_URL": (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/ptr_split_research"
+        ),
+        "PTR_LLM_DATABASE_URL_ALLOWLIST": (
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research"
+        ),
+        "PTR_LLM_CONTROL_TOKEN": "synthetic-control-token-v1",
+    }
+    with pytest.raises(ConfigurationError, match="DATABASE_HOST_NOT_ALLOWED"):
+        Settings.from_env(env)
+
+
 async def test_control_transport_failure_does_not_echo_response_or_secret():
     async def responder(request):
         assert request.headers["Authorization"] == "Bearer synthetic-control-token"

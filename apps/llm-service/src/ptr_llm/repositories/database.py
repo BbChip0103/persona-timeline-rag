@@ -3,25 +3,89 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from ptr_llm.billing import ProviderError
+
+_POSTGRES_SSLMODES = {"require", "verify-ca", "verify-full"}
+
+
+def _cluster_network() -> bool:
+    return os.environ.get("PTR_NETWORK_MODE") == "cluster" and bool(
+        os.environ.get("KUBERNETES_SERVICE_HOST")
+    )
+
+
+def _svc_host(hostname: str | None) -> bool:
+    host = (hostname or "").lower()
+    return host.endswith(".svc") or host.endswith(".svc.cluster.local")
+
+
+def _hostport_url(parsed) -> str:
+    if parsed.port is None:
+        raise ValueError
+    host = (parsed.hostname or "").lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{parsed.scheme}://{host}:{parsed.port}"
+
+
+def _database_identity_url(parsed) -> str:
+    if not parsed.username or parsed.password is None or not parsed.path or parsed.path == "/":
+        raise ValueError
+    return f"{_hostport_url(parsed).replace('://', f'://{parsed.username}@', 1)}{parsed.path}"
+
+
+def _only_pg_sslmode(query: str) -> bool:
+    if not query:
+        return False
+    try:
+        pairs = parse_qsl(query, strict_parsing=True, keep_blank_values=False)
+    except ValueError:
+        return False
+    return (
+        len(pairs) == 1
+        and pairs[0][0] == "sslmode"
+        and pairs[0][1] in _POSTGRES_SSLMODES
+    )
+
+
+def _cluster_database_allowed(parsed) -> bool:
+    try:
+        identity = _database_identity_url(parsed)
+    except ValueError:
+        return False
+    allowlist = {
+        entry.strip()
+        for entry in os.environ.get("PTR_LLM_DATABASE_URL_ALLOWLIST", "").split(",")
+        if entry.strip()
+    }
+    return identity in allowlist
 
 
 def assert_llm_database_url(url: str) -> None:
     try:
         parsed = urlsplit(url)
-        allowed = (
-            parsed.scheme in ("postgres", "postgresql")
-            and parsed.hostname in ("127.0.0.1", "localhost", "::1")
-            and parsed.port == 58432
-            and parsed.username in ("ptr_split_llm", "ptr_split_owner")
-            and parsed.path in ("/ptr_split_test", "/ptr_split_research")
-            and not parsed.query
-            and not parsed.fragment
-        )
+        base_allowed = parsed.scheme in ("postgres", "postgresql") and not parsed.fragment
+        if _cluster_network():
+            ssl_allowed = (
+                _only_pg_sslmode(parsed.query)
+                if not _svc_host(parsed.hostname)
+                else not parsed.query or _only_pg_sslmode(parsed.query)
+            )
+            allowed = base_allowed and ssl_allowed and _cluster_database_allowed(parsed)
+        else:
+            allowed = (
+                base_allowed
+                and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+                and parsed.port == 58432
+                and parsed.username in ("ptr_split_llm", "ptr_split_owner")
+                and parsed.path in ("/ptr_split_test", "/ptr_split_research")
+                and not parsed.query
+            )
     except ValueError:
         allowed = False
     if not allowed:

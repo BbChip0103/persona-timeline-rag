@@ -79,7 +79,7 @@ class ApiController {
   private readonly admitDraft:(owner:string)=>Promise<void>;
   private readonly log=createLog('api');
   constructor(@Inject(RUNTIME) private readonly runtime:SplitApiRuntime,@Inject(SSE) private readonly sse:SseOptions,@Inject(DRAFT_LIMIT) draftLimit:number,
-    @Inject(METRICS) private readonly metrics:ApiMetrics) {this.admitDraft=createDraftLimiter(draftLimit);}
+    @Inject(METRICS) private readonly metrics:ApiMetrics) {this.admitDraft=createDraftLimiter(draftLimit,runtime.draftLimiterClient?.());}
   /** D23: with a runtime that checks its dependencies, a failed database `SELECT 1` or Redis `PING` (1 s each) answers 503. */
   @Get('health') async health(@Res({passthrough:true}) response:Response) {
     const body={ok:true,service:'persona-timeline-rag',liveEnabled:this.runtime.billable};
@@ -87,6 +87,8 @@ class ApiController {
     if(!database||!redis) response.status(503);
     return {...body,ok:database&&redis,checks:{database:database?'ok':'down',redis:redis?'ok':'down'}};
   }
+  @Get('livez') livez() {return {ok:true,service:'persona-timeline-rag'};}
+  @Get('readyz') readyz(@Res({passthrough:true}) response:Response) {return this.health(response);}
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
     return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'연구용 AI 시뮬레이션 · 비공식'}))};
@@ -184,7 +186,7 @@ export async function createApiApplication(runtime:SplitApiRuntime,token:string,
     // Prometheus text (D18): no token, like /api/health (loopback bind, aggregates only).
     if(request.path==='/metrics/prom') return void servePrometheus(request.method,()=>metrics.render())
       .then(({status,headers,body})=>{response.writeHead(status,headers);response.end(body);});
-    if(request.method==='GET' && request.path==='/api/health') return next();
+    if(request.method==='GET' && ['/api/health','/api/livez','/api/readyz'].includes(request.path)) return next();
     const header=request.header('Authorization')??'';
     const supplied=header.startsWith('Bearer ')?header.slice(7):'';
     const hashed=supplied && supplied.length<=512?digest(supplied):undefined;

@@ -122,6 +122,7 @@ def main():
             "0002_receipt_scope.sql",
             "0003_post_summaries.sql",
             "0004_cumulative_budget_cap.sql",
+            "0005_generated_artifacts.sql",
         ):
             db.execute((Path("supabase/split") / name).read_text())
     from ptr_llm.providers.checkpoints import setup_call_checkpoints

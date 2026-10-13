@@ -58,6 +58,66 @@ def test_db_guard_valid_and_pool_binding():
         PostgresPersonaRepository(Pool(), URL)
 
 
+@pytest.mark.parametrize(
+    ("url", "allowlist"),
+    [
+        (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research",
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
+        ),
+        (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research?sslmode=require",
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
+        ),
+        (
+            "postgres://ptr_split_owner:synthetic@managed-postgres.example.com:5432/"
+            "ptr_split_test?sslmode=verify-full",
+            "postgres://ptr_split_owner@managed-postgres.example.com:5432/ptr_split_test",
+        ),
+    ],
+)
+def test_database_guard_cluster_allowlist(monkeypatch, url, allowlist):
+    monkeypatch.setenv("PTR_NETWORK_MODE", "cluster")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    monkeypatch.setenv("PTR_LLM_DATABASE_URL_ALLOWLIST", allowlist)
+    assert_llm_database_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "allowlist"),
+    [
+        (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research",
+            "",
+        ),
+        (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research?connect_timeout=1",
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
+        ),
+        (
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research?sslmode=disable",
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
+        ),
+        (
+            "postgresql://ptr_split_app:synthetic@postgres.ptr-data.svc:5432/"
+            "ptr_split_research?sslmode=require",
+            "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
+        ),
+    ],
+)
+def test_database_guard_cluster_rejections(monkeypatch, url, allowlist):
+    monkeypatch.setenv("PTR_NETWORK_MODE", "cluster")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    monkeypatch.setenv("PTR_LLM_DATABASE_URL_ALLOWLIST", allowlist)
+    with pytest.raises(ProviderError, match="UNSAFE_DATABASE_URL"):
+        assert_llm_database_url(url)
+
+
 def test_source_canonical_order_and_validation():
     assert list(validate_source(dict(reversed(list(SOURCE.items()))))) == list(SOURCE)
     with pytest.raises(CoreError):
