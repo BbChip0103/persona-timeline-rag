@@ -1,0 +1,192 @@
+{{- if .Values.gateway.enabled }}
+{{- $ns := .Values.namespaces.gateway -}}
+{{- $secret := .Values.secrets.gateway.existingSecret -}}
+{{- $image := printf "%s:%s" .Values.gateway.litellm.image.repository .Values.gateway.litellm.image.tag -}}
+{{- if .Values.gateway.litellm.image.digest }}{{- $image = printf "%s@%s" $image .Values.gateway.litellm.image.digest -}}{{- end }}
+{{- $fileHash := include (print $.Template.BasePath "/gateway/configmap.yaml") . | sha256sum -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-litellm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptr-litellm
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm
+spec:
+  replicas: {{ .Values.gateway.litellm.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: litellm
+      annotations:
+        ptr.io/litellm-files-sha256: {{ $fileHash | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: litellm
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.gateway.litellm.image.pullPolicy }}
+          command: ["litellm"]
+          args: ["--config", "/etc/litellm/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+          ports:
+            - name: http
+              containerPort: 4000
+          env:
+            - name: PTR_NETWORK_MODE
+              value: cluster
+            - name: PYTHONPATH
+              value: /etc/litellm:/etc/litellm/src
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: LITELLM_TELEMETRY
+              value: "False"
+            - name: PTR_VLLM_MODEL
+              value: {{ .Values.gateway.local.model | quote }}
+            - name: PTR_VLLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_VLLM_API_KEY
+            - name: PTR_OPENROUTER_MODEL
+              value: {{ .Values.gateway.openrouter.model | quote }}
+            - name: PTR_OPENROUTER_BASE_URL
+              value: {{ .Values.gateway.openrouter.baseUrl | quote }}
+            - name: PTR_OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_OPENROUTER_API_KEY
+            - name: PTR_LLM_CAPACITY_SPILLOVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LLM_CAPACITY_SPILLOVER_KEY
+            - name: PTR_LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LITELLM_MASTER_KEY
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LITELLM_MASTER_KEY
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: LITELLM_SALT_KEY
+            - name: PTR_LITELLM_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LITELLM_REDIS_PASSWORD
+            - name: PTR_ROUTING_REDIS_HOST
+              value: ptr-litellm-redis.{{ $ns }}.svc.cluster.local
+            - name: PTR_ROUTING_REDIS_PORT
+              value: "6379"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: DATABASE_URL
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.gateway.litellm.resources | indent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: litellm-files
+              mountPath: /etc/litellm
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: litellm-files
+          configMap:
+            name: ptr-litellm-files
+            items:
+              - key: config.yaml
+                path: config.yaml
+              - key: ptr_budget_gate.py
+                path: ptr_budget_gate.py
+              - key: gateway_budget.py
+                path: src/persona_timeline_rag/gateway_budget.py
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ptr-litellm
+  namespace: {{ $ns }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm
+{{- end }}

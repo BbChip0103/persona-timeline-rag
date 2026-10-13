@@ -1,0 +1,252 @@
+{{- if and .Values.gateway.enabled .Values.gateway.bootstrap.enabled }}
+{{- $gatewayNs := .Values.namespaces.gateway -}}
+{{- $appNs := .Values.namespaces.app -}}
+{{- $gatewaySecret := .Values.secrets.gateway.existingSecret -}}
+{{- $workerSecret := .Values.secrets.worker.existingSecret -}}
+{{- $bootstrapImage := printf "%s:%s" .Values.gateway.litellm.image.repository .Values.gateway.litellm.image.tag -}}
+{{- if .Values.gateway.litellm.image.digest }}{{- $bootstrapImage = printf "%s@%s" $bootstrapImage .Values.gateway.litellm.image.digest -}}{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptr-litellm-bootstrap
+  namespace: {{ $gatewayNs }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-bootstrap
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ptr-litellm-bootstrap-worker-secret
+  namespace: {{ $appNs }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $workerSecret | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ptr-litellm-bootstrap-worker-secret
+  namespace: {{ $appNs }}
+subjects:
+  - kind: ServiceAccount
+    name: ptr-litellm-bootstrap
+    namespace: {{ $gatewayNs }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ptr-litellm-bootstrap-worker-secret
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ptr-litellm-bootstrap-app-key
+  namespace: {{ $gatewayNs }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-bootstrap
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: litellm-bootstrap
+    spec:
+      serviceAccountName: ptr-litellm-bootstrap
+      restartPolicy: OnFailure
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 900
+        runAsGroup: 2000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: {{ $bootstrapImage | quote }}
+          imagePullPolicy: {{ .Values.gateway.litellm.image.pullPolicy }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import base64
+              import json
+              import os
+              import ssl
+              import sys
+              import time
+              import urllib.error
+              import urllib.request
+
+              master = os.environ["PTR_LITELLM_MASTER_KEY"]
+              spillover_key = os.environ["PTR_LLM_CAPACITY_SPILLOVER_KEY"]
+              encoded_spillover_key = base64.b64encode(spillover_key.encode()).decode()
+              token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+              ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              with open(token_path, encoding="utf-8") as handle:
+                  token = handle.read().strip()
+              context = ssl.create_default_context(cafile=ca_path)
+              api = "https://kubernetes.default.svc/api/v1/namespaces/{{ $appNs }}/secrets/{{ $workerSecret }}"
+
+              def k8s_request(data=None, method=None, timeout=10):
+                  body = None if data is None else json.dumps(data).encode()
+                  headers = {"Authorization": "Bearer " + token}
+                  if data is not None:
+                      headers["Content-Type"] = "application/merge-patch+json"
+                  req = urllib.request.Request(api, data=body, method=method, headers=headers)
+                  return urllib.request.urlopen(req, timeout=timeout, context=context)
+
+              def litellm_request(path, data, timeout=10):
+                  body = json.dumps(data).encode()
+                  req = urllib.request.Request(
+                      "http://ptr-litellm.{{ $gatewayNs }}.svc:4000" + path,
+                      data=body,
+                      headers={
+                          "Content-Type": "application/json",
+                          "Authorization": "Bearer " + master,
+                      },
+                  )
+                  return urllib.request.urlopen(req, timeout=timeout)
+
+              def delete_generated_key(key):
+                  try:
+                      with litellm_request("/key/delete", {"keys": [key]}, timeout=10):
+                          return
+                  except Exception:
+                      print("Generated LiteLLM app key cleanup failed (value not printed)", flush=True)
+
+              previous_key = None
+              encoded_previous_key = None
+              try:
+                  with k8s_request(timeout=10) as response:
+                      existing = json.load(response).get("data") or {}
+                  if "PTR_LLM_LITELLM_API_KEY" in existing:
+                      encoded_previous_key = existing["PTR_LLM_LITELLM_API_KEY"]
+                      previous_key = base64.b64decode(encoded_previous_key).decode()
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      raise SystemExit("PTR_WORKER_SECRET_MISSING") from None
+                  raise
+              except (ValueError, UnicodeDecodeError):
+                  raise SystemExit("PTR_WORKER_APP_KEY_DECODE_FAILED") from None
+              payload = {
+                  "models": ["primary", "openrouter-primary"],
+                  "allowed_routes": ["/v1/chat/completions", "/chat/completions"],
+                  "max_budget": float(os.environ["PTR_APP_KEY_MAX_BUDGET_USD"]),
+                  "budget_duration": "1d",
+                  "rpm_limit": int(os.environ["PTR_APP_KEY_RPM"]),
+                  "tpm_limit": int(os.environ["PTR_APP_KEY_TPM"]),
+                  "key_alias": "ptr-k8s-application-" + str(time.time_ns()),
+              }
+              key = None
+              deadline = time.monotonic() + 180
+              while time.monotonic() < deadline:
+                  try:
+                      with litellm_request("/key/generate", payload, timeout=10) as response:
+                          key = json.load(response)["key"]
+                      break
+                  except urllib.error.HTTPError as error:
+                      if 400 <= error.code < 500:
+                          raise SystemExit(f"PTR_LITELLM_APP_KEY_HTTP_{error.code}") from None
+                      time.sleep(3)
+                  except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
+                      time.sleep(3)
+              if not key:
+                  raise SystemExit("PTR_LITELLM_APP_KEY_BOOTSTRAP_TIMEOUT")
+
+              patch = {
+                  "data": {
+                      "PTR_LLM_LITELLM_API_KEY": base64.b64encode(key.encode()).decode(),
+                      "PTR_LLM_CAPACITY_SPILLOVER_KEY": encoded_spillover_key,
+                  }
+              }
+              patch_deadline = time.monotonic() + 90
+              while True:
+                  try:
+                      with k8s_request(patch, method="PATCH", timeout=10):
+                          break
+                  except urllib.error.HTTPError as error:
+                      if 400 <= error.code < 500:
+                          delete_generated_key(key)
+                          raise SystemExit(f"PTR_WORKER_SECRET_PATCH_HTTP_{error.code}") from None
+                      if time.monotonic() >= patch_deadline:
+                          delete_generated_key(key)
+                          raise SystemExit("PTR_LITELLM_APP_KEY_SECRET_PATCH_TIMEOUT") from None
+                      time.sleep(3)
+                  except (urllib.error.URLError, TimeoutError):
+                      if time.monotonic() >= patch_deadline:
+                          delete_generated_key(key)
+                          raise SystemExit("PTR_LITELLM_APP_KEY_SECRET_PATCH_TIMEOUT") from None
+                      time.sleep(3)
+              if previous_key and previous_key != key:
+                  try:
+                      with litellm_request("/key/delete", {"keys": [previous_key]}, timeout=10):
+                          pass
+                  except urllib.error.HTTPError as error:
+                      if encoded_previous_key:
+                          with k8s_request(
+                              {
+                                  "data": {
+                                      "PTR_LLM_LITELLM_API_KEY": encoded_previous_key,
+                                      "PTR_LLM_CAPACITY_SPILLOVER_KEY": encoded_spillover_key,
+                                  }
+                              },
+                              method="PATCH",
+                              timeout=10,
+                          ):
+                              pass
+                          delete_generated_key(key)
+                      if 400 <= error.code < 500:
+                          raise SystemExit(f"PTR_LITELLM_OLD_KEY_DELETE_HTTP_{error.code}") from None
+                      raise
+                  except (urllib.error.URLError, TimeoutError):
+                      if encoded_previous_key:
+                          with k8s_request(
+                              {
+                                  "data": {
+                                      "PTR_LLM_LITELLM_API_KEY": encoded_previous_key,
+                                      "PTR_LLM_CAPACITY_SPILLOVER_KEY": encoded_spillover_key,
+                                  }
+                              },
+                              method="PATCH",
+                              timeout=10,
+                          ):
+                              pass
+                          delete_generated_key(key)
+                      raise SystemExit("PTR_LITELLM_OLD_KEY_DELETE_TIMEOUT") from None
+              print("Created constrained LiteLLM app key (value not printed)", flush=True)
+          env:
+            - name: PTR_LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $gatewaySecret }}
+                  key: PTR_LITELLM_MASTER_KEY
+            - name: PTR_LLM_CAPACITY_SPILLOVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $gatewaySecret }}
+                  key: PTR_LLM_CAPACITY_SPILLOVER_KEY
+            - name: PTR_APP_KEY_MAX_BUDGET_USD
+              value: {{ .Values.gateway.bootstrap.maxBudgetUsd | quote }}
+            - name: PTR_APP_KEY_RPM
+              value: {{ .Values.gateway.bootstrap.rpm | quote }}
+            - name: PTR_APP_KEY_TPM
+              value: {{ .Values.gateway.bootstrap.tpm | quote }}
+          resources:
+{{ toYaml .Values.gateway.bootstrap.resources | indent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

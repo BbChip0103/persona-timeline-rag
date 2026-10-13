@@ -1,0 +1,99 @@
+{{- if and .Values.gateway.enabled .Values.gateway.fakeOpenRouter.enabled }}
+{{- $ns := .Values.namespaces.gateway -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-fake-openrouter
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: fake-openrouter
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: fake-openrouter
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptr-fake-openrouter
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: fake-openrouter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: fake-openrouter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: fake-openrouter
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 900
+        runAsGroup: 2000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fake-openrouter
+          image: "{{ .Values.images.worker.repository }}:{{ .Values.images.worker.tag }}"
+          imagePullPolicy: {{ .Values.images.worker.pullPolicy }}
+          command: ["python", "/opt/ptr/fake-openrouter.py"]
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: PTR_FAKE_OPENROUTER_COST
+              value: {{ .Values.gateway.fakeOpenRouter.cost | quote }}
+            - name: PTR_FAKE_OPENROUTER_EMIT_COST_HEADER
+              value: {{ ternary "1" "0" .Values.gateway.fakeOpenRouter.emitCostHeader | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.gateway.fakeOpenRouter.resources | indent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: litellm-files
+              mountPath: /opt/ptr
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: litellm-files
+          configMap:
+            name: ptr-litellm-files
+            items:
+              - key: fake-openrouter.py
+                path: fake-openrouter.py
+        - name: tmp
+          emptyDir: {}
+{{- end }}

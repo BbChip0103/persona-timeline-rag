@@ -8,11 +8,12 @@ import json
 import math
 import time
 from contextvars import ContextVar
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
 
-from persona_timeline_rag.gateway_budget import HEADER, sign_request
+from persona_timeline_rag.gateway_budget import HEADER, sign_request, sign_spillover_request
 
 from ptr_llm.billing import ProviderError, provider_request_scope
 
@@ -27,6 +28,8 @@ from .common import (
 )
 from .control_tokens import neutralize_json_strings, neutralize_messages
 from .transport import LimitedTransport
+
+_ALLOWED_CAPACITY_DROP_REASONS = frozenset(("rejected-saturated", "rejected-ttl-expired"))
 
 
 class _NoCookies(DefaultCookiePolicy):
@@ -120,6 +123,7 @@ class LiteLLMTextProvider:
         self._hook_context: ContextVar[Any] = ContextVar("litellm_request_hooks", default=None)
         self._client: Any = None
         self._sdk: Any = None
+        self._paid_sdk: Any = None
         self._runnables: dict[str, Any] = {}
         self._active: set[asyncio.Task[Any]] = set()
         self._closed = False
@@ -137,7 +141,9 @@ class LiteLLMTextProvider:
             raise ProviderError("PROVIDER_CONTEXT_REQUIRED")
         await hooks[1](response)
 
-    def _runnable(self, mode: str, response_schema: dict[str, Any] | None = None) -> Any:
+    def _runnable(
+        self, mode: str, response_schema: dict[str, Any] | None = None, *, paid: bool = False
+    ) -> Any:
         import httpx
         from langchain_openai import ChatOpenAI
         from pydantic import SecretStr
@@ -167,27 +173,35 @@ class LiteLLMTextProvider:
                 http_async_client=self._client,
             )
             self._runnables["plain"] = self._sdk
+        sdk = self._sdk
+        if paid:
+            if self._paid_sdk is None:
+                self._paid_sdk = self._sdk.model_copy(update={"model_name": "openrouter-primary"})
+            sdk = self._paid_sdk
+            if mode == "plain" and response_schema is None:
+                return sdk
         if response_schema is not None:
             # Reuse the transport, not a private per-turn schema/runnable cache.
-            return self._sdk.with_structured_output(
+            return sdk.with_structured_output(
                 {"title": "agent_reply", **response_schema},
                 method="json_schema",
                 strict=False,
                 include_raw=True,
             )
-        if mode not in self._runnables:
+        cache_key = ("paid:" if paid else "") + mode
+        if cache_key not in self._runnables:
             if mode == "agent":
                 from ptr_llm.core.protocol import AGENT_RESPONSE_JSON_SCHEMA
 
-                self._runnables[mode] = self._sdk.with_structured_output(
+                self._runnables[cache_key] = sdk.with_structured_output(
                     {"title": "agent_reply", **AGENT_RESPONSE_JSON_SCHEMA},
                     method="json_schema",
                     strict=False,
                     include_raw=True,
                 )
             else:
-                self._runnables[mode] = self._sdk.bind(response_format={"type": "json_object"})
-        return self._runnables[mode]
+                self._runnables[cache_key] = sdk.bind(response_format={"type": "json_object"})
+        return self._runnables[cache_key]
 
     async def aclose(self) -> None:
         async with self._close_lock:
@@ -308,8 +322,13 @@ class LiteLLMTextProvider:
         attempts = 0
         usage: dict[str, int | None] = {"promptTokens": None, "completionTokens": None}
         upstream, cost, generation_id = "litellm", None, None
+        primary_cost: int | None = None
+        paid_cost: int | None = None
         submitted = finished = False
         transport_error_code: str | None = None
+        drop_reason: str | None = None
+        current_request_model = self.model
+        paid_authorized = False
         key = self.request_fingerprint(messages, request_key, response_schema=response_schema)
         if self.ledger:
             safe_body: dict[str, Any] = {
@@ -382,31 +401,53 @@ class LiteLLMTextProvider:
             return text
 
         async def observe_request(request: httpx.Request) -> None:
-            nonlocal attempts, transport_error_code
+            nonlocal attempts, transport_error_code, current_request_model
             if (signal is not None and signal.is_set()) or time.time() * 1000 >= effective_deadline:
                 transport_error_code = (
                     "CANCELLED" if signal is not None and signal.is_set() else timeout_code
                 )
                 raise ProviderError(transport_error_code)
+            body = json.loads(request.content)
+            current_request_model = (
+                body.get("model") if isinstance(body.get("model"), str) else self.model
+            )
             if self.capacity_spillover_key is not None:
                 if not submitted:
                     raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
-                request.headers[HEADER] = sign_request(
-                    json.loads(request.content),
-                    self.capacity_spillover_key,
-                    key,
-                    int(min(effective_deadline, time.time() * 1000 + 25000)),
-                    self.reservation_microusd,
-                )
+                expiry = int(min(effective_deadline, time.time() * 1000 + 25000))
+                if body.get("model") == "openrouter-primary":
+                    if not paid_authorized:
+                        raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
+                    request.headers[HEADER] = sign_spillover_request(
+                        body, self.capacity_spillover_key, key, expiry, self.reservation_microusd
+                    )
+                else:
+                    request.headers[HEADER] = sign_request(
+                        body, self.capacity_spillover_key, key, expiry, self.reservation_microusd
+                    )
             attempts += 1
 
         async def observe_response(response: httpx.Response) -> None:
-            nonlocal upstream, cost, generation_id, usage, transport_error_code
+            nonlocal upstream, cost, primary_cost, paid_cost, generation_id, usage
+            nonlocal transport_error_code, drop_reason
             served = response.headers.get("x-litellm-model-id") or response.headers.get(
                 "x-ptr-upstream"
             )
-            if served in ("primary", "secondary", "fake", "openrouter-primary"):
+            is_paid_call = (
+                current_request_model == "openrouter-primary" or served == "openrouter-primary"
+            )
+            if is_paid_call:
+                upstream = "openrouter-primary"
+            elif served in ("primary", "secondary", "local-pool", "fake", "openrouter-primary"):
                 upstream = served
+            if not response.is_success:
+                candidate = response.headers.get("llm_provider-x-llm-d-request-dropped-reason")
+                drop_reason = (
+                    candidate
+                    if response.status_code == 429
+                    and candidate in _ALLOWED_CAPACITY_DROP_REASONS
+                    else None
+                )
             if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
                 raise ProviderError("PROVIDER_RESPONSE_LIMIT")
             try:
@@ -417,6 +458,7 @@ class LiteLLMTextProvider:
             if len(raw_bytes) > 2 * 1024 * 1024:
                 raise ProviderError("PROVIDER_RESPONSE_LIMIT")
             if self.ledger and response.is_success:
+                call_cost: int | None = None
                 try:
                     raw = response.json()
                     generation_id = raw.get("id") if isinstance(raw.get("id"), str) else None
@@ -426,25 +468,39 @@ class LiteLLMTextProvider:
                         "completionTokens": count(billed_usage.get("completion_tokens")),
                     }
                     value: Any = billed_usage.get("cost")
-                    if self.capacity_spillover_key and served == "openrouter-primary":
+                    if self.capacity_spillover_key and is_paid_call:
                         authoritative = response.headers.get("llm_provider-x-litellm-response-cost")
+                        value = None
                         if authoritative is not None:
                             try:
-                                value = float(authoritative)
-                            except ValueError:
+                                value = Decimal(authoritative)
+                            except InvalidOperation:
                                 value = None
-                    if (
-                        type(value) in (float, int)
-                        and math.isfinite(value)
-                        and value >= 0
-                        and math.ceil(value * 1_000_000) <= 2**53 - 1
-                    ):
-                        cost = math.ceil(value * 1_000_000)
+                    if type(value) in (float, int, Decimal):
+                        try:
+                            precise = Decimal(str(value))
+                            if precise.is_finite() and precise >= 0:
+                                microusd = precise * 1_000_000
+                                if microusd <= 2**53 - 1:
+                                    call_cost = int(
+                                        microusd.to_integral_value(rounding=ROUND_CEILING)
+                                    )
+                        except InvalidOperation:
+                            pass
                 except (ValueError, AttributeError, TypeError):
                     raise ProviderError("INVALID_PROVIDER_RESPONSE") from None
 
-            if self.capacity_spillover_key and served in ("primary", "secondary"):
-                cost = 0  # Trusted owned gateway selected a nonbillable local deployment.
+                if (
+                    self.capacity_spillover_key
+                    and not is_paid_call
+                    and served in ("local-pool", "primary", "secondary")
+                ):
+                    call_cost = 0  # Trusted owned gateway selected a nonbillable local deployment.
+                if current_request_model == "openrouter-primary":
+                    paid_cost = call_cost
+                else:
+                    primary_cost = call_cost
+                cost = call_cost
 
         token = self._hook_context.set((observe_request, observe_response))
         task = asyncio.current_task()
@@ -471,7 +527,7 @@ class LiteLLMTextProvider:
                         and saved.actual_microusd > saved.reserved_microusd
                     ):
                         raise ProviderError("PROVIDER_COST_EXCEEDS_RESERVATION")
-                    if saved.response is not None:
+                    if saved.state == "settled" and saved.response is not None:
                         cost = saved.actual_microusd
                         return success(saved.response)
                     raise ProviderError("REQUEST_UNRESOLVED_NO_RESUBMIT")
@@ -499,12 +555,34 @@ class LiteLLMTextProvider:
                 for m in safe
             ]
             remaining = (effective_deadline - time.time() * 1000) / 1000
-            raw = await bounded(
-                private_ainvoke(runnable, input_messages),
-                timeout=remaining,
-                signal=signal,
-                timeout_code=timeout_code,
-            )
+            try:
+                raw = await bounded(
+                    private_ainvoke(runnable, input_messages),
+                    timeout=remaining,
+                    signal=signal,
+                    timeout_code=timeout_code,
+                )
+            except Exception:
+                if (
+                    self.capacity_spillover_key is None
+                    or drop_reason not in _ALLOWED_CAPACITY_DROP_REASONS
+                    or attempts != 1
+                ):
+                    raise
+                paid_authorized = True
+                upstream, cost, generation_id = "litellm", None, None
+                drop_reason = None
+                paid_runnable = self._runnable(
+                    "agent" if agent else "timeline" if timeline else "plain",
+                    response_schema,
+                    paid=True,
+                )
+                raw = await bounded(
+                    private_ainvoke(paid_runnable, input_messages),
+                    timeout=(effective_deadline - time.time() * 1000) / 1000,
+                    signal=signal,
+                    timeout_code=timeout_code,
+                )
             if agent:
                 if not isinstance(raw, dict) or raw.get("parsed") is None:
                     raise ProviderError("INVALID_PROVIDER_RESPONSE")
@@ -523,6 +601,7 @@ class LiteLLMTextProvider:
             }
             receipt = {"text": checked_text(raw.content), "usage": usage, "upstream": upstream}
             if self.ledger:
+                cost = paid_cost if paid_authorized else primary_cost
                 await self.ledger.finish(key, cost, receipt, generation_id)
                 finished = True
                 if cost is not None and cost > self.reservation_microusd:
@@ -547,6 +626,7 @@ class LiteLLMTextProvider:
                     or transport_error_code
                     in ("CANCELLED", "PROVIDER_DEADLINE", "PROVIDER_TIMEOUT")
                 )
+                cost = paid_cost if paid_authorized else primary_cost
                 await asyncio.shield(
                     self.ledger.finish(key, 0 if no_network_expiry else cost, None, generation_id)
                 )

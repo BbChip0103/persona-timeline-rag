@@ -23,6 +23,7 @@ namespaces:
   app: ptr-app
   data: ptr-data
   inference: ptr-inference
+  gateway: ptr-gateway
 
 app:
   web:
@@ -61,6 +62,7 @@ secrets:
   maintenance: {existingSecret: ptr-maintenance}
   personas: {existingSecret: ptr-personas}
   data: {existingSecret: ptr-data}
+  gateway: {existingSecret: ptr-litellm}
 
 network:
   postgres:
@@ -77,6 +79,8 @@ network:
     url: http://ptr-api.ptr-app.svc:56441
   worker:
     url: http://ptr-worker.ptr-app.svc:58442
+  litellm:
+    url: http://ptr-litellm.ptr-gateway.svc:4000/v1
 
 policy:
   # policy.enabled controls all NetworkPolicy resources rendered by this chart.
@@ -89,6 +93,65 @@ policy:
   managedData:
     postgres: {cidrs: []}
     redis: {cidrs: []}
+
+gateway:
+  enabled: true
+  local:
+    model: openai/synthetic-chat
+  openrouter:
+    model: openrouter/deepinfra/meta-llama/Meta-Llama-3.1-8B-Instruct
+    baseUrl: http://ptr-fake-openrouter.ptr-gateway.svc:8000/v1
+  litellm:
+    replicas: 2
+    image:
+      repository: ghcr.io/berriai/litellm
+      tag: main-stable
+      digest: sha256:3d88bd757134a00e8c00237b85a021ab1f6d54abb9c1df750f411dbe7256a500
+      pullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "1", memory: 1Gi}
+  bootstrap:
+    enabled: true
+    maxBudgetUsd: 1.0
+    rpm: 120
+    tpm: 200000
+    apiServerCIDRs: []
+    apiServerPorts: [443]
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+  billing:
+    liveEnabled: "1"
+    allowExternalData: "1"
+    promptUsdPerM: "0.10"
+    completionUsdPerM: "0.50"
+    maxOutputTokens: 512
+    maxCallMicrousd: 100000
+  data:
+    enabled: false
+    postgres:
+      storage: 1Gi
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "1", memory: 1Gi}
+    redis:
+      storage: 1Gi
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits: {cpu: 500m, memory: 512Mi}
+  managedData:
+    postgres: {cidrs: []}
+    redis: {cidrs: []}
+  fakeOpenRouter:
+    enabled: false
+    cost: "0.000123"
+    emitCostHeader: true
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+  prod:
+    externalHttpsCidrs: []
 
 inference:
   enabled: true
@@ -128,6 +191,8 @@ inference:
       - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
     timeToFirstToken: 8s
     interTokenLatency: 100ms
+    enableRequestIdHeaders: false
+    logHttp: false
     resources:
       requests: {cpu: 100m, memory: 128Mi}
       limits: {cpu: "1", memory: 512Mi}

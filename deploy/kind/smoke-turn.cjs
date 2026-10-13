@@ -28,7 +28,12 @@ async function main() {
   stage = 'turn_create';
   const turn = await request(`sessions/${created.session.id}/turns`, {
     clientRequestId: `k2-${Date.now()}`,
-    text: '안녕하세요. 가상의 이야기를 나눠요.',
+    text: JSON.stringify({
+      message: 'K4_ID:echo-smoke',
+      status: 'answered',
+      evidenceRefs: [],
+      variableUpdates: {},
+    }),
   });
   stage = 'turn_poll';
   let final;

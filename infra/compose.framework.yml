@@ -123,7 +123,7 @@ services:
       PTR_VLLM_SECONDARY_BASE_URL: ${PTR_VLLM_SECONDARY_BASE_URL:-}
       PTR_VLLM_SECONDARY_API_KEY: ${PTR_VLLM_SECONDARY_API_KEY:-}
       PTR_OPENROUTER_MODEL: ${PTR_OPENROUTER_MODEL:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      PTR_OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     volumes:
       - ./litellm/ptr_routing.py:/app/ptr_routing.py:ro
       - ./litellm/routing_state.py:/app/routing_state.py:ro

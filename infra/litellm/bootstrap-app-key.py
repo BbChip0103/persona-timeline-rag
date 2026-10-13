@@ -10,6 +10,8 @@ from pathlib import Path
 
 from smoke import load_env
 
+ALLOWED_CHAT_ROUTES = ["/v1/chat/completions", "/chat/completions"]
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--env-file", required=True, type=Path)
 parser.add_argument("--output", required=True, type=Path)
@@ -34,6 +36,7 @@ try:
                 "rpm_limit": args.rpm,
                 "tpm_limit": args.tpm,
                 "key_alias": "ptr-application",
+                "allowed_routes": ALLOWED_CHAT_ROUTES,
             }
         ).encode(),
         headers={

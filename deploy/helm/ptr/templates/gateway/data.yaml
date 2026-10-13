@@ -1,0 +1,210 @@
+{{- if and .Values.gateway.enabled .Values.gateway.data.enabled }}
+{{- $ns := .Values.namespaces.gateway -}}
+{{- $secret := .Values.secrets.gateway.existingSecret -}}
+{{- $pgImage := printf "%s:%s" .Values.images.postgres.repository .Values.images.postgres.tag -}}
+{{- if .Values.images.postgres.digest }}{{- $pgImage = printf "%s@%s" $pgImage .Values.images.postgres.digest -}}{{- end }}
+{{- $redisImage := printf "%s:%s" .Values.images.redis.repository .Values.images.redis.tag -}}
+{{- if .Values.images.redis.digest }}{{- $redisImage = printf "%s@%s" $redisImage .Values.images.redis.digest -}}{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-litellm-postgres
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-postgres
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ptr-litellm-postgres
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-postgres
+spec:
+  serviceName: ptr-litellm-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: litellm-postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ $pgImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: ptr_litellm
+            - name: POSTGRES_DB
+              value: ptr_litellm
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LITELLM_DB_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ptr_litellm", "-d", "ptr_litellm"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ptr_litellm", "-d", "ptr_litellm"]
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.gateway.data.postgres.resources | indent 12 }}
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: postgres-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.gateway.data.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-litellm-redis
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ptr-litellm-redis
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm-redis
+spec:
+  serviceName: ptr-litellm-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: litellm-redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ $redisImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_LITELLM_REDIS_PASSWORD
+          command: ["/bin/sh", "-ec"]
+          args:
+            - exec redis-server --appendonly yes --maxmemory-policy noeviction --dir /data --requirepass "$REDIS_PASSWORD"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "REDISCLI_AUTH=\"$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.gateway.data.redis.resources | indent 12 }}
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.gateway.data.redis.storage }}
+{{- end }}

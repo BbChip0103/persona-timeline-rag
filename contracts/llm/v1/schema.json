@@ -926,8 +926,10 @@
                 "enum": [
                   "primary",
                   "secondary",
+                  "local-pool",
                   "fake",
                   "openrouter",
+                  "openrouter-primary",
                   "direct",
                   "unknown",
                   "litellm"

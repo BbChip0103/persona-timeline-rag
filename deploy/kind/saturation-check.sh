@@ -14,7 +14,7 @@ trap cleanup EXIT
 client_js=$(cat <<'JS'
 const count = Number(process.env.BURST_COUNT || 32);
 const url = 'http://chat-primary-epp.ptr-inference.svc.cluster.local:8081/v1/chat/completions';
-const body = JSON.stringify({model: 'synthetic-chat', messages: [{role: 'user', content: 'Synthetic load check'}], max_tokens: 1, stream: true});
+const body = JSON.stringify({model: 'synthetic-chat', messages: [{role: 'user', content: 'Synthetic load check'}], max_tokens: 64, stream: true});
 const outcomes = await Promise.all(Array.from({length: count}, async () => {
   const started = Date.now();
   try {

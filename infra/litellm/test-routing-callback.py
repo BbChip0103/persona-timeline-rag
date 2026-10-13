@@ -482,11 +482,11 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data["disable_fallbacks"])
         self.assertEqual(self.router.async_get_available_deployment.__self__.owner, self.callback)
 
-    async def test_nonprimary_sdk_retry_override_is_not_normalized(self):
+    async def test_nonprimary_sdk_retry_override_is_rejected(self):
         data = {"model": "openrouter-primary", "num_retries": 7, "max_retries": 9}
-        await self.prehook(data, call_type="acompletion")
-        self.assertEqual(data["num_retries"], 7)
-        self.assertEqual(data["max_retries"], 9)
+        with self.assertRaises(HTTPException) as failure:
+            await self.prehook(data, call_type="acompletion")
+        self.assertEqual(failure.exception.status_code, 403)
         self.assertEqual(self.state.selected, [])
 
     async def test_original_proxy_request_releases_copied_router_reservation(self):
@@ -792,15 +792,31 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                         actual.parameters[parameter].default, base.parameters[parameter].default
                     )
 
-    async def test_nonprimary_pre_hook_does_not_force_primary_policy(self):
-        data = {"model": "openrouter-primary", "timeout": 17, "metadata": {TOKEN: "a" * 32}}
-        await self.prehook(data)
-        self.assertNotIn("num_retries", data)
-        self.assertNotIn("disable_fallbacks", data)
-        self.assertEqual(data["timeout"], 17)
-        self.assertIsNone(reservation(data))
-        self.assertEqual(await self.select(model=data["model"]), "native-other-alias")
+    async def test_default_denies_nonprimary_or_missing_model(self):
+        for data in (
+            {"timeout": 17, "metadata": {TOKEN: "a" * 32}},
+            {"model": "openrouter-primary", "timeout": 17, "metadata": {TOKEN: "a" * 32}},
+            {"model": "openrouter/anthropic/claude-synthetic"},
+            {"model": "not-allowed"},
+        ):
+            with self.subTest(data=data):
+                with self.assertRaises(HTTPException) as failure:
+                    await self.prehook(data)
+                self.assertEqual(failure.exception.status_code, 403)
         self.assertEqual(self.state.selected, [])
+
+    async def test_primary_pass_through_path_is_denied(self):
+        data = {
+            "model": MODEL_GROUP,
+            "proxy_server_request": {
+                "url": "http://litellm.local/openrouter/v1/chat/completions",
+                "method": "POST",
+                "headers": {},
+            },
+        }
+        with self.assertRaises(HTTPException) as failure:
+            await self.prehook(data)
+        self.assertEqual(failure.exception.status_code, 403)
 
     async def test_primary_malicious_overrides_and_nonchat_are_rejected(self):
         for name in (
@@ -820,8 +836,9 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(HTTPException) as failure:
                     await self.prehook({"model": MODEL_GROUP, name: "synthetic"})
                 self.assertEqual(failure.exception.status_code, 400)
-        with self.assertRaises(HTTPException):
+        with self.assertRaises(HTTPException) as nonchat:
             await self.prehook({"model": MODEL_GROUP}, call_type="embedding")
+        self.assertEqual(nonchat.exception.status_code, 403)
         self.assertEqual(self.state.selected, [])
 
     async def test_stream_initial_success_and_first_chunks_hold_reservation(self):

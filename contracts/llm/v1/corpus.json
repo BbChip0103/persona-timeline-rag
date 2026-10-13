@@ -146,6 +146,28 @@
     }
   },
   {
+    "name": "k8s_served_ids_are_valid_wire_results",
+    "schema": "Result",
+    "valid": true,
+    "value": {
+      "kind": "completed",
+      "reply": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "turnId": "00000000-0000-4000-8000-000000000001",
+        "messageId": "00000000-0000-4000-8000-000000000002",
+        "personId": "synthetic-person",
+        "personaRevision": "synthetic-v1",
+        "responseKind": "small_talk",
+        "status": "answered",
+        "content": "synthetic reply",
+        "claims": [],
+        "evidence": [],
+        "limitations": [],
+        "serving": {"calls": 2, "upstreams": ["local-pool", "openrouter-primary"], "secondaryCalls": 1}
+      }
+    }
+  },
+  {
     "name": "reply_unknown_private_payload",
     "schema": "Reply",
     "valid": false,

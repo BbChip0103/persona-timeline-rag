@@ -145,7 +145,13 @@ spec:
                   name: {{ .Values.secrets.api.existingSecret }}
                   key: PTR_LLM_CONTROL_TOKEN
             - name: PTR_CHAT_PROVIDER
-              value: fake
+              value: {{ ternary "litellm" "fake" .Values.gateway.enabled | quote }}
+            {{- if .Values.gateway.enabled }}
+            - name: PTR_MODEL
+              value: primary
+            - name: PTR_LITELLM_BILLABLE
+              value: "1"
+            {{- end }}
             - name: PTR_TURN_QUEUE
               value: turns
             - name: PTR_EVENTS_NAMESPACE

@@ -118,10 +118,45 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.worker.existingSecret }}
                   key: PTR_LLM_CONTROL_TOKEN
+            {{- if .Values.gateway.enabled }}
+            - name: PTR_LLM_PROVIDER
+              value: litellm
+            - name: PTR_LLM_PUBLISHED_PERSONAS_FILE
+              value: /etc/ptr-personas/personas.json
+            - name: PTR_LLM_LITELLM_BASE_URL
+              value: {{ .Values.network.litellm.url | quote }}
+            - name: PTR_LLM_LITELLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.worker.existingSecret }}
+                  key: PTR_LLM_LITELLM_API_KEY
+            - name: PTR_LLM_LITELLM_BILLABLE
+              value: "1"
+            - name: PTR_LLM_LIVE_ENABLED
+              value: {{ .Values.gateway.billing.liveEnabled | quote }}
+            - name: PTR_LLM_ALLOW_EXTERNAL_DATA
+              value: {{ .Values.gateway.billing.allowExternalData | quote }}
+            - name: PTR_LLM_PROMPT_USD_PER_M
+              value: {{ .Values.gateway.billing.promptUsdPerM | quote }}
+            - name: PTR_LLM_COMPLETION_USD_PER_M
+              value: {{ .Values.gateway.billing.completionUsdPerM | quote }}
+            - name: PTR_LLM_MAX_OUTPUT_TOKENS
+              value: {{ .Values.gateway.billing.maxOutputTokens | quote }}
+            - name: PTR_LLM_MAX_CALL_MICROUSD
+              value: {{ .Values.gateway.billing.maxCallMicrousd | quote }}
+            - name: PTR_LLM_MODEL
+              value: primary
+            - name: PTR_LLM_CAPACITY_SPILLOVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.worker.existingSecret }}
+                  key: PTR_LLM_CAPACITY_SPILLOVER_KEY
+            {{- else }}
             - name: PTR_LLM_PROVIDER
               value: fake
             - name: PTR_LLM_MODEL
               value: synthetic/fake-text-v1
+            {{- end }}
             - name: PTR_LLM_QUEUE_NAME
               value: turns
             - name: PTR_LLM_QUEUE_PREFIX
@@ -168,8 +203,21 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            {{- if .Values.gateway.enabled }}
+            - name: published-personas
+              mountPath: /etc/ptr-personas
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
       volumes:
+        {{- if .Values.gateway.enabled }}
+        - name: published-personas
+          secret:
+            secretName: {{ .Values.secrets.personas.existingSecret }}
+            items:
+              - key: PTR_LLM_PUBLISHED_PERSONAS_JSON
+                path: personas.json
+        {{- end }}
         - name: tmp
           emptyDir: {}

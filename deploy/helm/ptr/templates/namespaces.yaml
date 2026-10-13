@@ -21,4 +21,13 @@ metadata:
   name: {{ .Values.namespaces.inference }}
   labels:
     ptr.io/namespace: inference
+---
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.gateway }}
+  labels:
+    ptr.io/namespace: gateway
+{{- end }}
 {{- end }}

@@ -1,8 +1,10 @@
 {{- $appNs := .Values.namespaces.app -}}
 {{- $dataNs := .Values.namespaces.data -}}
+{{- $gatewayNs := .Values.namespaces.gateway -}}
 {{- $apiPort := 56441 -}}
 {{- $workerPort := 58442 -}}
 {{- $webPort := 56440 -}}
+{{- $litellmPort := 4000 -}}
 {{- $postgresPort := int (default 5432 .Values.network.postgres.port) -}}
 {{- $redisPort := int (default 6379 .Values.network.redis.port) -}}
 {{- $gateway := default dict .Values.policy.gateway -}}
@@ -164,6 +166,31 @@ spec:
               app.kubernetes.io/component: api
       ports:
         - {protocol: TCP, port: {{ $apiPort }}}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-litellm
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $gatewayNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm
+      ports:
+        - {protocol: TCP, port: {{ $litellmPort }}}
+{{- end }}
 {{- if .Values.data.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

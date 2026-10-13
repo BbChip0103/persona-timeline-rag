@@ -363,11 +363,19 @@ class RoutingCallback(CustomLogger):
                 data[field].pop(DEADLINE, None)
                 data[field].pop(PREFILLED, None)
                 data[field].pop(BUDGET, None)
+        if data.get("model") != MODEL_GROUP:
+            raise HTTPException(403, "PTR_ROUTING_ROUTE_REJECTED")
+        original = data.get("proxy_server_request")
+        if original is not None and (
+            not isinstance(original, dict)
+            or urlsplit(original.get("url", "")).path
+            not in ("/v1/chat/completions", "/chat/completions")
+            or original.get("method", "POST") != "POST"
+        ):
+            raise HTTPException(403, "PTR_ROUTING_CHAT_REQUIRED")
         expires = None
-        if self.spillover and data.get("model") == SPILLOVER_MODEL:
-            raise HTTPException(403, "PTR_ROUTING_DIRECT_PAID_ALIAS_REJECTED")
         if self.spillover and data.get("model") == MODEL_GROUP:
-            original = data.get("proxy_server_request") or {}
+            original = original or {}
             headers = original.get("headers") or {}
             header = headers.pop(HEADER, None)
             for name in ("extra_headers", "headers"):
@@ -379,7 +387,7 @@ class RoutingCallback(CustomLogger):
                 not in ("/v1/chat/completions", "/chat/completions")
                 or original.get("method", "POST") != "POST"
             ):
-                raise HTTPException(400, "PTR_ROUTING_CHAT_REQUIRED")
+                raise HTTPException(403, "PTR_ROUTING_CHAT_REQUIRED")
             # These unsigned generation overrides cannot change a committed budget.
             if any(
                 k in data
@@ -413,7 +421,7 @@ class RoutingCallback(CustomLogger):
         if data.get("model") == MODEL_GROUP:
             # The pinned Proxy passes its async route name, unlike older docs.
             if call_type not in ("completion", "acompletion"):
-                raise HTTPException(400, "PTR_ROUTING_CHAT_REQUIRED")
+                raise HTTPException(403, "PTR_ROUTING_CHAT_REQUIRED")
             forbidden = (
                 "api_base",
                 "base_url",

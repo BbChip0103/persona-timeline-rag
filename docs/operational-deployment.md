@@ -11,6 +11,9 @@ Select a new owned Compose project/nonce, immutable verified backend and worker
 image IDs, separate private environment files and loopback ports in a `0600`
 operator Compose environment. Keep its directory `0700`. Do not print resolved
 Compose configuration: it can contain secrets. Validate with `config -q`.
+If paid failover is explicitly enabled, set `OPENROUTER_API_KEY` in that operator
+Compose environment. Compose maps it to `PTR_OPENROUTER_API_KEY` only in the gateway;
+keep it out of the gateway service env file and all other role env files.
 
 ```sh
 docker compose --env-file /private/compose.env \
@@ -50,6 +53,10 @@ limits and gateway-key budgets are **not** this monetary cap.
 Apply `supabase/split/0005_generated_artifacts.sql` before deploying the new API;
 draft requests fail without its table. No backfill of old `data/generated/*.json`
 is needed because `loadArtifact` has no caller; leave those files in place.
+
+When rolling out gateway receipts that can report the `local-pool` upstream, roll
+the API before workers that emit those receipts. This keeps the durable ACK schema
+reader ahead of the worker receipt writer during mixed-version deployments.
 
 ## Bounded acceptance and recovery
 

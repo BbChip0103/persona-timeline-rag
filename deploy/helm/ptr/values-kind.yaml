@@ -4,12 +4,28 @@ app:
   web: {replicas: 2}
   api: {replicas: 2}
   worker: {replicas: 2}
+gateway:
+  billing:
+    maxOutputTokens: 4096
+    # Keep synthetic turns reservable as the fixed research ledger fills.
+    maxCallMicrousd: 20000
+  bootstrap:
+    apiServerCIDRs: ["10.96.0.1/32", "172.29.0.4/32"]
+    apiServerPorts: [443, 6443]
+  data:
+    enabled: true
+  fakeOpenRouter:
+    enabled: true
 inference:
   engine:
     kind: sim
     replicas: 2
     maxNumSeqs: 2
-    mode: random
+    maxModelLen: 16384
+    mode: echo
+    interTokenLatency: 0s
+    enableRequestIdHeaders: true
+    logHttp: true
   testClient:
     enabled: true
   apiServerCIDRs: ["10.96.0.1/32"]

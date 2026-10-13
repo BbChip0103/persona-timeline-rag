@@ -1,0 +1,23 @@
+{{- if .Values.gateway.enabled }}
+{{- $config := .Files.Get "files/litellm/config.k8s.yaml" -}}
+{{- $gate := .Files.Get "files/litellm/ptr_budget_gate.py" -}}
+{{- $budget := .Files.Get "files/litellm/persona_timeline_rag/gateway_budget.py" -}}
+{{- $fakeOpenRouter := .Files.Get "files/litellm/fake-openrouter.py" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptr-litellm-files
+  namespace: {{ .Values.namespaces.gateway }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: litellm
+data:
+  config.yaml: |
+{{ $config | indent 4 }}
+  ptr_budget_gate.py: |
+{{ $gate | indent 4 }}
+  gateway_budget.py: |
+{{ $budget | indent 4 }}
+  fake-openrouter.py: |
+{{ $fakeOpenRouter | indent 4 }}
+{{- end }}

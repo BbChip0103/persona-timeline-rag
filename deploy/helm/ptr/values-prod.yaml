@@ -4,6 +4,28 @@ data:
 app:
   web: {replicas: 2}
   api: {replicas: 2}
+gateway:
+  bootstrap:
+    # Documentation placeholder only: replace with the cluster API endpoint CIDR.
+    apiServerCIDRs: ["192.0.2.1/32"]
+  data:
+    enabled: false
+  managedData:
+    postgres:
+      # Documentation placeholder only: TEST-NET-1, replace with managed LiteLLM Postgres CIDRs.
+      cidrs: ["192.0.2.0/24"]
+    redis:
+      # Documentation placeholder only: TEST-NET-2, replace with managed LiteLLM Redis CIDRs.
+      cidrs: ["198.51.100.0/24"]
+  fakeOpenRouter:
+    enabled: false
+  openrouter:
+    baseUrl: https://openrouter.ai/api/v1
+  prod:
+    # Documentation placeholder only: TEST-NET-3, replace with approved egress ranges.
+    # CIDR egress narrows destinations but is not host pinning; use an egress proxy
+    # or FQDN-aware policy when strict hostname control is required.
+    externalHttpsCidrs: ["203.0.113.0/24"]
 secrets:
   api: {existingSecret: ptr-api}
   worker: {existingSecret: ptr-worker}

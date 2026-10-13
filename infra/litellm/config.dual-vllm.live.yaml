@@ -35,7 +35,7 @@ model_list:
   - model_name: openrouter-primary
     litellm_params:
       model: os.environ/PTR_OPENROUTER_MODEL
-      api_key: os.environ/OPENROUTER_API_KEY
+      api_key: os.environ/PTR_OPENROUTER_API_KEY
       max_retries: 0
       timeout: 25
       extra_body:

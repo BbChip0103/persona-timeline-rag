@@ -102,6 +102,16 @@ jobs:
           set -euo pipefail
           diff -r supabase/migrations deploy/helm/ptr/files/supabase/migrations
           diff -r supabase/split deploy/helm/ptr/files/supabase/split
+      - name: LiteLLM chart files match source files
+        run: |
+          set -euo pipefail
+          expected="$RUNNER_TEMP/ptr-litellm-chart-files"
+          mkdir -p "$expected/persona_timeline_rag"
+          cp infra/litellm/config.k8s.yaml "$expected/config.k8s.yaml"
+          cp infra/litellm/ptr_budget_gate.py "$expected/ptr_budget_gate.py"
+          cp infra/litellm/fake-openrouter.py "$expected/fake-openrouter.py"
+          cp src/persona_timeline_rag/gateway_budget.py "$expected/persona_timeline_rag/gateway_budget.py"
+          diff -ru "$expected" deploy/helm/ptr/files/litellm
       - name: Kind image prune selection
         run: bash deploy/kind/test-up-prune.sh
       - name: Kubernetes schema validation

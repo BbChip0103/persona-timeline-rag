@@ -46,12 +46,21 @@ spec:
             - --served-model-name={{ $engine.model }}
             - --port=8000
             - --max-num-seqs={{ $engine.maxNumSeqs }}
+            {{- if gt (int $engine.maxModelLen) 0 }}
+            - --max-model-len={{ $engine.maxModelLen }}
+            {{- end }}
             - --mode={{ default "echo" $engine.mode }}
             - --latency-calculator=constant
             - --time-to-first-token={{ $engine.timeToFirstToken }}
             - --time-to-first-token-std-dev=0s
             - --inter-token-latency={{ $engine.interTokenLatency }}
             - --inter-token-latency-std-dev=0s
+            {{- if $engine.enableRequestIdHeaders }}
+            - --enable-request-id-headers
+            {{- end }}
+            {{- if $engine.logHttp }}
+            - --log-http
+            {{- end }}
           {{- else }}
           args:
             - --model

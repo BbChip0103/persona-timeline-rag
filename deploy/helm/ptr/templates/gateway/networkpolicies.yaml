@@ -1,0 +1,231 @@
+{{- if and .Values.gateway.enabled (ne .Values.policy.enabled false) }}
+{{- $appNs := .Values.namespaces.app -}}
+{{- $gatewayNs := .Values.namespaces.gateway -}}
+{{- $inferenceNs := .Values.namespaces.inference -}}
+{{- $litellmPort := 4000 -}}
+{{- $postgresPort := 5432 -}}
+{{- $redisPort := 6379 -}}
+{{- $fakeOpenRouterPort := 8000 -}}
+{{- $gatewayPgCidrs := default (list) .Values.gateway.managedData.postgres.cidrs -}}
+{{- $gatewayRedisCidrs := default (list) .Values.gateway.managedData.redis.cidrs -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-gateway-default-deny
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-gateway-allow-dns
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-ingress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm-bootstrap
+      ports:
+        - {protocol: TCP, port: {{ $litellmPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-egress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $inferenceNs }}
+          podSelector:
+            matchLabels:
+              llm-d-router-standalone: {{ .Values.inference.routerService }}
+      ports:
+        - {protocol: TCP, port: 8081}
+    {{- if .Values.gateway.data.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm-postgres
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm-redis
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+    {{- else }}
+    {{- range $gatewayPgCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+    {{- end }}
+    {{- range $gatewayRedisCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.gateway.fakeOpenRouter.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: fake-openrouter
+      ports:
+        - {protocol: TCP, port: {{ $fakeOpenRouterPort }}}
+    {{- else }}
+    {{- range .Values.gateway.prod.externalHttpsCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: 443}
+    {{- end }}
+    {{- end }}
+{{- if .Values.gateway.data.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-postgres-ingress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm-postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-redis-ingress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm-redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+{{- end }}
+{{- if .Values.gateway.fakeOpenRouter.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-fake-openrouter-ingress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: fake-openrouter
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm
+      ports:
+        - {protocol: TCP, port: {{ $fakeOpenRouterPort }}}
+{{- end }}
+{{- if .Values.gateway.bootstrap.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-bootstrap-egress
+  namespace: {{ $gatewayNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm-bootstrap
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: litellm
+      ports:
+        - {protocol: TCP, port: {{ $litellmPort }}}
+    {{- range .Values.gateway.bootstrap.apiServerCIDRs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        {{- range $.Values.gateway.bootstrap.apiServerPorts }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

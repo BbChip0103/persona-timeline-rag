@@ -11,9 +11,79 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 INIT = ROOT / "infra/langfuse/init-framework-env.py"
 COMPOSE = ROOT / "infra/compose.framework.yml"
+SPLIT_COMPOSE = ROOT / "infra/split/compose.operational.yml"
+APP_COMPOSE = ROOT / "infra/compose.app.yml"
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_openrouter_key_is_mapped_only_into_framework_gateway(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / "new.env"
+            subprocess.run(
+                ["python", str(INIT), "--output", str(env)], check=True, capture_output=True
+            )
+            env.write_text(
+                env.read_text().replace(
+                    "OPENROUTER_API_KEY=\n", "OPENROUTER_API_KEY=synthetic-compose-sentinel\n"
+                )
+            )
+            result = subprocess.run(
+                ["docker", "compose", "--env-file", str(env), "-f", str(COMPOSE),
+                 "--profile", "smoke", "config", "--format", "json"],
+                check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]},
+            )
+            services = json.loads(result.stdout)["services"]
+            self.assertEqual(
+                services["litellm"]["environment"]["PTR_OPENROUTER_API_KEY"],
+                "synthetic-compose-sentinel",
+            )
+            self.assertNotIn("OPENROUTER_API_KEY", services["litellm"]["environment"])
+            for name, service in services.items():
+                if name != "litellm":
+                    self.assertNotIn("PTR_OPENROUTER_API_KEY", service.get("environment", {}))
+                    self.assertNotIn("OPENROUTER_API_KEY", service.get("environment", {}))
+
+    def test_openrouter_key_is_mapped_only_into_split_gateway(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            role_env = root / "role.env"
+            role_env.write_text("SYNTHETIC_PLACEHOLDER=1\n")
+            published = root / "published.json"
+            published.write_text("{}\n")
+            compose_env = root / "compose.env"
+            compose_env.write_text("\n".join([
+                "PTR_OPERATIONAL_PROJECT=synthetic-split",
+                "PTR_OPERATIONAL_OWNER=synthetic-owner",
+                "PTR_OPERATIONAL_BACKEND_IMAGE=synthetic-backend:local",
+                "PTR_OPERATIONAL_WORKER_IMAGE=synthetic-worker:local",
+                "PTR_OPERATIONAL_GATEWAY_PORT=36435",
+                "PTR_OPERATIONAL_GATEWAY_DB_PORT=58433",
+                "PTR_OPERATIONAL_GATEWAY_REDIS_PORT=58480",
+                "OPENROUTER_API_KEY=synthetic-compose-sentinel",
+                *[f"{key}={role_env}" for key in (
+                    "PTR_FRAMEWORK_APP_ENV_FILE", "PTR_LLM_SERVICE_ENV_FILE",
+                    "PTR_OPERATIONAL_WEB_ENV_FILE", "PTR_OPERATIONAL_GATEWAY_ENV_FILE",
+                    "PTR_OPERATIONAL_GATEWAY_DB_ENV_FILE", "PTR_OPERATIONAL_GATEWAY_REDIS_ENV_FILE",
+                )],
+                f"PTR_OPERATIONAL_PUBLISHED_PERSONAS_FILE={published}",
+                f"PTR_OPERATIONAL_GATEWAY_CONFIG={ROOT / 'infra/litellm/config.live.yaml'}",
+            ]) + "\n")
+            result = subprocess.run(
+                ["docker", "compose", "--env-file", str(compose_env), "-f", str(APP_COMPOSE),
+                 "-f", str(SPLIT_COMPOSE), "config", "--format", "json"],
+                check=True, capture_output=True, text=True, env={"PATH": os.environ["PATH"]},
+            )
+            services = json.loads(result.stdout)["services"]
+            self.assertEqual(
+                services["model-gateway"]["environment"]["PTR_OPENROUTER_API_KEY"],
+                "synthetic-compose-sentinel",
+            )
+            self.assertNotIn("OPENROUTER_API_KEY", services["model-gateway"]["environment"])
+            for name, service in services.items():
+                if name != "model-gateway":
+                    self.assertNotIn("PTR_OPENROUTER_API_KEY", service.get("environment", {}))
+                    self.assertNotIn("OPENROUTER_API_KEY", service.get("environment", {}))
+
     def test_generated_secrets_unique_private_and_never_overwritten(self):
         with tempfile.TemporaryDirectory() as folder:
             env = Path(folder) / "new.env"

@@ -1,0 +1,19 @@
+{
+  "database": "ptr_split_test",
+  "personas": [
+    {
+      "id": "synthetic-split-persona",
+      "personId": "synthetic-split-person",
+      "label": "Synthetic Split",
+      "language": "ko",
+      "revision": "synthetic-v1",
+      "reviewStatus": "synthetic",
+      "identity": "A fictional synthetic test character, not a real person.",
+      "concept": "Synthetic split regression",
+      "style": ["brief polite Korean"],
+      "boundaries": ["No private biography"],
+      "sourceRefs": [],
+      "greeting": "안녕하세요. 합성 캐릭터입니다."
+    }
+  ]
+}
