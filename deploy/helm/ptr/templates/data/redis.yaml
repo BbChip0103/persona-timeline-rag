@@ -1,0 +1,127 @@
+{{- if .Values.data.enabled }}
+{{- $ns := .Values.namespaces.data -}}
+{{- $secret := .Values.secrets.data.existingSecret -}}
+{{- $redisUser := .Values.network.redis.username | default "ptr" -}}
+{{- $redisImage := printf "%s:%s" .Values.images.redis.repository .Values.images.redis.tag -}}
+{{- if .Values.images.redis.digest }}{{- $redisImage = printf "%s@%s" $redisImage .Values.images.redis.digest -}}{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-redis
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ptr-redis
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: ptr-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: {{ $redisImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: PTR_NETWORK_MODE
+              value: cluster
+            - name: REDIS_APP_USER
+              value: {{ $redisUser | quote }}
+            - name: REDIS_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: REDIS_PASSWORD
+            - name: REDIS_KEDA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: REDIS_KEDA_PASSWORD
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              REDIS_APP_PASSWORD_SHA256="$(printf '%s' "$REDIS_APP_PASSWORD" | sha256sum | awk '{print $1}')"
+              REDIS_KEDA_PASSWORD_SHA256="$(printf '%s' "$REDIS_KEDA_PASSWORD" | sha256sum | awk '{print $1}')"
+              cat > /tmp/users.acl <<EOF
+              user default off
+              user ${REDIS_APP_USER} on #${REDIS_APP_PASSWORD_SHA256} allcommands allkeys
+              user keda on #${REDIS_KEDA_PASSWORD_SHA256} +ping +llen ~ptr:turns:*
+              EOF
+              exec redis-server --appendonly yes --maxmemory-policy noeviction --dir /data --aclfile /tmp/users.acl
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "REDISCLI_AUTH=\"$REDIS_APP_PASSWORD\" redis-cli --user \"$REDIS_APP_USER\" ping | grep -q PONG"]
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "REDISCLI_AUTH=\"$REDIS_APP_PASSWORD\" redis-cli --user \"$REDIS_APP_USER\" ping | grep -q PONG"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-ec", "REDISCLI_AUTH=\"$REDIS_APP_PASSWORD\" redis-cli --user \"$REDIS_APP_USER\" ping | grep -q PONG"]
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.data.redis.resources | indent 12 }}
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.data.redis.storage }}
+{{- end }}

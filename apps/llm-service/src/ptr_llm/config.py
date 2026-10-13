@@ -192,13 +192,13 @@ class Settings:
             if db_id not in _allowlist(env, "PTR_LLM_DATABASE_URL_ALLOWLIST"):
                 raise ConfigurationError("DATABASE_URL_NOT_ALLOWED")
         else:
-            allowed = set(_LOOPBACK_HOSTS)
-            allowed.update(
+            allowed_hosts = set(_LOOPBACK_HOSTS)
+            allowed_hosts.update(
                 x.strip()
                 for x in env.get("PTR_LLM_DATABASE_HOST_ALLOWLIST", "").split(",")
                 if x.strip()
             )
-            if db_parsed.hostname not in allowed:
+            if db_parsed.hostname not in allowed_hosts:
                 raise ConfigurationError("DATABASE_HOST_NOT_ALLOWED")
         token = env.get("PTR_LLM_CONTROL_TOKEN", env.get("PTR_LLM_INTERNAL_TOKEN", ""))
         if len(token) < 24 or len(token) > 512 or any(ord(c) < 33 or ord(c) > 126 for c in token):

@@ -7,8 +7,28 @@ import { z } from 'zod';
  * rule id, never a value.
  */
 export interface ConfigProblem {key:string;rule:string}
-/** The proxy's only API target (D7). The synthetic UI (e2e) has its own port, like HOST in auth.ts. */
-export const apiUrl=(env:NodeJS.ProcessEnv=process.env)=>env.PTR_SYNTHETIC_UI==='1'?'http://127.0.0.1:56449':'http://127.0.0.1:56441';
+/** The proxy target is fixed for local mode and explicitly pinned to a service in cluster mode. */
+const clusterMode=(env:NodeJS.ProcessEnv)=>env.PTR_NETWORK_MODE==='cluster'&&!!env.KUBERNETES_SERVICE_HOST;
+const dnsLabel=/^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
+const clusterApiHost=(namespace:string)=>`ptr-api.${namespace}.svc`;
+const clusterApiUrl=(env:NodeJS.ProcessEnv):string|undefined=>{
+  const raw=env.PTR_CLUSTER_API_URL, namespace=env.PTR_CLUSTER_API_NAMESPACE;
+  if(!raw||!namespace||!dnsLabel.test(namespace))return;
+  try {
+    const url=new URL(raw);
+    const host=clusterApiHost(namespace);
+    if(url.protocol!=='http:'||(url.hostname!==host&&url.hostname!==`${host}.cluster.local`)||!url.port||url.username||url.password||url.pathname!=='/'||url.search||url.hash)return;
+    return `${url.protocol}//${url.host}`;
+  }catch{return;}
+};
+export const apiUrl=(env:NodeJS.ProcessEnv=process.env)=>{
+  if(clusterMode(env)){
+    const target=clusterApiUrl(env);
+    if(!target)throw new Error('INVALID_CLUSTER_API_URL');
+    return target;
+  }
+  return env.PTR_SYNTHETIC_UI==='1'?'http://127.0.0.1:56449':'http://127.0.0.1:56441';
+};
 export const blank=(value:string|undefined)=>!value?.trim();
 const REQUIRED=['PTR_API_TOKEN','PTR_SESSION_SECRET','PTR_UI_PASSWORD'] as const;
 const schema=z.object({
@@ -25,12 +45,12 @@ export function webSchemaProblems(env:NodeJS.ProcessEnv):ConfigProblem[] {
 /** PTR_API_URL is no longer read: the constant is used. The same value is a warning, a different one an error (D7). */
 export function apiUrlProblem(env:NodeJS.ProcessEnv):{level:'error'|'warning';problem:ConfigProblem}|undefined {
   if(env.PTR_API_URL===undefined) return;
-  return env.PTR_API_URL===apiUrl(env)?{level:'warning',problem:{key:'PTR_API_URL',rule:'constant_ignored'}}
+  return env.PTR_API_URL===(clusterMode(env)?clusterApiUrl(env):apiUrl(env))?{level:'warning',problem:{key:'PTR_API_URL',rule:'constant_ignored'}}
     :{level:'error',problem:{key:'PTR_API_URL',rule:'api_url_constant'}};
 }
 export function checkWebConfig(env:NodeJS.ProcessEnv):{errors:ConfigProblem[];warnings:ConfigProblem[]} {
   const url=apiUrlProblem(env);
-  return {errors:[...(url?.level==='error'?[url.problem]:[]),...webSchemaProblems(env)],warnings:url?.level==='warning'?[url.problem]:[]};
+  return {errors:[...(url?.level==='error'?[url.problem]:[]),...(clusterMode(env)&&!clusterApiUrl(env)?[{key:'PTR_CLUSTER_API_URL',rule:'cluster_service_required'}]:[]),...webSchemaProblems(env)],warnings:url?.level==='warning'?[url.problem]:[]};
 }
 /** Startup check; skipped while `next build` runs (no secrets there). Throws after one `config_invalid` line. */
 export function registerWebConfig(env:NodeJS.ProcessEnv=process.env,write:(line:string)=>void=line=>console.error(line)):void {

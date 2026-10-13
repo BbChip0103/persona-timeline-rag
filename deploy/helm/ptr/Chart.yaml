@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ptr
+description: Isolated persona timeline research application
+type: application
+version: 0.1.0
+appVersion: "k2"

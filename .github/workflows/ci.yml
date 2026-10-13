@@ -72,6 +72,41 @@ jobs:
           output=$(docker run --rm -e PTR_LLM_SERVICE_MODE=legacy ptr-backend-ci:${{ github.sha }} 2>&1) && exit 1
           test "$output" = 'API_STARTUP_FAILED LEGACY_RUNTIME_NOT_PACKAGED'
 
+  k8s-chart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v4.3.0
+      - name: Install kubeconform v0.8.0
+        run: |
+          install_dir="$RUNNER_TEMP/kubeconform"
+          mkdir -p "$install_dir"
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz -o "$install_dir/kubeconform.tar.gz"
+          echo '9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz' | (cd "$install_dir" && sha256sum -c -)
+          tar -C "$install_dir" -xzf "$install_dir/kubeconform.tar.gz" kubeconform
+          echo "$install_dir" >> "$GITHUB_PATH"
+      - name: Helm lint
+        run: |
+          helm lint deploy/helm/ptr --values deploy/helm/ptr/values-kind.yaml
+          helm lint deploy/helm/ptr --values deploy/helm/ptr/values-prod.yaml
+      - name: Synthetic bootstrap SQL matches the source migrations
+        run: |
+          set -euo pipefail
+          diff -r supabase/migrations deploy/helm/ptr/files/supabase/migrations
+          diff -r supabase/split deploy/helm/ptr/files/supabase/split
+      - name: Kind image prune selection
+        run: bash deploy/kind/test-up-prune.sh
+      - name: Kubernetes schema validation
+        run: |
+          set -euo pipefail
+          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml | kubeconform -strict -summary
+          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-prod.yaml | kubeconform -strict -summary
+
   integration:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04

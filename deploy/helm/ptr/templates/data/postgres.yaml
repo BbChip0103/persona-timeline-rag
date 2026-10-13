@@ -1,0 +1,160 @@
+{{- if .Values.data.enabled }}
+{{- $ns := .Values.namespaces.data -}}
+{{- $secret := .Values.secrets.data.existingSecret -}}
+{{- $pgImage := printf "%s:%s" .Values.images.postgres.repository .Values.images.postgres.tag -}}
+{{- if .Values.images.postgres.digest }}{{- $pgImage = printf "%s@%s" $pgImage .Values.images.postgres.digest -}}{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptr-postgres-init
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: postgres
+data:
+  10-split-init.sh: |
+    #!/bin/sh
+    set -eu
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      -v app_password="$PTR_SPLIT_APP_PASSWORD" \
+      -v llm_password="$PTR_SPLIT_LLM_PASSWORD" <<'SQL'
+    CREATE EXTENSION IF NOT EXISTS vector;
+    CREATE ROLE ptr_split_app LOGIN PASSWORD :'app_password';
+    CREATE ROLE ptr_split_llm LOGIN PASSWORD :'llm_password';
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-postgres
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: postgres
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ptr-postgres
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: ptr-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ $pgImage | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: PTR_NETWORK_MODE
+              value: cluster
+            - name: POSTGRES_USER
+              value: ptr_split_owner
+            - name: POSTGRES_DB
+              value: ptr_split_test
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: POSTGRES_PASSWORD
+            - name: PTR_SPLIT_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_SPLIT_APP_PASSWORD
+            - name: PTR_SPLIT_LLM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: PTR_SPLIT_LLM_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            - postgres
+            - -c
+            - log_statement=none
+            - -c
+            - log_min_error_statement=panic
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "ptr_split_owner", "-d", "ptr_split_test"]
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ptr_split_owner", "-d", "ptr_split_test"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ptr_split_owner", "-d", "ptr_split_test"]
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+{{ toYaml .Values.data.postgres.resources | indent 12 }}
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: postgres-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: postgres-init
+          configMap:
+            name: ptr-postgres-init
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.data.postgres.storage }}
+{{- end }}

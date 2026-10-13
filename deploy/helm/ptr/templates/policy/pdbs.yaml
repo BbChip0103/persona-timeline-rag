@@ -1,0 +1,41 @@
+{{- if gt (int .Values.app.web.replicas) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ptr-web
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: web
+{{- end }}
+{{- if gt (int .Values.app.api.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ptr-api
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+{{- end }}
+{{- if gt (int .Values.app.worker.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ptr-worker
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+{{- end }}

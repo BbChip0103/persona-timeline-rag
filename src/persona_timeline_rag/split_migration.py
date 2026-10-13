@@ -7,11 +7,16 @@ process environments; logs/manifests contain counts and hashes, never source row
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
 import subprocess
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -38,6 +43,53 @@ LEGACY_CHECKPOINTS = (
 
 class MigrationError(Exception):
     """Sanitized failure, safe to display without a database URL."""
+
+
+@dataclass(frozen=True)
+class SplitBootstrapProfile:
+    name: str
+    allowed_hosts: frozenset[str]
+    port: int
+    database: str
+    users: Mapping[str, str]
+    target_error: str
+    connect_attempts: int = 1
+    retry_seconds: float = 0
+    success_message: str = "Synthetic bootstrap + native saver + 6 runtime permission denials PASS"
+
+
+LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE = SplitBootstrapProfile(
+    name="local",
+    allowed_hosts=frozenset({"127.0.0.1"}),
+    port=58432,
+    database="ptr_split_test",
+    users={
+        "OWNER": "ptr_split_owner",
+        "APP": "ptr_split_app",
+        "LLM": "ptr_split_llm",
+    },
+    target_error="SYNTHETIC_RUNTIME_TARGET_REQUIRED",
+)
+
+KIND_SYNTHETIC_BOOTSTRAP_PROFILE = SplitBootstrapProfile(
+    name="kind",
+    allowed_hosts=frozenset(
+        {"ptr-postgres.ptr-data.svc", "ptr-postgres.ptr-data.svc.cluster.local"}
+    ),
+    port=5432,
+    database="ptr_split_test",
+    users={
+        "OWNER": "ptr_split_owner",
+        "APP": "ptr_split_app",
+        "LLM": "ptr_split_llm",
+    },
+    target_error="SYNTHETIC_CLUSTER_TARGET_REQUIRED",
+    connect_attempts=60,
+    retry_seconds=2,
+    success_message=(
+        "Synthetic cluster bootstrap + native saver + 6 runtime permission denials PASS"
+    ),
+)
 
 
 def read_environment(path: Path) -> dict[str, str]:
@@ -222,6 +274,196 @@ def partition(connection: Any, sql_path: Path) -> None:
         if app or llm:
             raise MigrationError("TARGET_ALREADY_PARTITIONED")
         cursor.execute(sql_path.read_text())
+
+
+def _validate_synthetic_bootstrap_url(raw: str, role: str, profile: SplitBootstrapProfile) -> None:
+    target = urlsplit(raw)
+    if not (
+        target.scheme in ("postgres", "postgresql")
+        and target.hostname in profile.allowed_hosts
+        and target.port == profile.port
+        and target.path == f"/{profile.database}"
+        and target.username == profile.users[role]
+        and target.password
+        and not target.query
+        and not target.fragment
+    ):
+        raise RuntimeError(profile.target_error)
+
+
+def _split_bootstrap_sql(sql_root: Path) -> tuple[list[Path], list[Path]]:
+    migrations = sorted((sql_root / "migrations").glob("*.sql"))
+    split_files = sorted((sql_root / "split").glob("*.sql"))
+    if not migrations or not split_files or split_files[0].name != "0001_owner_partition.sql":
+        raise RuntimeError("SPLIT_BOOTSTRAP_SQL_REQUIRED")
+    return migrations, split_files
+
+
+def _seed_synthetic_split_fixture(db: Any) -> None:
+    persona = {
+        "id": "synthetic-split-persona",
+        "personId": "synthetic-split-person",
+        "label": "Synthetic Split",
+        "language": "ko",
+        "revision": "synthetic-v1",
+        "reviewStatus": "synthetic",
+        "identity": "A fictional synthetic test character, not a real person.",
+        "concept": "Synthetic split regression",
+        "style": ["brief polite Korean"],
+        "boundaries": ["No private biography"],
+        "sourceRefs": [],
+        "greeting": "안녕하세요. 합성 캐릭터입니다.",
+    }
+    post = {
+        "id": "synthetic-split-source",
+        "personId": persona["personId"],
+        "caption": "합성 파란책 기록: 가상의 파란 책을 읽었어요.",
+        "postedAt": "2024-03-05T09:00:00Z",
+        "eventDate": None,
+        "sourceUrl": "https://example.com/synthetic/split/1",
+        "hash": "synthetic-split-hash",
+        "snapshot": "synthetic-v1",
+        "unsafe": False,
+    }
+
+    def encode(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    db.execute(
+        "INSERT INTO personas VALUES(%s,%s,%s)",
+        (persona["id"], persona["personId"], persona["revision"]),
+    )
+    document = encode(persona)
+    db.execute(
+        "INSERT INTO persona_versions(persona_id,revision,document,content_hash) "
+        "VALUES(%s,%s,%s,%s)",
+        (
+            persona["id"],
+            persona["revision"],
+            document,
+            hashlib.sha256(document.encode()).hexdigest(),
+        ),
+    )
+    document = encode(post)
+    db.execute(
+        "INSERT INTO source_posts(id,person_id,posted_at,event_date,caption,unsafe,"
+        "source_url,snapshot,source_hash,content_hash,origin,document) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (
+            post["id"],
+            post["personId"],
+            post["postedAt"],
+            None,
+            post["caption"],
+            False,
+            post["sourceUrl"],
+            post["snapshot"],
+            post["hash"],
+            hashlib.sha256(document.encode()).hexdigest(),
+            "synthetic_fixture",
+            document,
+        ),
+    )
+
+
+def _default_setup_checkpoints(owner_url: str) -> Any:
+    from ptr_llm.providers.checkpoints import setup_call_checkpoints
+
+    return setup_call_checkpoints(owner_url)
+
+
+async def _await_setup_result(result: Awaitable[Any]) -> Any:
+    return await result
+
+
+def bootstrap_synthetic_split_database(
+    env: Mapping[str, str],
+    *,
+    sql_root: Path,
+    profile: SplitBootstrapProfile,
+    connect: Callable[..., Any] | None = None,
+    driver: Any | None = None,
+    setup_checkpoints: Callable[[str], Any] | None = None,
+    partition_fn: Callable[[Any, Path], None] = partition,
+    stage_callback: Callable[[str], None] | None = None,
+) -> str:
+    """Initialize the synthetic split database and verify runtime role boundaries."""
+    driver = driver or _driver()
+    connect = connect or driver.connect
+    setup_checkpoints = setup_checkpoints or _default_setup_checkpoints
+
+    for role in profile.users:
+        _validate_synthetic_bootstrap_url(env[f"PTR_SPLIT_TEST_{role}_DATABASE_URL"], role, profile)
+
+    migrations, split_files = _split_bootstrap_sql(sql_root)
+    owner_url = env["PTR_SPLIT_TEST_OWNER_DATABASE_URL"]
+    db = None
+    last_error: Exception | None = None
+    for _ in range(profile.connect_attempts):
+        if stage_callback:
+            stage_callback("database_connect")
+        try:
+            db = connect(owner_url, autocommit=True)
+            break
+        except driver.OperationalError as exc:
+            last_error = exc
+            if profile.retry_seconds:
+                time.sleep(profile.retry_seconds)
+    if db is None:
+        raise RuntimeError("SYNTHETIC_POSTGRES_UNAVAILABLE") from last_error
+
+    with db:
+        if stage_callback:
+            stage_callback("empty_target_check")
+        if db.execute("SELECT current_database(),current_user").fetchone() != (
+            profile.database,
+            profile.users["OWNER"],
+        ):
+            raise RuntimeError("SYNTHETIC_OWNER_IDENTITY_REQUIRED")
+        tables = db.execute(
+            "SELECT COUNT(*) FROM pg_tables WHERE schemaname IN ('app','llm') "
+            "OR (schemaname='public' AND tablename<>'spatial_ref_sys')"
+        ).fetchone()
+        if tables is None or tables[0]:
+            raise RuntimeError("EMPTY_TARGET_REQUIRED")
+        for path in migrations:
+            if stage_callback:
+                stage_callback(path.name)
+            db.execute(path.read_text())
+        _seed_synthetic_split_fixture(db)
+        if stage_callback:
+            stage_callback("owner_partition")
+        partition_fn(db, split_files[0])
+        for path in split_files[1:]:
+            if stage_callback:
+                stage_callback(path.name)
+            db.execute(path.read_text())
+
+    if stage_callback:
+        stage_callback("native_checkpoints")
+    setup_result = setup_checkpoints(owner_url)
+    if inspect.isawaitable(setup_result):
+        asyncio.run(_await_setup_result(setup_result))
+
+    for role, schema, other, own, foreign in [
+        ("APP", "app", "llm", "sessions", "personas"),
+        ("LLM", "llm", "app", "personas", "sessions"),
+    ]:
+        if stage_callback:
+            stage_callback(f"permission_{role.lower()}")
+        with connect(env[f"PTR_SPLIT_TEST_{role}_DATABASE_URL"], autocommit=True) as db:
+            db.execute(f"SELECT COUNT(*) FROM {schema}.{own}")
+            for query in [
+                f"SELECT * FROM {other}.{foreign}",
+                f"CREATE TABLE {schema}.forbidden_ddl(id int)",
+                "CREATE SCHEMA forbidden_schema",
+            ]:
+                try:
+                    db.execute(query)
+                except driver.errors.InsufficientPrivilege:
+                    continue
+                raise RuntimeError("RUNTIME_PERMISSION_BOUNDARY_FAILED")
+    return profile.success_message
 
 
 def migrate(source_url: str, target_url: str, directory: Path, sql_path: Path) -> dict[str, Any]:

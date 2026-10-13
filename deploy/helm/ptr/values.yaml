@@ -1,0 +1,90 @@
+# Images are overridden with unique local tags by deploy/kind/up.sh.
+images:
+  backend:
+    repository: ptr-backend
+    tag: k2
+    pullPolicy: IfNotPresent
+  worker:
+    repository: ptr-worker
+    tag: k2
+    pullPolicy: IfNotPresent
+  postgres:
+    repository: pgvector/pgvector
+    digest: sha256:94aee7e88f98125114657cab98e28c5dfa8dd517a6bf83fd98b503439f1e3de6
+    tag: 0.8.1-pg15
+  redis:
+    repository: redis
+    digest: sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    tag: 7.4.5-alpine
+
+namespaces:
+  # Provisioned before chart install so existing Secrets can be created safely.
+  create: false
+  app: ptr-app
+  data: ptr-data
+
+app:
+  web:
+    replicas: 2
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+  api:
+    replicas: 2
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+  worker:
+    replicas: 1
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "2", memory: 2Gi}
+
+data:
+  enabled: false
+  postgres:
+    storage: 2Gi
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+  redis:
+    storage: 1Gi
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+
+# These names refer to preexisting Secrets. No chart template creates credentials.
+secrets:
+  api: {existingSecret: ptr-api}
+  worker: {existingSecret: ptr-worker}
+  maintenance: {existingSecret: ptr-maintenance}
+  personas: {existingSecret: ptr-personas}
+  data: {existingSecret: ptr-data}
+
+network:
+  postgres:
+    host: ptr-postgres.ptr-data.svc
+    port: 5432
+    scheme: postgresql
+    database: ptr_split_test
+  redis:
+    host: ptr-redis.ptr-data.svc
+    port: 6379
+    scheme: redis
+    username: ptr
+  api:
+    url: http://ptr-api.ptr-app.svc:56441
+  worker:
+    url: http://ptr-worker.ptr-app.svc:58442
+
+policy:
+  # policy.enabled controls all NetworkPolicy resources rendered by this chart.
+  # Set false only in clusters where another policy layer enforces equivalent boundaries.
+  enabled: true
+  # policy.gateway identifies the ingress-controller namespace allowed to reach ptr-web.
+  # Kubernetes injects the immutable kubernetes.io/metadata.name label on every namespace.
+  gateway:
+    namespace: gateway
+  managedData:
+    postgres: {cidrs: []}
+    redis: {cidrs: []}

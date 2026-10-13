@@ -1,0 +1,6 @@
+data:
+  enabled: true
+app:
+  web: {replicas: 2}
+  api: {replicas: 2}
+  worker: {replicas: 2}

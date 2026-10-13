@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-api
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 56441
+      targetPort: http

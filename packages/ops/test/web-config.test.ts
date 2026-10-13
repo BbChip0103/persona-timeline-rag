@@ -45,3 +45,16 @@ test('PTR_API_URL: the constant warns, anything else fails; the synthetic UI kee
   expect(apiUrl({PTR_SYNTHETIC_UI:'1'})).toBe('http://127.0.0.1:56449');
   expect(checkWebConfig({...valid,PTR_SYNTHETIC_UI:'1',PTR_API_URL:'http://127.0.0.1:56449'})).toEqual({errors:[],warnings:[{key:'PTR_API_URL',rule:'constant_ignored'}]});
 });
+
+test('cluster web accepts only an explicit in-cluster API target',()=>{
+  const cluster={...valid,PTR_NETWORK_MODE:'cluster',KUBERNETES_SERVICE_HOST:'10.0.0.1',PTR_CLUSTER_API_NAMESPACE:'ptr-app'};
+  expect(checkWebConfig(cluster).errors).toContainEqual({key:'PTR_CLUSTER_API_URL',rule:'cluster_service_required'});
+  expect(checkWebConfig({...cluster,PTR_CLUSTER_API_URL:'https://external.example:443'}).errors).toContainEqual({key:'PTR_CLUSTER_API_URL',rule:'cluster_service_required'});
+  const target='http://ptr-api.ptr-app.svc:56441';
+  expect(apiUrl({...cluster,PTR_CLUSTER_API_URL:target})).toBe(target);
+  expect(checkWebConfig({...cluster,PTR_CLUSTER_API_URL:target}).errors).toEqual([]);
+  expect(checkWebConfig({...cluster,PTR_CLUSTER_API_URL:'http://ptr-api.ptr-app.svc.cluster.local:56441'}).errors).toEqual([]);
+  expect(checkWebConfig({...cluster,PTR_CLUSTER_API_URL:'http://ptr-api.other.svc:56441'}).errors).toContainEqual({key:'PTR_CLUSTER_API_URL',rule:'cluster_service_required'});
+  expect(checkWebConfig({...cluster,PTR_CLUSTER_API_URL:'http://evil.ptr-app.svc:56441'}).errors).toContainEqual({key:'PTR_CLUSTER_API_URL',rule:'cluster_service_required'});
+  expect(apiUrl({PTR_CLUSTER_API_URL:'http://evil.ptr-app.svc:56441'})).toBe('http://127.0.0.1:56441');
+});

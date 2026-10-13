@@ -26,6 +26,8 @@ export const ENV_REGISTRY:Readonly<Record<string,EnvEntry>>={
     'PTR_CLUSTER_DATABASE_URL_ALLOWLIST','PTR_CLUSTER_DATABASE_IDENTITIES',
     'PTR_CLUSTER_HTTP_URL_ALLOWLIST'],production('api')),
   PTR_CLUSTER_REDIS_URL_ALLOWLIST:production('api','web'),
+  PTR_CLUSTER_API_NAMESPACE:production('web'),
+  PTR_CLUSTER_API_URL:production('web'),
   PTR_WEB_REDIS_URL:production('web'),
   ...each(['PTR_LLM_HOST','PTR_LLM_REDIS_URL_ALLOWLIST','PTR_LLM_BACKEND_URL_ALLOWLIST',
     'PTR_LLM_DATABASE_URL_ALLOWLIST'],production('worker')),

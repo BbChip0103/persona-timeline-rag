@@ -1,19 +1,27 @@
 """Synthetic bootstrap must provision the native saver before testing runtime roles."""
 
-import importlib.util
 import sys
 from pathlib import Path
 
-import psycopg
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-SPEC = importlib.util.spec_from_file_location(
-    "split_bootstrap", ROOT / "scripts/split-bootstrap.py"
+sys.path.insert(0, str(ROOT / "src"))
+
+from persona_timeline_rag.split_migration import (  # noqa: E402
+    LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
+    SplitBootstrapProfile,
+    bootstrap_synthetic_split_database,
 )
-assert SPEC and SPEC.loader
-bootstrap = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(bootstrap)
+
+
+class FakeInsufficientPrivilege(Exception):
+    pass
+
+
+class FakeDriver:
+    class errors:
+        InsufficientPrivilege = FakeInsufficientPrivilege
 
 
 def environment():
@@ -37,7 +45,7 @@ class Connection:
         self.last_sql = sql
         self.events.append(sql)
         if "forbidden" in sql or sql.startswith("SELECT * FROM"):
-            raise psycopg.errors.InsufficientPrivilege("synthetic denial")
+            raise FakeInsufficientPrivilege("synthetic denial")
         return self
 
     def fetchone(self):
@@ -47,45 +55,49 @@ class Connection:
 
 
 @pytest.fixture
-def configured(monkeypatch):
+def configured(tmp_path):
     env, events = environment(), []
-    monkeypatch.setattr(sys, "argv", ["split-bootstrap", "--roles-env", "synthetic-only.env"])
-    monkeypatch.setattr(bootstrap, "read_environment", lambda _: env)
-    monkeypatch.setattr(bootstrap, "partition", lambda db, path: events.append(path.name))
+    sql_root = tmp_path / "supabase"
+    (sql_root / "migrations").mkdir(parents=True)
+    (sql_root / "split").mkdir()
+    for directory, names in {
+        "migrations": ["002.sql", "001.sql"],
+        "split": ["0002_receipt_scope.sql", "0001_owner_partition.sql", "0003_post_summaries.sql"],
+    }.items():
+        for name in names:
+            (sql_root / directory / name).write_text(f"-- {directory}/{name}\n")
 
     async def setup(url):
         assert url == env["PTR_SPLIT_TEST_OWNER_DATABASE_URL"]
         events.append("native-saver-setup")
 
-    # Require a real imported owner setup surface, not another TS saver wrapper.
-    import ptr_llm.providers.checkpoints as checkpoints
-
-    monkeypatch.setattr(checkpoints, "setup_call_checkpoints", setup)
-    monkeypatch.setattr(
-        bootstrap.psycopg,
-        "connect",
-        lambda url, **kwargs: Connection(events, owner="ptr_split_owner:" in url),
-    )
-    return env, events
+    return env, events, sql_root, setup
 
 
 def test_bootstrap_applies_split_upgrades_then_native_saver_before_runtime_probes(configured):
-    _, events = configured
-    bootstrap.main()
+    env, events, sql_root, setup = configured
+    bootstrap_synthetic_split_database(
+        env,
+        sql_root=sql_root,
+        profile=LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
+        connect=lambda url, **kwargs: Connection(events, owner="ptr_split_owner:" in url),
+        driver=FakeDriver,
+        setup_checkpoints=setup,
+        partition_fn=lambda db, path: events.append(path.name),
+    )
     partition_at = events.index("0001_owner_partition.sql")
     native_at = events.index("native-saver-setup")
-    scope_at = next(i for i, sql in enumerate(events) if "split/0002_receipt_scope.sql" in sql)
-    summary_at = next(i for i, sql in enumerate(events) if "split/0003_post_summaries.sql" in sql)
-    budget_at = next(
-        i for i, sql in enumerate(events) if "split/0004_cumulative_budget_cap.sql" in sql
-    )
-    artifact_at = next(
-        i for i, sql in enumerate(events) if "split/0005_generated_artifacts.sql" in sql
+    migration_1_at = next(i for i, sql in enumerate(events) if "-- migrations/001.sql" in sql)
+    migration_2_at = next(i for i, sql in enumerate(events) if "-- migrations/002.sql" in sql)
+    scope_at = next(i for i, sql in enumerate(events) if "-- split/0002_receipt_scope.sql" in sql)
+    summary_at = next(
+        i for i, sql in enumerate(events) if "-- split/0003_post_summaries.sql" in sql
     )
     runtime_at = next(
         i for i, sql in enumerate(events) if "SELECT COUNT(*) FROM app.sessions" in sql
     )
-    assert partition_at < scope_at < summary_at < budget_at < artifact_at < native_at < runtime_at
+    assert migration_1_at < migration_2_at < partition_at
+    assert partition_at < scope_at < summary_at < native_at < runtime_at
 
 
 @pytest.mark.parametrize(
@@ -99,35 +111,85 @@ def test_bootstrap_applies_split_upgrades_then_native_saver_before_runtime_probe
     ],
 )
 def test_bootstrap_rejects_runtime_target_mismatch_before_owner_connection(
-    configured, monkeypatch, changed
+    configured, changed
 ):
-    env, _ = configured
+    env, _, sql_root, setup = configured
     env["PTR_SPLIT_TEST_APP_DATABASE_URL"] = changed
-    monkeypatch.setattr(bootstrap.psycopg, "connect", lambda *a, **k: pytest.fail("DB opened"))
     with pytest.raises(RuntimeError, match="SYNTHETIC_RUNTIME_TARGET_REQUIRED"):
-        bootstrap.main()
+        bootstrap_synthetic_split_database(
+            env,
+            sql_root=sql_root,
+            profile=LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
+            connect=lambda *a, **k: pytest.fail("DB opened"),
+            driver=FakeDriver,
+            setup_checkpoints=setup,
+        )
 
 
-def test_bootstrap_refuses_existing_target_without_ddl_or_setup(configured, monkeypatch):
-    _, events = configured
-    monkeypatch.setattr(
-        bootstrap.psycopg,
-        "connect",
-        lambda *a, **k: Connection(events, owner=True, populated=True),
-    )
+def test_bootstrap_refuses_existing_target_without_ddl_or_setup(configured):
+    env, events, sql_root, setup = configured
     with pytest.raises(RuntimeError, match="EMPTY_TARGET_REQUIRED"):
-        bootstrap.main()
+        bootstrap_synthetic_split_database(
+            env,
+            sql_root=sql_root,
+            profile=LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
+            connect=lambda *a, **k: Connection(events, owner=True, populated=True),
+            driver=FakeDriver,
+            setup_checkpoints=setup,
+        )
     assert len(events) == 2
 
 
-def test_bootstrap_rejects_connected_owner_identity_before_ddl(configured, monkeypatch):
-    _, events = configured
+def test_bootstrap_rejects_connected_owner_identity_before_ddl(configured):
+    env, events, sql_root, setup = configured
 
     class Foreign(Connection):
         def fetchone(self):
             return ("ptr_split_research", "ptr_split_owner")
 
-    monkeypatch.setattr(bootstrap.psycopg, "connect", lambda *a, **k: Foreign(events, owner=True))
     with pytest.raises(RuntimeError, match="SYNTHETIC_OWNER_IDENTITY_REQUIRED"):
-        bootstrap.main()
+        bootstrap_synthetic_split_database(
+            env,
+            sql_root=sql_root,
+            profile=LOCAL_SYNTHETIC_BOOTSTRAP_PROFILE,
+            connect=lambda *a, **k: Foreign(events, owner=True),
+            driver=FakeDriver,
+            setup_checkpoints=setup,
+        )
     assert events == ["SELECT current_database(),current_user"]
+
+
+def test_kind_profile_requires_the_pinned_service_target(configured):
+    env, _, sql_root, setup = configured
+    profile = SplitBootstrapProfile(
+        name="kind",
+        allowed_hosts=frozenset(
+            {"ptr-postgres.ptr-data.svc", "ptr-postgres.ptr-data.svc.cluster.local"}
+        ),
+        port=5432,
+        database="ptr_split_test",
+        users={
+            "OWNER": "ptr_split_owner",
+            "APP": "ptr_split_app",
+            "LLM": "ptr_split_llm",
+        },
+        target_error="SYNTHETIC_CLUSTER_TARGET_REQUIRED",
+    )
+    env["PTR_SPLIT_TEST_OWNER_DATABASE_URL"] = (
+        "postgresql://ptr_split_owner:synthetic@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
+    )
+    env["PTR_SPLIT_TEST_APP_DATABASE_URL"] = (
+        "postgresql://ptr_split_app:synthetic@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
+    )
+    env["PTR_SPLIT_TEST_LLM_DATABASE_URL"] = (
+        "postgresql://ptr_split_llm:synthetic@other-service.ptr-data.svc:5432/ptr_split_test"
+    )
+    with pytest.raises(RuntimeError, match="SYNTHETIC_CLUSTER_TARGET_REQUIRED"):
+        bootstrap_synthetic_split_database(
+            env,
+            sql_root=sql_root,
+            profile=profile,
+            connect=lambda *a, **k: pytest.fail("DB opened"),
+            driver=FakeDriver,
+            setup_checkpoints=setup,
+        )

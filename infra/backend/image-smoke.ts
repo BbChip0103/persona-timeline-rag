@@ -2,10 +2,14 @@
 import assert from 'node:assert/strict';
 import { readdirSync, existsSync } from 'node:fs';
 import { createApiApplication } from '../../apps/api/src/app';
+import { apiBindHost } from '../../apps/api/src/bind-host';
+import { createSplitRuntime } from '../../apps/api/src/split-runtime';
 import type { SplitApiRuntime } from '../../apps/api/src/split-runtime';
 
 async function main() {
   assert.equal(process.getuid?.(), 900);
+  assert.equal(apiBindHost('0.0.0.0'), '0.0.0.0');
+  assert.equal(typeof createSplitRuntime, 'function');
   const forbidden = /(?:langchain|langfuse|(?:^|\/)openai(?:@|\/)|litellm)/i;
   assert.equal(readdirSync('/app/node_modules/.pnpm').filter(name => forbidden.test(name)).length, 0);
   for (const path of ['data', 'reports', 'packages/providers', 'apps/llm-service', 'apps/api/src/runtime.ts', 'apps/api/src/worker.ts']) {

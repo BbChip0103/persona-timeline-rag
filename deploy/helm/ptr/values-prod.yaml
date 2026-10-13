@@ -1,0 +1,30 @@
+# Template-only profile. External Secrets must provision the named Secrets.
+data:
+  enabled: false
+app:
+  web: {replicas: 2}
+  api: {replicas: 2}
+secrets:
+  api: {existingSecret: ptr-api}
+  worker: {existingSecret: ptr-worker}
+  maintenance: {existingSecret: ptr-maintenance}
+  personas: {existingSecret: ptr-personas}
+network:
+  postgres:
+    host: postgres.example.invalid
+    port: 5432
+    scheme: postgresql
+    database: ptr_split_research
+  redis:
+    host: redis.example.invalid
+    port: 6379
+    scheme: rediss
+    username: ptr
+policy:
+  managedData:
+    postgres:
+      # Documentation placeholder only: TEST-NET-1, replace with managed Postgres CIDRs.
+      cidrs: ["192.0.2.0/24"]
+    redis:
+      # Documentation placeholder only: TEST-NET-2, replace with managed Redis CIDRs.
+      cidrs: ["198.51.100.0/24"]

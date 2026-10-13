@@ -1,0 +1,194 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptr-api
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.app.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: api
+        ptr.network/role: app
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 900
+        runAsGroup: 2000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-schema
+          image: "{{ .Values.images.worker.repository }}:{{ .Values.images.worker.tag }}"
+          imagePullPolicy: {{ .Values.images.worker.pullPolicy }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import os
+              import sys
+              import time
+              import psycopg
+              deadline = time.monotonic() + 180
+              while time.monotonic() < deadline:
+                  try:
+                      with psycopg.connect(os.environ["PTR_APP_DATABASE_URL"], connect_timeout=3) as db:
+                          row = db.execute("SELECT to_regclass('app.generated_artifacts')").fetchone()
+                          if row and row[0] is not None:
+                              sys.exit(0)
+                  except psycopg.Error:
+                      pass
+                  print("waiting for split schema", flush=True)
+                  time.sleep(2)
+              raise SystemExit("SCHEMA_READY_TIMEOUT")
+          env:
+            - name: PTR_APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_APP_DATABASE_URL
+            - name: PYTHONPYCACHEPREFIX
+              value: /tmp/pycache
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 900
+            runAsGroup: 2000
+          resources:
+            {{- toYaml .Values.app.api.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: api
+          image: "{{ .Values.images.backend.repository }}:{{ .Values.images.backend.tag }}"
+          imagePullPolicy: {{ .Values.images.backend.pullPolicy }}
+          command: ["node", "--import", "tsx", "apps/api/src/packaged-main.ts"]
+          ports:
+            - name: http
+              containerPort: 56441
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/.cache
+            - name: PTR_NETWORK_MODE
+              value: cluster
+            - name: PTR_LLM_SERVICE_MODE
+              value: split
+            - name: PTR_API_HOST
+              value: 0.0.0.0
+            - name: PTR_API_PORT
+              value: "56441"
+            - name: PTR_LLM_SERVICE_URL
+              value: {{ .Values.network.worker.url | quote }}
+            - name: PTR_CLUSTER_HTTP_URL_ALLOWLIST
+              value: {{ .Values.network.worker.url | quote }}
+            - name: PTR_CLUSTER_DATABASE_URL_ALLOWLIST
+              value: "{{ .Values.network.postgres.scheme }}://{{ .Values.network.postgres.host }}:{{ .Values.network.postgres.port }}"
+            - name: PTR_CLUSTER_DATABASE_IDENTITIES
+              value: "{{ .Values.network.postgres.database }}:ptr_split_app"
+            - name: PTR_CLUSTER_REDIS_URL_ALLOWLIST
+              value: "{{ .Values.network.redis.scheme }}://{{ .Values.network.redis.username }}@{{ .Values.network.redis.host }}:{{ .Values.network.redis.port }}"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_APP_DATABASE_URL
+            - name: PTR_APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_APP_DATABASE_URL
+            - name: PTR_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_REDIS_URL
+            - name: PTR_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_API_TOKEN
+            - name: PTR_API_SYNTHETIC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_API_SYNTHETIC_TOKEN
+            - name: PTR_LLM_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.api.existingSecret }}
+                  key: PTR_LLM_CONTROL_TOKEN
+            - name: PTR_CHAT_PROVIDER
+              value: fake
+            - name: PTR_TURN_QUEUE
+              value: turns
+            - name: PTR_EVENTS_NAMESPACE
+              value: events
+            - name: PTR_DB_POOL_MAX
+              value: "8"
+            - name: PTR_QUEUE_MAX_DEPTH
+              value: "256"
+            - name: PTR_DISPATCH_GRACE_MS
+              value: "200"
+            - name: PTR_DISPATCH_INTERVAL_MS
+              value: "1000"
+          livenessProbe:
+            httpGet:
+              path: /api/livez
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /api/livez
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.app.api.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

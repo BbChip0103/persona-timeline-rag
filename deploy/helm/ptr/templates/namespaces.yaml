@@ -1,0 +1,17 @@
+{{- if .Values.namespaces.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.app }}
+  labels:
+    ptr.io/namespace: app
+---
+{{- if .Values.data.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.data }}
+  labels:
+    ptr.io/namespace: data
+{{- end }}
+{{- end }}

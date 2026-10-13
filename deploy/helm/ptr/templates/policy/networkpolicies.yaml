@@ -1,0 +1,457 @@
+{{- $appNs := .Values.namespaces.app -}}
+{{- $dataNs := .Values.namespaces.data -}}
+{{- $apiPort := 56441 -}}
+{{- $workerPort := 58442 -}}
+{{- $webPort := 56440 -}}
+{{- $postgresPort := int (default 5432 .Values.network.postgres.port) -}}
+{{- $redisPort := int (default 6379 .Values.network.redis.port) -}}
+{{- $gateway := default dict .Values.policy.gateway -}}
+{{- $gatewayNamespace := default "gateway" $gateway.namespace -}}
+{{- $pgCidrs := default (list) .Values.policy.managedData.postgres.cidrs -}}
+{{- $redisCidrs := default (list) .Values.policy.managedData.redis.cidrs -}}
+{{- if and (not .Values.data.enabled) (or (not $pgCidrs) (not $redisCidrs)) }}
+{{- fail "policy.managedData.postgres.cidrs and policy.managedData.redis.cidrs must both be set when data.enabled=false" }}
+{{- end }}
+{{- if ne .Values.policy.enabled false }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-app-default-deny
+  namespace: {{ $appNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-app-allow-dns
+  namespace: {{ $appNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-web-ingress
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: web
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $gatewayNamespace }}
+      ports:
+        - {protocol: TCP, port: {{ $webPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-web-to-api
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: web
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+      ports:
+        - {protocol: TCP, port: {{ $apiPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-api-ingress
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: web
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+      ports:
+        - {protocol: TCP, port: {{ $apiPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-api-to-worker
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+      ports:
+        - {protocol: TCP, port: {{ $workerPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-ingress
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+      ports:
+        - {protocol: TCP, port: {{ $workerPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-api
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+      ports:
+        - {protocol: TCP, port: {{ $apiPort }}}
+{{- if .Values.data.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-api-to-data
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $dataNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: postgres
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $dataNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: redis
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-data
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $dataNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: postgres
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $dataNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: redis
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-web-to-redis
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: web
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $dataNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: redis
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-data-default-deny
+  namespace: {{ $dataNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-data-allow-dns
+  namespace: {{ $dataNs }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-bootstrap-to-postgres
+  namespace: {{ $dataNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: bootstrap
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: postgres
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-postgres-ingress
+  namespace: {{ $dataNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: bootstrap
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-redis-ingress
+  namespace: {{ $dataNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $appNs }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: web
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+{{- else }}
+{{- if or $pgCidrs $redisCidrs }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-api-to-managed-data
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+  policyTypes: [Egress]
+  egress:
+{{- range $pgCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+{{- end }}
+{{- range $redisCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+{{- end }}
+{{- if $redisCidrs }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-web-to-managed-redis
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: web
+  policyTypes: [Egress]
+  egress:
+{{- range $redisCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+{{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-managed-data
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+{{- range $pgCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+{{- end }}
+{{- range $redisCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: {{ $redisPort }}}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
