@@ -32,12 +32,17 @@ test('final image copies the narrow split sources, never builder dependencies or
 test('deployment gives Nest only generated artifacts and Python a separate read-only corpus', () => {
   const compose = read('infra/compose.app.yml');
   const backendMount = compose.split('x-data: &data')[1]!.split('services:')[0]!;
-  expect(backendMount).toContain('source: ../data/generated');
-  expect(backendMount).not.toMatch(/source: \.\.\/data\s*\n/);
+  expect(backendMount).toContain('source: ${PTR_OPERATIONAL_DATA_DIR:-../data}/generated');
+  expect(backendMount).not.toMatch(/source: \$\{PTR_OPERATIONAL_DATA_DIR:-\.\.\/data\}\r?$/m);
+  expect(backendMount).toContain('target: /app/data/generated');
+  expect(backendMount).toContain('read_only: true');
+  expect(backendMount).toContain('create_host_path: false');
   const worker = compose.split('  worker:')[1]!.split('  web:')[0]!;
   expect(worker).toContain('PTR_LLM_SERVICE_ENV_FILE:?');
-  expect(worker).toContain('source: ../data\n');
+  expect(worker).toContain('source: ${PTR_OPERATIONAL_DATA_DIR:-../data}\n');
+  expect(worker).toContain('target: /app/data\n');
   expect(worker).toContain('read_only: true');
+  expect(worker).toContain('create_host_path: false');
 });
 
 test.each([
