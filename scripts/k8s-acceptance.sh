@@ -260,6 +260,9 @@ parts = {
     "readyStart": host.get("readyStart", "unknown"),
     "desiredPeak60": host.get("desiredPeakWithin60sAfterSubmit", "unknown"),
     "readyPeak60": host.get("readyPeakWithin60sAfterSubmit", "unknown"),
+    "expectedWorkerCap": host.get("expectedWorkerCap", "unknown"),
+    "workerCapObserved": host.get("workerCapObserved", "unknown"),
+    "workerCapReached": host.get("workerCapReached", "unknown"),
     "desiredFinal": host.get("desiredFinal", "unknown"),
     "readyFinal": host.get("readyFinal", "unknown"),
     "activeHold": host.get("activeHoldPassed", "unknown"),
@@ -275,8 +278,9 @@ passed = (
     and int(result.get("duplicateCompletionRows", -1)) == 0
     and int(host.get("desiredStart") or 0) == 2
     and int(host.get("readyStart") or 0) == 2
-    and int(host.get("desiredPeakWithin60sAfterSubmit") or 0) >= 6
-    and int(host.get("readyPeakWithin60sAfterSubmit") or 0) >= 6
+    and host.get("expectedWorkerCap") == 3
+    and host.get("workerCapObserved") is True
+    and host.get("workerCapReached") is True
     and int(host.get("desiredFinal") or 0) == 2
     and int(host.get("readyFinal") or 0) == 2
     and host.get("activeHoldPassed") is True

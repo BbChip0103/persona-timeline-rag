@@ -154,15 +154,15 @@ jobs:
             local rendered
             rendered="$RUNNER_TEMP/${release}-${namespace}-$(basename "$values").yaml"
             helm template "$release" "$chart" --namespace "$namespace" --values "$values" > "$rendered"
-            kubeconform -strict -summary -skip InferencePool,ScaledObject,TriggerAuthentication,ServiceMonitor -schema-location default "$rendered"
+            kubeconform -strict -summary -skip InferencePool,ScaledObject,TriggerAuthentication,ClusterTriggerAuthentication,ServiceMonitor -schema-location default "$rendered"
             for expected in "$@"; do
               local kind="${expected%%:*}"
               local schema="${expected#*:}"
               validate_crd_kind "$rendered" "$kind" "$schema"
             done
           }
-          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-kind.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor
-          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-prod.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor
+          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-kind.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ClusterTriggerAuthentication ServiceMonitor
+          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-prod.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ClusterTriggerAuthentication ServiceMonitor
           validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-kind.yaml ServiceMonitor
           validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-prod.yaml ServiceMonitor
 

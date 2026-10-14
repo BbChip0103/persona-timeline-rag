@@ -172,6 +172,23 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: ptr-kube-state-metrics-ingress
+  namespace: ptr-monitoring
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kube-state-metrics}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: ptr-prometheus-operator-monitoring-ingress
   namespace: ptr-monitoring
 spec:

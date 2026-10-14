@@ -41,6 +41,27 @@ def response(model, **overrides):
     }
 
 
+class DeadlineLedger(MemoryBudgetLedger):
+    def __init__(self, *, slow_step: str, advance):
+        super().__init__()
+        self.slow_step = slow_step
+        self.advance = advance
+
+    async def reserve(self, *args, **kwargs):
+        value = await super().reserve(*args, **kwargs)
+        if self.slow_step == "reserve":
+            await asyncio.sleep(0)
+            self.advance()
+        return value
+
+    async def submitted(self, *args, **kwargs):
+        value = await super().submitted(*args, **kwargs)
+        if self.slow_step == "submitted":
+            await asyncio.sleep(0)
+            self.advance()
+        return value
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -438,6 +459,91 @@ async def test_ambiguous_http_4xx_without_explicit_zero_cost_stays_unknown():
         await client.generate([{"role": "user", "content": "synthetic"}], request_key="synthetic")
     assert len(calls) == 1
     await client.aclose()
+
+
+@pytest.mark.parametrize("slow_step", ["reserve", "submitted"])
+async def test_deadline_crossed_during_ledger_never_submits_native_chat(
+    monkeypatch, slow_step
+):
+    calls = []
+    now = 1_000_000.0
+    deadline_at = now * 1000 + 500
+
+    def fake_time():
+        return now
+
+    def advance_past_deadline():
+        nonlocal now
+        now += 1
+
+    def fail_network(request):
+        calls.append(request)
+        pytest.fail("No network")
+
+    import time
+
+    monkeypatch.setattr(time, "time", fake_time)
+    ledger = DeadlineLedger(slow_step=slow_step, advance=advance_past_deadline)
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=ledger,
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(fail_network),
+    )
+    client._text_verified = True
+    client.structured_outputs = True
+    try:
+        with pytest.raises(ProviderError, match="PROVIDER_DEADLINE"):
+            await client.generate(
+                [{"role": "user", "content": "synthetic"}],
+                request_key=f"synthetic-{slow_step}",
+                deadline_at=deadline_at,
+            )
+        assert calls == []
+        receipt = next(iter(ledger.requests.values()))
+        assert receipt.state == "settled"
+        assert receipt.actual_microusd == 0
+    finally:
+        await client.aclose()
+
+
+async def test_paid_http_503_keeps_unknown_no_resubmit_and_hides_private_error(caplog):
+    caplog.set_level(logging.DEBUG)
+    calls = []
+    private_error = "PRIVATE_UPSTREAM_SYNTHETIC_TOKEN"
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            503,
+            json={
+                "error": private_error,
+                "metadata": {"provider_message": private_error},
+            },
+        )
+
+    client = make_client(handler)
+    messages = [{"role": "user", "content": "synthetic"}]
+    try:
+        with pytest.raises(ProviderError) as first:
+            await client.generate(messages, request_key="synthetic-503")
+        assert first.value.code == "PROVIDER_HTTP_503"
+        with pytest.raises(ProviderError) as second:
+            await client.generate(messages, request_key="synthetic-503")
+        assert second.value.code == "REQUEST_UNRESOLVED_NO_RESUBMIT"
+        assert len(calls) == 1
+        receipt = next(iter(client.ledger.requests.values()))
+        assert receipt.state == "unknown"
+        assert receipt.response is None
+        first_error = str(first.value)
+        second_error = str(second.value)
+        assert private_error not in first_error
+        assert private_error not in second_error
+        assert private_error not in caplog.text
+    finally:
+        await client.aclose()
 
 
 async def test_concurrent_native_contexts_keep_signal_key_and_output_isolated():

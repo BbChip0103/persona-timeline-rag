@@ -1,6 +1,8 @@
 {{- if .Values.autoscaling.worker.enabled }}
 {{- $redisTLS := eq .Values.network.redis.scheme "rediss" -}}
 {{- $caTLS := and $redisTLS .Values.autoscaling.worker.redis.caKey -}}
+{{- $prometheusAddress := default (printf "http://%s-kube-promet-prometheus.%s.svc:%v" .Values.monitoring.prometheus.releaseName .Values.monitoring.prometheus.namespace .Values.monitoring.prometheus.port) .Values.autoscaling.engine.prometheus.serverAddress -}}
+{{- $engineDeployment := printf "ptr-%s" .Values.inference.engine.kind -}}
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
@@ -40,12 +42,22 @@ spec:
   cooldownPeriod: {{ .Values.autoscaling.worker.cooldownPeriod }}
   minReplicaCount: {{ .Values.autoscaling.worker.minReplicaCount }}
   maxReplicaCount: {{ .Values.autoscaling.worker.maxReplicaCount }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.worker.scaleDownStabilizationSeconds }}
+    scalingModifiers:
+      formula: {{ printf "min(max(wait / %v, active / %v), ceil(engines * %v * (scaling_up > 0 ? %v : %v) / %v))" .Values.autoscaling.worker.redis.waitListLength .Values.app.worker.concurrency .Values.inference.engine.maxNumSeqs .Values.autoscaling.worker.scaleUpHeadroom .Values.autoscaling.worker.steadyHeadroom .Values.app.worker.concurrency | quote }}
+      target: "1"
+      metricType: AverageValue
   fallback:
     failureThreshold: {{ .Values.autoscaling.worker.fallback.failureThreshold }}
     replicas: {{ .Values.autoscaling.worker.fallback.replicas }}
+    behavior: {{ .Values.autoscaling.worker.fallback.behavior }}
   triggers:
     - type: redis
-      name: wait-list
+      name: wait
       metadata:
         listName: {{ .Values.autoscaling.worker.redis.waitList | quote }}
         listLength: {{ .Values.autoscaling.worker.redis.waitListLength | quote }}
@@ -56,7 +68,7 @@ spec:
       authenticationRef:
         name: {{ .Values.autoscaling.worker.redis.triggerAuthenticationName }}
     - type: redis
-      name: active-list
+      name: active
       metadata:
         listName: {{ .Values.autoscaling.worker.redis.activeList | quote }}
         listLength: {{ .Values.app.worker.concurrency | quote }}
@@ -65,4 +77,19 @@ spec:
         {{- end }}
       authenticationRef:
         name: {{ .Values.autoscaling.worker.redis.triggerAuthenticationName }}
+    - type: prometheus
+      name: engines
+      metadata:
+        serverAddress: {{ $prometheusAddress | quote }}
+        metricName: ptr_ready_engines
+        query: {{ printf "max(kube_deployment_status_replicas_ready{namespace=%q,deployment=%q})" .Values.namespaces.inference $engineDeployment | quote }}
+        threshold: "1"
+        ignoreNullValues: "false"
+    - type: prometheus
+      name: scaling_up
+      metadata:
+        serverAddress: {{ $prometheusAddress | quote }}
+        metricName: ptr_engine_scaling_up
+        query: {{ printf "(max(kube_deployment_spec_replicas{namespace=%q,deployment=%q}) > bool max(kube_deployment_status_replicas_ready{namespace=%q,deployment=%q})) or vector(0)" .Values.namespaces.inference $engineDeployment .Values.namespaces.inference $engineDeployment | quote }}
+        threshold: "1"
 {{- end }}

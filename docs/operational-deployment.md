@@ -91,9 +91,9 @@ app.worker.concurrency`, plus operational headroom, while staying within the
 approved maximum credit limit. The worker active-list scaler threshold derives
 from `app.worker.concurrency`, so the active trigger tracks that same capacity
 instead of a separate stale value.
-The kind EPP queue TTL is 30 seconds because the simulator's first token takes
-eight seconds; the queue size remains eight. Production retains its two-second
-flow-control TTL.
+The kind EPP queue TTL is two seconds. The V5 synthetic run slows the simulator
+instead of widening the router TTL, so the flow-control timeout matches the
+production contract.
 For V5, apply `deploy/kind/k5-worker-values.yaml` after `values-kind.yaml` to
 keep the two allowed synthetic engines warm, then restore the ordinary kind
 values after the run so V6 can check engine scale-up from one. The kind API

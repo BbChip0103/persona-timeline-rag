@@ -1,4 +1,5 @@
-# kube-prometheus-stack chart 92.3.1: operator and Prometheus only.
+# kube-prometheus-stack chart 92.3.1: operator, Prometheus, and a scoped
+# kube-state-metrics deployment collector for engine scale-up detection.
 defaultRules:
   create: false
 alertmanager:
@@ -20,7 +21,14 @@ kubeScheduler:
 kubeProxy:
   enabled: false
 kubeStateMetrics:
-  enabled: false
+  enabled: true
+kube-state-metrics:
+  collectors: [deployments]
+  namespaces: ptr-inference
+  rbac:
+    useClusterRole: false
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
 nodeExporter:
   enabled: false
 prometheusOperator:

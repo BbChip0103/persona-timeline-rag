@@ -12,7 +12,8 @@ app:
   web: {replicas: 2}
   # The 200-turn synthetic burst may wait behind the two simulated engines.
   api: {replicas: 2, maxQueueMs: 600000}
-  worker: {replicas: 2, concurrency: 4}
+  # One simulator has maxNumSeqs=2; one worker at concurrency 2 matches it.
+  worker: {replicas: 1, concurrency: 2}
 llm:
   billing:
     maxOutputTokens: 2048
@@ -81,6 +82,7 @@ autoscaling:
     web: {minReplicas: 2, maxReplicas: 3}
     api: {minReplicas: 2, maxReplicas: 4}
   worker:
+    minReplicaCount: 1
     maxReplicaCount: 6
   engine:
     maxReplicaCount: 2

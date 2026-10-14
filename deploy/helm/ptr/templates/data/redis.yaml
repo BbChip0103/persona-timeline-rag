@@ -90,7 +90,7 @@ spec:
               cat > /tmp/users.acl <<EOF
               user default off
               user ${REDIS_APP_USER} on #${REDIS_APP_PASSWORD_SHA256} allcommands allkeys
-              user keda on #${REDIS_KEDA_PASSWORD_SHA256} +ping +type +llen %R~ptr:turns:* (+eval +evalsha +type +llen ~ptr:turns:*)
+              user keda on #${REDIS_KEDA_PASSWORD_SHA256} +ping +type +llen %R~ptr:turns:* (+eval +type +llen ~ptr:turns:*)
               EOF
               exec redis-server --appendonly yes --maxmemory-policy noeviction --dir /data --aclfile /tmp/users.acl
           securityContext:

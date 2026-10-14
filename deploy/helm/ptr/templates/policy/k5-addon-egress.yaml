@@ -182,6 +182,12 @@ spec:
       ports: [{protocol: TCP, port: 10250}]
     - to:
         - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: kube-state-metrics}
+      ports: [{protocol: TCP, port: 8080}]
+    - to:
+        - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: {{ $app }}}
           podSelector:
             matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: api}
@@ -199,6 +205,24 @@ spec:
           podSelector:
             matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: inference-engine}
       ports: [{protocol: TCP, port: 8000}]
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-kube-state-metrics-egress
+  namespace: ptr-monitoring
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kube-state-metrics}
+  policyTypes: [Egress]
+  egress:
+    {{- range $apiServerCidrs }}
+    - to: [{ipBlock: {cidr: {{ . | quote }}}}]
+      ports:
+        {{- range $apiServerPorts }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
     {{- end }}
 ---
 apiVersion: networking.k8s.io/v1

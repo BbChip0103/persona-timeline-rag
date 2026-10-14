@@ -1,5 +1,31 @@
 {{- if and .Values.inference.enabled .Values.autoscaling.engine.enabled }}
 {{- $prometheusAddress := default (printf "http://%s-kube-promet-prometheus.%s.svc:%v" .Values.monitoring.prometheus.releaseName .Values.monitoring.prometheus.namespace .Values.monitoring.prometheus.port) .Values.autoscaling.engine.prometheus.serverAddress -}}
+{{- $redisTLS := eq .Values.network.redis.scheme "rediss" -}}
+{{- $caTLS := and $redisTLS .Values.autoscaling.engine.redis.caKey -}}
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: {{ .Values.autoscaling.engine.redis.clusterTriggerAuthenticationName }}
+spec:
+  secretTargetRef:
+    - parameter: address
+      name: {{ .Values.autoscaling.engine.redis.existingSecret }}
+      key: {{ .Values.autoscaling.engine.redis.addressKey }}
+    - parameter: username
+      name: {{ .Values.autoscaling.engine.redis.existingSecret }}
+      key: {{ .Values.autoscaling.engine.redis.usernameKey }}
+    - parameter: password
+      name: {{ .Values.autoscaling.engine.redis.existingSecret }}
+      key: {{ .Values.autoscaling.engine.redis.passwordKey }}
+    {{- if $caTLS }}
+    - parameter: tls
+      name: {{ .Values.autoscaling.engine.redis.existingSecret }}
+      key: {{ required "autoscaling.engine.redis.tlsKey is required with Redis CA" .Values.autoscaling.engine.redis.tlsKey }}
+    - parameter: ca
+      name: {{ .Values.autoscaling.engine.redis.existingSecret }}
+      key: {{ .Values.autoscaling.engine.redis.caKey }}
+    {{- end }}
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -17,22 +43,48 @@ spec:
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.engine.scaleUpStabilizationSeconds }}
         scaleDown:
           stabilizationWindowSeconds: {{ .Values.autoscaling.engine.scaleDownStabilizationSeconds }}
+    scalingModifiers:
+      formula: {{ printf "max(ceil((wait + active) / (%v * %v)), ceil(kv / %v))" .Values.inference.engine.maxNumSeqs .Values.autoscaling.worker.steadyHeadroom .Values.autoscaling.engine.prometheus.kvThreshold | quote }}
+      target: "1"
+      metricType: AverageValue
+      activationTarget: "0"
+  fallback:
+    failureThreshold: {{ .Values.autoscaling.engine.fallback.failureThreshold }}
+    replicas: {{ .Values.autoscaling.engine.maxReplicaCount }}
+    behavior: {{ .Values.autoscaling.engine.fallback.behavior }}
   triggers:
+    - type: redis
+      name: wait
+      metadata:
+        listName: {{ .Values.autoscaling.engine.redis.waitList | quote }}
+        listLength: "1"
+        {{- if and $redisTLS (not $caTLS) }}
+        enableTLS: "true"
+        {{- end }}
+      authenticationRef:
+        name: {{ .Values.autoscaling.engine.redis.clusterTriggerAuthenticationName }}
+        kind: ClusterTriggerAuthentication
+    - type: redis
+      name: active
+      metadata:
+        listName: {{ .Values.autoscaling.engine.redis.activeList | quote }}
+        listLength: "1"
+        {{- if and $redisTLS (not $caTLS) }}
+        enableTLS: "true"
+        {{- end }}
+      authenticationRef:
+        name: {{ .Values.autoscaling.engine.redis.clusterTriggerAuthenticationName }}
+        kind: ClusterTriggerAuthentication
     - type: prometheus
-      name: epp-flow-control-queue
+      name: kv
       metadata:
         serverAddress: {{ $prometheusAddress | quote }}
-        metricName: llm_d_epp_flow_control_queue_size
-        query: sum(llm_d_epp_flow_control_queue_size)
-        threshold: {{ .Values.autoscaling.engine.prometheus.queueThreshold | quote }}
-    - type: prometheus
-      name: engine-kv-cache-usage
-      metricType: Value
-      metadata:
-        serverAddress: {{ $prometheusAddress | quote }}
-        metricName: vllm_kv_cache_usage_perc
-        query: {{ printf "avg(vllm:kv_cache_usage_perc{pool=%q})" .Values.inference.pool | quote }}
-        threshold: {{ .Values.autoscaling.engine.prometheus.kvThreshold | quote }}
+        metricName: ptr_engine_kv_usage_replicas
+        query: {{ printf "avg(vllm:kv_cache_usage_perc{pool=%q}) * max(kube_deployment_status_replicas_ready{namespace=%q,deployment=%q})" .Values.inference.pool .Values.namespaces.inference (printf "ptr-%s" .Values.inference.engine.kind) | quote }}
+        threshold: "1"
+        ignoreNullValues: "false"
 {{- end }}

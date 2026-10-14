@@ -15,6 +15,7 @@ fi
 "${kubectl_cmd[@]}" create namespace ptr-app --dry-run=client -o yaml | "${kubectl_cmd[@]}" apply -f - >/dev/null
 "${kubectl_cmd[@]}" create namespace ptr-data --dry-run=client -o yaml | "${kubectl_cmd[@]}" apply -f - >/dev/null
 "${kubectl_cmd[@]}" create namespace ptr-system --dry-run=client -o yaml | "${kubectl_cmd[@]}" apply -f - >/dev/null
+"${kubectl_cmd[@]}" create namespace ptr-keda --dry-run=client -o yaml | "${kubectl_cmd[@]}" apply -f - >/dev/null
 
 rand_hex() {
   openssl rand -hex 32
@@ -51,26 +52,29 @@ if [ "$existing" -gt 0 ] && [ "$existing" -lt 5 ]; then
 fi
 
 apply_keda_redis_secret() {
-  if "${kubectl_cmd[@]}" get secret ptr-keda-redis -n ptr-app >/dev/null 2>&1; then
-    return
-  fi
   local password="$1"
-  if ! "${kubectl_cmd[@]}" apply -f - >/dev/null 2>&1 <<EOF
+  local namespace
+  for namespace in ptr-app ptr-keda; do
+    if "${kubectl_cmd[@]}" get secret ptr-keda-redis -n "$namespace" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! "${kubectl_cmd[@]}" apply -f - >/dev/null 2>&1 <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
   name: ptr-keda-redis
-  namespace: ptr-app
+  namespace: $namespace
 type: Opaque
 stringData:
   REDIS_ADDRESS: "ptr-redis.ptr-data.svc:6379"
   REDIS_USERNAME: "keda"
   REDIS_PASSWORD: "$password"
 EOF
-  then
-    printf 'Synthetic KEDA Redis Secret apply failed (values withheld)\n' >&2
-    exit 1
-  fi
+    then
+      printf 'Synthetic KEDA Redis Secret apply failed (values withheld)\n' >&2
+      exit 1
+    fi
+  done
 }
 
 patch_existing_maintenance_secret() {
@@ -256,6 +260,12 @@ synthetic_secret_keys:
   - PTR_PERSONA_FIXTURE
   - PTR_LLM_PUBLISHED_PERSONAS_JSON
 - namespace: ptr-app
+  name: ptr-keda-redis
+  keys:
+  - REDIS_ADDRESS
+  - REDIS_USERNAME
+  - REDIS_PASSWORD
+- namespace: ptr-keda
   name: ptr-keda-redis
   keys:
   - REDIS_ADDRESS

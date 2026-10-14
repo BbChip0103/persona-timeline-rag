@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import re
 import sqlite3
 import subprocess
@@ -201,13 +202,16 @@ class InferenceChartContractTest(unittest.TestCase):
         worker = document(result.stdout, "ScaledObject", "ptr-worker")
         engine = document(result.stdout, "ScaledObject", "ptr-sim")
         trigger_auth = document(result.stdout, "TriggerAuthentication", "ptr-worker-redis")
+        engine_auth = parsed_document(
+            result.stdout, "ClusterTriggerAuthentication", "ptr-keda-redis"
+        )
         api_hpa = document(result.stdout, "HorizontalPodAutoscaler", "ptr-api")
         engine_monitor = document(result.stdout, "ServiceMonitor", "ptr-engine")
         api_service = document(result.stdout, "Service", "ptr-api")
         engine_service = document(result.stdout, "Service", "ptr-engine-metrics")
 
         for field in (
-            "minReplicaCount: 2",
+            "minReplicaCount: 1",
             "maxReplicaCount: 6",
             "failureThreshold: 3",
             "replicas: 4",
@@ -215,31 +219,41 @@ class InferenceChartContractTest(unittest.TestCase):
             'listLength: "8"',
             'activationListLength: "1"',
             'listName: "ptr:turns:active"',
-            'listLength: "4"',
+            'listLength: "2"',
         ):
             self.assertIn(field, worker)
         self.assertIn("key: REDIS_ADDRESS", trigger_auth)
         self.assertIn("key: REDIS_USERNAME", trigger_auth)
         self.assertIn("key: REDIS_PASSWORD", trigger_auth)
         self.assertNotIn("ptr-api", trigger_auth)
+        self.assertEqual(
+            [item["parameter"] for item in engine_auth["spec"]["secretTargetRef"]],
+            ["address", "username", "password"],
+        )
+        self.assertTrue(all(
+            item["name"] == "ptr-keda-redis"
+            for item in engine_auth["spec"]["secretTargetRef"]
+        ))
         self.assertIn("averageUtilization: 70", api_hpa)
         self.assertIn("maxReplicas: 4", api_hpa)
         for field in (
             "minReplicaCount: 1",
             "maxReplicaCount: 2",
             "stabilizationWindowSeconds: 60",
-            "metricType: Value",
-            "query: sum(llm_d_epp_flow_control_queue_size)",
-            'threshold: "4"',
-            'query: "avg(vllm:kv_cache_usage_perc{pool=\\"chat-primary\\"})"',
-            'threshold: "0.8"',
+            "scaleUp:",
+            'formula: "max(ceil((wait + active) / (2 * 1.0)), ceil(kv / 0.8))"',
+            "metricType: AverageValue",
+            'listName: "ptr:turns:wait"',
+            'listName: "ptr:turns:active"',
+            'threshold: "1"',
+            'ignoreNullValues: "false"',
         ):
             self.assertIn(field, engine)
-        self.assertEqual(engine.count("metricType: Value"), 1)
+        self.assertNotIn("llm_d_epp_flow_control_queue_size", engine)
         self.assertEqual(
             [trigger.get("metricType", "AverageValue") for trigger in
              parsed_document(result.stdout, "ScaledObject", "ptr-sim")["spec"]["triggers"]],
-            ["AverageValue", "Value"],
+            ["AverageValue"] * 3,
         )
         self.assertIn('ptr.io/monitoring: "true"', api_service)
         self.assertIn('ptr.io/monitoring: "true"', engine_service)
@@ -280,9 +294,13 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertEqual(
             [trigger.get("metricType", "AverageValue") for trigger in
              parsed_document(result.stdout, "ScaledObject", "ptr-vllm")["spec"]["triggers"]],
-            ["AverageValue", "Value"],
+            ["AverageValue"] * 3,
         )
         self.assertIn("stabilizationWindowSeconds: 600", engine)
+        self.assertIn(
+            'formula: "max(ceil((wait + active) / (8 * 1.0)), ceil(kv / 0.8))"',
+            engine,
+        )
         self.assertIn("maxUnavailable: 1", engine_pdb)
         self.assertNotIn("ptr-litellm", result.stdout)
         self.assertNotIn("ptr-gateway", result.stdout)
@@ -295,6 +313,80 @@ class InferenceChartContractTest(unittest.TestCase):
         trigger_auth = document(result.stdout, "TriggerAuthentication", "ptr-worker-redis")
         self.assertNotIn("enableTLS", worker)
         self.assertNotIn("parameter: ca", trigger_auth)
+
+    def test_engine_demand_formula_fallback_and_redis_authentication(self) -> None:
+        for profile, sequences, maximum in (("kind", 2, 2), ("prod", 8, 32)):
+            with self.subTest(profile=profile):
+                result = helm_template(profile)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                name = "ptr-sim" if profile == "kind" else "ptr-vllm"
+                spec = parsed_document(result.stdout, "ScaledObject", name)["spec"]
+                self.assertEqual(spec["fallback"], {
+                    "failureThreshold": 3,
+                    "replicas": maximum,
+                    "behavior": "currentReplicasIfLower",
+                })
+                self.assertEqual(spec["advanced"]["scalingModifiers"], {
+                    "formula": (
+                        f"max(ceil((wait + active) / ({sequences} * 1.0)), "
+                        "ceil(kv / 0.8))"
+                    ),
+                    "target": "1", "metricType": "AverageValue", "activationTarget": "0",
+                })
+                self.assertEqual(
+                    spec["advanced"]["horizontalPodAutoscalerConfig"]["behavior"]
+                    ["scaleUp"]["stabilizationWindowSeconds"], 60,
+                )
+                wait, active, kv = spec["triggers"]
+                self.assertEqual(
+                    [(item["type"], item["name"]) for item in spec["triggers"]],
+                    [("redis", "wait"), ("redis", "active"), ("prometheus", "kv")],
+                )
+                for item in (wait, active):
+                    self.assertEqual(item["metadata"]["listLength"], "1")
+                    self.assertNotIn("activationListLength", item["metadata"])
+                    self.assertEqual(item["authenticationRef"], {
+                        "name": "ptr-keda-redis", "kind": "ClusterTriggerAuthentication",
+                    })
+                self.assertEqual(
+                    kv["metadata"]["query"],
+                    'avg(vllm:kv_cache_usage_perc{pool="chat-primary"}) * '
+                    f'max(kube_deployment_status_replicas_ready{{namespace="ptr-inference",deployment="{name}"}})',
+                )
+                self.assertEqual(kv["metadata"]["ignoreNullValues"], "false")
+
+        changed = helm_template(
+            "kind", "--set", "autoscaling.worker.steadyHeadroom=1.5",
+            "--set", "inference.engine.maxNumSeqs=4",
+        )
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        spec = parsed_document(changed.stdout, "ScaledObject", "ptr-sim")["spec"]
+        self.assertEqual(
+            spec["advanced"]["scalingModifiers"]["formula"],
+            "max(ceil((wait + active) / (4 * 1.5)), ceil(kv / 0.8))",
+        )
+        self.assertEqual(spec["triggers"][0]["metadata"]["listLength"], "1")
+
+    def test_prod_engine_backlog_math_matches_steady_worker_capacity(self) -> None:
+        result = helm_template("prod")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spec = parsed_document(result.stdout, "ScaledObject", "ptr-vllm")["spec"]
+        self.assertEqual(
+            spec["advanced"]["scalingModifiers"]["formula"],
+            "max(ceil((wait + active) / (8 * 1.0)), ceil(kv / 0.8))",
+        )
+
+        sequences = 8
+        concurrency = 4
+        steady_headroom = 1.0
+        for engines in (2, 3, 4, 8):
+            with self.subTest(engines=engines):
+                worker_cap = math.ceil(engines * sequences * steady_headroom / concurrency)
+                active_at_cap = worker_cap * concurrency
+                desired_at_cap = math.ceil(active_at_cap / (sequences * steady_headroom))
+                desired_with_wait = math.ceil((1 + active_at_cap) / (sequences * steady_headroom))
+                self.assertEqual(desired_at_cap, engines)
+                self.assertGreater(desired_with_wait, engines)
 
     def test_rediss_without_custom_ca_uses_scaledobject_tls(self) -> None:
         result = helm_template("prod", "--set", "autoscaling.worker.redis.caKey=")
@@ -461,6 +553,14 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertNotIn("- podSelector: {}", prometheus)
         self.assertNotIn("- podSelector: {}", keda)
 
+    def test_kind_redis_keda_acl_keeps_eval_without_evalsha(self) -> None:
+        result = helm_template("kind")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        redis = document(result.stdout, "StatefulSet", "ptr-redis")
+        self.assertIn("user keda on", redis)
+        self.assertIn("+eval +type +llen ~ptr:turns:*", redis)
+        self.assertNotIn("+evalsha", redis)
+
     def test_monitoring_ingress_only_admits_prometheus_pods_on_metrics_ports(self) -> None:
         result = helm_template("kind")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -469,6 +569,7 @@ class InferenceChartContractTest(unittest.TestCase):
             "ptr-api-monitoring-ingress": 56441,
             "ptr-inference-monitoring-ingress": 8000,
             "ptr-epp-monitoring-ingress": 9090,
+            "ptr-kube-state-metrics-ingress": 8080,
         }
         for name, port in expected.items():
             policy = parsed_document(result.stdout, "NetworkPolicy", name)
@@ -563,7 +664,7 @@ class InferenceChartContractTest(unittest.TestCase):
         kind = helm_template("kind")
         self.assertEqual(kind.returncode, 0, kind.stderr)
         worker = document(kind.stdout, "Deployment", "ptr-worker")
-        self.assertIn('name: PTR_LLM_CONCURRENCY\n              value: "4"', worker)
+        self.assertIn('name: PTR_LLM_CONCURRENCY\n              value: "2"', worker)
         prod = helm_template("prod")
         self.assertEqual(prod.returncode, 0, prod.stderr)
         prod_worker = document(prod.stdout, "Deployment", "ptr-worker")
@@ -574,9 +675,107 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         worker = parsed_document(result.stdout, "ScaledObject", "ptr-worker")
         active = next(
-            trigger for trigger in worker["spec"]["triggers"] if trigger["name"] == "active-list"
+            trigger for trigger in worker["spec"]["triggers"] if trigger["name"] == "active"
         )
         self.assertEqual(active["metadata"]["listLength"], "7")
+
+    def test_worker_missing_ready_metric_uses_fallback_instead_of_zero(self) -> None:
+        monitoring = yaml.safe_load(
+            (ROOT / "deploy/kind/prometheus-values.yaml").read_text()
+        )["kube-state-metrics"]
+        self.assertEqual(monitoring["collectors"], ["deployments"])
+        self.assertEqual(monitoring["namespaces"], "ptr-inference")
+        self.assertIs(monitoring["rbac"]["useClusterRole"], False)
+
+        for profile, engine_name in (("kind", "ptr-sim"), ("prod", "ptr-vllm")):
+            with self.subTest(profile=profile):
+                result = helm_template(profile)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                worker = parsed_document(result.stdout, "ScaledObject", "ptr-worker")["spec"]
+                triggers = {item["name"]: item for item in worker["triggers"]}
+                self.assertEqual(
+                    triggers["engines"]["metadata"]["query"],
+                    'max(kube_deployment_status_replicas_ready{namespace="ptr-inference",'
+                    f'deployment="{engine_name}"}})',
+                )
+                self.assertEqual(
+                    triggers["engines"]["metadata"]["ignoreNullValues"], "false"
+                )
+                self.assertEqual(
+                    triggers["scaling_up"]["metadata"]["query"],
+                    (
+                        f'(max(kube_deployment_spec_replicas{{namespace="ptr-inference",'
+                        f'deployment="{engine_name}"}}) > bool '
+                        f'max(kube_deployment_status_replicas_ready{{namespace="ptr-inference",'
+                        f'deployment="{engine_name}"}})) or vector(0)'
+                    ),
+                )
+                self.assertEqual(worker["fallback"], {
+                    "failureThreshold": 3,
+                    "replicas": 4,
+                    "behavior": "currentReplicasIfLower",
+                })
+
+    def test_worker_scaling_modifiers_cap_queue_demand_by_ready_engines(self) -> None:
+        for profile, max_num_seqs, concurrency in (("kind", 2, 2), ("prod", 8, 4)):
+            with self.subTest(profile=profile):
+                result = helm_template(profile)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                worker = parsed_document(result.stdout, "ScaledObject", "ptr-worker")["spec"]
+                self.assertEqual(worker["minReplicaCount"], 1 if profile == "kind" else 2)
+                self.assertEqual(
+                    worker["minReplicaCount"], math.ceil(max_num_seqs / concurrency)
+                )
+                self.assertEqual(worker["maxReplicaCount"], 6 if profile == "kind" else 40)
+                self.assertEqual(worker["fallback"], {
+                    "failureThreshold": 3, "replicas": 4,
+                    "behavior": "currentReplicasIfLower",
+                })
+                advanced = worker["advanced"]
+                self.assertEqual(
+                    advanced["horizontalPodAutoscalerConfig"]["behavior"]["scaleDown"]
+                    ["stabilizationWindowSeconds"], 120,
+                )
+                self.assertEqual(advanced["scalingModifiers"], {
+                    "formula": (
+                        f"min(max(wait / 8, active / {concurrency}), "
+                        f"ceil(engines * {max_num_seqs} * "
+                        f"(scaling_up > 0 ? 1.25 : 1.0) / {concurrency}))"
+                    ),
+                    "target": "1", "metricType": "AverageValue",
+                })
+                wait, active, engines, scaling_up = worker["triggers"]
+                self.assertEqual(
+                    [(trigger["name"], trigger["type"]) for trigger in worker["triggers"]],
+                    [
+                        ("wait", "redis"),
+                        ("active", "redis"),
+                        ("engines", "prometheus"),
+                        ("scaling_up", "prometheus"),
+                    ],
+                )
+                self.assertEqual(wait["metadata"]["listName"], "ptr:turns:wait")
+                self.assertEqual(wait["metadata"]["listLength"], "8")
+                self.assertEqual(active["metadata"]["listName"], "ptr:turns:active")
+                self.assertEqual(active["metadata"]["listLength"], str(concurrency))
+                engine_name = "ptr-sim" if profile == "kind" else "ptr-vllm"
+                self.assertEqual(engines["metadata"]["threshold"], "1")
+                self.assertEqual(scaling_up["metadata"]["threshold"], "1")
+
+        changed = helm_template(
+            "kind", "--set", "app.worker.concurrency=5",
+            "--set", "inference.engine.maxNumSeqs=6",
+            "--set", "autoscaling.worker.redis.waitListLength=16",
+            "--set", "autoscaling.worker.steadyHeadroom=1.1",
+            "--set", "autoscaling.worker.scaleUpHeadroom=1.5",
+        )
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        worker = parsed_document(changed.stdout, "ScaledObject", "ptr-worker")["spec"]
+        self.assertEqual(
+            worker["advanced"]["scalingModifiers"]["formula"],
+            "min(max(wait / 16, active / 5), "
+            "ceil(engines * 6 * (scaling_up > 0 ? 1.5 : 1.1) / 5))",
+        )
 
     def test_kind_v5_queue_wait_and_engine_scale_match_synthetic_capacity(self) -> None:
         kind = helm_template("kind")
@@ -619,6 +818,30 @@ class InferenceChartContractTest(unittest.TestCase):
     def test_kind_up_labels_inference_namespace_like_chart(self) -> None:
         up_script = (ROOT / "deploy/kind/up.sh").read_text()
         self.assertIn("ptr.io/namespace=inference", up_script)
+        self.assertIn("policy.apiServerCIDRs[1]=$control_plane_ip/32", up_script)
+
+        rendered = helm_template(
+            "kind", "--set-string", "policy.apiServerCIDRs[1]=172.29.0.3/32",
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        prometheus_policy = parsed_document(
+            rendered.stdout, "NetworkPolicy", "ptr-prometheus-egress",
+        )
+        api_cidrs = [
+            target["ipBlock"]["cidr"]
+            for rule in prometheus_policy["spec"]["egress"]
+            for target in rule.get("to", [])
+            if "ipBlock" in target
+        ]
+        self.assertEqual(api_cidrs, ["10.96.0.1/32", "172.29.0.3/32"])
+        ksm_policy = parsed_document(
+            rendered.stdout, "NetworkPolicy", "ptr-kube-state-metrics-egress",
+        )
+        self.assertEqual(
+            [peer["ipBlock"]["cidr"] for rule in ksm_policy["spec"]["egress"]
+             for peer in rule["to"]],
+            api_cidrs,
+        )
 
 
 if __name__ == "__main__":

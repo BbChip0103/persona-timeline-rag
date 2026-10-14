@@ -16,8 +16,13 @@ The repository URLs used by the installer are the official chart repositories:
 `deploy/kind/up.sh` pulls the chart archives first, checks these SHA-256
 digests, and installs the verified local archives.
 
-The Prometheus profile retains only Prometheus Operator and Prometheus. It
-disables Grafana, Alertmanager, node-exporter, kube-state-metrics, bundled
-rules, and Kubernetes control-plane scraping, and requests small resources.
+The Prometheus profile retains Prometheus Operator, Prometheus, and the
+chart-pinned kube-state-metrics subchart (8.6.0). The latter collects only
+Deployment metrics in `ptr-inference` with a namespace Role and RoleBinding
+(`rbac.useClusterRole: false`), so worker scaling can compare desired and ready
+engine replicas without cluster-wide kube-state-metrics access. It disables
+Grafana, Alertmanager, node-exporter,
+bundled rules, and Kubernetes control-plane scraping, and requests small
+resources.
 The metrics-server profile sets `--kubelet-insecure-tls` for kind kubelets.
 This flag is restricted to this local kind profile.

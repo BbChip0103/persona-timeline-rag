@@ -57,11 +57,22 @@ autoscaling:
     enabled: true
     pollingInterval: 10
     cooldownPeriod: 120
+    scaleDownStabilizationSeconds: 120
     minReplicaCount: 2
     maxReplicaCount: 40
+    # The worker cap is ceil(ready_engines * engine.maxNumSeqs * headroom / concurrency).
+    # steadyHeadroom keeps workers matched to ready GPU capacity. scaleUpHeadroom
+    # applies only while the engine Deployment's desired replicas exceed ready replicas.
+    steadyHeadroom: "1.0"
+    scaleUpHeadroom: "1.25"
+    # KEDA currentReplicasIfLower keeps the current worker count when it is
+    # below fallback.replicas, and otherwise emits fallback.replicas. This
+    # prevents a metrics outage from overcommitting a small run while capping a
+    # larger run at four workers until metrics recover.
     fallback:
       failureThreshold: 3
       replicas: 4
+      behavior: currentReplicasIfLower
     redis:
       triggerAuthenticationName: ptr-worker-redis
       existingSecret: ptr-keda-redis
@@ -80,10 +91,27 @@ autoscaling:
     cooldownPeriod: 120
     minReplicaCount: 1
     maxReplicaCount: 32
+    scaleUpStabilizationSeconds: 60
     scaleDownStabilizationSeconds: 600
+    fallback:
+      failureThreshold: 3
+      # currentReplicasIfLower emits the current engine count when it is below
+      # fallback.replicas, otherwise fallback.replicas. The template sets
+      # fallback.replicas to maxReplicaCount so an outage cannot scale engines
+      # down inside the configured GPU range.
+      behavior: currentReplicasIfLower
+    redis:
+      clusterTriggerAuthenticationName: ptr-keda-redis
+      existingSecret: ptr-keda-redis
+      addressKey: REDIS_ADDRESS
+      usernameKey: REDIS_USERNAME
+      passwordKey: REDIS_PASSWORD
+      caKey: ""
+      tlsKey: ""
+      waitList: ptr:turns:wait
+      activeList: ptr:turns:active
     prometheus:
       serverAddress: ""
-      queueThreshold: "4"
       kvThreshold: "0.8"
 
 monitoring:

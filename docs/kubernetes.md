@@ -54,6 +54,7 @@ timeout 900s helm --kube-context kind-ptr-k8s install ptr deploy/helm/ptr \
   --set "images.backend.repository=ptr-backend" --set "images.backend.tag=$backend_tag" \
   --set "images.worker.repository=ptr-worker" --set "images.worker.tag=$worker_tag" \
   --set-string "inference.apiServerCIDRs[1]=$control_plane_ip/32" \
+  --set-string "policy.apiServerCIDRs[1]=$control_plane_ip/32" \
   --wait --timeout 12m
 timeout 300s helm --kube-context kind-ptr-k8s install chat-primary deploy/helm/ptr-router \
   --namespace ptr-inference --values deploy/helm/ptr-router/values-kind.yaml \
@@ -76,7 +77,7 @@ The role Secrets are `ptr-api` (`PTR_APP_DATABASE_URL`, `PTR_REDIS_URL`, tokens
 and session/UI credentials), `ptr-worker` (`PTR_LLM_DATABASE_URL`,
 `PTR_LLM_REDIS_URL`, control token), `ptr-maintenance` (maintenance DB/Redis
 URLs and controls), `ptr-personas` (synthetic fixture), `ptr-keda-redis` (Redis
-address/user/password), `ptr-data` (local DB/Redis credentials), and
+address/user/password in both `ptr-app` and `ptr-keda`), `ptr-data` (local DB/Redis credentials), and
 `ptr-worker-openrouter` (a synthetic worker-only key in kind). Never inspect or
 print their values. On success the smoke command
 prints `{"state":"completed","durableAck":true,"outboxRemoved":true}`.
@@ -92,6 +93,7 @@ timeout 900s helm --kube-context kind-ptr-k8s upgrade ptr deploy/helm/ptr \
   --set "images.backend.repository=ptr-backend" --set "images.backend.tag=$backend_tag" \
   --set "images.worker.repository=ptr-worker" --set "images.worker.tag=$worker_tag" \
   --set-string "inference.apiServerCIDRs[1]=$control_plane_ip/32" \
+  --set-string "policy.apiServerCIDRs[1]=$control_plane_ip/32" \
   --wait --timeout 12m
 timeout 300s helm --kube-context kind-ptr-k8s history ptr -n ptr-system
 timeout 900s helm --kube-context kind-ptr-k8s rollback ptr REVISION -n ptr-system --wait --timeout 12m
@@ -137,9 +139,12 @@ configuration. Before use:
   spillover is off. `ptr-personas` supplies
   `PTR_LLM_PUBLISHED_PERSONAS_JSON`. `ptr-maintenance` supplies
   `PTR_LLM_MAINTENANCE_DATABASE_URL` and approved maintenance controls/Redis
-  URL. `ptr-keda-redis` supplies `REDIS_ADDRESS`, `REDIS_USERNAME`,
-  `REDIS_PASSWORD`, plus `REDIS_CA` and `REDIS_TLS_MODE=enable` for a private
-  CA. No `ptr-data` Secret is needed when
+  URL. Provision `ptr-keda-redis` in the app namespace for the worker
+  `TriggerAuthentication` and in the KEDA operator namespace for the engine
+  `ClusterTriggerAuthentication` (`ptr-keda` in kind, or the configured
+  `KEDA_CLUSTER_OBJECT_NAMESPACE`). Both copies supply `REDIS_ADDRESS`,
+  `REDIS_USERNAME`, `REDIS_PASSWORD`, plus `REDIS_CA` and
+  `REDIS_TLS_MODE=enable` for a private CA. No `ptr-data` Secret is needed when
   `data.enabled=false`.
 - Install NVIDIA GPU Operator, create a dedicated GPU node pool with
   `ptr.io/gpu-pool=true` and `nvidia.com/gpu` taint, and provide the model
@@ -166,11 +171,77 @@ worker has 100 s to finish and ACK in-flight BullMQ jobs; engine has 60 s plus
 The single EPP replica has no leader election or PDB; losing it produces an
 approximately 2 s routing gap during replacement, even though readiness recovers.
 
-HPA targets 70% CPU for web and API. KEDA polls every 10 s: worker
-Redis wait-list threshold 8 and active-list trigger tied to worker concurrency
-(4 in kind); fallback uses 4 workers after 3 failures. Engine scaling watches
-EPP queue-size threshold 4 and vLLM KV cache usage threshold 0.8, subject to GPU pool
-capacity and a stabilization window. Validate these thresholds on real GPUs.
+HPA targets 70% CPU for web and API. The worker's composed KEDA metric targets
+one replica per unit of
+`min(max(wait/8, active/C), ceil(readyEngines * S * H / C))`, where `S` is
+engine `maxNumSeqs`, `C` is worker concurrency, and `H` is
+`desiredEngines > readyEngines ? scaleUpHeadroom : steadyHeadroom`.
+The two chart knobs default to `autoscaling.worker.steadyHeadroom=1.0` and
+`scaleUpHeadroom=1.25`. `wait` and `active` are BullMQ list lengths;
+`readyEngines` comes from `kube_deployment_status_replicas_ready`, and the
+scale-up comparison uses `kube_deployment_spec_replicas` for the same engine
+Deployment. Prometheus `up` can see a simulator before its readiness probe
+passes, so it cannot define worker capacity. Kind enables the
+kube-state-metrics 8.6.0 subchart of
+the pinned kube-prometheus-stack 92.3.1, restricted to Deployment collection
+in `ptr-inference` with namespace Role RBAC (`useClusterRole: false`);
+production monitoring must use the same namespace-scoped RBAC and scrape the
+same metrics. Grafana and
+Alertmanager stay disabled in kind.
+
+At a stable engine count, worker capacity matches the ready GPU capacity, so a
+sustained backlog alone does not create paid spillover. During engine startup,
+the temporary 1.25 headroom can admit more work than the ready engines can
+serve; EPP saturation may then grant paid spillover. The paid ledger and the
+approved 1 USD kind cap still bound usage. In kind (`S=2`, `C=2`), the steady
+caps are 1 and 2 workers for one and two engines, respectively. Kind sets the
+worker minimum to 1 so the one-engine steady count matches capacity. The
+scale-up caps from one and two ready engines are 2 and 3 workers, respectively.
+Kind also passes the actual control-plane endpoint CIDR to `policy.apiServerCIDRs`:
+Prometheus needs this egress after Service DNAT to discover scrape targets.
+The composite metric uses `AverageValue` with target 1, so HPA treats its
+value as the desired replica count. The worker minimum is 1 in kind and 2 in
+production, with
+a 120 s HPA scale-down stabilization window. KEDA's 10 s polling interval
+refreshes status; HPA queries the metric independently at this minimum.
+If the ready-engine series disappears, the `engines` trigger's
+`ignoreNullValues: "false"` makes the missing result an error instead of feeding
+zero into the worker formula. The `scaling_up`
+trigger retains `or vector(0)`. If any scaler fails 3 consecutive metric reads,
+KEDA `currentReplicasIfLower` emits the current
+worker count when it is below `fallback.replicas=4`, otherwise 4, until metrics
+recover.
+
+Engine scaling no longer depends on an EPP queue-size metric. Its composite
+metric uses `AverageValue` target 1:
+`max(ceil((wait + active) / (S * steadyHeadroom)), ceil(kv / 0.8))`.
+The Redis backlog terms read `ptr:turns:wait` and `ptr:turns:active`. The
+divisor equals the steady worker headroom capacity of one engine, so a full
+stable worker pool holds the current engine count; any additional waiting turn
+requests another engine. Engine Redis triggers omit `activationListLength`
+because the minimum is one replica. The KV term
+uses `avg(vllm:kv_cache_usage_perc) * readyEngines`, so the existing average KV
+target of 0.8 becomes a desired replica count. Engine fallback also uses
+`currentReplicasIfLower` with `fallback.replicas=maxReplicaCount`, so a Redis or
+Prometheus outage cannot scale GPUs down within the configured range. Production
+keeps a 600 s engine scale-down stabilization window; scale-up stabilization is
+60 s. The existing `ptr-keda-redis-ingress` policy already permits the KEDA
+operator to read Redis. [KEDA 2.21.0's Redis list scaler](https://github.com/kedacore/keda/blob/v2.21.0/pkg/scalers/redis_scaler.go#L122-L177)
+executes a Lua `EVAL` to handle list and sorted-set lengths, so the KEDA ACL retains `+eval` on the
+queue keys; `+evalsha` is unnecessary. The selector grants only `TYPE` and
+`LLEN` within that script.
+
+For production `S=8`, `C=4` and steady headroom `1.0`, the full worker pool
+holds exactly `E` engines without triggering another one:
+
+| Ready engines `E` | Worker cap | Active at cap, `W=0` | Desired engines | Desired with `W=1` |
+|---:|---:|---:|---:|---:|
+| 2 | 4 | 16 | 2 | 3 |
+| 3 | 6 | 24 | 3 | 4 |
+| 4 | 8 | 32 | 4 | 5 |
+| 8 | 16 | 64 | 8 | 9 |
+EPP v0.11.0 also exposes flow-control capacity utilization and pool
+saturation metrics; these are observational only in this chart.
 
 Daily split and framework retention are CronJobs. Kind runs weekly review jobs
 as synthetic smoke only; production runs them on the host. `Forbid` stops
@@ -179,8 +250,9 @@ scheduled overlap only: operators must serialize manual Jobs themselves.
 ServiceMonitors scrape API `/metrics/prom`, EPP `/metrics`
 and vLLM `/metrics`. The worker has no metrics HTTP endpoint in this deployment.
 Alert on nonterminal turn age/outbox growth, API readiness, queue wait and KEDA
-fallback, EPP drops versus saturation/timeouts, engine readiness/restarts,
-spillover rate, and paid budget/unknown receipts. Keep telemetry redacted.
+fallback, missing engine scrape data, EPP drops versus saturation/timeouts,
+engine readiness/restarts, spillover rate, and paid budget/unknown receipts.
+Keep telemetry redacted.
 
 Spillover is allowed only for EPP `rejected-saturated` or
 `rejected-ttl-expired` drop reasons. A bare 503, engine 5xx, timeout or reset is

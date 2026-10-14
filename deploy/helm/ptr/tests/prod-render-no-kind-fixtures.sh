@@ -28,3 +28,4 @@ case "$status" in
     exit "$status"
     ;;
 esac
+printf 'prod render excludes kind-only OpenRouter fixture settings: PASS\n'

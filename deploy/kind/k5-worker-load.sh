@@ -12,6 +12,8 @@ api_label="${PTR_API_LABEL:-app.kubernetes.io/component=api}"
 worker_deployment="${PTR_WORKER_DEPLOYMENT:-ptr-worker}"
 engine_namespace="ptr-inference"
 engine_deployment="ptr-sim"
+expected_engine_min="${K5_EXPECT_ENGINE_MIN:-2}"
+expected_engine_ready="${K5_EXPECT_ENGINE_READY:-$expected_engine_min}"
 turn_count="${TURN_COUNT:-200}"
 submit_concurrency="${SUBMIT_CONCURRENCY:-80}"
 poll_ms="${POLL_MS:-1000}"
@@ -24,8 +26,8 @@ job_name="k5-worker-load-$(date +%s)"
 
 engine_min="$(timeout 20s kubectl --context "$context" -n "$engine_namespace" get scaledobject "$engine_deployment" -o jsonpath='{.spec.minReplicaCount}')"
 engine_ready="$(timeout 20s kubectl --context "$context" -n "$engine_namespace" get deployment "$engine_deployment" -o jsonpath='{.status.readyReplicas}')"
-if [[ "$engine_min" != "2" || "${engine_ready:-0}" -lt 2 ]]; then
-  echo "engine ScaledObject must be pinned to two replicas for V5" >&2
+if [[ "$engine_min" != "$expected_engine_min" || "${engine_ready:-0}" -lt "$expected_engine_ready" ]]; then
+  echo "engine ScaledObject must be pinned to two replicas for V5; got minReplicaCount=$engine_min readyReplicas=${engine_ready:-0}" >&2
   exit 1
 fi
 
@@ -578,6 +580,7 @@ fi
 
 timeout 30s "$host_python" - "$node_out" "$probe_status" "$throughput_only" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -603,6 +606,8 @@ desired_start = replicas[0]["desired"] if replicas else None
 ready_start = replicas[0]["ready"] if replicas else None
 desired_peak_60 = max((row["desired"] for row in within_60), default=0)
 ready_peak_60 = max((row["ready"] for row in within_60), default=0)
+desired_peak_all = max((row["desired"] for row in replicas), default=0)
+ready_peak_all = max((row["ready"] for row in replicas), default=0)
 desired_final = replicas[-1]["desired"] if replicas else None
 ready_final = replicas[-1]["ready"] if replicas else None
 while_active = [
@@ -614,7 +619,10 @@ downsteps_while_active = sum(
     current["desired"] < previous["desired"]
     for previous, current in zip(while_active, while_active[1:])
 )
-scale_up_passed = desired_start == 2 and ready_start == 2 and desired_peak_60 >= 6 and ready_peak_60 >= 6
+expected_cap = int(os.environ.get("K5_EXPECT_WORKER_CAP", "3"))
+cap_observed = desired_peak_all <= expected_cap and ready_peak_all <= expected_cap
+cap_reached = desired_peak_60 >= expected_cap and ready_peak_60 >= expected_cap
+scale_up_passed = desired_start == 2 and ready_start == 2 and cap_observed and cap_reached
 active_hold_passed = bool(active_samples) and downsteps_while_active == 0
 scale_down_passed = desired_final == 2 and ready_final == 2
 
@@ -626,6 +634,11 @@ summary = {
     "readyStart": ready_start,
     "desiredPeakWithin60sAfterSubmit": desired_peak_60,
     "readyPeakWithin60sAfterSubmit": ready_peak_60,
+    "desiredPeakAll": desired_peak_all,
+    "readyPeakAll": ready_peak_all,
+    "expectedWorkerCap": expected_cap,
+    "workerCapObserved": cap_observed,
+    "workerCapReached": cap_reached,
     "desiredFinal": desired_final,
     "readyFinal": ready_final,
     "scaleDownToMinObserved": desired_final is not None and desired_final <= 2,

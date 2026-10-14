@@ -79,4 +79,72 @@ This is a targeted L4 verification on `kind-ptr-k8s` with synthetic data and the
 - After rollout, all 32 active pods and 13 deployments were Ready. A synthetic RAG-off smoke turn completed with one durable ACK and no outbox residue.
 - One `saturation-check.sh` run passed: 32 requests yielded 2 successes, 22 `rejected-saturated` drops and 8 `rejected-ttl-expired` drops.
 - One `worker-spillover-check.sh` run completed 100/100 turns: 90 settled paid ledger receipts matched 90 fake OpenRouter submissions, with no duplicate fake submissions. After the helper restored its temporary worker setting and API autoscaling settled, all 39 active pods and 13 deployments were Ready.
-- Offline L4 checks: service pytest 1,598 passed/24 skipped; root pytest 154 passed/80 subtests; `make check` 141 unittests plus Ruff and mypy; main Jest 1,702 passed/110 skipped and OTel Jest 18 passed; TS typecheck, lint, web build, three Compose renders, four Helm lint profiles, kind/prod kubeconform plus local CRD schemas, fake engine 7 tests, fake OpenRouter 6 tests, production fixture render guard and actionlint all passed.
+- Offline L4 checks (corrected by independent review; the original report said 1,598): service pytest 1,485 passed/24 skipped; root pytest 154 passed/80 subtests; `make check` 141 unittests plus Ruff and mypy; main Jest 1,702 passed/110 skipped and OTel Jest 18 passed; TS typecheck, lint, web build, three Compose renders, four Helm lint profiles, kind/prod kubeconform plus local CRD schemas, fake engine 7 tests, fake OpenRouter 6 tests, production fixture render guard and actionlint all passed.
+
+## L5 autoscaling correction, 2026-10-14
+
+First L5 round (worker cap only, before the engine-demand fix), recorded by the
+coordinator from that round's report:
+
+| Case | Result |
+|---|---|
+| A — one engine, 200 turns | Wait list peaked at 196; workers held at the 2/2 cap; 200/200 completed, 0 failed, 0 outbox. |
+| B — two engines | Workers reached the 3/3 cap; 100/100 completed. The second engine had to be forced with a temporary minimum because the engine queue trigger read a metric name that EPP v0.11.0 does not export (`llm_d_epp_flow_control_queue_size`); review also showed a structural deadlock (worker cap keeps the EPP queue below the engine threshold). Fixed below. |
+| C — drain | Workers returned to 2 and engines to 1; no lost turns. |
+| D — Prometheus outage | Fallback reached 4 workers; recovered afterwards. Superseded by `currentReplicasIfLower` below. |
+
+The kind worker concurrency for the active L5 chart is 2. Older V5/V6 rows above
+used concurrency 4 and should not be compared directly to the L5 worker cap.
+With `maxNumSeqs=2` and the default 1.25 headroom, one ready engine caps workers
+at 2 and two ready engines cap workers at 3.
+
+Live L5 E1-E3 results on `kind-ptr-k8s`, synthetic data and fake OpenRouter.
+The final 200-turn run used the corrected `AverageValue` engine formula in Helm
+revision 21; revision 22 restored the kind control-plane CIDR after the outage:
+
+- E1 submitted 200 turns at about 14:04:03 UTC. Engines scaled from 1 to 2 at
+  14:04:58 UTC and the second engine was Ready at 14:04:59 UTC. The worker cap
+  rose from 2 to 3; the third worker was created at 14:05:13 UTC and all three
+  were Ready by 14:05:30 UTC. The run completed 200/200 with 0 failed, 0
+  cancelled, 0 outbox residue and 0 duplicate completion rows. Ledger rows:
+  100 local and 100 fake spillover; fake OpenRouter submitted 100 requests with
+  0 duplicate IDs.
+- E2 scaled Prometheus to zero from 14:05:35 to 14:06:31 UTC. Engines held at 2
+  and workers held at 3 while both KEDA ScaledObjects showed fallback. The
+  Prometheus pod returned, but its Kubernetes discovery remained blocked by a
+  missing kind control-plane CIDR from the Helm upgrade. Revision 22 restored
+  that CIDR; all eight scrape targets were then healthy and fallback cleared.
+- E3 drained the Redis wait and active lists to zero. Workers returned from 3
+  to 2 at 14:08:57 UTC; engines returned from 2 to 1 at 14:10:12 UTC after
+  scraping recovered. The E1 terminal proof found 0 lost turns.
+
+L5 round 2, 2026-10-14 UTC, used the same synthetic kind cluster and fake
+OpenRouter only. The worker formula now uses Deployment Ready replicas from
+kube-state-metrics and 1.0 headroom at steady state; 1.25 applies while desired
+engines exceed Ready engines. The engine backlog divisor uses the 1.0 steady
+headroom. kube-state-metrics 8.6.0 was enabled with only the `ptr-inference`
+Deployment collector. KEDA's Redis list scaler still needs `EVAL`; `EVALSHA`
+was removed. Live ACL dry runs allowed `EVAL`, denied `EVALSHA`, and both
+ScaledObjects remained healthy.
+
+| Case | Result |
+|---|---|
+| F1 — fixed one engine | Engine max was pinned to the current count of 1. With the final kind worker minimum of 1, 60/60 turns completed, 0 failed/cancelled/outbox/duplicate rows; wait peaked at 58 and active at 2. Across 200 samples, desired and Ready workers stayed at the steady cap of 1. Fake spillover receipts: **0** (1,118 before and after). An earlier fixed-two-engine run also completed 200/200 with 0 lost, workers at 2/2 across 404 samples, wait peak 196, and **0** fake spillover receipts (1,028 before and after). |
+| F2 — one to two engines | Kind's worker minimum 1 and a temporary simulator readiness delay of 90 s exposed the scale-up window. Engines first showed desired 2 / Ready 1 at 15:03:30; Prometheus `scaling_up=1` at 15:03:47; workers reached 2/2 at 15:04:20, never above the scale-up cap of 2. The second engine was Ready at 15:05:00, with workers at the two-engine steady cap of 2/2 through the remaining 32 s of sampling. All 100/100 turns completed, with 0 failed/cancelled/outbox/duplicate rows. Fake spillover receipts: **26** (1,092 to 1,118). |
+| F3 — idle | After restoring engine max to 2 and removing the temporary readiness delay, engines returned to 1/1, workers to the final kind minimum of 1/1, and both Redis wait and active lists were 0. The passing F1 and F2 terminal proofs found 0 lost turns. |
+
+An initial F2 attempt used Prometheus `up` for ready-engine capacity. It
+counted the second simulator while its Deployment was still unready, allowing
+workers to reach 3; that signal was replaced with Deployment Ready replicas.
+The initial attempt's 100 turns reached terminal state, but its helper hit a
+Kubernetes API sampling timeout after completion, so only the corrected F2
+run above is counted as a passing terminal proof.
+
+Prometheus was scaled to 0 from 15:08:08 to 15:09:12 UTC. At 15:08:56 both
+KEDA ScaledObjects were in fallback and held workers 2/2 and engines 1/1;
+fallback cleared at 15:09:39. After changing kind's worker minimum to 1, a
+second outage ran from 15:25:35 to 15:26:39 UTC. At 15:26:24 both ScaledObjects
+were in fallback and held workers and engines at 1/1; fallback cleared at
+15:26:47. A synthetic RAG-off smoke turn completed with durable ACK and no
+outbox residue on the final profile. One saturation check passed: 32 requests,
+2 successes, 22 `rejected-saturated`, and 8 `rejected-ttl-expired` drops.

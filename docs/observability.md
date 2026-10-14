@@ -93,6 +93,29 @@ API readiness checks Postgres and Redis. If either check fails, the answer is
 are the source of truth for pod availability. Compose operational checks use
 `ops:status`, the API metrics endpoint and the Python worker health endpoint.
 
+## Engine Scraping
+
+The live EPP v0.11.0 `/metrics` HELP text identifies
+`llm_d_epp_flow_control_global_capacity_utilization_requests` as the fraction
+of configured global request capacity in use, and
+`llm_d_epp_flow_control_pool_saturation` as the dispatch gating signal by
+pipeline stage (`effective` is the maximum of prefill and decode, with 1.0 as
+the gate). They are diagnostic gauges, not engine demand triggers.
+
+The Helm chart does not install a Prometheus Operator, so it does not render a
+`PrometheusRule`. Configure the equivalent alert in the cluster's alerting
+system:
+
+```promql
+absent(up{job="ptr-engine-metrics", namespace="ptr-inference"} == 1)
+```
+
+Name it `EngineScrapeMissing` and page after two minutes. Without engine scrape
+data, worker scaling treats ready engines as zero and stays at the worker
+minimum. The engine KV trigger treats a missing series as an error; after the
+failure threshold, fallback holds the current engine count until scraping
+recovers.
+
 ## Sources
 
 -  (LiteLLM removal) §1, §4 row L4 and §6.4, `private design notes` repo

@@ -16,6 +16,9 @@ autoscaling:
     # Keep this equal to the GPU pool capacity for the target cluster.
     maxReplicaCount: 32
     scaleDownStabilizationSeconds: 600
+    redis:
+      caKey: REDIS_CA
+      tlsKey: REDIS_TLS_MODE
 maintenance:
   enabled: true
   jobs:
