@@ -8,12 +8,14 @@ and container state. It never reads or prints container environment values.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +57,7 @@ CONFIG_MOUNT_TARGETS = {
     "/app/persona_timeline_rag/gateway_budget.py",
     "/app/ptr-config.yaml",
 }
-DATA_TREE_NAMES = {"data"}
+EXCLUDED_TREE_NAMES = {"node_modules", ".venv", "__pycache__", ".next", "dist", "build"}
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,29 @@ def write_json_private(path: Path, value: Any) -> None:
         handle.write("\n")
     temp.chmod(0o600)
     temp.replace(path)
+
+
+def sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def replace_file_atomically(captured: Path, source: Path, mode: int) -> None:
+    create_missing_private_parents(source.parent)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=source.parent, prefix=".ptr-restore-", delete=False) as output:
+            temporary = Path(output.name)
+            with captured.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+            os.fchmod(output.fileno(), mode)
+        os.replace(temporary, source)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def docker(args: list[str]) -> str:
@@ -252,6 +277,53 @@ def compose_hashes(
     return hashes
 
 
+def compose_file_references(
+    project: str, env_file: Path, config_files: list[Path], working_dir: Path,
+) -> list[Path]:
+    """Read resolved file paths only; never log Compose's expanded JSON or environment."""
+    command = ["docker", "compose", "--env-file", str(env_file), "-p", project]
+    for path in config_files:
+        command.extend(["-f", str(path)])
+    command.extend(["config", "--format", "json", "--no-env-resolution"])
+    result = subprocess.run(
+        command, check=True, text=True, capture_output=True, timeout=120, cwd=working_dir
+    )
+    config = json.loads(result.stdout)
+    if not isinstance(config, dict):
+        fail("invalid Compose config structure")
+    paths: list[Path] = []
+    services = config.get("services") or {}
+    definitions = config.get("configs") or {}
+    if not isinstance(services, dict) or not isinstance(definitions, dict):
+        fail("invalid Compose file references")
+    for service in services.values():
+        if not isinstance(service, dict):
+            fail("invalid Compose service")
+        for entry in service.get("env_file") or []:
+            raw = entry if isinstance(entry, str) else entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(raw, str):
+                fail("invalid Compose env_file reference")
+            path = resolve_compose_reference(raw, config_files, working_dir)
+            if path.exists():
+                add_unique(paths, path)
+            elif not isinstance(entry, dict) or entry.get("required", True):
+                fail(f"required Compose env_file is missing: {path}")
+    for definition in definitions.values():
+        if not isinstance(definition, dict):
+            fail("invalid Compose config definition")
+        raw = definition.get("file")
+        if isinstance(raw, str):
+            add_unique(paths, resolve_compose_reference(raw, config_files, working_dir))
+    return paths
+
+
+def resolve_compose_reference(raw: str, config_files: list[Path], working_dir: Path) -> Path:
+    path = Path(raw)
+    if path.is_absolute():
+        return path.resolve()
+    return (config_files[0].parent / path).resolve() if config_files else (working_dir / path).resolve()
+
+
 def snapshot_path_for(source: Path, root: Path) -> Path:
     if not source.is_absolute():
         source = source.resolve()
@@ -270,17 +342,22 @@ def add_source(
     source: Path,
     snapshot_root: Path,
     reason: str,
-    exclude_data: bool = False,
 ) -> None:
+    if any(part in EXCLUDED_TREE_NAMES for part in source.parts):
+        fail(f"required source is inside an excluded generated tree: {source}")
     if not source.exists():
         fail(f"source path does not exist: {source}")
     source = source.absolute()
-    paths = [source]
-    if stat.S_ISDIR(source.lstat().st_mode):
-        paths.extend(sorted(source.rglob("*")))
+    paths: list[Path] = []
+    def visit(path: Path) -> None:
+        if path.name in EXCLUDED_TREE_NAMES:
+            return
+        paths.append(path)
+        if stat.S_ISDIR(path.lstat().st_mode):
+            for child in sorted(path.iterdir()):
+                visit(child)
+    visit(source)
     for path in paths:
-        if exclude_data and any(part in DATA_TREE_NAMES for part in path.relative_to(source).parts):
-            continue
         mode = path.lstat().st_mode
         if stat.S_ISDIR(mode):
             directories.add(path)
@@ -428,10 +505,8 @@ def capture(args: argparse.Namespace) -> int:
     config_files: list[Path] = []
     mount_paths: list[Path] = []
     env_files: list[Path] = []
+    referenced_files: list[Path] = []
     groups: dict[tuple[Path, tuple[Path, ...], Path], list[str]] = {}
-    if any(not path.is_absolute() for path in args.extra_path):
-        fail("extra paths must be absolute")
-    extra_paths = [path.absolute() for path in args.extra_path]
     for service, row in services.items():
         row_labels = labels(row)
         working_dir_raw = row_labels.get(WORKING_DIR_LABEL)
@@ -475,21 +550,23 @@ def capture(args: argparse.Namespace) -> int:
         ):
             fail(HASH_MISMATCH)
         hashes.update(group_hashes)
+        for path in compose_file_references(
+            args.project, env_path, list(service_configs), working_dir
+        ):
+            add_unique(referenced_files, path)
 
     assert_output_outside_sources(
-        output, [*working_dirs, *config_files, *env_files, *mount_paths, *extra_paths]
+        output, [*working_dirs, *config_files, *env_files, *referenced_files, *mount_paths]
     )
-    for working_dir in working_dirs:
-        add_source(files, directories, links, working_dir, output, "working_dir", exclude_data=True)
     for config_file in config_files:
         add_source(files, directories, links, config_file, output, "compose_config")
     for env_file in env_files:
         add_source(files, directories, links, env_file, output, "compose_env")
+    for reference in referenced_files:
+        add_source(files, directories, links, reference, output, "compose_reference")
     for service, row in services.items():
         for mount_path in mount_sources(row):
             add_source(files, directories, links, mount_path, output, f"mount:{service}")
-    for extra_path in extra_paths:
-        add_source(files, directories, links, extra_path, output, "extra_path")
     output = ensure_private_output(args.output)
     for directory in sorted(directories, key=lambda path: (len(path.parts), str(path))):
         private_dir(snapshot_path_for(directory, output))
@@ -550,7 +627,6 @@ def capture(args: argparse.Namespace) -> int:
             }
             for (working_dir, service_configs, env_path), group_services in ordered_groups
         ],
-        "extra_paths": [str(path) for path in extra_paths],
         "directories": [
             {"source": str(path), "mode": oct(stat.S_IMODE(path.lstat().st_mode))}
             for path in sorted(directories)
@@ -611,6 +687,7 @@ def restore(args: argparse.Namespace) -> int:
         not isinstance(row, dict) or not isinstance(row.get("source"), str) for row in directories
     ):
         fail("invalid directory manifest entry")
+    directories_created = 0
     for row in sorted(
         directories, key=lambda value: (len(Path(value["source"]).parts), value["source"])
     ):
@@ -620,7 +697,9 @@ def restore(args: argparse.Namespace) -> int:
         if args.apply and not directory.exists():
             create_missing_private_parents(directory)
             directory.chmod(int(str(row.get("mode") or "0o700"), 8))
+            directories_created += 1
     restored = 0
+    skipped_files = 0
     for row in files:
         if not isinstance(row, dict):
             fail("invalid file manifest entry")
@@ -634,14 +713,14 @@ def restore(args: argparse.Namespace) -> int:
         if not captured.is_file():
             fail(f"snapshot file missing: {rel}")
         mode = int(str(row.get("mode") or "0o600"), 8)
-        print(f"restore {captured.relative_to(snapshot)} -> {source}")
+        if source.is_file() and not source.is_symlink() and sha256_file(source) == sha256_file(captured):
+            skipped_files += 1
+            continue
         if args.apply:
-            create_missing_private_parents(source.parent)
-            if source.is_symlink():
-                source.unlink()
-            shutil.copyfile(captured, source)
-            source.chmod(mode)
+            replace_file_atomically(captured, source, mode)
         restored += 1
+    restored_links = 0
+    skipped_links = 0
     for row in links:
         if not isinstance(row, dict):
             fail("invalid link manifest entry")
@@ -658,16 +737,26 @@ def restore(args: argparse.Namespace) -> int:
         captured = snapshot / rel
         if not captured.is_symlink() or os.readlink(captured) != target:
             fail(f"snapshot link missing: {rel}")
-        print(f"restore {rel} -> {source}")
+        if source.is_symlink() and os.readlink(source) == target:
+            skipped_links += 1
+            continue
         if args.apply:
             create_missing_private_parents(source.parent)
-            if source.is_symlink() or source.is_file():
-                source.unlink()
-            if source.exists():
+            if source.exists() and source.is_dir() and not source.is_symlink():
                 fail(f"restore link target is a directory: {source}")
-            source.symlink_to(target)
-        restored += 1
-    print(f"restored={restored}" if args.apply else f"would_restore={restored}")
+            temporary = source.with_name(f".ptr-restore-link-{os.getpid()}-{restored_links}")
+            try:
+                temporary.symlink_to(target)
+                os.replace(temporary, source)
+            finally:
+                temporary.unlink(missing_ok=True)
+        restored_links += 1
+    action = "restored" if args.apply else "would_restore"
+    print(f"files_{action}={restored}")
+    print(f"files_skipped_identical={skipped_files}")
+    print(f"links_{action}={restored_links}")
+    print(f"links_skipped_identical={skipped_links}")
+    print(f"directories_created={directories_created}")
     return 0
 
 
@@ -679,7 +768,6 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--owner", required=True)
     capture_parser.add_argument("--output", required=True, type=Path)
     capture_parser.add_argument("--inspect-fixture", type=Path)
-    capture_parser.add_argument("--extra-path", action="append", default=[], type=Path)
     capture_parser.set_defaults(func=capture)
     restore_parser = sub.add_parser("restore")
     restore_parser.add_argument("--snapshot", required=True, type=Path)

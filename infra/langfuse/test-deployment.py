@@ -17,6 +17,54 @@ APP_COMPOSE = ROOT / "infra/compose.app.yml"
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_compose_config_exposes_referenced_paths_without_env_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "op.env").write_text("PROJECT_NAME=synthetic\n")
+            (root / "role.env").write_text("PRIVATE_SENTINEL=synthetic-hidden-value\n")
+            (root / "site.yml").write_text("synthetic: true\n")
+            (root / "compose.yml").write_text(
+                "services:\n  api:\n    image: busybox:stable\n"
+                "    env_file: ./role.env\n    configs: [site]\n"
+                "configs:\n  site:\n    file: ./site.yml\n"
+            )
+            result = subprocess.run(
+                ["docker", "compose", "--env-file", str(root / "op.env"),
+                 "-f", str(root / "compose.yml"), "config", "--format", "json",
+                 "--no-env-resolution"], check=True, capture_output=True,
+                text=True, timeout=10,
+            )
+            config = json.loads(result.stdout)
+            self.assertEqual(config["services"]["api"]["env_file"][0]["path"],
+                             str(root / "role.env"))
+            self.assertEqual(config["configs"]["site"]["file"], str(root / "site.yml"))
+            self.assertNotIn("synthetic-hidden-value", result.stdout)
+
+    def test_redeploy_preflight_checks_host_tools_before_step_one(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        preflight = runbook.split("Before step 1, check", 1)[1].split("1. Preflight", 1)[0]
+        command = preflight.split("```sh", 1)[1].split("```", 1)[0]
+        for required in ("command -v python3", "command -v docker", "docker compose version --short"):
+            self.assertIn(required, command)
+        self.assertIn("(2, 24)", command)
+        result = subprocess.run(["bash", "-n"], input=command, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_redeploy_migration_uses_pinned_container_and_valid_shell(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        step = runbook.split("4. Apply `split/0005`", 1)[1].split("5. Deploy the API", 1)[0]
+        command = step.split("```sh", 1)[1].split("```", 1)[0]
+        self.assertIn("postgres:17.6-alpine@sha256:ef257d85", command)
+        self.assertEqual(command.count('docker run --rm --network host'), 2)
+        self.assertEqual(command.count('--env-file "${OWNER_DB_ENV}"'), 2)
+        self.assertIn('dst=/migration.sql,readonly', command)
+        self.assertIn('app.generated_artifacts', command)
+        self.assertIn('split/0005_generated_artifacts.sql', command)
+        result = subprocess.run(["bash", "-n"], input=command, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_framework_smoke_has_only_the_direct_fake_engine(self):
         with tempfile.TemporaryDirectory() as folder:
             env = Path(folder) / "new.env"

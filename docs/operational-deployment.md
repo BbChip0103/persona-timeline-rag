@@ -209,6 +209,27 @@ APP_BASE='http://127.0.0.1:<api-port>'
 WORKER_BASE='http://127.0.0.1:<worker-port>'
 ```
 
+Before step 1, check the required host tools. Compose must be v2.24 or later.
+This preflight reads no private configuration and stops before changing the stack.
+
+```sh
+(
+  set -euo pipefail
+  command -v python3 >/dev/null
+  command -v docker >/dev/null
+  command -v timeout >/dev/null
+  COMPOSE_VERSION="$(timeout 10 docker compose version --short)"
+  python3 - "${COMPOSE_VERSION}" <<'PY'
+import re
+import sys
+match = re.fullmatch(r'v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?', sys.argv[1])
+if match is None or tuple(map(int, match.groups())) < (2, 24):
+    raise SystemExit('Docker Compose v2.24 or later is required')
+PY
+  echo host_tools_ok
+)
+```
+
 1. Preflight the existing project and owner. The redeploy must reuse the same
    Compose project name because Compose orphans are scoped only inside one
    project. A new project name would leave the old stack running on the host
@@ -229,15 +250,15 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    print nothing and exit zero. If it prints a container or fails, stop: the
    project contains a different or missing owner label.
 
-2. Create the rollback set before changing anything. The snapshot helper reads
-   Set `SNAPSHOT` to persistent host storage. Never use `/tmp` or a path beneath
+2. Create the rollback set before changing anything. Set `SNAPSHOT` to persistent
+   host storage. Never use `/tmp` or a path beneath
    it: a reboot can remove the only rollback set. The live stack from the
    2026-10-11 cutover has a group whose working directory and bind mounts are
    under `/tmp`; a host reboot can wipe those sources. This redeploy moves the
    stack to the repository checkout.
 
-   The snapshot helper reads
-   Docker labels, bind mount paths, image references and running state. It uses
+   The snapshot helper reads Docker labels, bind mount paths, image references
+   and running state. It uses
    each service's labeled working directory, Compose file paths and
    `com.docker.compose.project.environment_file` to group services. From each
    group's working directory, it runs
@@ -251,7 +272,11 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    mounts, including `/app/data/generated`, which remain in place. Unknown bind
    mount targets stop capture until classified in the helper. It copies allowlisted
    config/code bind mounts, every group's labeled Compose files and env file,
-   and every labeled working directory tree except `data/` into
+   and file references from `env_file` and Compose `configs` discovered through
+   captured `docker compose config --format json --no-env-resolution` output.
+   It never prints that output or env values. It does not copy the working
+   directory tree or generated `node_modules`, `.venv`, `__pycache__`, `.next`,
+   `dist` or `build` directories. These sources go into
    `${SNAPSHOT}/root/<absolute-path-without-leading-slash>` with `0700`
    directories and `0600` files, writes a private
    manifest, copies the restore helper into the snapshot, records each saved
@@ -276,14 +301,6 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
      python3 scripts/operational-snapshot.py capture \
        --project "${PROJECT}" \
        --owner "${OWNER_NONCE}" \
-       --extra-path "${OP_ENV}" \
-       --extra-path "${OLD_BACKEND_ENV}" \
-       --extra-path "${OLD_WEB_ENV}" \
-       --extra-path "${OLD_WORKER_ENV}" \
-       --extra-path "${GATEWAY_ENV}" \
-       --extra-path "${GATEWAY_DB_ENV}" \
-       --extra-path "${GATEWAY_REDIS_ENV}" \
-       --extra-path "${GATEWAY_CONFIG}" \
        --output "${SNAPSHOT}"
      python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
        --snapshot "${SNAPSHOT}" --dry-run >/dev/null
@@ -295,17 +312,20 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    ```
 
    The rollback source paths are now the manifest, not the current checkout. The
-   explicit extra paths capture the private Compose and role env files, which
-   Docker does not necessarily expose as bind mounts. Each input path must be
-   absolute. The helper restores these paths from the same manifest. The
+   Compose file references capture the private role env/config files; the
+   labeled env file and config mounts are captured as well. The helper restores
+   these paths from the same manifest. The
    `compose_groups` entries record each group's services, working directory,
-   Compose files, labeled env file and git state (`none` or `clean@<rev>`)
-   separately from extra paths. The capture summary prints rollback order.
+   Compose files, labeled env file and git state (`none` or `clean@<rev>`).
+   The capture summary prints rollback order.
    Restore only the snapshot's config/code sources; data mounts stay untouched.
 
    The research DB, ledger, receipts and queue are not snapshotted or reset.
    This redeploy applies only `split/0005`; it does not backfill, erase or replay
    provider accounting.
+   After the rollback window closes, an operator may manually delete old
+   oversized snapshots from private storage. Keep the current snapshot until
+   then; this procedure does not remove it.
 
 3. Prepare the new private configuration from the snapshots before migration.
    Keep the old files untouched. The helper copies existing keys, removes the
@@ -358,15 +378,28 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    owner URL must be `PTR_LLM_MAINTENANCE_DATABASE_URL` in a private file, and
    it must point to the `ptr_split_owner` role for `ptr_split_research`.
 
+   The private owner file must be a Docker `--env-file` with a plain
+   `PTR_LLM_MAINTENANCE_DATABASE_URL=...` entry. Its value is passed only to
+   the container. Run the pinned PostgreSQL 17.6 client already used by this
+   repository; the SQL mount is read-only. The client uses host networking to
+   reach the verified loopback owner URL.
+
    ```sh
-   set -a
-   . "${OWNER_DB_ENV}"
-   set +a
-   OWNER_DATABASE_URL="${PTR_LLM_MAINTENANCE_DATABASE_URL:?}"
-   PGCONNECT_TIMEOUT=5 timeout 30 psql "${OWNER_DATABASE_URL}" -v ON_ERROR_STOP=1 \
-     --file supabase/split/0005_generated_artifacts.sql
-   PGCONNECT_TIMEOUT=5 timeout 10 psql "${OWNER_DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc \
-     "SELECT current_database(), current_user, to_regclass('app.generated_artifacts') IS NOT NULL, EXISTS (SELECT 1 FROM public.ptr_schema_migrations WHERE name='split/0005_generated_artifacts.sql')"
+   (
+     set -euo pipefail
+     test -r "${OWNER_DB_ENV}"
+     test -r supabase/split/0005_generated_artifacts.sql
+     PG_IMAGE='postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94'
+     timeout 45 docker run --rm --network host \
+       --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
+       --mount "type=bind,src=${PWD}/supabase/split/0005_generated_artifacts.sql,dst=/migration.sql,readonly" \
+       --entrypoint sh "${PG_IMAGE}" -c \
+       'exec psql --no-psqlrc "$PTR_LLM_MAINTENANCE_DATABASE_URL" -v ON_ERROR_STOP=1 -f /migration.sql'
+     timeout 20 docker run --rm --network host \
+       --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
+       --entrypoint sh "${PG_IMAGE}" -c \
+       'exec psql --no-psqlrc "$PTR_LLM_MAINTENANCE_DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT current_database(), current_user, to_regclass('\''app.generated_artifacts'\'') IS NOT NULL, EXISTS (SELECT 1 FROM public.ptr_schema_migrations WHERE name='\''split/0005_generated_artifacts.sql'\'')"'
+   )
    ```
 
    The last command must show `ptr_split_research`, `ptr_split_owner`, `t` and

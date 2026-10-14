@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,7 @@ def inspect_row(service: str, project: str, owner: str, root: Path) -> dict[str,
         "State": {"Running": True},
         "Config": {"Image": f"example/{service}:deployed", "Labels": labels},
         "Mounts": [
+            {"Type": "bind", "Source": str(root / "mounted-code"), "Destination": "/app/ptr_routing.py"},
             {
                 "Type": "bind",
                 "Source": str(root / "private" / f"{service}.env"),
@@ -72,6 +74,8 @@ class OperationalSnapshotTests(unittest.TestCase):
         (deployed / "infra" / "split").mkdir(parents=True)
         (deployed / "private").mkdir()
         (deployed / "private" / "op.env").write_text("OP_SECRET=hidden\n")
+        (deployed / "private" / "compose-referenced.env").write_text("REFERENCED_SECRET=hidden\n")
+        (deployed / "infra" / "split" / "referenced.yaml").write_text("synthetic: true\n")
         (deployed / "mounted-code" / "gateway").mkdir(parents=True)
         (deployed / "mounted-code" / "empty").mkdir()
         (deployed / "mounted-code" / "empty").chmod(0o755)
@@ -137,6 +141,8 @@ class OperationalSnapshotTests(unittest.TestCase):
                 {
                     "env": env_path,
                     "files": row_labels["com.docker.compose.project.config_files"].split(","),
+                    "referenced_env": str(Path(directory) / "private" / "compose-referenced.env"),
+                    "referenced_config": str(Path(directory) / "infra" / "split" / "referenced.yaml"),
                     "services": [],
                 },
             )
@@ -150,9 +156,13 @@ class OperationalSnapshotTests(unittest.TestCase):
             "assert sys.argv[4:6] == ['-p', 'ptr-op']\n"
             "assert sys.argv[6:6+2*len(group['files'])] == "
             "[part for file in group['files'] for part in ('-f', file)]\n"
-            "assert sys.argv[6+2*len(group['files']):8+2*len(group['files'])] == "
-            "['config', '--hash']\n"
-            "assert len(sys.argv) == 9+2*len(group['files'])\n"
+            "tail = sys.argv[6+2*len(group['files']):]\n"
+            "if tail == ['config', '--format', 'json', '--no-env-resolution']:\n"
+            " print(__import__('json').dumps({'services': {s: {'env_file': "
+            "[{'path': group['referenced_env']}]} for s in group['services']}, "
+            "'configs': {'site': {'file': group['referenced_config']}}})); sys.exit(0)\n"
+            "assert tail[:2] == ['config', '--hash']\n"
+            "assert len(tail) == 3\n"
             "services = sys.argv[-1].split(',')\n"
             f"hashes = {hashes!r}\n"
             "assert services == sorted(group['services'])\n"
@@ -169,6 +179,9 @@ class OperationalSnapshotTests(unittest.TestCase):
         shared_env.write_text("OP_SECRET=hidden\n", encoding="utf-8")
         (second / "infra" / "split").mkdir(parents=True)
         (second / "private").mkdir()
+        (second / "mounted-code").mkdir()
+        (second / "private" / "compose-referenced.env").write_text("REFERENCED_SECRET=hidden\n")
+        (second / "infra" / "split" / "referenced.yaml").write_text("synthetic: true\n")
         for relative in (
             "infra/compose.app.yml",
             "infra/split/compose.operational.yml",
@@ -195,9 +208,6 @@ class OperationalSnapshotTests(unittest.TestCase):
         with self.tempdir() as raw:
             folder = Path(raw)
             deployed, fixture = self.write_fixture(folder)
-            extra = folder / "private-compose.env"
-            extra.write_text("EXTRA_SECRET=hidden\n", encoding="utf-8")
-            extra.chmod(0o600)
             snapshot = folder / "snapshot"
             result = run(
                 "capture",
@@ -209,8 +219,6 @@ class OperationalSnapshotTests(unittest.TestCase):
                 snapshot,
                 "--inspect-fixture",
                 fixture,
-                "--extra-path",
-                extra,
                 env=self.fake_docker(folder, fixture),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -221,7 +229,7 @@ class OperationalSnapshotTests(unittest.TestCase):
             self.assertEqual(sorted(manifest["expected_services"]), sorted(SERVICES))
             self.assertEqual({row["service"] for row in manifest["services"]}, set(SERVICES))
             self.assertTrue(all(len(row["config_hash"]) == 64 for row in manifest["services"]))
-            self.assertEqual(manifest["extra_paths"], [str(extra)])
+            self.assertNotIn("extra_paths", manifest)
             self.assertEqual(len(manifest["compose_config_files"]), 3)
             self.assertEqual(manifest["compose_env_file"], str(deployed / "private" / "op.env"))
             self.assertEqual(len(manifest["compose_groups"]), 1)
@@ -229,6 +237,11 @@ class OperationalSnapshotTests(unittest.TestCase):
             self.assertNotIn("deployed_git_revision", manifest)
             self.assertFalse(any("data/generated" in row["source"] for row in manifest["files"]))
             self.assertFalse(any("/data" in row["source"] for row in manifest["directories"]))
+            self.assertFalse(any(row["reason"] == "working_dir" for row in manifest["files"]))
+            self.assertTrue(any(row["source"] == str(deployed / "private" / "compose-referenced.env")
+                                and row["reason"] == "compose_reference" for row in manifest["files"]))
+            self.assertTrue(any(row["source"] == str(deployed / "infra" / "split" / "referenced.yaml")
+                                and row["reason"] == "compose_reference" for row in manifest["files"]))
             self.assertTrue((snapshot / "tools" / "operational-snapshot.py").is_file())
             rollback_images = (snapshot / "rollback-images.yml").read_text(encoding="utf-8")
             for service in SERVICES:
@@ -264,10 +277,10 @@ class OperationalSnapshotTests(unittest.TestCase):
             )
 
             target = deployed / "mounted-code" / "gateway" / "router.py"
+            original_inode = target.stat().st_ino
             target.write_text("BROKEN = True\n", encoding="utf-8")
             (deployed / "data" / "generated" / "draft.json").write_text('{"draft":"new"}\n')
             (deployed / "infra" / "split" / "site.yml").unlink()
-            extra.unlink()
             (deployed / "mounted-code" / "empty").rmdir()
             (deployed / "mounted-code" / "gateway" / "router-link.py").unlink()
             parent_mode = os.stat(target.parent).st_mode & 0o777
@@ -302,10 +315,10 @@ class OperationalSnapshotTests(unittest.TestCase):
             )
             self.assertEqual(applied.returncode, 0, applied.stderr)
             self.assertEqual(target.read_text(encoding="utf-8"), "ROUTER = 'synthetic-private'\n")
+            self.assertNotEqual(target.stat().st_ino, original_inode)
             self.assertEqual(
                 (deployed / "infra" / "split" / "site.yml").read_text(), "services: {}\n"
             )
-            self.assertEqual(extra.read_text(), "EXTRA_SECRET=hidden\n")
             self.assertEqual(
                 (deployed / "data" / "generated" / "draft.json").read_text(),
                 '{"draft":"new"}\n',
@@ -316,6 +329,52 @@ class OperationalSnapshotTests(unittest.TestCase):
                 os.readlink(deployed / "mounted-code" / "gateway" / "router-link.py"), "router.py"
             )
             self.assertEqual(os.stat(target.parent).st_mode & 0o777, parent_mode)
+
+    def test_capture_excludes_build_trees_and_unreferenced_working_files(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            deployed, fixture = self.write_fixture(folder)
+            for name in ("node_modules", ".venv", "__pycache__", ".next", "dist", "build"):
+                path = deployed / name
+                path.mkdir()
+                (path / "esbuild").write_text("generated")
+                mounted = deployed / "mounted-code" / name
+                mounted.mkdir()
+                (mounted / "esbuild").write_text("generated")
+            (deployed / "unreferenced.txt").write_text("skip")
+            snapshot = folder / "snapshot"
+            result = run("capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                         "--output", snapshot, "--inspect-fixture", fixture,
+                         env=self.fake_docker(folder, fixture))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            captured = {row["source"] for row in manifest["files"]}
+            self.assertNotIn(str(deployed / "unreferenced.txt"), captured)
+            for name in ("node_modules", ".venv", "__pycache__", ".next", "dist", "build"):
+                self.assertFalse(any(name in Path(path).parts for path in captured))
+
+    def test_restore_identical_file_is_noop_and_changed_file_is_atomic(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            deployed, fixture = self.write_fixture(folder)
+            snapshot = folder / "snapshot"
+            result = run("capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                         "--output", snapshot, "--inspect-fixture", fixture,
+                         env=self.fake_docker(folder, fixture))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            target = deployed / "mounted-code" / "gateway" / "router.py"
+            initial_inode = target.stat().st_ino
+            identical = run("restore", "--snapshot", snapshot, "--apply")
+            self.assertEqual(identical.returncode, 0, identical.stderr)
+            self.assertEqual(target.stat().st_ino, initial_inode)
+            self.assertIn("files_skipped_identical=", identical.stdout)
+            target.write_text("changed\n")
+            old_inode = target.stat().st_ino
+            changed = run("restore", "--snapshot", snapshot, "--apply")
+            self.assertEqual(changed.returncode, 0, changed.stderr)
+            self.assertNotEqual(target.stat().st_ino, old_inode)
+            self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(),
+                             hashlib.sha256((snapshot / "root" / str(target).lstrip("/")).read_bytes()).hexdigest())
 
     def test_capture_refuses_owner_mismatch(self) -> None:
         with self.tempdir() as raw:
@@ -539,8 +598,9 @@ class OperationalSnapshotTests(unittest.TestCase):
             )
             dry = run("restore", "--snapshot", snapshot, "--dry-run")
             self.assertEqual(dry.returncode, 0, dry.stderr)
-            self.assertIn(str(first / "infra" / "compose.app.yml"), dry.stdout)
-            self.assertIn(str(second / "infra" / "compose.app.yml"), dry.stdout)
+            self.assertIn("files_would_restore=", dry.stdout)
+            self.assertNotIn(str(first), dry.stdout)
+            self.assertNotIn(str(second), dry.stdout)
             self.assertNotIn("hidden", dry.stdout + dry.stderr)
 
     def test_two_groups_refuse_hash_mismatch_in_spillover(self) -> None:
