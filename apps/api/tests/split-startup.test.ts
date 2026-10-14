@@ -98,6 +98,22 @@ test('split runtime routes generated artifacts to the Postgres store',async()=>{
   } finally {await runtime.close();save.mockRestore();get.mockRestore();}
 });
 
+test.each([
+  [undefined,false],
+  ['0',false],
+  ['1',true],
+])('split runtime maps PTR_PAID_SPILLOVER=%s to billable=%s',async(value,billable)=>{
+  const runtime=createSplitRuntime({PTR_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_test',
+    PTR_REDIS_URL:'redis://:synthetic@127.0.0.1:58479/0',PTR_LLM_CONTROL_TOKEN:'synthetic-control-token-1234567890',
+    PTR_BACKEND_MAINTENANCE:'0',...(value===undefined?{}:{PTR_PAID_SPILLOVER:value})});
+  try {expect(runtime.billable).toBe(billable);} finally {await runtime.close();}
+});
+test('split runtime rejects local plus paid spillover because TS has no spillover ledger',()=>{
+  expect(()=>createSplitRuntime({PTR_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_test',
+    PTR_REDIS_URL:'redis://:synthetic@127.0.0.1:58479/0',PTR_LLM_CONTROL_TOKEN:'synthetic-control-token-1234567890',
+    PTR_BACKEND_MAINTENANCE:'0',PTR_CHAT_PROVIDER:'local',PTR_PAID_SPILLOVER:'1'})).toThrow();
+});
+
 test('generated artifact migration stays in app schema with private grants and no source table',()=>{
   const migration=readFileSync(join(root,'supabase/split/0005_generated_artifacts.sql'),'utf8');
   expect(migration).toContain('CREATE TABLE IF NOT EXISTS app.generated_artifacts');

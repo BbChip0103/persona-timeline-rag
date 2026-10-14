@@ -3,15 +3,15 @@ import { unlink, writeFile } from 'node:fs/promises';
 import { assertSyntheticTargets, fixtures, frameworkEnvironment, readGeneratedEnv, traceEvidence } from './framework-smoke';
 const source={PTR_FRAMEWORK_TEST_DB_PASSWORD:'synthetic-db',PTR_FRAMEWORK_QUEUE_PASSWORD:'synthetic-redis',PTR_FAKE_ENGINE_PORT:'58001',
   PTR_GUARDRAILS_PORT:'58002',PTR_GUARDRAILS_TOKEN:'synthetic-guardrails-token',LANGFUSE_BASE_URL:'http://127.0.0.1:58003',
-  LANGFUSE_PUBLIC_KEY:'synthetic-public',LANGFUSE_SECRET_KEY:'synthetic-secret',OPENROUTER_API_KEY:'DO_NOT_INHERIT',PTR_LITELLM_MASTER_KEY:'DO_NOT_INHERIT',
+  LANGFUSE_PUBLIC_KEY:'synthetic-public',LANGFUSE_SECRET_KEY:'synthetic-secret',OPENROUTER_API_KEY:'DO_NOT_INHERIT',
   GOAL1_LIVE_ENABLED:'true',LANGSMITH_TRACING:'true'};
 const key={PTR_LLM_LOCAL_API_KEY:'synthetic-local-key'};
 test('explicit child environment excludes live/provider/master credentials and forces synthetic modes',()=>{
   const env=frameworkEnvironment(source,key,'/tmp/synthetic-personas.json','fw-smoke-test');
-  expect(env.OPENROUTER_API_KEY).toBeUndefined();expect(env.PTR_LITELLM_MASTER_KEY).toBeUndefined();expect(env.GOAL1_LIVE_ENABLED).toBeUndefined();
-  expect(env.PTR_CHAT_PROVIDER).toBe('litellm');expect(env.PTR_LITELLM_BILLABLE).toBe('0');expect(env.PTR_SAFETY_FILTER).toBe('off');
+  expect(env.OPENROUTER_API_KEY).toBeUndefined();expect(env.GOAL1_LIVE_ENABLED).toBeUndefined();
+  expect(env.PTR_CHAT_PROVIDER).toBe('local');expect(env.PTR_PAID_SPILLOVER).toBe('0');expect(env.PTR_SAFETY_FILTER).toBe('off');
   expect(env.PTR_LLM_PROVIDER).toBeUndefined();
-  expect(env.PTR_LITELLM_BASE_URL).toBe('http://127.0.0.1:58001/v1');expect(env.PTR_LITELLM_API_KEY).toBe('synthetic-local-key');
+  expect(env.PTR_LLM_LOCAL_BASE_URL).toBe('http://127.0.0.1:58001/v1');expect(env.PTR_LLM_LOCAL_API_KEY).toBe('synthetic-local-key');
   expect(env.LANGSMITH_TRACING).toBe('false');expect(env.PTR_LANGFUSE_CAPTURE_CONTENT).toBe('0');
   expect(env.PTR_API_TOKEN).not.toBe(env.PTR_API_SYNTHETIC_TOKEN);
 });

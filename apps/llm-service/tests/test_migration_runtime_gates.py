@@ -11,56 +11,6 @@ from ptr_llm.control import ControlUnavailable
 from ptr_llm.worker import ExecutionStopped
 
 
-def billable_env(**values):
-    return {
-        "PTR_LLM_PROVIDER": "litellm",
-        "PTR_LLM_LITELLM_BILLABLE": "1",
-        "PTR_LLM_PROMPT_USD_PER_M": "0.1",
-        "PTR_LLM_COMPLETION_USD_PER_M": "0.3",
-        "PTR_LLM_LITELLM_BASE_URL": "http://127.0.0.1:1/v1",
-        "PTR_LLM_LITELLM_API_KEY": "synthetic-not-a-provider-key",
-        **values,
-    }
-
-
-@pytest.mark.parametrize(
-    "consent",
-    [
-        {},
-        {"PTR_LLM_LIVE_ENABLED": "1"},
-        {"PTR_LLM_ALLOW_EXTERNAL_DATA": "1"},
-        {"PTR_LLM_LIVE_ENABLED": "true", "PTR_LLM_ALLOW_EXTERNAL_DATA": "1"},
-    ],
-)
-async def test_billable_proxy_requires_both_explicit_consents_before_pool(monkeypatch, consent):
-    from ptr_llm import runtime as module
-
-    def forbidden_pool(**_):
-        pytest.fail("Consent must be validated before DB pool construction")
-
-    monkeypatch.setattr(module, "AsyncConnectionPool", forbidden_pool)
-    with pytest.raises(ProviderError, match="LIVE_NOT_ENABLED"):
-        await module.build_runtime(_settings(), billable_env(**consent))
-
-
-async def test_billable_proxy_with_both_consents_is_accepted_without_network(monkeypatch, tmp_path):
-    from ptr_llm import runtime as module
-
-    monkeypatch.setattr(module, "AsyncConnectionPool", FakePool)
-    registry = tmp_path / "synthetic-publication.json"
-    registry.write_text('{"database":"ptr_split_test","personas":[]}', encoding="utf-8")
-    built = await module.build_runtime(
-        _settings(),
-        billable_env(
-            PTR_LLM_LIVE_ENABLED="1",
-            PTR_LLM_ALLOW_EXTERNAL_DATA="1",
-            PTR_LLM_PUBLISHED_PERSONAS_FILE=str(registry),
-        ),
-    )
-    assert built.provider.provider.ledger is not None
-    await built.close()
-
-
 async def test_factory_preserves_historical_classifier_configuration(monkeypatch):
     from ptr_llm import runtime as module
 
@@ -187,13 +137,18 @@ async def test_receipt_io_monitors_lock_and_control_loss(operation, loss):
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_factory_preserves_litellm_prompt_byte_limit(monkeypatch, tmp_path):
+async def test_factory_preserves_local_prompt_byte_limit(monkeypatch, tmp_path):
     from ptr_llm import runtime as module
 
     monkeypatch.setattr(module, "AsyncConnectionPool", FakePool)
     registry = tmp_path / "synthetic-publication.json"
     registry.write_text('{"database":"ptr_split_test","personas":[]}', encoding="utf-8")
-    env = billable_env(PTR_LLM_LITELLM_BILLABLE="0", PTR_LLM_PUBLISHED_PERSONAS_FILE=str(registry))
+    env = {
+        "PTR_LLM_PROVIDER": "local",
+        "PTR_LLM_LOCAL_BASE_URL": "http://127.0.0.1:1/v1",
+        "PTR_LLM_LOCAL_MODEL": "synthetic-local",
+        "PTR_LLM_PUBLISHED_PERSONAS_FILE": str(registry),
+    }
     built = await module.build_runtime(_settings(), env)
     assert built.provider.provider.provider.input_bytes == 65536
     await built.close()
@@ -282,20 +237,3 @@ async def test_observed_jev_is_one_call_with_reported_usage_and_no_raw_data():
     }
     assert telemetry.updates[-1]["metadata"]["accounting"] == "reported-receipt"
     assert "never-export" not in str(telemetry.updates)
-
-
-async def test_unapproved_proxy_alias_cannot_be_declared_nonbillable(monkeypatch):
-    from ptr_llm import runtime as module
-
-    def forbidden_pool(**_):
-        pytest.fail("Nonbillable alias must be checked before pool construction")
-
-    monkeypatch.setattr(module, "AsyncConnectionPool", forbidden_pool)
-    with pytest.raises(ProviderError, match="UNAPPROVED_NONBILLABLE_ALIAS"):
-        await module.build_runtime(
-            _settings(),
-            {
-                **billable_env(PTR_LLM_LITELLM_BILLABLE="0"),
-                "PTR_LLM_MODEL": "paid-synthetic-alias",
-            },
-        )

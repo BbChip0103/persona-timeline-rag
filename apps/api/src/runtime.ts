@@ -10,7 +10,7 @@ import { BullMqTurnDelivery, RedisTurnEventSource, RedisTurnEvents, createRedisC
 import { createLog, FrameworkTelemetry, frameworkTelemetryConfig, type FrameworkObservation } from '@ptr/ops';
 import { CheckpointedTextProvider, GuardrailsClient, AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, REPLY_GUARD_REVISION } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository, PostgresRetrieval, PostgresSourceRepository } from '@ptr/storage';
-import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, LiteLLMTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
+import { DECISION_MODEL_IDS, DEFAULT_JEV_MODEL, FakeEmbeddingProvider, JevInputSafetyClassifier, JevIntentClassifier, FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider, OpenRouterClient, PostgresBudgetLedger, liveOptionsFromEnvironment, parseLatencyProfile } from '@ptr/providers';
 import type {CreativeArtifact} from './creative-artifact';
 export type {CreativeArtifact} from './creative-artifact';
 export interface ApiRuntime {
@@ -127,29 +127,26 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
   const providerName=env.PTR_CHAT_PROVIDER??'fake';
   const billable=paidSpilloverPossible(env);
-  if(!['fake','litellm'].includes(providerName))throw new CoreError('INVALID_INPUT','Legacy provider routes were removed');
-  let model=providerName==='fake'?'synthetic/fake-text-v1':env.PTR_MODEL??'primary';
+  if(!['fake','local'].includes(providerName))throw new CoreError('INVALID_INPUT','Legacy provider routes were removed');
+  if(billable&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))throw new CoreError('INVALID_INPUT');
+  if(providerName==='local'&&billable)throw new CoreError('INVALID_INPUT','Local provider has no TS spillover ledger');
+  let model=providerName==='fake'?'synthetic/fake-text-v1':env.PTR_LLM_LOCAL_MODEL??'';
   let provider:TextProvider=fakeText;
   if(env.PTR_FAKE_LATENCY!==undefined) {
     if(providerName!=='fake')throw new CoreError('INVALID_INPUT');
     provider=new LatencyInjectedTextProvider(fakeText,parseLatencyProfile(env.PTR_FAKE_LATENCY));model+='+'+'latency';
   }
-  if(providerName==='litellm') {
-    if(!env.PTR_LITELLM_BASE_URL||!env.PTR_LITELLM_API_KEY)throw new CoreError('INVALID_INPUT');
-    if(!billable&&model!=='primary')throw new CoreError('INVALID_INPUT','Unapproved billable model alias');
-    if(billable&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))throw new CoreError('INVALID_INPUT');
-    const reservation=Number(env.PTR_LITELLM_RESERVATION_MICROUSD??100000);
-    provider=new LiteLLMTextProvider({baseUrl:env.PTR_LITELLM_BASE_URL,apiKey:env.PTR_LITELLM_API_KEY,model,
-      ...(billable?{billable:{ledger:new PostgresBudgetLedger(pool,databaseUrl),reservationMicrousd:reservation}}:{}),
-      onMetrics:metrics=>generation.getStore()?.update({model,metadata:{attempts:metrics.attempts,totalMs:metrics.totalMs},
-        ...(metrics.costMicrousd===null?{}:{costDetails:{total:metrics.costMicrousd/1000000}})})});
+  if(providerName==='local') {
+    if(!env.PTR_LLM_LOCAL_BASE_URL||!model)throw new CoreError('INVALID_INPUT');
+    provider=new OpenAICompatibleTextProvider({baseUrl:env.PTR_LLM_LOCAL_BASE_URL,apiKey:env.PTR_LLM_LOCAL_API_KEY,model,
+      structuredAgentReplies:true,onMetrics:metrics=>generation.getStore()?.update({model,metadata:{attempts:metrics.attempts,totalMs:metrics.totalMs}})});
   }
   let guardrails:GuardrailsClient|undefined;
   if(env.PTR_GUARDRAILS_URL||env.PTR_GUARDRAILS_TOKEN) {
     if(!env.PTR_GUARDRAILS_URL||!env.PTR_GUARDRAILS_TOKEN)throw new CoreError('INVALID_INPUT');
     guardrails=new GuardrailsClient({baseUrl:env.PTR_GUARDRAILS_URL,apiKey:env.PTR_GUARDRAILS_TOKEN,timeoutMs:Number(env.PTR_GUARDRAILS_TIMEOUT_MS??2500)});
   }
-  if(providerName==='litellm'&&!guardrails)throw new CoreError('INVALID_INPUT');
+  if(providerName==='local'&&!guardrails)throw new CoreError('INVALID_INPUT');
   // Domain composition preserves provider identity in offline tests; production calls carry real generation spans.
   if(frameworkTelemetryConfig(env).enabled) {
     const transport=provider;
@@ -205,9 +202,9 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const semanticSearch=providerName==='fake';
   // Only costly self-hosted turn calls get a minimal durable response checkpoint. Paid chat/Jev already
   // have independent request ledgers; drafts keep the unwrapped provider. Cheap graph stages restart.
-  const turnProvider=providerName==='litellm'&&!billable
+  const turnProvider=providerName==='local'&&!billable
     ?new CheckpointedTextProvider(provider,{checkpointer:new PostgresSaver(pool),
-      identity:JSON.stringify({revision:'litellm-turn-receipt-v1',baseUrl:env.PTR_LITELLM_BASE_URL,
+      identity:JSON.stringify({revision:'local-turn-receipt-v1',baseUrl:env.PTR_LLM_LOCAL_BASE_URL,
         model,maxOutputTokens:512,temperature:0,structuredOutput:'agent-json-schema-v1'})})
     :provider;
   const chat=new ChatService({store,personas,provider:turnProvider,leases:store,delivery,events,maxQueueDepth:queueMaxDepth,semanticSearch,

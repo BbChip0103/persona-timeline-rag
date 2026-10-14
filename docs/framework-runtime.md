@@ -7,9 +7,14 @@ and private env files; see [split cutover/runbook](python-llm-split.md). Histori
 framework instructions below describe the retained TS reference/runtime and must not
 be used to give Python the old all-in-one credentials.
 
-# Framework runtime: current serving path
+# Historical framework runtime
 
-The default application has exactly three TypeScript processes: NestJS API, a Nest
+The current serving path is the Python split runtime described in
+[python-llm-split.md](python-llm-split.md), [kubernetes.md](kubernetes.md) and
+[operational-deployment.md](operational-deployment.md). The TypeScript framework
+runtime below is historical.
+
+The archived application had exactly three TypeScript processes: NestJS API, a Nest
 BullMQ worker, and Next.js web. It does not launch a dispatcher, bespoke gateway,
 server registry, credit/DRR scheduler or capacity-controller loop. The separate
 [framework infrastructure](framework-deployment.md) supplies LiteLLM, Guardrails

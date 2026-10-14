@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic OpenAI chat fixture ONLY. Never a replacement for real LiteLLM or vLLM."""
+"""Synthetic OpenAI chat fixture ONLY. Never a replacement for a real model server."""
 
 import json
 import os
@@ -53,7 +53,7 @@ def _request_id(body, headers):
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     request_id = (
         headers.get("x-request-id")
-        or headers.get("x-litellm-request-id")
+        or headers.get("x-openai-request-id")
         or metadata.get("request_id")
         or metadata.get("requestId")
     )

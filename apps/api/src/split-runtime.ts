@@ -45,6 +45,7 @@ const assertSplitServiceUrl=(url:URL,env:NodeJS.ProcessEnv)=>{
 /** Split production composition uses only app-schema storage and queue/control clients. No DDL/provider construction. */
 export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRuntime {
   const billable=paidSpilloverPossible(env);
+  if(env.PTR_CHAT_PROVIDER==='local'&&billable)throw new CoreError('INVALID_INPUT');
   const databaseUrl=env.PTR_APP_DATABASE_URL??env.DATABASE_URL??'';
   let db:URL;try{db=new URL(databaseUrl);}catch{throw new CoreError('INVALID_INPUT');}
   try{assertLocalDatabaseUrl(databaseUrl,env);}catch{throw new CoreError('INVALID_INPUT');}

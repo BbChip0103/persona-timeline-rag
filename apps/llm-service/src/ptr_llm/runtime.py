@@ -38,7 +38,6 @@ from .providers import (
     FakeTextProvider,
     JevInputSafetyClassifier,
     JevIntentClassifier,
-    LiteLLMTextProvider,
     OpenRouterClient,
     OpenRouterEmbeddingProvider,
 )
@@ -362,10 +361,9 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
     env = os.environ if env is None else env
     assert_llm_database_url(settings.database_url)
     prompt_config = PromptManagementConfig.from_env(env)
-    # Paid proxy routes preserve the explicit live/data gates from the TS
-    # runtime. Validate before opening a pool or constructing any provider.
-    pricing = None
     provider_choice = env.get("PTR_LLM_PROVIDER", "fake")
+    if provider_choice == "litellm":
+        raise ProviderError("LITELLM_PROVIDER_REMOVED")
     spillover_mode = env.get("PTR_LLM_SPILLOVER", "off")
     cluster_network = _cluster_network(env)
     if not cluster_network and _compose_openrouter_key_present(env):
@@ -397,37 +395,6 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             raise ProviderError("INVALID_RUNTIME_CONFIG") from None
         if not math.isfinite(key_max_limit_usd) or key_max_limit_usd <= 0:
             raise ProviderError("INVALID_RUNTIME_CONFIG")
-    spillover_key = env.get("PTR_LLM_CAPACITY_SPILLOVER_KEY")
-    if spillover_key is not None and (
-        len(spillover_key.encode()) < 32
-        or env.get("PTR_LLM_PROVIDER") != "litellm"
-        or env.get("PTR_LLM_LITELLM_BILLABLE") != "1"
-        or env.get("PTR_LLM_MODEL", "primary") != "primary"
-    ):
-        raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
-    if env.get("PTR_LLM_PROVIDER", "fake") == "litellm":
-        billable = env.get("PTR_LLM_LITELLM_BILLABLE", "0")
-        if billable not in ("0", "1"):
-            raise ProviderError("INVALID_RUNTIME_CONFIG")
-        if billable == "0" and env.get("PTR_LLM_MODEL", "primary") != "primary":
-            raise ProviderError("UNAPPROVED_NONBILLABLE_ALIAS")
-        if billable == "1":
-            try:
-                pricing = {
-                    "prompt": float(env["PTR_LLM_PROMPT_USD_PER_M"]),
-                    "completion": float(env["PTR_LLM_COMPLETION_USD_PER_M"]),
-                }
-            except (KeyError, ValueError):
-                raise ProviderError("PRICING_UNVERIFIED") from None
-            if not all(
-                math.isfinite(v) and (v > 0 if spillover_key else v >= 0) for v in pricing.values()
-            ):
-                raise ProviderError("PRICING_UNVERIFIED")
-            if (
-                env.get("PTR_LLM_LIVE_ENABLED") != "1"
-                or env.get("PTR_LLM_ALLOW_EXTERNAL_DATA") != "1"
-            ):
-                raise ProviderError("LIVE_NOT_ENABLED")
     if settings.database_url.split("://", 1)[1].split(":", 1)[0] != "ptr_split_llm":
         raise ProviderError("RUNTIME_REQUIRES_LLM_ROLE")
     pool: AsyncConnectionPool[AsyncConnection[dict[str, Any]]] = AsyncConnectionPool(
@@ -481,7 +448,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         input_bytes = _integer(
             env,
             "PTR_LLM_INPUT_BYTES",
-            65536 if provider_name in ("litellm", "local") else 32768,
+            65536 if provider_name == "local" else 32768,
             1,
             1048576,
         )
@@ -514,22 +481,6 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         if provider_name == "fake":
             model = "synthetic/fake-text-v1"
             provider = FakeTextProvider()
-        elif provider_name == "litellm":
-            model = env.get("PTR_LLM_MODEL", "primary")
-            billable = env.get("PTR_LLM_LITELLM_BILLABLE", "0")
-            provider = LiteLLMTextProvider(
-                base_url=env.get("PTR_LLM_LITELLM_BASE_URL", ""),
-                model=model,
-                api_key=env.get("PTR_LLM_LITELLM_API_KEY", ""),
-                max_output_tokens=tokens,
-                timeout_ms=timeout_ms,
-                input_bytes=input_bytes,
-                ledger=ledger if billable == "1" else None,
-                pricing_ceiling=pricing,
-                capacity_spillover_key=spillover_key,
-                on_metrics=_observe_provider_metrics,
-                reservation_microusd=_integer(env, "PTR_LLM_MAX_CALL_MICROUSD", 100000, 1, 1000000),
-            )
         elif provider_name == "local":
             model = env.get("PTR_LLM_LOCAL_MODEL", "")
             provider = DirectLocalTextProvider(
@@ -553,11 +504,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             model, provider = client.model, client
         else:
             raise ProviderError("INVALID_RUNTIME_CONFIG")
-        if not (
-            provider_name == "openrouter"
-            or provider_name == "litellm"
-            and env.get("PTR_LLM_LITELLM_BILLABLE") == "1"
-        ):
+        if provider_name != "openrouter":
             provider = CheckpointedTextProvider(provider, AsyncPostgresSaver(pool))
         provider = ObservedProvider(provider, telemetry, model, prompts=prompts)
         provider.provider_name = provider_name

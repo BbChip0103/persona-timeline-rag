@@ -15,13 +15,22 @@ proxy and shared login limiter. The worker uses `PTR_LLM_DATABASE_URL_ALLOWLIST`
 
 `PTR_API_HOST`, `PTR_WEB_HOST` and `PTR_LLM_HOST` select service bind addresses;
 the Helm chart sets pod-reachable addresses while Compose retains loopback
-defaults. In the gateway Secret, the operator key name is
-`PTR_OPENROUTER_API_KEY`; do not use the old `OPENROUTER_API_KEY` key name for
-the Kubernetes gateway. Cluster guard failures include
+defaults. The worker-only OpenRouter Secret uses `OPENROUTER_API_KEY` only when
+`PTR_LLM_SPILLOVER=openrouter`; Compose must not carry an OpenRouter key.
+Cluster guard failures include
 `DATABASE_HOST_NOT_ALLOWED`, `REDIS_URL_NOT_ALLOWED`,
 `BACKEND_URL_NOT_ALLOWED`, `INVALID_CLUSTER_API_URL` and
 `cluster_service_required`. A submitted call with an uncertain receipt is
 classified `PROVIDER_REQUEST_UNRESOLVED` and must not be retried.
+
+### Why no LLM gateway
+
+ (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
+removes the gateway from the current configuration surface. The paid budget is
+enforced by the durable provider ledger plus the paid provider key's credit
+limit. The EPP owns local routing/admission, and the paid OpenRouter key lives
+only in the Kubernetes worker Secret. Operational rollback restores the old
+gateway from a private snapshot rather than from files kept in this repository.
 
 ## Compose direct local model path
 
@@ -30,21 +39,21 @@ the authenticated vLLM SSH tunnel on loopback. Its private env file sets
 `PTR_LLM_LOCAL_BASE_URL` (the tunnel's `http://127.0.0.1:<port>/v1` URL),
 `PTR_LLM_LOCAL_MODEL` (the served model ID), `PTR_LLM_LOCAL_API_KEY` (the vLLM
 key) and `PTR_LLM_SPILLOVER=off`. The API/backend env sets
-`PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to the same ID. Keep the legacy
-`PTR_LITELLM_BILLABLE` API switch unset or `0` until its L3 replacement; local
-chat is not billable, so drafts require `clientRequestId` only for billable
-chat. Neither the worker nor backend/web env files contain an OpenRouter key.
+`PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to the same ID. Local chat is not
+billable, so drafts require `clientRequestId` only for billable chat. Neither
+the worker nor backend/web env files contain an OpenRouter key.
 Compose has no central EPP admission signal, so local vLLM queues excess work
 instead of starting paid spillover.
 
-The production variable table below describes the earlier single-host profile;
-the split Kubernetes roles above use additional variables. Its gateway and
-OpenRouter entries do not apply to the split Compose override described in
-[operational-deployment.md](operational-deployment.md).
+The production variable table below describes the older single-host TypeScript
+profile. It is retained as historical reference for archived runs; current
+Compose operation uses the direct local split path above, and Kubernetes uses
+the role-specific variables in the Helm chart.
 
-Production is one process per role (api, worker, dispatcher, web, and gateway when the chat provider is `gateway`) with
-**19 environment variables**. Every other knob is a constant; the scaling features measured in goal2 stay in the code
-behind `PTR_DEMO_SCALING=1` ([demo-mode.md](demo-mode.md)). Design:  (decisions D3–D9).
+Historical production was one process per role with **19 environment
+variables**. Every other knob was a constant; the scaling features measured in
+goal2 stayed in the code behind `PTR_DEMO_SCALING=1` ([demo-mode.md](demo-mode.md)).
+Design:  (decisions D3-D9).
 
 ## Startup check
 
@@ -73,31 +82,32 @@ code that call `createRuntime(env)` directly are not gated. The order of the che
 
 | Variable | Roles | Rule (rule id) |
 | --- | --- | --- |
-| `DATABASE_URL` | api, worker, dispatcher; gateway with OpenRouter failover | required (`missing`); the isolated loopback database (`database_url_guard`) |
+| `DATABASE_URL` | api, worker, dispatcher; historical gateway with OpenRouter failover | required (`missing`); the isolated loopback database (`database_url_guard`) |
 | `PTR_REDIS_URL` | api, worker, dispatcher | required; the isolated loopback Redis (`redis_url_guard`) as the ACL user `ptr`: `redis://ptr:<password>@127.0.0.1:56479/0` (`redis_username_ptr`) |
-| `PTR_CHAT_PROVIDER` | api, worker | required; `gateway` or `openrouter` (`production_provider`) |
+| `PTR_CHAT_PROVIDER` | api, worker | historical values were `gateway` or `openrouter`; current split values are `local` for Compose and split API control in Kubernetes (`production_provider`) |
 | `PTR_MODEL` | api, worker | required with `openrouter`; an allowlisted OpenRouter chat model (`model_allowlist`) |
 | `PTR_API_TOKEN` | api, web | required; 24–512 characters (`token_length`) |
 | `PTR_SESSION_SECRET` | web | required; at least 32 characters (`secret_length`) |
 | `PTR_UI_PASSWORD` | web | required; at least 12 characters, the login route's own minimum (`password_length`) |
-| `PTR_GATEWAY_TOKEN` | gateway; api and worker with the `gateway` provider | required there; 24–512 characters |
-| `PTR_GATEWAY_UPSTREAMS_FILE` | gateway | required; the file exists (`file_missing`), parses (`upstreams_file_invalid`) and holds exactly one pool (`upstreams_pool_count`), whose name is the served model; repo-relative for Compose |
-| `PTR_GATEWAY_FAILOVER` | gateway | `off` (default) or `openrouter` (`invalid_value`) |
+| `PTR_GATEWAY_TOKEN` | historical gateway; api and worker with the historical `gateway` provider | retained only for archived runs; 24-512 characters |
+| `PTR_GATEWAY_UPSTREAMS_FILE` | historical gateway | retained only for archived runs; repo-relative for archived Compose |
+| `PTR_GATEWAY_FAILOVER` | historical gateway | retained only for archived runs; `off` or `openrouter` |
 | `PTR_WORKER_CONCURRENCY` | worker | 1–1024, default 32 (`invalid_value`) |
 | `PTR_PERSONAS_FILE`, `PTR_AUTHORED_PERSONAS_FILE` | api, worker | optional; a regular file when set (`file_missing`) |
 | `PTR_INTENT_CLASSIFIER`, `PTR_SAFETY_FILTER` | api, worker | `off` or `jev` (`invalid_value`) |
-| `GOAL1_LIVE_ENABLED`, `GOAL1_ALLOW_EXTERNAL_DATA`, `OPENROUTER_API_KEY` | api, worker, gateway | all three needed (`true`, `true`, a key) when the `openrouter` provider, a `jev` helper or OpenRouter failover is on (`live_trio`) |
+| `GOAL1_LIVE_ENABLED`, `GOAL1_ALLOW_EXTERNAL_DATA`, `OPENROUTER_API_KEY` | api, worker, historical gateway | all three needed (`true`, `true`, a key) when a direct OpenRouter provider, a `jev` helper or historical OpenRouter failover is on (`live_trio`) |
 | `PTR_DEMO_SCALING` | all | `1` opens the demo layer; `0` or unset = production (`invalid_value` otherwise) |
 
-Behaviour fixed by the production profile: the gateway asks for structured agent replies (guided decoding) by default;
-the dispatcher runs without a chat provider (leases, delivery and events only); the gateway serves the single pool of
-its upstreams file; the web proxy always targets `http://127.0.0.1:56441`.
+Behaviour fixed by the historical production profile: the gateway asked for
+structured agent replies by default; the dispatcher ran without a chat provider;
+the gateway served the single pool of its upstreams file; the web proxy always
+targeted `http://127.0.0.1:56441`.
 
 ## `pnpm ops:check-env`
 
 ```bash
-pnpm ops:check-env                       # .env.local, roles api,worker,dispatcher,web (+ gateway when PTR_CHAT_PROVIDER=gateway)
-pnpm ops:check-env --file <path> --roles gateway
+pnpm ops:check-env                       # archived .env.local check
+pnpm ops:check-env --file <path> --roles api,worker,web
 ```
 
 The file is parsed like `node --env-file`. Output: one line per problem, `warning|error <role|all> <rule> <KEY>`, then
@@ -114,7 +124,7 @@ since relative paths are resolved against the current directory.
 | --- | --- | --- | --- |
 | `DATABASE_URL`, `PTR_API_TOKEN`, `PTR_UI_PASSWORD`, `PTR_SESSION_SECRET` | P | keep | nothing (the value rule's id if it fails) |
 | `PTR_PERSONAS_FILE` | P | keep; repo-relative for Compose | `path_not_repo_relative` if absolute |
-| `PTR_CHAT_PROVIDER` | P | must be `gateway` or `openrouter`; `fake` and `selfhosted` need `PTR_DEMO_SCALING=1` | `production_provider` otherwise |
+| `PTR_CHAT_PROVIDER` | P | archived profile required `gateway` or `openrouter`; current split Compose uses `local` | `production_provider` otherwise |
 | `PTR_MODEL` | P | keep (now a production key) | `model_allowlist` if not allowlisted |
 | `GOAL1_LIVE_ENABLED`, `GOAL1_ALLOW_EXTERNAL_DATA`, `OPENROUTER_API_KEY` | P | keep | `live_trio` when needed and incomplete |
 | `PTR_REDIS_URL` | P | add the user name `ptr` when Redis moves to the ACL ([runbook](runbook.md#redis-acl-migration-and-rollback)) | `redis_username_ptr` without it |
@@ -128,21 +138,23 @@ since relative paths are resolved against the current directory.
 With the keys of the current `.env.local` and the default roles, the expected result is no errors and four warnings:
 `constant_ignored PTR_API_URL` and `unused_key` for `GOAL1_BUDGET_USD`, `PTR_EMBEDDING_MODEL`, `REPLICATE_API_TOKEN`.
 Value-dependent rules (`production_provider`, `model_allowlist`, `live_trio`, `api_url_constant`,
-`path_not_repo_relative`, `file_missing`, `password_length`, `redis_username_ptr`) can add lines. With `PTR_CHAT_PROVIDER=gateway` the gateway role is added and
-reports `missing PTR_GATEWAY_TOKEN` and `missing PTR_GATEWAY_UPSTREAMS_FILE`; api and worker report
-`missing PTR_GATEWAY_TOKEN` too.
+`path_not_repo_relative`, `file_missing`, `password_length`, `redis_username_ptr`)
+can add lines. Historical gateway checks are retained only for archived
+environment files and are not part of the current split deployment.
 
 ## Other names
 
 The registry lists every name the code, harness and infra files read; a test (`packages/ops/test/env-scan.test.ts`)
-fails when a file reads a name it does not list. Classes besides P: D (demo layer: gateway, capacity, registry and
-upstream-agent knobs, leases, queues, Jev and safety tuning, ports), H (tests, harness and research scripts), R (above),
+fails when a file reads a name it does not list. Classes besides P: D (demo layer:
+historical gateway/capacity/registry knobs, leases, queues, Jev and safety tuning, ports), H (tests, harness and research scripts), R (above),
 I (Compose, psql and redis-cli: database and Redis passwords, `PTR_UID`/`PTR_GID`), S (`HOME`, `PATH`, `NODE_ENV`,
 `VIRTUAL_ENV`, `NEXT_PHASE`).
 
 ## Sources
 
 -  (operations round 2) §3 and decisions D3–D9, `private design notes` repo
+  `<private-design-notes>`.
+-  (LiteLLM removal) §1, §4 row L4 and §6.4, `private design notes` repo
   `<private-design-notes>`.
 - Node.js `util.parseEnv` (the `--env-file` parser): https://nodejs.org/api/util.html#utilparseenvcontent
 - Next.js `instrumentation.ts` `register()`: https://nextjs.org/docs/app/guides/instrumentation

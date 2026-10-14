@@ -39,7 +39,7 @@ Scope: `kind-ptr-k8s`, synthetic data, local simulator, fake OpenRouter, and no 
 | `pnpm test` | 1,777 passed; 110 skipped |
 | `pnpm typecheck`, `pnpm lint`, web build | 3/3 passed |
 | Compose app and framework config | 2/2 passed |
-| infra/litellm | 96 passed; 14 skipped |
+| retired LiteLLM proxy helpers | 96 passed; 14 skipped |
 | Helm lint | 4/4 profiles passed |
 | kubeconform | 186 valid; 0 invalid/errors |
 
@@ -70,3 +70,13 @@ L3 kind re-verification (synthetic data and fake OpenRouter only):
 - Helm lint passed for app and router kind/prod values. Kubeconform found 79/56 app resources and 8/8 router resources for kind/prod, with zero invalid or errors after CRD schema checks.
 
 The full V7 wrapper had a 10/10 saturation and spillover pass in one L3 run, but its first negative-probe attempt encountered a transient API 502 before reaching the forged-header target. A later full rerun was stopped after the known intermittent EPP saturation failure appeared on its first repeat. `V7NEG` provides the completed negative-case evidence above; no full V7 PASS is claimed for L3.
+
+## L4 gateway removal addendum, 2026-10-14
+
+This is a targeted L4 verification on `kind-ptr-k8s` with synthetic data and the in-cluster fake OpenRouter. It does not change the historical acceptance verdict above or claim a full V7 rerun.
+
+- The current `ptr` chart upgraded to revision 5 with `ptr-backend:k2-l4-20261014a` and `ptr-worker:k2-l4-20261014a`. An earlier upgrade attempt hit the previous `kubectl-set` ownership of the worker model timeout; the successful kind-only upgrade used Helm server-side conflict resolution. The worker now renders `PTR_LLM_MODEL_TIMEOUT_MS=25000` and has no `PTR_PAID_SPILLOVER` env.
+- After rollout, all 32 active pods and 13 deployments were Ready. A synthetic RAG-off smoke turn completed with one durable ACK and no outbox residue.
+- One `saturation-check.sh` run passed: 32 requests yielded 2 successes, 22 `rejected-saturated` drops and 8 `rejected-ttl-expired` drops.
+- One `worker-spillover-check.sh` run completed 100/100 turns: 90 settled paid ledger receipts matched 90 fake OpenRouter submissions, with no duplicate fake submissions. After the helper restored its temporary worker setting and API autoscaling settled, all 39 active pods and 13 deployments were Ready.
+- Offline L4 checks: service pytest 1,598 passed/24 skipped; root pytest 154 passed/80 subtests; `make check` 141 unittests plus Ruff and mypy; main Jest 1,702 passed/110 skipped and OTel Jest 18 passed; TS typecheck, lint, web build, three Compose renders, four Helm lint profiles, kind/prod kubeconform plus local CRD schemas, fake engine 7 tests, fake OpenRouter 6 tests, production fixture render guard and actionlint all passed.

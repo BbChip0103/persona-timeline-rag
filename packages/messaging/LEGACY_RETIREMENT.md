@@ -1,9 +1,13 @@
-# Framework migration: obsolete gateway/fleet retirement
+# Historical framework migration: obsolete gateway/fleet retirement
+
+This is a historical deletion record for the earlier framework migration. The current implementation removes the LiteLLM proxy path; current serving uses direct
+local vLLM through Compose or Kubernetes EPP/InferencePool, with optional
+worker-only direct OpenRouter spillover in Kubernetes.
 
 ## Deletion plan and rationale
 
-Plan44 selects LiteLLM Proxy for model routing and NestJS BullMQ processors for
-queue execution. Keeping the previous gateway application, Redis fleet registry,
+Plan44 selected LiteLLM Proxy for model routing and NestJS BullMQ processors for
+queue execution at that time. Keeping the previous gateway application, Redis fleet registry,
 credit/DRR/prefix admission controller, capacity leader or separate dispatcher
 would retain an active parallel runtime instead of the approved big-bang change.
 This is deletion of superseded orchestration, not permission to delete domain
@@ -44,5 +48,5 @@ source binding, safety, request-ledger, outbox or stale-result write protections
   counters and process start time. It makes no routing/admission decisions and
   no network calls; no gateway application remains behind it.
 
-Validation is synthetic. Deletion does not demonstrate live LiteLLM capacity or
-real-model quality; those require the separate framework integration gates.
+Validation was synthetic. Deletion did not demonstrate live LiteLLM capacity or
+real-model quality; those were separate historical framework integration gates.

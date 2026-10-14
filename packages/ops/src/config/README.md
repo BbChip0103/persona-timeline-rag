@@ -1,4 +1,8 @@
-# Framework configuration cleanup plan
+# Historical framework configuration cleanup plan
+
+This plan belongs to the archived framework/LiteLLM migration. The current
+configuration surface is the split API/worker/web path, with no active LiteLLM
+readiness probe.
 
 1. Keep `web.ts`'s public authentication, fixed API target and build-time behavior.
 2. Lock operator safety: key/rule-only errors, explicit-file env checking, no startup
@@ -15,14 +19,14 @@
 6. Preserve the Prometheus parse/read-facing status utility, replace synthetic
    fixtures with genuine Registry/Counter collectors, and stop probing obsolete
    dispatcher/gateway roles or their bespoke metrics. Default probes are API and
-   worker. Explicit configured LiteLLM/Langfuse readiness checks make no model
+   worker. Historical configured LiteLLM/Langfuse readiness checks made no model
    calls or credential-bearing requests.
 
 Web authentication and synthetic target isolation have existing regression tests;
 operator/status contracts use synthetic values and transport doubles only.
 
-Readiness sources: [LiteLLM probes](https://docs.litellm.ai/docs/proxy/health)
-(`/health/readiness`, never the billable model-testing `/health`),
+Historical readiness sources: [LiteLLM probes](https://docs.litellm.ai/docs/proxy/health)
+(`/health/readiness`, never the billable model-testing `/health`) and
 [Langfuse readiness](https://langfuse.com/self-hosting/configuration/health-readiness-endpoints)
 (`/api/public/ready`). These probes prove process readiness, not successful model
 inference, trace ingestion, experiments or human-review workflows.

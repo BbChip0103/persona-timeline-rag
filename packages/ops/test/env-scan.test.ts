@@ -16,7 +16,7 @@ const patterns=[/\b(?:process\.)?env\??\.([A-Z_][A-Z0-9_]*)/gu,
 test('active framework/web environment reads have registry entries',()=>{
   const found=new Map<string,string>();
   for(const file of files)for(const pattern of patterns)for(const match of readFileSync(file,'utf8').matchAll(pattern))found.set(match[1]!,relative(ROOT,file));
-  for(const name of ['PTR_LITELLM_BASE_URL','PTR_GUARDRAILS_URL','PTR_REDIS_URL','LANGFUSE_BASE_URL','PTR_UI_PASSWORD','NEXT_PHASE'])expect(found.has(name)).toBe(true);
+  for(const name of ['PTR_LLM_LOCAL_BASE_URL','PTR_GUARDRAILS_URL','PTR_REDIS_URL','LANGFUSE_BASE_URL','PTR_UI_PASSWORD','NEXT_PHASE'])expect(found.has(name)).toBe(true);
   expect([...found].filter(([name])=>!ENV_REGISTRY[name]).map(([name,file])=>`${name} (${file})`)).toEqual([]);
 });
 test('safety threshold controls are production controls, not a demo-only bypass',()=>{

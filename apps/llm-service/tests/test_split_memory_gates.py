@@ -20,6 +20,11 @@ SPEC.loader.exec_module(PROOF)
 URL = "postgresql://ptr_split_llm:synthetic-only@127.0.0.1:58432/ptr_split_test"
 
 
+def test_proof_manifest_sources_exist():
+    assert "apps/llm-service/src/ptr_llm/providers/local.py" in PROOF.SOURCE_FILES
+    assert all((PROOF.ROOT / source).is_file() for source in PROOF.SOURCE_FILES)
+
+
 def points(slope=0):
     return [
         {

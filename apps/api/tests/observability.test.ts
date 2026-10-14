@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { INestApplication } from '@nestjs/common';
 import type { Persona } from '@ptr/contracts';
 import { ChatService, InMemoryConversationStore, InMemoryPersonaRepository, TurnWorker, type TextProvider } from '@ptr/core';
-import { LiteLLMTextProvider } from '@ptr/providers';
+import { OpenAICompatibleTextProvider } from '@ptr/providers';
 import { parseExposition, PROM_CONTENT_TYPE } from '@ptr/ops';
 import { createApiApplication } from '../src/app';
 import { workerMaintenanceObservability, workerObservability } from '../src/observability';
@@ -90,7 +90,7 @@ describe('api /metrics/prom and health ',()=>{
     expect(check).toHaveBeenCalledTimes(2);
   });
   test.each([true,false])('health reports whether paid spillover is possible (%s), not the provider route',async billable=>{
-    runtime.providerName='litellm';runtime.billable=billable;
+    runtime.providerName='local';runtime.billable=billable;
     expect((await (await call('health')).json()).liveEnabled).toBe(billable);
   });
 });
@@ -153,19 +153,19 @@ describe('worker and outbox observability',()=>{
   });
 });
 
-describe('turnId correlation through the real LangChain proxy transport',()=>{
+describe('turnId correlation through the real local OpenAI-compatible transport',()=>{
   const servers:Server[]=[];
   afterEach(async()=>{await Promise.all(servers.splice(0).map(server=>{server.closeAllConnections();return new Promise(resolve=>server.close(resolve));}));});
-  test('worker records LiteLLM serving and sanitized logs while public DTO omits serving',async()=>{
+  test('worker records local serving and sanitized logs while public DTO omits serving',async()=>{
     const workerLines:string[]=[];let requests=0;
     const proxy=createServer((_req,res)=>{
-      requests++;res.writeHead(200,{'content-type':'application/json'});
-      res.end(JSON.stringify({id:'synthetic-1',object:'chat.completion',created:1,model:'synthetic-model',
-        choices:[{index:0,message:{role:'assistant',content:'반가워요.'},finish_reason:'stop'}],
-        usage:{prompt_tokens:12,completion_tokens:4,total_tokens:16}}));
+      requests++;res.writeHead(200,{'content-type':'text/event-stream','x-ptr-upstream':'local'});
+      res.end(`data: ${JSON.stringify({choices:[{delta:{content:'반가워요.'}}]})}\n\n`+
+        `data: ${JSON.stringify({choices:[],usage:{prompt_tokens:12,completion_tokens:4,total_tokens:16}})}\n\n`+
+        'data: [DONE]\n\n');
     });
     servers.push(proxy);await new Promise<void>(resolve=>proxy.listen(0,'127.0.0.1',resolve));
-    const provider=new LiteLLMTextProvider({baseUrl:`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/v1`,model:'synthetic-model',apiKey:'synthetic-token'});
+    const provider=new OpenAICompatibleTextProvider({baseUrl:`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/v1`,model:'synthetic-model',apiKey:'synthetic-token'});
     const observed=workerObservability({activeTurns:()=>0,write:line=>workerLines.push(line)});
     const store=new InMemoryConversationStore();
     const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,leases:store,delivery:{publish:async()=>undefined,backlog:async()=>0},...observed.chatHooks});
@@ -175,11 +175,11 @@ describe('turnId correlation through the real LangChain proxy transport',()=>{
     const finished=workerLines.map(line=>JSON.parse(line)).find(event=>event.event==='turn_finished')!;
     expect(finished.turnId).toBe(turn.id);expect(requests).toBe(1);
     const done=await chat.getTurn('lt-obs',turn.id);
-    expect(done.reply?.serving).toEqual({calls:1,upstreams:['litellm'],secondaryCalls:0});
+    expect(done.reply?.serving).toEqual({calls:1,upstreams:['local'],secondaryCalls:0});
     expect(publicTurn(done).reply).not.toHaveProperty('serving');
     expect(JSON.stringify(publicTurn(done))).not.toContain('serving');
     expect(workerLines.join('')).not.toContain('SENTINEL');
-    expect(value(await observed.render(),'ptr_model_calls_total',{upstream_kind:'litellm'})).toBe(1);
+    expect(value(await observed.render(),'ptr_model_calls_total',{upstream_kind:'local'})).toBe(1);
   });
 });
 

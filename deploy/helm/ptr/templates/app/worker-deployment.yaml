@@ -148,11 +148,13 @@ spec:
             - name: PTR_LLM_OPENROUTER_BASE_URL
               value: {{ .Values.llm.openrouter.baseUrlOverride | quote }}
             {{- end }}
+            {{- if eq .Values.llm.spillover "openrouter" }}
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.workerOpenRouter.existingSecret }}
                   key: {{ .Values.secrets.workerOpenRouter.apiKeyKey }}
+            {{- end }}
             - name: PTR_LLM_LIVE_ENABLED
               value: {{ .Values.llm.billing.liveEnabled | quote }}
             - name: PTR_LLM_ALLOW_EXTERNAL_DATA
@@ -165,8 +167,6 @@ spec:
               value: {{ .Values.llm.billing.maxOutputTokens | quote }}
             - name: PTR_LLM_MAX_CALL_MICROUSD
               value: {{ .Values.llm.billing.maxCallMicrousd | quote }}
-            - name: PTR_PAID_SPILLOVER
-              value: "1"
             - name: PTR_LLM_QUEUE_NAME
               value: turns
             - name: PTR_LLM_QUEUE_PREFIX

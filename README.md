@@ -7,7 +7,7 @@
 - 독립 Python RAG·agent 서비스(`apps/llm-service`, uv/별도 이미지/CI): persona·검색·LangGraph/LangChain·inline Guardrails/Jev·Langfuse v4·평가/검수. 기존 승인 데이터 준비·검증 CLI도 직접 재사용한다.
 - TypeScript/pnpm workspace: NestJS API, Next.js/React 채팅, shared contracts/core/providers/storage.
 - 전용 **DB-only 로컬 Supabase PostgreSQL15 + pgvector**: Auth/Storage/Studio 전체 배포가 아니다. owner/person/revision 고정 세션, history/reload, idempotency/cancel, lexical substring baseline 및1536dim exact cosine 검색.
-- 명시적 fake/LiteLLM provider와 총 **US$2 / 10,000요청 durable shared ledger**, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
+- 명시적 fake/local/OpenRouter provider와 durable shared ledger, provider key credit limit, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
 - 공개 fixture는 합성이다. 실제 persona는 개발 캡션 통계 기반 **silver**이며 사람 검수 완료/본인 복제 정확도를 주장하지 않는다. 근거 없는 사건 날짜를 게시일로 대체하지 않는다.
 - 새 API 세션은 **agent-loop 캐릭터 에이전트**다. 페르소나·실제 누적 대화·최소 대화 변수와 근거를 받아 자연어 답변을 만들고, 선택적 읽기 전용 검색 도구를 제한된 루프로 실행한다. 과거 legacy 원문 인용 renderer와 구분하며 다른 프로젝트 reference agent loop 전체 엔진의 동등성을 주장하지 않는다.
 - **RAG 없음 / 본문만 / 본문+이미지 설명**을 세션에 고정한다. 이미지 설명은 `gpt-6-luna`/`medium`으로 생성한 관찰·강조·의도 해석을 별도 출처로 색인하며, 원사진을 매 채팅 요청에 직접 넣는 방식은 아니다. 의도 해석은 단정형 어미여도 실제 작성자의 확정 의도가 아니다.
@@ -19,7 +19,11 @@
 
 범용 로그인·요청 제한·웹 캐시/SSE·로그·DB CRUD·재시도는 [네이티브 라이브러리 소유권과 남는 정책](docs/generic-framework-components.md)을 따른다. 기존 브라우저 cookie는 한 번 다시 로그인해야 하며 owner/history는 유지된다.
 
-Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker → LiteLLM/model serving**이 기본 경로입니다. Nest는 접수 outbox·DB fencing·최종 atomic commit/SSE를, Python은 LLM 처리·큰 호출 receipt·유료 장부·inline Guardrails/Jev·native Langfuse v4 평가/검수를 맡습니다. 코드/의존성/이미지/CI·app/llm DB 계정과 private env를 분리했습니다. [현재 분리 실행·자료이전 계약](docs/python-llm-split.md)과 [Python CLI](apps/llm-service/README.md)를 먼저 따르세요. [TS 프레임워크 실행](docs/framework-runtime.md)·[이전 배포](docs/framework-deployment.md)·[이전 평가](docs/framework-evaluation.md)는 명시적 legacy 재현 기록입니다. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
+Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker → local vLLM 또는 worker-only OpenRouter**가 현재 기본 경로입니다. Nest는 접수 outbox·DB fencing·최종 atomic commit/SSE를, Python은 LLM 처리·큰 호출 receipt·유료 장부·inline Guardrails/Jev·native Langfuse v4 평가/검수를 맡습니다. Kubernetes는 EPP/InferencePool이 local vLLM 라우팅을 맡고, paid spillover가 켜진 경우에만 worker가 OpenRouter를 직접 호출합니다. Compose 운영 경로는 local vLLM만 사용합니다. 코드/의존성/이미지/CI·app/llm DB 계정과 private env를 분리했습니다. [현재 분리 실행·자료이전 계약](docs/python-llm-split.md)과 [Python CLI](apps/llm-service/README.md)를 먼저 따르세요. [TS 프레임워크 실행](docs/framework-runtime.md)·[이전 배포](docs/framework-deployment.md)·[이전 평가](docs/framework-evaluation.md)는 명시적 legacy 재현 기록입니다. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
+
+### Why no LLM gateway
+
+ (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4) removes the LLM gateway from the current architecture. Budget enforcement lives in the durable provider ledger plus the paid provider key's credit limit, routing/admission for local serving lives in the EPP, and the paid OpenRouter key exists only in the Kubernetes worker Secret. Rollback restores the old gateway from the private operational snapshot rather than from this repository.
 
 ## Kubernetes
 

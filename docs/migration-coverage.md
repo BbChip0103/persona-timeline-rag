@@ -8,12 +8,12 @@ private source material or human-review rows.
 |---|---|---|
 | Admission, session/message truth, outbox, fencing, authoritative Complete CAS | Nest backend; `app` schema and app-role credentials | Actual isolated PG and Nest→Python crash-recovery smoke |
 | Queue delivery, lease renewal, cancellation, receipt replay and ACK | BullMQ Python worker; bounded receipt I/O and token/control watcher | Actual queue, immutable ACK recovery, real Psycopg cancellation tests |
-| Model execution and cache/state-aware routing | LiteLLM 1.104.2 with project routing callback and atomic shared Redis credits | Two actual proxies with synthetic engines, SSE/lease/auth/no-retry tests; existing research proxy mounts qualified |
+| Model execution and local routing | Direct local vLLM provider; Kubernetes local routing/admission through EPP/InferencePool; optional worker-only direct OpenRouter spillover | Direct-provider tests, EPP/engine kind checks, worker spillover checks and no-resubmission ledger tests |
 | Turn/agent orchestration and call-only checkpointing | Native LangGraph; ephemeral context, no per-stage history checkpoints | Native call tests and actual native PostgreSQL saver tests |
 | Retrieval, embeddings and prompts | Native LangChain algorithms with read-only scoped adapters | Native-call spies, ordering/provenance/privacy/byte-budget regressions; see [component boundaries](langchain-components.md) |
 | Input/output validation | Actual Guardrails SDK inline in Python, plus strict project provenance/JSON policy | Synthetic input/output/authentication regressions; a separate Guardrails service is not required by this default path |
-| Paid consent, immutable accounting and unknown no-resubmit | Durable Python ledger; billable aliases require live/data consent and verified pricing | Mock-transport fresh/replay/unknown tests; nonbillable runtime is restricted to `primary` |
-| Tracking | Langfuse v4 application observations, usage and reported receipt cost for LiteLLM/OpenRouter/Jev | Redacted synthetic observation tests; unknown cost is not reported as zero |
+| Paid consent, immutable accounting and unknown no-resubmit | Durable Python ledger plus provider key credit limit; paid OpenRouter requires live/data consent and verified pricing | Mock-transport fresh/replay/unknown tests; nonbillable runtime is restricted to local vLLM |
+| Tracking | Langfuse v4 application observations, usage and reported receipt cost for OpenRouter/Jev | Redacted synthetic observation tests; unknown cost is not reported as zero |
 | Evaluations and experiment review queues | Native Langfuse dataset experiments and annotation APIs | Synthetic SDK/API tests; explicit existing-dataset runs pin native UTC dataset versions |
 | Approved source preparation/import | Explicit offline split-owner CLI; original screening/split/hash policies, authored protection and atomic qualified SQL | Actual disposable PG rollback/identity/provenance and DB-free CLI dry-run; see [preparation](split-source-preparation.md) |
 | Weekly local and native central review | Read-only sampler plus separately approved masked final-turn review copies; native independent traces/annotation queues, durable unknown journal | Actual synthetic SDK IDs/source clock/queue readback and owned trace deletion; never open real review sheets during verification |
@@ -21,11 +21,12 @@ private source material or human-review rows.
 
 ## Safety/default parity
 
-- LiteLLM input defaults to 65536 bytes; direct OpenRouter defaults to 32768.
+- Local vLLM input defaults to 65536 bytes; direct OpenRouter defaults to 32768.
   Explicit operator limits still win. Jev intent/safety defaults are independently
   1500/2500 ms, intent confidence 0.6; validated overrides are supported.
-- Nonbillable LiteLLM uses only the approved `primary` runtime alias. Billable
-  startup requires both live and external-data consent before a pool is opened.
+- Nonbillable local serving uses only the approved local provider configuration.
+  Billable startup requires both live and external-data consent before a paid
+  OpenRouter client is opened.
 - Ambient native SDK callbacks, LangSmith tracing and ChatOpenAI cache are not
   alternate raw-data stores. Invocation isolation is task-local; unsupported global
   SDK debug/verbose or environment-created callbacks fail closed. Global SDK

@@ -6,9 +6,10 @@ serving. The worker uses `PTR_LLM_PROVIDER=local` with the authenticated loopbac
 `PTR_LLM_LOCAL_AUTH_REQUIRED=1`, with `PTR_LLM_SPILLOVER=off`; it must not carry
 OpenRouter keys in Compose mode.
 The historical TS worker is retired; the API rejects `PTR_LLM_SERVICE_MODE=legacy`.
-The former Nest → Python → LiteLLM proxy route is retained only as rollback
-context until L4 removes it. See `apps/llm-service/README.md` for native Python
-experiments, reviews, ingestion and persona commands.
+The former Nest → Python → LiteLLM proxy route is historical after L4; rollback
+uses the private operational snapshot, not active repository files. See
+`apps/llm-service/README.md` for native Python experiments, reviews, ingestion
+and persona commands.
 
 ## Ownership
 
@@ -86,9 +87,10 @@ not the private source/persona corpus.
 For semantic retrieval set an approved query embedding provider/revision in Python
 and mirror `PTR_LLM_SEMANTIC_SEARCH=1` in Nest only when that capability is available.
 Never compare real stored embeddings with synthetic hash vectors. Jev uses the same
-bounded durable paid ledger as generation. Nonbillable self-host routes do not silently
-fall back to paid APIs. Explicit billable LiteLLM additionally requires trusted
-`PTR_LLM_PROMPT_USD_PER_M` / `PTR_LLM_COMPLETION_USD_PER_M` ceilings matching selected routes.
+bounded durable paid ledger as generation. Nonbillable local routes do not silently
+fall back to paid APIs. Explicit billable direct OpenRouter use additionally
+requires trusted `PTR_LLM_PROMPT_USD_PER_M` / `PTR_LLM_COMPLETION_USD_PER_M`
+ceilings matching selected routes.
 
 New RAG-enabled sessions and the UI search selector default to **semantic**.
 If the backend has no semantic capability, default or explicit semantic session
@@ -243,7 +245,7 @@ Python sync receipts and preserved TS tables remain compatible/read-only respect
 See [upstream durability modes](https://docs.langchain.com/oss/python/langgraph/checkpointers#durability-modes).
 
 Outer turn/character graphs and the call graph are compiled once, with fresh ephemeral
-invocation contexts. The LiteLLM SDK/HTTP connection pool is service-owned and explicitly
+invocation contexts. Provider HTTP clients are service-owned and explicitly
 closed on shutdown; usage/deadline/cancellation hooks remain request-local. No global GC
 disable/threshold tuning or reduced validation/tracing is used to meet the load gate.
 

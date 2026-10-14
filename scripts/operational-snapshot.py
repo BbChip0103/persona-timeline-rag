@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Historical pre-L2 Compose service names are required to capture and restore
+# the deployed rollback snapshot; current deployments never start these roles.
 EXPECTED_SERVICES = {
     "api",
     "web",
@@ -49,6 +51,7 @@ CONFIG_MOUNT_TARGETS = {
     "/app/ptr_routing.py",
     "/app/routing_state.py",
     "/app/routing_telemetry.py",
+    # Required when restoring a pre-L2 deployment from its saved image.
     "/app/persona_timeline_rag/gateway_budget.py",
     "/app/ptr-config.yaml",
 }

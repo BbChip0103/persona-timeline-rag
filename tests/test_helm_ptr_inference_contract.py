@@ -58,7 +58,13 @@ class InferenceChartContractTest(unittest.TestCase):
             env["PTR_LLM_OPENROUTER_BASE_URL"],
             "http://ptr-fake-openrouter.ptr-app.svc.cluster.local:8000",
         )
-        self.assertEqual(env["PTR_PAID_SPILLOVER"], "1")
+        self.assertNotIn("PTR_PAID_SPILLOVER", env)
+        api = parsed_document(kind.stdout, "Deployment", "ptr-api")
+        api_env = {
+            item["name"]: item.get("value")
+            for item in api["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(api_env["PTR_PAID_SPILLOVER"], "1")
         self.assertEqual(env["PTR_LLM_MAX_OUTPUT_TOKENS"], "2048")
         self.assertEqual(env["PTR_LLM_MAX_CALL_MICROUSD"], "5000")
         self.assertLessEqual(200 * int(env["PTR_LLM_MAX_CALL_MICROUSD"]), 1_000_000)

@@ -193,7 +193,7 @@ llm:
     model: synthetic-chat
     authRequired: false
     inputBytes: 65536
-    timeoutMs: 30000
+    timeoutMs: 25000
   openrouter:
     model: google/gemma-4-26b-a4b-it
     baseUrlOverride: ""

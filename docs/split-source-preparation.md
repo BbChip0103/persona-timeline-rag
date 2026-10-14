@@ -2,8 +2,9 @@
 
 `pnpm prepare:split` is an **offline maintenance tool**, not a serving worker or a
 LangChain wrapper. It reuses `prepare()` and `importablePersonas()` from the historical
-TS preparation tool. Serving remains backend / Python worker / LLM gateway. No model,
-embedding, download, startup DDL or service restart is performed by this command.
+TS preparation tool. Current serving is the split backend / Python worker /
+direct provider path. No model, embedding, download, startup DDL or service
+restart is performed by this command.
 
 ## Explicit inputs and authorization
 

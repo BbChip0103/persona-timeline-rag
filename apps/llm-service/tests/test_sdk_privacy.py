@@ -13,13 +13,20 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langsmith import Client as LangSmithClient
 from langsmith import tracing_context
 from test_evidence_selection import Retrieval, run
-from test_providers_billing import response
 
-from ptr_llm.providers import CheckpointedTextProvider, FakeTextProvider, LiteLLMTextProvider
+from ptr_llm.providers import CheckpointedTextProvider, DirectLocalTextProvider, FakeTextProvider
 
 SENTINEL = "SDK_SYNTHETIC_PRIVATE_SENTINEL"
 HOOK = ContextVar("ptr_synthetic_privacy_hook", default=None)
 register_configure_hook(HOOK, inheritable=True)
+
+
+def response(content):
+    return {
+        "id": "synthetic-generation",
+        "choices": [{"message": {"role": "assistant", "content": content}}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+    }
 
 
 class Recorder(BaseCallbackHandler):
@@ -70,10 +77,9 @@ async def test_all_native_sdk_entrypoints_keep_ambient_callbacks_private(kind, m
         )
         return httpx.Response(200, json=response(answer))
 
-    provider = LiteLLMTextProvider(
-        base_url="http://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(transport),
     )
     trace_session = BlockedTraceSession()
@@ -119,12 +125,12 @@ async def test_all_native_sdk_entrypoints_keep_ambient_callbacks_private(kind, m
 
 
 @pytest.mark.parametrize("global_setting", ["_debug", "_verbose", "env_hook"])
-async def test_unsupported_global_raw_logging_is_prepaid_fail_closed(
+async def test_unsupported_global_raw_logging_fails_closed_before_network(
     global_setting, monkeypatch, capsys
 ):
     from langchain_core import globals as sdk_globals
 
-    from ptr_llm.billing import MemoryBudgetLedger, ProviderError
+    from ptr_llm.billing import ProviderError
 
     created, network = [], []
 
@@ -148,19 +154,15 @@ async def test_unsupported_global_raw_logging_is_prepaid_fail_closed(
         network.append(request)
         raise AssertionError("unsupported SDK logging cannot submit")
 
-    ledger = MemoryBudgetLedger()
-    provider = LiteLLMTextProvider(
-        base_url="http://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
-        ledger=ledger,
-        pricing_ceiling={"prompt": 0.5, "completion": 3.0},
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(transport),
     )
     try:
         with pytest.raises(ProviderError, match="SDK_RAW_TRACING_FORBIDDEN"):
             await provider.generate([{"role": "user", "content": SENTINEL}])
-        assert not network and not created and not ledger.requests
+        assert not network and not created
         assert SENTINEL not in capsys.readouterr().out
     finally:
         await provider.aclose()
@@ -190,10 +192,9 @@ async def test_native_chat_sdk_never_reads_or_writes_ambient_second_cache(monkey
     async def transport(request):
         return httpx.Response(200, json=response("synthetic reply"))
 
-    provider = LiteLLMTextProvider(
-        base_url="http://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(transport),
     )
     try:

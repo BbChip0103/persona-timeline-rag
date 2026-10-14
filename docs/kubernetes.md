@@ -19,6 +19,16 @@ The kind engine is a simulator on fake GPU nodes; its OpenRouter endpoint is a
 local fake. The router is a separate Helm release in `ptr-inference`. NetworkPolicy
 limits the permitted paths.
 
+## Why no LLM gateway
+
+ (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
+removes the LLM gateway from the active Kubernetes architecture. The worker
+calls local vLLM through the EPP/InferencePool path, and the EPP owns
+routing/admission for local serving. Paid spillover is a worker-only direct
+OpenRouter call, guarded by the durable provider ledger and the provider key's
+credit limit. The paid key exists only in the worker Secret; rollback restores
+the old gateway from the private operational snapshot, not from this repository.
+
 ## Install on kind
 
 Prerequisites: Docker 29.8.1, kind v0.33.0 (kindest/node v1.37.0),
@@ -120,9 +130,11 @@ configuration. Before use:
   `PTR_UI_PASSWORD` (the web reads Redis, API token, session secret and UI
   password from this Secret).
   `ptr-worker` supplies `PTR_LLM_DATABASE_URL`, `PTR_LLM_REDIS_URL`,
-  `PTR_LLM_CONTROL_TOKEN`. `ptr-worker-openrouter` supplies a dedicated
-  `OPENROUTER_API_KEY` with a provider-side credit limit no greater than
-  `PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD`. `ptr-personas` supplies
+  `PTR_LLM_CONTROL_TOKEN`. When `llm.spillover=openrouter`,
+  `ptr-worker-openrouter` supplies a dedicated `OPENROUTER_API_KEY` with a
+  provider-side credit limit no greater than
+  `PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD`; omit that Secret/env path when
+  spillover is off. `ptr-personas` supplies
   `PTR_LLM_PUBLISHED_PERSONAS_JSON`. `ptr-maintenance` supplies
   `PTR_LLM_MAINTENANCE_DATABASE_URL` and approved maintenance controls/Redis
   URL. `ptr-keda-redis` supplies `REDIS_ADDRESS`, `REDIS_USERNAME`,

@@ -9,7 +9,7 @@ Adapters are for application/provider contracts, not alternative RAG orchestrati
 | Function | Native component | Explicit adapter/policy boundary |
 | --- | --- | --- |
 | Direct OpenRouter standard chat | `ChatOpenAI` async/create+parse | Exact metered wire/body order, raw receipts/cost, no SDK retry or independent client |
-| Gateway text and guided output | `ChatOpenAI`, `with_structured_output` | Metered transport, model allowlist, receipts, cancellation |
+| Local/direct text and guided output | `ChatOpenAI`, `with_structured_output` | Metered transport, model allowlist, receipts, cancellation |
 | Summary child → original parents | `MultiVectorRetriever` | Read-only normalized PostgreSQL stores, pinned run, current hashes/revisions |
 | Legacy caption/image semantic search | `VectorStoreRetriever` | Scoped cosine SQL, trusted person/date/timezone/evidence condition |
 | Search → answer evidence | Existing native retriever, similarity top 3 | Trusted filters, original parent hydration, no retrieval-stage JEV decision |
@@ -120,8 +120,8 @@ this private SDK wrapper boundary on upgrades.
 - Generic PGVectorStore initialization is not a replacement for normalized scoped
   source/summary tables. No DDL, copied collections or reembedding is required here.
 - The optional direct OpenRouter text driver and JEV decisions transport retain
-  provider-specific privacy, pricing and durable receipt contracts. Gateway text
-  generation is already native ChatOpenAI. Native transport replacement must prove
+  provider-specific privacy, pricing and durable receipt contracts. Direct local
+  text generation is native ChatOpenAI. Native transport replacement must prove
   exact receipt/request equivalence before adoption; a wrapper alone is not that migration.
 - Lexical filtering, licensed/trusted evidence validation, whole-source budgeting,
   model/cost policy and deletion/ownership guards are application contracts.

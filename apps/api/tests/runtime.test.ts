@@ -1,4 +1,4 @@
-import { FakeTextProvider, LatencyInjectedTextProvider, LiteLLMTextProvider } from '@ptr/providers';
+import { FakeTextProvider, LatencyInjectedTextProvider, OpenAICompatibleTextProvider } from '@ptr/providers';
 import { BullMqTurnDelivery } from '@ptr/messaging';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -43,21 +43,21 @@ test('turns always run through Redis workers: queue knobs are validated and the 
   for(const url of ['','redis://:x@10.0.0.5:56479/0','redis://127.0.0.1:56479/0'])
     expect(()=>createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:url})).toThrow();
 });
-const framework={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'litellm',
-  PTR_LITELLM_BASE_URL:'http://127.0.0.1:57460/v1',PTR_LITELLM_API_KEY:'synthetic_proxy_token_abcdefghij',
+const framework={DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'local',
+  PTR_LLM_LOCAL_BASE_URL:'http://127.0.0.1:57460/v1',PTR_LLM_LOCAL_MODEL:'synthetic-local-model',PTR_LLM_LOCAL_API_KEY:'synthetic_proxy_token_abcdefghij',
   PTR_GUARDRAILS_URL:'http://127.0.0.1:57464',PTR_GUARDRAILS_TOKEN:'synthetic_guard_token_abcdefghij'};
 test('nonbillable turn route checkpoints costly model calls only; raw adapter stays available for drafts',async()=>{
   const runtime=createRuntime(framework);
-  expect(runtime.provider).toBeInstanceOf(LiteLLMTextProvider);expect(runtime.executionStore).toBe(runtime.leases);
+  expect(runtime.provider).toBeInstanceOf(OpenAICompatibleTextProvider);expect(runtime.executionStore).toBe(runtime.leases);
   const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
   expect(options.guardrails).toBeDefined();expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).not.toBe(runtime.provider);expect(options.observeStage).toBeDefined();
   expect(options.semanticSearch).toBe(false);await runtime.close?.();
 });
 test('legacy chat routes are rejected rather than retained as hidden parallel defaults',()=>{
-  for(const PTR_CHAT_PROVIDER of ['gateway','selfhosted','openrouter','unknown'])
+  for(const PTR_CHAT_PROVIDER of ['gateway','selfhosted','openrouter','litellm','unknown'])
     expect(()=>createRuntime({...framework,PTR_CHAT_PROVIDER})).toThrow();
   expect(()=>createRuntime({...framework,PTR_GUARDRAILS_TOKEN:undefined})).toThrow();
-  expect(()=>createRuntime({...framework,PTR_MODEL:'openrouter-primary'})).toThrow();
+  expect(()=>createRuntime({...framework,PTR_LLM_LOCAL_MODEL:''})).toThrow();
 });
 test('real vectors cannot be queried using synthetic hashes',async()=>{
   const runtime=createRuntime(framework);
@@ -134,10 +134,8 @@ describe('persona catalogue: generated list + authored list ',()=>{
 });
 
 test('paid spillover possible model calls use their existing ledger instead of another checkpoint wrapper',async()=>{
-  const runtime=createRuntime({...framework,PTR_PAID_SPILLOVER:'1',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true'});
-  const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
-  expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).toBe(runtime.provider);
-  expect(runtime.billable).toBe(true);await runtime.close?.();
+  expect(()=>createRuntime({...framework,PTR_PAID_SPILLOVER:'1'})).toThrow();
+  expect(()=>createRuntime({...framework,PTR_PAID_SPILLOVER:'1',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true'})).toThrow();
 });
 test('fake domain generation has no stage or model checkpoint wrapper',async()=>{
   const runtime=createRuntime({DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl});

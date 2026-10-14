@@ -12,7 +12,7 @@ test('only API, worker and dependency-free web are roles',()=>expect(ROLES).toEq
 test.each(['api','worker','web'] as EnvRole[])('%s valid framework configuration has no errors',role=>{
   expect(checkRole(role,valid(role))).toEqual({role,errors:[],warnings:[]});
 });
-test.each(['api','worker'] as const)('%s operator uses framework fake/LiteLLM contract, not old gateway/model allowlists',role=>{
+test.each(['api','worker'] as const)('%s operator uses framework fake/local contract, not old gateway/model allowlists',role=>{
   expect(checkRole(role,{...runtime(),PTR_CHAT_PROVIDER:'gateway'}).errors).toContainEqual({key:'PTR_CHAT_PROVIDER',rule:'invalid_enum_value'});
   expect(checkRole(role,{...runtime(),PTR_CHAT_PROVIDER:undefined}).errors.some(problem=>problem.key==='PTR_CHAT_PROVIDER')).toBe(true);
   expect(checkRole(role,{...runtime(),PTR_MODEL:'local-model-alias'}).errors).toEqual([]);
@@ -24,9 +24,9 @@ test('framework validation preserves isolated DB/Redis and concurrency guards',(
     expect(JSON.stringify(report)).not.toContain('PRIVATE_SENTINEL');
   }
 });
-test('Jev and paid LiteLLM gates are the same as framework startup, no demo bypass',()=>{
+test('Jev and paid spillover gates are the same as framework startup, no demo bypass',()=>{
   expect(checkRole('worker',{...runtime(),PTR_SAFETY_FILTER:'jev'}).errors).toContainEqual({key:'PTR_SAFETY_FILTER',rule:'paid_jev_not_enabled'});
-  expect(checkRole('worker',{...runtime(),PTR_LITELLM_BILLABLE:'1'}).errors).toContainEqual({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
+  expect(checkRole('worker',{...runtime(),PTR_PAID_SPILLOVER:'1'}).errors).toContainEqual({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
   expect(checkRole('worker',{PTR_DEMO_SCALING:'1',PTR_CHAT_PROVIDER:'fake'}).errors).toContainEqual({key:'PTR_DEMO_SCALING',rule:'retired_setting'});
 });
 test.each(['PTR_GATEWAY_TOKEN','PTR_CAPACITY_CONTROLLER','PTR_UPSTREAM_HEARTBEAT_MS','PTR_REGISTRY_PREFIX','PTR_EXECUTION'])(

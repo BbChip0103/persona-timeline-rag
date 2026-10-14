@@ -67,10 +67,11 @@ authenticated loopback vLLM endpoint directly, with `PTR_LLM_PROVIDER=local`,
 `PTR_LLM_LOCAL_AUTH_REQUIRED=1`, with `PTR_LLM_SPILLOVER=off`.
 
 Do not run the old LiteLLM smoke, app-key bootstrap or proxy profile commands for
-the operational stack. The `infra/litellm` code remains only as rollback material
-until the L4 cleanup removes it. Retry, fallback, health-probe and cost limits for
-the active stack are enforced at the worker/provider boundary and verified by
-`pnpm ops:status` plus `scripts/operational-smoke.ts`.
+the operational stack. L4 removes the retired LiteLLM proxy helper directory from the active
+repository; rollback uses the private operational snapshot. Retry, fallback,
+health-probe and cost limits for the active stack are enforced at the
+worker/provider boundary and verified by `pnpm ops:status` plus
+`scripts/operational-smoke.ts`.
 
 ## Guardrails and Langfuse v4
 

@@ -1,4 +1,4 @@
-/** Pure read-only vLLM metrics parser retained after LiteLLM replaced the custom gateway.
+/** Pure read-only vLLM metrics parser for local engine observations.
  * No polling, router, registry, credit admission or failover state lives here.
  */
 export interface EngineMetrics {

@@ -105,7 +105,7 @@ services:
     ports:
       - "127.0.0.1:${PTR_FAKE_ENGINE_PORT:?required}:8000"
     volumes:
-      - ./litellm/fake-engine.py:/fixture/fake-engine.py:ro
+      - ./fake-engine/fake-engine.py:/fixture/fake-engine.py:ro
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2)"]
       interval: 3s

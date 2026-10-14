@@ -9,19 +9,19 @@ const token=z.string().min(24).max(512);
 const optional=<T extends z.ZodTypeAny>(value:T)=>z.preprocess(input=>input===''?undefined:input,value.optional());
 const integer=(fallback:number,min:number,max:number)=>z.coerce.number().int().min(min).max(max).default(fallback);
 const schema=z.object({
-  DATABASE_URL:z.string().min(1),PTR_REDIS_URL:z.string().min(1),PTR_CHAT_PROVIDER:z.enum(['fake','local','litellm']),
+  DATABASE_URL:z.string().min(1),PTR_REDIS_URL:z.string().min(1),PTR_CHAT_PROVIDER:z.enum(['fake','local']),
   PTR_PERSONAS_FILE:z.string().min(1),PTR_API_TOKEN:token,PTR_API_SYNTHETIC_TOKEN:optional(token),
   PTR_API_PORT:integer(56441,1024,65535),PTR_WORKER_CONCURRENCY:integer(32,1,1024),
   PTR_QUEUE_MAX_DEPTH:integer(256,1,100000),PTR_TURN_MAX_QUEUE_MS:integer(60000,1000,3600000),
   PTR_TURN_QUEUE:z.string().regex(/^[a-z0-9-]{1,40}$/).default('turns'),
   PTR_EVENTS_NAMESPACE:z.string().regex(/^[a-z0-9-]{1,40}$/).default('events'),
-  PTR_LITELLM_BASE_URL:optional(z.string().url()),PTR_LITELLM_API_KEY:optional(token),
-  PTR_MODEL:z.string().min(1).default('primary'),PTR_LITELLM_BILLABLE:z.enum(['0','1']).default('0'),
+  PTR_LLM_LOCAL_BASE_URL:optional(z.string().url()),PTR_LLM_LOCAL_MODEL:optional(z.string().min(1)),PTR_LLM_LOCAL_API_KEY:optional(z.string().min(16).max(512)),
+  PTR_MODEL:z.string().min(1).default('primary'),PTR_PAID_SPILLOVER:z.enum(['0','1']).default('0'),
   PTR_GUARDRAILS_URL:z.string().url().optional(),PTR_GUARDRAILS_TOKEN:z.string().min(16).optional(),
   PTR_GUARDRAILS_TIMEOUT_MS:integer(2500,50,10000),
   PTR_DB_POOL_MAX:integer(32,1,1024),PTR_MAX_ATTEMPTS:integer(3,1,10),
   PTR_QUEUE_LOCK_MS:integer(30000,300,600000),PTR_DISPATCH_GRACE_MS:integer(2000,0,600000),
-  PTR_DISPATCH_INTERVAL_MS:integer(1000,50,60000),PTR_LITELLM_RESERVATION_MICROUSD:integer(100000,1,1000000000),
+  PTR_DISPATCH_INTERVAL_MS:integer(1000,50,60000),
   PTR_INTENT_CLASSIFIER:z.enum(['jev','off']).default('off'),PTR_SAFETY_FILTER:z.enum(['jev','off']).default('off'),
   PTR_JEV_MODEL:z.literal('typesafe/jev-1.13').default('typesafe/jev-1.13'),
   PTR_JEV_TIMEOUT_MS:integer(1500,50,10000),PTR_SAFETY_TIMEOUT_MS:integer(2500,50,10000),
@@ -53,19 +53,19 @@ export function loadFrameworkConfig(role:FrameworkRole,env:NodeJS.ProcessEnv=pro
   }
   if(config.PTR_API_SYNTHETIC_TOKEN===config.PTR_API_TOKEN)problems.push({key:'PTR_API_SYNTHETIC_TOKEN',rule:'token_reuse'});
   for(const key of ['PTR_GUARDRAILS_URL','PTR_GUARDRAILS_TOKEN'] as const)if(!config[key])problems.push({key,rule:'required_validator'});
-  if(config.PTR_CHAT_PROVIDER==='litellm') {
-    for(const key of ['PTR_LITELLM_BASE_URL','PTR_LITELLM_API_KEY','PTR_GUARDRAILS_URL','PTR_GUARDRAILS_TOKEN'] as const)
-      if(!config[key])problems.push({key,rule:'required_for_litellm'});
+  if(config.PTR_CHAT_PROVIDER==='local') {
+    for(const key of ['PTR_LLM_LOCAL_BASE_URL','PTR_LLM_LOCAL_MODEL','PTR_GUARDRAILS_URL','PTR_GUARDRAILS_TOKEN'] as const)
+      if(!config[key])problems.push({key,rule:'required_for_local'});
   }
-  if(config.PTR_CHAT_PROVIDER==='litellm'&&config.PTR_LITELLM_BILLABLE==='0'&&config.PTR_MODEL!=='primary')problems.push({key:'PTR_MODEL',rule:'paid_or_unknown_model_requires_ledger'});
-  if(config.PTR_LITELLM_BILLABLE==='1'&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))problems.push({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
+  if(config.PTR_PAID_SPILLOVER==='1'&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))problems.push({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
+  if(config.PTR_CHAT_PROVIDER==='local'&&config.PTR_PAID_SPILLOVER==='1')problems.push({key:'PTR_PAID_SPILLOVER',rule:'local_has_no_spillover_ledger'});
   if(config.PTR_ENVIRONMENT==='production'&&(config.PTR_LANGFUSE_ENABLED!=='1'||!config.PTR_GUARDRAILS_URL||!config.PTR_GUARDRAILS_TOKEN))
     problems.push({key:'PTR_ENVIRONMENT',rule:'production_observability_and_validation_required'});
   if(config.PTR_INTENT_CLASSIFIER==='jev'||config.PTR_SAFETY_FILTER==='jev') {
     if(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'||!env.OPENROUTER_API_KEY)
       problems.push({key:'PTR_SAFETY_FILTER',rule:'paid_jev_not_enabled'});
   }
-  for(const key of Object.keys(env))if(key.startsWith('PTR_GATEWAY_')||key.startsWith('PTR_CAPACITY_')||key==='PTR_EXECUTION')
+  for(const key of Object.keys(env))if(key.startsWith('PTR_GATEWAY_')||key.startsWith('PTR_CAPACITY_')||key.startsWith('PTR_LITELLM_')||key==='PTR_EXECUTION')
     problems.push({key,rule:'retired_setting'});
   if(['LANGSMITH_TRACING' ,'LANGCHAIN_TRACING_V2'].some(key=>env[key]==='true'||env[key]==='1'))
     problems.push({key:'LANGSMITH_TRACING',rule:'unapproved_external_trace'});

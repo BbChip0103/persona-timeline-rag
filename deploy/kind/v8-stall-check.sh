@@ -89,7 +89,7 @@ trap cleanup EXIT
 
 ensure_fake_engine_configmap() {
   timeout 15s kubectl --context "$context" -n "$namespace" create configmap "$configmap" \
-    --from-file=fake-engine.py=infra/litellm/fake-engine.py \
+    --from-file=fake-engine.py=infra/fake-engine/fake-engine.py \
     --dry-run=client -o yaml |
     timeout 30s kubectl --context "$context" apply -f - >/dev/null
 }

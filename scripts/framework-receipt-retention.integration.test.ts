@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import type { ChatSession, Persona } from '@ptr/contracts';
 import { PostgresConversationStore, PostgresPersonaRepository } from '@ptr/storage';
-import { LiteLLMTextProvider, PostgresBudgetLedger, type ProviderRequestScope } from '@ptr/providers';
+import { PostgresBudgetLedger, ProviderError, type ProviderRequestScope } from '@ptr/providers';
 import { retainFrameworkReceipts } from './framework-receipt-retention';
 const raw=process.env.PTR_FRAMEWORK_TEST_DATABASE_URL;
 const enabled=(()=>{if(!raw)return false;const u=new URL(raw);return u.hostname==='127.0.0.1'&&u.port==='57432'&&u.pathname==='/ptr_framework_test'&&u.username==='ptr_framework_tester';})();
@@ -44,19 +44,19 @@ const enabled=(()=>{if(!raw)return false;const u=new URL(raw);return u.hostname=
     expect((await ledger.get(draft))?.response).toBeNull();
     expect((await retainFrameworkReceipts(pool,{requestKeys:keys,apply:true,confirmDatabase:'ptr_framework_test'})).scrubbed).toBe(0);
   });
-  test('a real ChatOpenAI adapter cannot rebill after its completed raw receipt expires',async()=>{
+  test('a scrubbed completed raw receipt keeps the idempotency tombstone without raw replay',async()=>{
     const id=await turn(true);
-    const fetcher=jest.fn(async()=>new Response(JSON.stringify({id:'synthetic-generation',object:'chat.completion',created:1,model:'synthetic-model',
-      choices:[{index:0,message:{role:'assistant',content:'synthetic private receipt'},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2,cost:0.000001}}),{headers:{'content-type':'application/json'}}));
-    const provider=new LiteLLMTextProvider({baseUrl:'http://127.0.0.1:18001/v1',model:'synthetic-model',apiKey:'synthetic-token',fetch:fetcher,billable:{ledger,reservationMicrousd:100}});
-    const input=[{role:'user' as const,content:'synthetic receipt request'}],options={signal:new AbortController().signal,requestKey:id};
-    await expect(provider.generate(input,options)).resolves.toBe('synthetic private receipt');
-    const row=(await pool.query('SELECT key FROM ptr_provider_requests WHERE turn_id=$1',[id])).rows[0];keys.push(row.key);
-    await pool.query("UPDATE ptr_provider_requests SET receipt_received_at=now()-interval '91 days' WHERE key=$1",[row.key]);
-    const before=await ledger.get(row.key);
-    expect((await retainFrameworkReceipts(pool,{requestKeys:[row.key],apply:true,confirmDatabase:'ptr_framework_test'})).scrubbed).toBe(1);
-    await expect(provider.generate(input,options)).rejects.toThrow('REQUEST_UNRESOLVED_NO_RESUBMIT');expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(await ledger.get(row.key)).toMatchObject({...before,response:null});
+    const key=await receipt({kind:'chat',turnId:id});
+    const before=await ledger.get(key);
+    expect(before).not.toBeNull();
+    expect(before?.response).toEqual({synthetic:'raw-conversation-sentinel'});
+    await pool.query("UPDATE ptr_provider_requests SET receipt_received_at=now()-interval '91 days' WHERE key=$1",[key]);
+    expect((await retainFrameworkReceipts(pool,{requestKeys:[key],apply:true,confirmDatabase:'ptr_framework_test'})).scrubbed).toBe(1);
+    const saved=await ledger.reserve(key,100,{scope:{kind:'chat',turnId:id}});
+    expect(saved.created).toBe(false);
+    expect(saved.request).toMatchObject({...before!,response:null});
+    expect(saved.request.response).toBeNull();
+    await expect(ledger.submitted(key)).rejects.toEqual(new ProviderError('REQUEST_ALREADY_SUBMITTED'));
   });
   test('locked terminal turn is skipped without waiting or scrubbing; retry after unlock succeeds',async()=>{
     const id=await turn(true),key=await receipt({kind:'decision',turnId:id}),client=await pool.connect();

@@ -1,6 +1,12 @@
-# Goal2 serving: queued execution, SSE, LLM gateway, load harness and engine benchmarks
+# Historical Goal2 serving: queued execution, SSE, LLM gateway, load harness and engine benchmarks
 
-Current contract and reproduction steps for the Goal2 (LLMOps) work, including the large-scale rework. Measured
+> Historical reference only. Current serving removes the LLM gateway per design
+> 63 and uses the split Python worker with direct local vLLM/OpenRouter providers;
+> Kubernetes local routing/admission is handled by EPP/InferencePool. Use
+> [kubernetes.md](kubernetes.md), [configuration.md](configuration.md) and
+> [operational-deployment.md](operational-deployment.md) for current operation.
+
+Archived contract and reproduction steps for the Goal2 (LLMOps) work, including the large-scale rework. Measured
 results and the decision history live in the issue repository; this file only says how the system behaves and how
 to rerun it.
 

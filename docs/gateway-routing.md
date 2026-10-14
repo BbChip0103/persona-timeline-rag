@@ -1,4 +1,9 @@
-# LiteLLM engine routing
+# Historical LiteLLM engine routing
+
+> Historical reference only. The current implementation removes the LiteLLM proxy and
+> retired proxy implementation from the active repository. Do not run these
+> commands against the current checkout; rollback restores this path from the
+> private operational snapshot captured before cutover.
 
 The digest-pinned LiteLLM **1.104.2 Proxy**, not a replacement gateway, loads
 `ptr_routing.router` through its normal custom-callback configuration. Authentication,
@@ -95,14 +100,10 @@ but only multiple engines can benefit from a different destination choice.
 
 ## Verification
 
-```sh
-python3 infra/litellm/test-routing-telemetry.py
-# Requires a NEW, explicitly isolated loopback Redis, not app/research Redis:
-PTR_ROUTING_TEST_REDIS_URL=redis://127.0.0.1:<isolated-port>/0 \
-  apps/llm-service/.venv/bin/python infra/litellm/test-routing-state.py
-apps/llm-service/.venv/bin/python infra/litellm/test-routing-callback.py
-apps/llm-service/.venv/bin/python infra/litellm/routing-smoke.py
-```
+The former verification commands used the retired LiteLLM proxy helper scripts, which are deleted in L4.
+They are intentionally not runnable from the current checkout. Use the private
+operational snapshot for rollback validation, or the current Kubernetes checks in
+[kubernetes.md](kubernetes.md) for active direct serving.
 
 The smoke creates its own private environment, two synthetic engines and two real
 pinned Proxy replicas sharing fresh Redis/Postgres, and removes only that project's
@@ -161,8 +162,6 @@ US$0.1/0.5 per million input/output tokens. Prices and availability must be chec
 before changing this configuration. See [OpenRouter provider preferences](https://openrouter.ai/docs/guides/routing/provider-selection)
 and [model endpoints/prices](https://openrouter.ai/api/v1/models/google/gemma-4-26b-a4b-it/endpoints).
 
-`infra/litellm/capacity-smoke.py` uses two real pinned Proxies and isolated fake
-local/paid engines, with Internet masquerading disabled. It proves local-first,
-fresh overload→simulated OpenRouter with no local submission, one-use budget
-admission, tamper/direct-alias refusal, no retry on paid failure and no grant
-header forwarded. It does not prove real OpenRouter availability or answer quality.
+The former capacity smoke used two real pinned Proxies and
+isolated fake local/paid engines. It is historical after L4 and is not part of
+active CI.

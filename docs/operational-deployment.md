@@ -12,7 +12,9 @@ operational Compose redeploy before that deployment benefits from them; obtain
 user approval for that redeploy. Apply
 `supabase/split/0005_generated_artifacts.sql` before the API, and roll out the
 API reader before workers that emit the new receipt wire schema. Check durable
-ACKs and readiness after each role rollout.
+ACKs and readiness after each role rollout. Ship the API and worker images from
+the same source revision; the API must understand every receipt label the worker
+can write.
 
 ## Configuration and supervision
 
@@ -44,9 +46,9 @@ Web receives only UI/session/API credentials and no corpus mount. Backend receiv
 the app role/control credentials; Python receives the LLM role and local vLLM
 key. The worker calls vLLM directly through the authenticated loopback tunnel.
 The Compose services are api, web and worker; no gateway database or Redis is
-provisioned. All roles restart `unless-stopped`. The `infra/litellm` routing
-code and checks are retained only as rollback material until L4 deletes them;
-they are no longer part of operational CI for this direct path.
+provisioned. All roles restart `unless-stopped`. LiteLLM routing code is not
+part of the current repository after L4; rollback material lives in the private
+operational snapshot captured before cutover.
 
 Run the existing GPU engine through an authenticated private endpoint. When native
 remote process supervision is unavailable, an operator-owned user-systemd unit can
@@ -56,11 +58,20 @@ TTL to a persistent service. Enable user linger only when persistent execution i
 authorized. Native supervision is not proof of host reboot, instance recreation,
 network availability or multi-engine performance.
 
+### Why no LLM gateway
+
+ (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
+removes the gateway from the active operational path. The durable provider
+ledger and the provider key's credit limit enforce paid budget, the EPP owns
+local routing/admission in Kubernetes, and the paid key lives only in the
+Kubernetes worker. Compose is local-only. Rollback restores the old gateway from
+the private snapshot rather than from this checkout.
+
 Apply `supabase/split/0004_cumulative_budget_cap.sql` with the selected research
 owner before live work. It makes the cumulative US$1 budget operator-controlled;
 runtime cannot raise or delete/recreate the global cap. Preserve existing ledger,
 immutable migration baseline and unknown reservations. GPU qualification call
-limits and gateway-key budgets are **not** this monetary cap.
+limits and provider-key budgets are **not** this monetary cap.
 
 For a repeatable kind-only synthetic load run after the split ledger fills,
 drain the kind API and workers, rename the old `ptr_split_test` database to a
@@ -68,19 +79,18 @@ distinct archive name, create an empty `ptr_split_test`, and run the existing
 kind bootstrap Job before restoring the deployments. The archived database
 retains all prior `unknown` reservations; never resubmit those requests. The
 bootstrap rejects a nonempty target and re-applies the ordinary synthetic
-US$1 cap. The kind-only `gateway.billing.maxCallMicrousd: 5000` limits the
+US$1 cap. The kind-only `llm.billing.maxCallMicrousd: 5000` limits the
 reservation exposure of a 200-turn V5 run to US$1.00 even if all receipts are
 `unknown`; it does not change the production setting or ledger rules. Do not
 use this procedure for the research or production database.
 
-The constrained LiteLLM application key must not be the first bottleneck during
-worker scale-out. Set `gateway.bootstrap.rpm` to at least
-`autoscaling.worker.maxReplicaCount * app.worker.concurrency`, plus operational
-headroom. The production floor is `40 * 4 * 1.25 = 200 rpm`; the configured
-`5000 rpm` also accommodates repeated short turns. The kind profile uses
-`1000 rpm` and four in-flight turns per worker. The worker active-list scaler
-threshold derives from `app.worker.concurrency`, so the active trigger tracks
-that same capacity instead of a separate stale value.
+When paid spillover is enabled, the constrained worker-only OpenRouter key must
+not be the first bottleneck during worker scale-out. Its provider-side rate and
+credit limits must cover `autoscaling.worker.maxReplicaCount *
+app.worker.concurrency`, plus operational headroom, while staying within the
+approved maximum credit limit. The worker active-list scaler threshold derives
+from `app.worker.concurrency`, so the active trigger tracks that same capacity
+instead of a separate stale value.
 The kind EPP queue TTL is 30 seconds because the simulator's first token takes
 eight seconds; the queue size remains eight. Production retains its two-second
 flow-control TTL.
@@ -123,7 +133,7 @@ Apply `supabase/split/0005_generated_artifacts.sql` before deploying the new API
 draft requests fail without its table. No backfill of old `data/generated/*.json`
 is needed because `loadArtifact` has no caller; leave those files in place.
 
-When rolling out gateway receipts that can report the `local-pool` upstream, roll
+When rolling out receipt labels that can report the `local-pool` upstream, roll
 the API before workers that emit those receipts. This keeps the durable ACK schema
 reader ahead of the worker receipt writer during mixed-version deployments.
 

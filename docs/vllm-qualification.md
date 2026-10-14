@@ -1,6 +1,10 @@
 # Bounded real-vLLM qualification
 
-`scripts/vllm-loadtest.ts` compares archived original (`ee9f55c`), archived
+> Historical reference only. The retired vLLM load harness is removed with the L4
+> LiteLLM cleanup because it depended on deleted proxy callbacks.
+> These commands are not runnable from the current checkout.
+
+The retired vLLM load harness compares archived original (`ee9f55c`), archived
 TypeScript migration (`3dc6ff8`), and a fresh Python-split snapshot. This is a
 synthetic, small-sample qualification, not a production capacity benchmark or a
 replacement for the earlier 32-turn fixed-delay gate.
@@ -46,7 +50,7 @@ Run from the source root, with explicit approved private provider artifacts:
 
 ```sh
 umask 077
-pnpm exec tsx scripts/vllm-loadtest.ts \
+pnpm exec tsx <archived-vllm-load-harness> \
   --serving-env=/tmp/ptr-owned-provider/serving.env \
   --provider-metadata=/tmp/ptr-owned-provider \
   --output=/tmp/ptr-vllm-load-owned-run

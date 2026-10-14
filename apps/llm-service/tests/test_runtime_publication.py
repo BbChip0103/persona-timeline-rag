@@ -79,7 +79,7 @@ async def test_unset_authored_file_is_not_discovered_and_plain_array_is_supporte
     default.mkdir(parents=True)
     write(default / "personas.json", [a])
     write(default / "personas.authored.json", [authored])
-    approved = selection({"PTR_LLM_PROVIDER": "litellm"})
+    approved = selection({"PTR_LLM_PROVIDER": "local"})
     assert [p["id"] for p in await runtime([a, authored], approved).catalogue()] == [a["id"]]
     approved = selection(
         {
@@ -157,7 +157,7 @@ async def test_explicit_bound_snapshot_is_exclusive_without_default_file(tmp_pat
     monkeypatch.chdir(tmp_path)
     approved = card("approved")
     env = {
-        "PTR_LLM_PROVIDER": "litellm",
+        "PTR_LLM_PROVIDER": "local",
         "PTR_LLM_PUBLISHED_PERSONAS_FILE": write(
             tmp_path / "published.json", {"database": "ptr_split_test", "personas": [approved]}
         ),

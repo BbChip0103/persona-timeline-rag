@@ -10,11 +10,18 @@ from core_domain_test import Personas, Provider, Retrieval, grant, noop, respons
 from jsonschema import Draft202012Validator, ValidationError
 from langgraph.checkpoint.memory import InMemorySaver
 from test_agent_evidence_origin import source_with_image
-from test_providers_billing import response as transport_response
 
 from ptr_llm.core import protocol
 from ptr_llm.core.runtime import LLMEngine
-from ptr_llm.providers import CheckpointedTextProvider, LiteLLMTextProvider
+from ptr_llm.providers import CheckpointedTextProvider, DirectLocalTextProvider
+
+
+def transport_response(content):
+    return {
+        "id": "synthetic-generation",
+        "choices": [{"message": {"role": "assistant", "content": content}}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+    }
 
 
 def schema(sources):
@@ -100,10 +107,9 @@ async def test_native_sdk_and_checkpoint_schemas_do_not_cross_cache_or_retain_ca
         requests.append(body)
         return httpx.Response(200, json=transport_response(response("Synthetic evidence!")))
 
-    provider = LiteLLMTextProvider(
-        base_url="https://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(handler),
     )
     try:
@@ -127,7 +133,7 @@ async def test_native_sdk_and_checkpoint_schemas_do_not_cross_cache_or_retain_ca
 
 
 async def test_nonconforming_transport_output_is_not_repaired_or_retried():
-    from ptr_llm.billing import MemoryBudgetLedger, ProviderError
+    from ptr_llm.billing import ProviderError
 
     source = source_with_image()
     bad = {"sourceId": source["id"], "annotationId": "synthetic-image", "quote": source["caption"]}
@@ -137,38 +143,29 @@ async def test_nonconforming_transport_output_is_not_repaired_or_retried():
         calls.append(request)
         return httpx.Response(200, json=transport_response(response(refs=[bad])))
 
-    ledger = MemoryBudgetLedger()
-    provider = LiteLLMTextProvider(
-        base_url="https://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
-        ledger=ledger,
-        pricing_ceiling={"prompt": 0.5, "completion": 3.0},
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(handler),
     )
     try:
         messages = [{"role": "system", "content": "AGENT_JSON_REPLY"}]
-        for _ in range(2):
-            with pytest.raises(ProviderError):
-                await provider.generate(
-                    messages, request_key="synthetic-bad-binding", response_schema=schema([source])
-                )
+        with pytest.raises(ProviderError):
+            await provider.generate(
+                messages, request_key="synthetic-bad-binding", response_schema=schema([source])
+            )
         assert len(calls) == 1
     finally:
         await provider.aclose()
 
 
-async def test_schema_bytes_count_before_submission_or_ledger_reservation():
-    from ptr_llm.billing import MemoryBudgetLedger, ProviderError
+async def test_schema_bytes_count_before_submission():
+    from ptr_llm.billing import ProviderError
 
-    ledger = MemoryBudgetLedger()
-    provider = LiteLLMTextProvider(
-        base_url="https://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         input_bytes=1000,
-        ledger=ledger,
-        pricing_ceiling={"prompt": 0.5, "completion": 3.0},
         transport=httpx.MockTransport(lambda _: pytest.fail("network forbidden")),
     )
     try:
@@ -177,7 +174,6 @@ async def test_schema_bytes_count_before_submission_or_ledger_reservation():
                 [{"role": "system", "content": "AGENT_JSON_REPLY"}],
                 response_schema=schema([source_with_image()]),
             )
-        assert not ledger.requests
     finally:
         await provider.aclose()
 
@@ -213,10 +209,9 @@ async def test_sdk_partial_json_repair_is_not_an_accepted_raw_response():
         requests.append(request)
         return httpx.Response(200, json=transport_response(response("Synthetic!")[:-1]))
 
-    provider = LiteLLMTextProvider(
-        base_url="https://synthetic.invalid/v1",
-        model="primary",
-        api_key="synthetic",
+    provider = DirectLocalTextProvider(
+        base_url="http://127.0.0.1:1/v1",
+        model="synthetic-local",
         transport=httpx.MockTransport(handler),
     )
     try:

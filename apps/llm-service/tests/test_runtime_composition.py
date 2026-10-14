@@ -103,6 +103,18 @@ async def test_factory_runtime_owner_role_rejected_before_pool_open(monkeypatch)
     assert len(FakePool.instances) == before
 
 
+async def test_litellm_provider_is_removed_before_pool_open(monkeypatch):
+    from ptr_llm import runtime as module
+    from ptr_llm.billing import ProviderError
+
+    def forbidden_pool(**_):
+        pytest.fail("removed LiteLLM provider must be rejected before DB pool construction")
+
+    monkeypatch.setattr(module, "AsyncConnectionPool", forbidden_pool)
+    with pytest.raises(ProviderError, match="LITELLM_PROVIDER_REMOVED"):
+        await module.build_runtime(_settings(), {"PTR_LLM_PROVIDER": "litellm"})
+
+
 async def test_factory_failed_open_closes_pool(monkeypatch):
     from ptr_llm import runtime as module
 
@@ -113,26 +125,6 @@ async def test_factory_failed_open_closes_pool(monkeypatch):
     monkeypatch.setattr(FakePool, "open", fail)
     with pytest.raises(RuntimeError, match="synthetic-open-failure"):
         await module.build_runtime(_settings(), {})
-    assert FakePool.instances[-1].closed
-
-
-@pytest.mark.parametrize(
-    "prices", [{}, {"PTR_LLM_PROMPT_USD_PER_M": "nan", "PTR_LLM_COMPLETION_USD_PER_M": "0.3"}]
-)
-async def test_billable_litellm_untrusted_prices_rejected(monkeypatch, prices):
-    from ptr_llm import runtime as module
-    from ptr_llm.billing import ProviderError
-
-    monkeypatch.setattr(module, "AsyncConnectionPool", FakePool)
-    with pytest.raises(ProviderError, match="PRICING_UNVERIFIED"):
-        await module.build_runtime(
-            _settings(),
-            {
-                "PTR_LLM_PROVIDER": "litellm",
-                "PTR_LLM_LITELLM_BILLABLE": "1",
-                **prices,
-            },
-        )
     assert FakePool.instances[-1].closed
 
 

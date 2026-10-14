@@ -151,7 +151,7 @@ spec:
             - name: PTR_MODEL
               value: synthetic/fake-text-v1
             - name: PTR_PAID_SPILLOVER
-              value: "1"
+              value: {{ ternary "1" "0" (eq .Values.llm.spillover "openrouter") | quote }}
             - name: PTR_TURN_QUEUE
               value: turns
             - name: PTR_TURN_MAX_QUEUE_MS

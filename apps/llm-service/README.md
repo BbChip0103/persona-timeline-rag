@@ -4,7 +4,10 @@ This is the independent orchestration worker, not the GPU inference server. Nest
 sessions, input outbox, execution fencing and atomic final-message commit. Python owns
 persona/source/vector retrieval, LangGraph, inline Guardrails/Jev, costly-call receipts,
 paid ambiguity protection, Langfuse v4 and domain evaluation. It completes a queue job
-only after Nest's durable commit ACK. Model-serving remains LiteLLM + existing GPU/provider.
+only after Nest's durable commit ACK. Current model serving is direct local vLLM
+for Compose, and local vLLM through EPP/InferencePool plus optional worker-only
+direct OpenRouter spillover for Kubernetes. LiteLLM provider support is
+historical and rejected for the active runtime.
 
 ```sh
 uv sync --project apps/llm-service --locked
@@ -129,8 +132,10 @@ Upstream interfaces verified against installed SDK and official docs:
 [score query v3](https://langfuse.com/docs/api-and-data-platform/features/query-via-sdk).
 
 Full owner-role provisioning/copy/rollback and nonsecret env templates: [split runbook](../../docs/python-llm-split.md).
-Billable LiteLLM requires explicit trusted `PTR_LLM_PROMPT_USD_PER_M` and
-`PTR_LLM_COMPLETION_USD_PER_M` price ceilings; missing/nonfinite values fail startup.
+Billable direct OpenRouter use requires explicit live/data approval, trusted
+price ceilings and a configured provider key credit limit; missing or nonfinite
+limits fail startup. Compose keeps `PTR_LLM_SPILLOVER=off` and carries no
+OpenRouter key.
 
 Native split owner operations are `ptr-llm checkpoint-setup` and `ptr-llm retention`.
 Select `PTR_LLM_MAINTENANCE_DATABASE_URL` in a separate private maintenance environment;

@@ -27,6 +27,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+SOURCE_FILES = (
+    "apps/llm-service/src/ptr_llm/bootstrap.py",
+    "apps/llm-service/src/ptr_llm/providers/checkpoints.py",
+    "apps/llm-service/src/ptr_llm/providers/local.py",
+    "apps/llm-service/src/ptr_llm/core/runtime.py",
+    "contracts/llm/v1/models.py",
+)
 GATES: dict[str, Any] = {
     "jobs": 10000,
     "lateWindowEnds": [8000, 9000, 10000],
@@ -303,7 +310,7 @@ async def workload(output, mode):
     from psycopg.rows import dict_row
     from psycopg_pool import AsyncConnectionPool
     from ptr_llm.core.runtime import LLMEngine
-    from ptr_llm.providers import CheckpointedTextProvider, LiteLLMTextProvider
+    from ptr_llm.providers import CheckpointedTextProvider, DirectLocalTextProvider
     from ptr_llm.repositories import ResultReceiptStore
     from ptr_llm.repositories.database import assert_llm_database_url
     from ptr_llm.telemetry import FrameworkTelemetry, TelemetryConfig
@@ -507,9 +514,9 @@ async def workload(output, mode):
         should_export_span=lambda span: False,
         mask=lambda **kwargs: None,
     )
-    raw = LiteLLMTextProvider(
+    raw = DirectLocalTextProvider(
         base_url="http://127.0.0.1:1/v1",
-        model="primary",
+        model="synthetic-memory-model",
         api_key="synthetic-memory-key",
         transport=httpx.MockTransport(transport),
     )
@@ -886,14 +893,7 @@ def parent(output, roles_env):
 
     shutil.copyfile(__file__, directory / "proof-source.py")
     (directory / "proof-source.py").chmod(0o600)
-    source_files = [
-        "apps/llm-service/src/ptr_llm/bootstrap.py",
-        "apps/llm-service/src/ptr_llm/providers/checkpoints.py",
-        "apps/llm-service/src/ptr_llm/providers/langchain.py",
-        "apps/llm-service/src/ptr_llm/core/runtime.py",
-        "contracts/llm/v1/models.py",
-    ]
-    hashes = {file: hashlib.sha256((ROOT / file).read_bytes()).hexdigest() for file in source_files}
+    hashes = {file: hashlib.sha256((ROOT / file).read_bytes()).hexdigest() for file in SOURCE_FILES}
     write(
         directory / "source-manifest.json",
         {
