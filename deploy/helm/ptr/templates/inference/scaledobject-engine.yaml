@@ -1,0 +1,38 @@
+{{- if and .Values.inference.enabled .Values.autoscaling.engine.enabled }}
+{{- $prometheusAddress := default (printf "http://%s-kube-promet-prometheus.%s.svc:%v" .Values.monitoring.prometheus.releaseName .Values.monitoring.prometheus.namespace .Values.monitoring.prometheus.port) .Values.autoscaling.engine.prometheus.serverAddress -}}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ptr-{{ .Values.inference.engine.kind }}
+  namespace: {{ .Values.namespaces.inference }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ptr-{{ .Values.inference.engine.kind }}
+  pollingInterval: {{ .Values.autoscaling.engine.pollingInterval }}
+  cooldownPeriod: {{ .Values.autoscaling.engine.cooldownPeriod }}
+  minReplicaCount: {{ .Values.autoscaling.engine.minReplicaCount }}
+  maxReplicaCount: {{ .Values.autoscaling.engine.maxReplicaCount }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.engine.scaleDownStabilizationSeconds }}
+  triggers:
+    - type: prometheus
+      name: epp-flow-control-queue
+      metadata:
+        serverAddress: {{ $prometheusAddress | quote }}
+        metricName: llm_d_epp_flow_control_queue_size
+        query: sum(llm_d_epp_flow_control_queue_size)
+        threshold: {{ .Values.autoscaling.engine.prometheus.queueThreshold | quote }}
+    - type: prometheus
+      name: engine-kv-cache-usage
+      metricType: Value
+      metadata:
+        serverAddress: {{ $prometheusAddress | quote }}
+        metricName: vllm_kv_cache_usage_perc
+        query: {{ printf "avg(vllm:kv_cache_usage_perc{pool=%q})" .Values.inference.pool | quote }}
+        threshold: {{ .Values.autoscaling.engine.prometheus.kvThreshold | quote }}
+{{- end }}

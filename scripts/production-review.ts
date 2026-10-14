@@ -2,9 +2,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { lstat, readFile, rename, writeFile, unlink, readdir, open } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { createNativeReviewSpan } from '../packages/ops/src/production-review-transport';
-import { createLangfuseClient, FrameworkTelemetry, redactTelemetry, type LangfuseClient } from '../packages/ops/src/langfuse';
-import { evaluationConfig } from './framework-evaluate';
+import type { LangfuseClient } from '../packages/ops/src/langfuse';
 import { readOnlyPool, selectDatabaseReview, type Candidate } from './review-sample';
 
 export const REVIEW_ENVIRONMENT = 'production-review';
@@ -46,8 +44,8 @@ async function saveJournal(file: string, entry: Journal, reserve = false): Promi
   const directory = await open(resolve(file, '..'), 'r');
   try { await directory.sync(); } finally { await directory.close(); }
 }
-function cleanReviewText(value: string): string {
-  return String(redactTelemetry(value)).replace(/https?:\/\/[^\s<>]+/gi, '[URL]').replace(/(?:\/(?:home|tmp|etc|app)\/)[^\s]+/g, '[PATH]');
+function cleanReviewText(value: string, redact: (value: unknown) => unknown): string {
+  return String(redact(value)).replace(/https?:\/\/[^\s<>]+/gi, '[URL]').replace(/(?:\/(?:home|tmp|etc|app)\/)[^\s]+/g, '[PATH]');
 }
 async function queueItems(client: LangfuseClient, queueId: string) {
   const items = [];
@@ -103,6 +101,7 @@ export async function exportProductionReview(candidates: Candidate[], options: R
   if (JSON.stringify(names.sort()) !== JSON.stringify(REVIEW_DIMENSIONS.map(d => d.name).sort())) throw new Error('REVIEW_RUBRIC_MISMATCH');
   const counts = { planned: candidates.length, exported: 0, queued: 0, existing: 0, applied: options.apply === true };
   if (!options.apply) return counts;
+  const { redactTelemetry } = await import('../packages/ops/src/langfuse');
   await privateDirectory(options.stateDir);
   // Exclusive invocation lock. A crash leaves it fail-closed until operator reconciliation.
   const lock = join(options.stateDir, 'production-review.lock');
@@ -110,7 +109,7 @@ export async function exportProductionReview(candidates: Candidate[], options: R
   try {
     for (const row of candidates) {
       const sourceKey = createHmac('sha256', Buffer.from(options.salt, 'hex')).update(JSON.stringify([projectId, options.queueId, row.id, row.finishedAt])).digest('hex');
-      const input = cleanReviewText(row.userText), output = cleanReviewText(row.reply);
+      const input = cleanReviewText(row.userText, redactTelemetry), output = cleanReviewText(row.reply, redactTelemetry);
       if (Buffer.byteLength(JSON.stringify({ input, output }), 'utf8') > 65536) throw new Error('REVIEW_PAYLOAD_BYTE_LIMIT');
       const digest = createHash('sha256').update(JSON.stringify([input, output])).digest('hex');
       const payload: Payload = { originalRunAt: row.finishedAt!, input, output, metadata: { managedBy: 'ptr-production-review', sourceKey,
@@ -165,6 +164,11 @@ async function main() {
   const since = /^([1-7])d$/.exec(value('--since') ?? ''); const seed = value('--seed');
   if (!since || !/^\d{1,9}$/.test(seed ?? '') || !args.includes('--queue') || !stateDir) throw new Error('REVIEW_USAGE');
   if (args.includes('--apply') && process.env.PTR_PRODUCTION_REVIEW_APPROVAL !== 'approved-redacted-final-turn-review') throw new Error('REVIEW_EXPLICIT_APPROVAL_REQUIRED');
+  const [{ createNativeReviewSpan }, { createLangfuseClient, FrameworkTelemetry }, { evaluationConfig }] = await Promise.all([
+    import('../packages/ops/src/production-review-transport'),
+    import('../packages/ops/src/langfuse'),
+    import('./framework-evaluate'),
+  ]);
   const config = { ...evaluationConfig(), environment: REVIEW_ENVIRONMENT, captureContent: true };
   const client = createLangfuseClient(config); const telemetry = new FrameworkTelemetry(config);
   try {

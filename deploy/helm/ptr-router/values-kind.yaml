@@ -45,7 +45,8 @@ llm-d-router-standalone:
           saturationDetector: {pluginRef: concurrency-detector}
           # Maximum engine replicas (2) × 4 queued requests per replica.
           maxRequests: "8"
-          defaultRequestTTL: 2s
+          # Synthetic first-token latency is 8s; two queued waves need time to drain.
+          defaultRequestTTL: 30s
     proxy:
       enabled: true
       proxyType: envoy
@@ -330,3 +331,9 @@ llm-d-router-standalone:
                                   port_value: 9002
                             load_balancing_weight: 1
                       {{- end }}
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    path: /metrics

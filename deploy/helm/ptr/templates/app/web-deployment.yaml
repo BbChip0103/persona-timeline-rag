@@ -7,7 +7,9 @@ metadata:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: web
 spec:
+  {{- if not .Values.autoscaling.hpa.enabled }}
   replicas: {{ .Values.app.web.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ptr

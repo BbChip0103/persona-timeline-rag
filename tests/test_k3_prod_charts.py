@@ -54,6 +54,7 @@ def test_kind_router_keeps_saturation_profile() -> None:
     rendered = render("kind")
     deployment = document(rendered, "Deployment", "test-release-epp")
     config = document(rendered, "ConfigMap", "test-release-epp")
+    monitor = document(rendered, "ServiceMonitor", "test-release-epp")
 
     assert "replicas: 1" in deployment
     assert "--ha-enable-leader-election" not in deployment
@@ -62,6 +63,9 @@ def test_kind_router_keeps_saturation_profile() -> None:
     assert "--metrics-endpoint-auth=false" in deployment
     assert 'maxRequests: "8"' in config
     assert "maxConcurrency: 2" in config
+    assert 'app.kubernetes.io/name: "test-release-epp"' in monitor
+    assert "port: http-metrics" in monitor
+    assert 'path: "/metrics"' in monitor
 
 
 def test_prod_queue_budget_is_literal_in_profile() -> None:

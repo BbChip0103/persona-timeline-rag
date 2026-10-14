@@ -1,0 +1,20 @@
+{{- if and .Values.inference.enabled .Values.monitoring.serviceMonitors.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptr-engine-metrics
+  namespace: {{ .Values.namespaces.inference }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: inference-engine
+    ptr.io/monitoring: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: inference-engine
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+{{- end }}

@@ -17,6 +17,12 @@ export const RETENTION_DAYS = 90;
 export const MIN_DB_POPULATION = 20;
 const DAY_MS = 86_400_000;
 
+export function reviewRoot(repositoryRoot: string, env: Record<string, string | undefined>): string {
+  return env.PTR_MAINTENANCE_SYNTHETIC_ONLY === '1'
+    ? '/tmp/ptr-maintenance-review-root'
+    : repositoryRoot;
+}
+
 export interface Queryable { query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>; end(): Promise<void> }
 export interface Deps {
   root: string; env: Record<string, string | undefined>; now: Date; connect: (url: string) => Queryable;
@@ -315,5 +321,5 @@ export async function run(argv: string[], deps: Deps): Promise<number> {
   }
 }
 
-if (require.main === module) void run(process.argv.slice(2), { root: resolve(__dirname, '..'), env: process.env, now: new Date(), connect: readOnlyPool,
+if (require.main === module) void run(process.argv.slice(2), { root: reviewRoot(resolve(__dirname, '..'), process.env), env: process.env, now: new Date(), connect: readOnlyPool,
   out: line => process.stdout.write(`${line}\n`), err: line => process.stderr.write(`${line}\n`) }).then(code => { process.exitCode = code; });

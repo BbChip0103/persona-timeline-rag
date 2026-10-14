@@ -1,0 +1,8 @@
+# KEDA chart 2.21.0. Keep the kind control plane small.
+resources:
+  operator:
+    requests: {cpu: 50m, memory: 128Mi}
+  metricServer:
+    requests: {cpu: 50m, memory: 128Mi}
+  webhooks:
+    requests: {cpu: 25m, memory: 64Mi}

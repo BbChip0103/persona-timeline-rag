@@ -3,7 +3,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { allocate, readOnlyPool, run, selectDatabaseReview, type Queryable } from './review-sample';
+import { allocate, readOnlyPool, reviewRoot, run, selectDatabaseReview, type Queryable } from './review-sample';
+
+test('kind synthetic review uses an emptyDir root', () => {
+  expect(reviewRoot('/app', { PTR_MAINTENANCE_SYNTHETIC_ONLY: '1' })).toBe('/tmp/ptr-maintenance-review-root');
+  expect(reviewRoot('/app', {})).toBe('/app');
+});
 
 // Pass-through wrapper so one test can make the sheet write fail (node:fs/promises properties cannot be spied on).
 jest.mock('node:fs/promises', () => {

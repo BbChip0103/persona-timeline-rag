@@ -1,0 +1,68 @@
+{{- if .Values.autoscaling.worker.enabled }}
+{{- $redisTLS := eq .Values.network.redis.scheme "rediss" -}}
+{{- $caTLS := and $redisTLS .Values.autoscaling.worker.redis.caKey -}}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ .Values.autoscaling.worker.redis.triggerAuthenticationName }}
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  secretTargetRef:
+    - parameter: address
+      name: {{ .Values.autoscaling.worker.redis.existingSecret }}
+      key: {{ .Values.autoscaling.worker.redis.addressKey }}
+    - parameter: username
+      name: {{ .Values.autoscaling.worker.redis.existingSecret }}
+      key: {{ .Values.autoscaling.worker.redis.usernameKey }}
+    - parameter: password
+      name: {{ .Values.autoscaling.worker.redis.existingSecret }}
+      key: {{ .Values.autoscaling.worker.redis.passwordKey }}
+    {{- if $caTLS }}
+    - parameter: tls
+      name: {{ .Values.autoscaling.worker.redis.existingSecret }}
+      key: {{ required "autoscaling.worker.redis.tlsKey is required with Redis CA" .Values.autoscaling.worker.redis.tlsKey }}
+    - parameter: ca
+      name: {{ .Values.autoscaling.worker.redis.existingSecret }}
+      key: {{ .Values.autoscaling.worker.redis.caKey }}
+    {{- end }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ptr-worker
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ptr-worker
+  pollingInterval: {{ .Values.autoscaling.worker.pollingInterval }}
+  cooldownPeriod: {{ .Values.autoscaling.worker.cooldownPeriod }}
+  minReplicaCount: {{ .Values.autoscaling.worker.minReplicaCount }}
+  maxReplicaCount: {{ .Values.autoscaling.worker.maxReplicaCount }}
+  fallback:
+    failureThreshold: {{ .Values.autoscaling.worker.fallback.failureThreshold }}
+    replicas: {{ .Values.autoscaling.worker.fallback.replicas }}
+  triggers:
+    - type: redis
+      name: wait-list
+      metadata:
+        listName: {{ .Values.autoscaling.worker.redis.waitList | quote }}
+        listLength: {{ .Values.autoscaling.worker.redis.waitListLength | quote }}
+        activationListLength: {{ .Values.autoscaling.worker.redis.waitActivationListLength | quote }}
+        {{- if and $redisTLS (not $caTLS) }}
+        enableTLS: "true"
+        {{- end }}
+      authenticationRef:
+        name: {{ .Values.autoscaling.worker.redis.triggerAuthenticationName }}
+    - type: redis
+      name: active-list
+      metadata:
+        listName: {{ .Values.autoscaling.worker.redis.activeList | quote }}
+        listLength: {{ .Values.app.worker.concurrency | quote }}
+        {{- if and $redisTLS (not $caTLS) }}
+        enableTLS: "true"
+        {{- end }}
+      authenticationRef:
+        name: {{ .Values.autoscaling.worker.redis.triggerAuthenticationName }}
+{{- end }}

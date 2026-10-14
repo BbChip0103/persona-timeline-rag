@@ -1,0 +1,129 @@
+{{- define "ptr.maintenance.env" }}
+- name: PTR_LLM_MAINTENANCE_DATABASE_URL
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_LLM_MAINTENANCE_DATABASE_URL}}
+- name: PTR_NETWORK_MODE
+  value: cluster
+- name: PTR_LLM_DATABASE_URL_ALLOWLIST
+  value: {{ printf "%s://ptr_split_owner@%s:%v/%s" .root.Values.network.postgres.scheme .root.Values.network.postgres.host .root.Values.network.postgres.port .root.Values.network.postgres.database | quote }}
+- name: PTR_CLUSTER_DATABASE_URL_ALLOWLIST
+  value: {{ printf "%s://%s:%v" .root.Values.network.postgres.scheme .root.Values.network.postgres.host .root.Values.network.postgres.port | quote }}
+- name: PTR_CLUSTER_DATABASE_IDENTITIES
+  value: {{ printf "%s:ptr_split_owner" .root.Values.network.postgres.database | quote }}
+- name: PTR_MAINTENANCE_DATABASE_URL
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_LLM_MAINTENANCE_DATABASE_URL}}
+- name: PTR_MAINTENANCE_REDIS_URL
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_REDIS_URL, optional: true}}
+- name: PTR_MAINTENANCE_SYNTHETIC_ONLY
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_SYNTHETIC_ONLY, optional: true}}
+- name: PTR_MAINTENANCE_APPLY
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_APPLY, optional: true}}
+- name: PTR_MAINTENANCE_TIMEOUT_SECONDS
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_TIMEOUT_SECONDS, optional: true}}
+- name: PTR_MAINTENANCE_DAILY_LIMIT
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_DAILY_LIMIT, optional: true}}
+- name: PTR_MAINTENANCE_WEEKLY_SINCE_DAYS
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_WEEKLY_SINCE_DAYS, optional: true}}
+- name: PTR_MAINTENANCE_LANGFUSE_FROM
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_LANGFUSE_FROM, optional: true}}
+- name: PTR_MAINTENANCE_LANGFUSE_PROJECT_ID
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_LANGFUSE_PROJECT_ID, optional: true}}
+- name: PTR_MAINTENANCE_LANGFUSE_QUEUE_IDS
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_LANGFUSE_QUEUE_IDS, optional: true}}
+- name: PTR_MAINTENANCE_REVIEW_QUEUE_ID
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_MAINTENANCE_REVIEW_QUEUE_ID, optional: true}}
+- name: PTR_MAINTENANCE_REVIEW_STATE_DIR
+  value: {{ .root.Values.maintenance.reviewStateDir | quote }}
+- name: PTR_PRODUCTION_REVIEW_APPROVAL
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_PRODUCTION_REVIEW_APPROVAL, optional: true}}
+- name: PTR_PRODUCTION_REVIEW_SALT
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: PTR_PRODUCTION_REVIEW_SALT, optional: true}}
+- name: LANGFUSE_BASE_URL
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: LANGFUSE_BASE_URL, optional: true}}
+- name: LANGFUSE_PUBLIC_KEY
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: LANGFUSE_PUBLIC_KEY, optional: true}}
+- name: LANGFUSE_SECRET_KEY
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: LANGFUSE_SECRET_KEY, optional: true}}
+- name: LANGFUSE_ALLOW_LOCAL_HTTP
+  valueFrom: {secretKeyRef: {name: {{ .secret }}, key: LANGFUSE_ALLOW_LOCAL_HTTP, optional: true}}
+- name: HOME
+  value: /tmp
+- name: TMPDIR
+  value: /tmp
+- name: XDG_CACHE_HOME
+  value: /tmp/.cache
+{{- end }}
+{{- if .Values.maintenance.enabled }}
+{{- $app := .Values.namespaces.app -}}
+{{- $secret := default .Values.secrets.maintenance.existingSecret .Values.maintenance.secretName -}}
+{{- $common := dict "root" . "secret" $secret -}}
+{{- $jobs := list
+  (dict "name" "ptr-maintenance-daily-split-retention" "schedule" .Values.maintenance.schedules.dailySplitRetention "image" "worker" "resources" .Values.maintenance.resources.python "operation" "daily-split-retention" "enabled" .Values.maintenance.jobs.dailySplitRetention.enabled "syntheticSmoke" false)
+  (dict "name" "ptr-maintenance-daily-framework-retention" "schedule" .Values.maintenance.schedules.dailyFrameworkRetention "image" "backend" "resources" .Values.maintenance.resources.ts "operation" "daily-framework-retention" "enabled" .Values.maintenance.jobs.dailyFrameworkRetention.enabled "syntheticSmoke" false)
+  (dict "name" "ptr-maintenance-weekly-review-sample" "schedule" .Values.maintenance.schedules.weeklyReviewSample "image" "backend" "resources" .Values.maintenance.resources.ts "operation" "weekly-review-sample" "enabled" .Values.maintenance.jobs.weeklyReviewSample.enabled "syntheticSmoke" .Values.maintenance.jobs.weeklyReviewSample.syntheticSmoke)
+  (dict "name" "ptr-maintenance-weekly-production-review" "schedule" .Values.maintenance.schedules.weeklyProductionReview "image" "backend" "resources" .Values.maintenance.resources.ts "operation" "weekly-production-review" "enabled" .Values.maintenance.jobs.weeklyProductionReview.enabled "syntheticSmoke" .Values.maintenance.jobs.weeklyProductionReview.syntheticSmoke)
+-}}
+{{- range $job := $jobs }}
+{{- if $job.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $job.name }}
+  namespace: {{ $app }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: maintenance
+    {{- if $job.syntheticSmoke }}
+    ptr.io/synthetic-smoke: "true"
+    ptr.io/host-only-production-step: "true"
+    {{- end }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  timeZone: {{ $.Values.maintenance.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ $.Values.maintenance.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ $.Values.maintenance.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $.Values.maintenance.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ $.Values.maintenance.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ptr
+            app.kubernetes.io/component: maintenance
+            ptr.io/maintenance-step: {{ $job.operation }}
+            {{- if $job.syntheticSmoke }}
+            ptr.io/synthetic-smoke: "true"
+            ptr.io/host-only-production-step: "true"
+            {{- end }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          volumes:
+            - name: tmp
+              emptyDir: {}
+          containers:
+            - name: maintenance
+              image: {{ index $.Values.images $job.image "repository" }}:{{ index $.Values.images $job.image "tag" }}
+              imagePullPolicy: {{ index $.Values.images $job.image "pullPolicy" }}
+              command: ["python3", "scripts/split-maintenance.py"]
+              args: ["--k8s", "--operation", {{ $job.operation | quote }}]
+              env:
+                {{- include "ptr.maintenance.env" $common | nindent 16 }}
+              resources:
+                {{- toYaml $job.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 900
+                runAsGroup: 2000
+                capabilities: {drop: ["ALL"]}
+                seccompProfile: {type: RuntimeDefault}
+              volumeMounts:
+                - {name: tmp, mountPath: /tmp}
+---
+{{- end }}
+{{- end }}
+{{- end }}

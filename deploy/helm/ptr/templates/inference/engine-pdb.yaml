@@ -1,4 +1,9 @@
-{{- if and .Values.inference.enabled (gt (int .Values.inference.engine.replicas) 1) }}
+{{- /*
+The engine PDB is useful only when the steady-state replica count is greater than
+one. Kind starts V6 at one engine so KEDA can prove 1 -> 2 scale-up; rendering a
+PDB with maxUnavailable: 1 there would not protect availability.
+*/ -}}
+{{- if and .Values.inference.enabled (gt (int .Values.autoscaling.engine.minReplicaCount) 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

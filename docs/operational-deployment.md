@@ -11,9 +11,9 @@ Select a new owned Compose project/nonce, immutable verified backend and worker
 image IDs, separate private environment files and loopback ports in a `0600`
 operator Compose environment. Keep its directory `0700`. Do not print resolved
 Compose configuration: it can contain secrets. Validate with `config -q`.
-If paid failover is explicitly enabled, set `OPENROUTER_API_KEY` in that operator
-Compose environment. Compose maps it to `PTR_OPENROUTER_API_KEY` only in the gateway;
-keep it out of the gateway service env file and all other role env files.
+If paid failover is explicitly enabled, set `PTR_OPENROUTER_API_KEY` in the
+private gateway env file referenced by `PTR_OPERATIONAL_GATEWAY_ENV_FILE`; keep
+that key out of the operator Compose env file and all other role env files.
 
 ```sh
 docker compose --env-file /private/compose.env \
@@ -49,6 +49,63 @@ owner before live work. It makes the cumulative US$1 budget operator-controlled;
 runtime cannot raise or delete/recreate the global cap. Preserve existing ledger,
 immutable migration baseline and unknown reservations. GPU qualification call
 limits and gateway-key budgets are **not** this monetary cap.
+
+For a repeatable kind-only synthetic load run after the split ledger fills,
+drain the kind API and workers, rename the old `ptr_split_test` database to a
+distinct archive name, create an empty `ptr_split_test`, and run the existing
+kind bootstrap Job before restoring the deployments. The archived database
+retains all prior `unknown` reservations; never resubmit those requests. The
+bootstrap rejects a nonempty target and re-applies the ordinary synthetic
+US$1 cap. The kind-only `gateway.billing.maxCallMicrousd: 5000` limits the
+reservation exposure of a 200-turn V5 run to US$1.00 even if all receipts are
+`unknown`; it does not change the production setting or ledger rules. Do not
+use this procedure for the research or production database.
+
+The constrained LiteLLM application key must not be the first bottleneck during
+worker scale-out. Set `gateway.bootstrap.rpm` to at least
+`autoscaling.worker.maxReplicaCount * app.worker.concurrency`, plus operational
+headroom. The production floor is `40 * 4 * 1.25 = 200 rpm`; the configured
+`5000 rpm` also accommodates repeated short turns. The kind profile uses
+`1000 rpm` and four in-flight turns per worker. The worker active-list scaler
+threshold derives from `app.worker.concurrency`, so the active trigger tracks
+that same capacity instead of a separate stale value.
+The kind EPP queue TTL is 30 seconds because the simulator's first token takes
+eight seconds; the queue size remains eight. Production retains its two-second
+flow-control TTL.
+For V5, apply `deploy/kind/k5-worker-values.yaml` after `values-kind.yaml` to
+keep the two allowed synthetic engines warm, then restore the ordinary kind
+values after the run so V6 can check engine scale-up from one. The kind API
+allows ten minutes of synthetic queue wait; the production default remains one
+minute. This avoids expiring unclaimed V5 turns while the 200-turn burst drains.
+
+Kubernetes maintenance CronJobs use `concurrencyPolicy: Forbid` for scheduled
+overlap only. Operators must not start a manual Job while a scheduled or manual
+run is active, or start two manual runs together. Concurrent SQL apply runs are
+still row-safe: native split retention and the legacy checkpoint and receipt
+retention select candidates with `SKIP LOCKED`, then mutate those locked rows
+in the same transaction. These retention steps remain valid Kubernetes CronJobs.
+
+The weekly human-review steps are host/systemd-only in production.
+`review-sample` writes private review sheets under the repo root, which is
+read-only in the Kubernetes image, and `production-review` uses a lock and
+journal that must live in a shared durable private directory. A Kubernetes
+`emptyDir` would make that state per pod run. The production chart values
+therefore disable `weekly-review-sample` and `weekly-production-review`; run
+them only through the operator-owned host timers described in
+`infra/split/maintenance`. Kind keeps those two CronJobs enabled only as
+synthetic smoke tests, labelled `ptr.io/synthetic-smoke=true` and
+`ptr.io/host-only-production-step=true`, with `/tmp` state and no private review
+sheet output.
+
+Redis classifies KEDA 2.21's `EVAL` with a declared key as write-capable even
+when the script only calls `TYPE` and `LLEN`. The kind Redis ACL therefore uses
+`%R~ptr:turns:*` for direct reads and a second queue-key selector for `EVAL`;
+neither selector grants `SET` or another write command. Verify script-write
+denial after changing KEDA or Redis versions.
+For production `rediss` with a private CA, the worker scaler's Secret must
+provide `REDIS_CA` and `REDIS_TLS_MODE=enable`. KEDA uses these together in
+`TriggerAuthentication`; its `enableTLS` trigger field is reserved for the
+system-CA path without a custom CA.
 
 Apply `supabase/split/0005_generated_artifacts.sql` before deploying the new API;
 draft requests fail without its table. No backfill of old `data/generated/*.json`

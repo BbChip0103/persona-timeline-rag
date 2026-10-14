@@ -33,14 +33,110 @@ app:
       limits: {cpu: "1", memory: 1Gi}
   api:
     replicas: 2
+    maxQueueMs: 60000
     resources:
       requests: {cpu: 100m, memory: 256Mi}
       limits: {cpu: "1", memory: 1Gi}
   worker:
-    replicas: 1
+    replicas: 2
+    concurrency: 4
     resources:
       requests: {cpu: 200m, memory: 512Mi}
       limits: {cpu: "2", memory: 2Gi}
+
+autoscaling:
+  hpa:
+    enabled: true
+    cpuUtilization: 70
+    web:
+      minReplicas: 2
+      maxReplicas: 6
+    api:
+      minReplicas: 2
+      maxReplicas: 10
+    litellm:
+      minReplicas: 2
+      maxReplicas: 6
+  worker:
+    enabled: true
+    pollingInterval: 10
+    cooldownPeriod: 120
+    minReplicaCount: 2
+    maxReplicaCount: 40
+    fallback:
+      failureThreshold: 3
+      replicas: 4
+    redis:
+      triggerAuthenticationName: ptr-worker-redis
+      existingSecret: ptr-keda-redis
+      addressKey: REDIS_ADDRESS
+      usernameKey: REDIS_USERNAME
+      passwordKey: REDIS_PASSWORD
+      caKey: ""
+      tlsKey: ""
+      waitList: ptr:turns:wait
+      waitListLength: "8"
+      waitActivationListLength: "1"
+      activeList: ptr:turns:active
+  engine:
+    enabled: true
+    pollingInterval: 10
+    cooldownPeriod: 120
+    minReplicaCount: 1
+    maxReplicaCount: 32
+    scaleDownStabilizationSeconds: 600
+    prometheus:
+      serverAddress: ""
+      queueThreshold: "4"
+      kvThreshold: "0.8"
+
+monitoring:
+  prometheus:
+    releaseName: ptr-monitoring
+    namespace: ptr-monitoring
+    port: 9090
+  serviceMonitors:
+    enabled: true
+    interval: 15s
+    api:
+      path: /metrics/prom
+    litellm:
+      path: /metrics
+    engine:
+      path: /metrics
+
+maintenance:
+  enabled: false
+  secretName: ptr-maintenance
+  timeZone: Asia/Seoul
+  startingDeadlineSeconds: 600
+  activeDeadlineSeconds: 310
+  reviewStateDir: /tmp/ptr-maintenance-review-state
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  schedules:
+    dailySplitRetention: "15 3 * * *"
+    dailyFrameworkRetention: "25 3 * * *"
+    weeklyReviewSample: "45 3 * * 1"
+    weeklyProductionReview: "55 3 * * 1"
+  jobs:
+    dailySplitRetention:
+      enabled: true
+    dailyFrameworkRetention:
+      enabled: true
+    weeklyReviewSample:
+      enabled: false
+      syntheticSmoke: false
+    weeklyProductionReview:
+      enabled: false
+      syntheticSmoke: false
+  resources:
+    python:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    ts:
+      requests: {cpu: 50m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
 
 data:
   enabled: false

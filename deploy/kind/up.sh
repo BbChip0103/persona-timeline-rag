@@ -8,6 +8,7 @@ repo_root="$(cd -- "$script_dir/../.." && pwd)"
 kind_bin="${KIND:-kind}"
 kubectl_bin="${KUBECTL:-kubectl}"
 docker_bin="${DOCKER:-docker}"
+helm_bin="${HELM:-helm}"
 kubectl_cmd=("$kubectl_bin" --context "kind-$cluster_name")
 
 if [ "$cluster_name" != "ptr-k8s" ]; then
@@ -63,11 +64,46 @@ if ! "$kind_bin" get clusters | grep -Fxq "$cluster_name"; then
   "$kind_bin" create cluster --config "$script_dir/cluster.yaml" --name "$cluster_name"
 fi
 
+# Exact official chart versions; the values files bound kind resource use.
+addon_dir="$(mktemp -d)"
+gie_manifest=""
+cleanup() {
+  rm -rf -- "$addon_dir"
+  if [ -n "$gie_manifest" ]; then
+    rm -f -- "$gie_manifest"
+  fi
+}
+trap cleanup EXIT
+
+pull_pinned_chart() {
+  local repo="$1" chart="$2" version="$3" sha256="$4" archive
+  archive="$addon_dir/${chart}-${version}.tgz"
+  "$helm_bin" pull "$repo/$chart" --version "$version" --destination "$addon_dir" >/dev/null
+  printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c - >/dev/null
+  printf '%s\n' "$archive"
+}
+
+"$helm_bin" repo add keda https://kedacore.github.io/charts --force-update >/dev/null
+"$helm_bin" repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ --force-update >/dev/null
+"$helm_bin" repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update >/dev/null
+"$helm_bin" repo update >/dev/null
+keda_chart="$(pull_pinned_chart keda keda 2.21.0 a7da56bf41a33dad9d2fc82a6fdecee552fff947d80bf1e1dbcf4db0f9e26dee)"
+metrics_server_chart="$(pull_pinned_chart metrics-server metrics-server 3.14.0 c2ca1185c01e6e7f53dd1b7d131f0c9b3fa50e003ed068b784563a1b5a3422a1)"
+prometheus_chart="$(pull_pinned_chart prometheus-community kube-prometheus-stack 92.3.1 5c976ae9562ec3b28b571f38e109e5d3f2ea3355573da416cd06be52dce6bd6a)"
+"$helm_bin" --kube-context "kind-$cluster_name" upgrade --install ptr-keda "$keda_chart" \
+  --version 2.21.0 --namespace ptr-keda --create-namespace --values "$script_dir/keda-values.yaml" \
+  --wait --timeout 5m >/dev/null
+"$helm_bin" --kube-context "kind-$cluster_name" upgrade --install ptr-metrics-server "$metrics_server_chart" \
+  --version 3.14.0 --namespace kube-system --values "$script_dir/metrics-server-values.yaml" \
+  --wait --timeout 5m >/dev/null
+"$helm_bin" --kube-context "kind-$cluster_name" upgrade --install ptr-monitoring "$prometheus_chart" \
+  --version 92.3.1 --namespace ptr-monitoring --create-namespace --values "$script_dir/prometheus-values.yaml" \
+  --wait --timeout 5m >/dev/null
+
 # Gateway API Inference Extension v1.6.0 release asset (InferencePool v1 CRD only).
 gie_version="v1.6.0"
 gie_sha256="8f8fd05fa7369abbe99fd149d8ff3995bfa4aa87455003e78dc144201ec8f1c8"
 gie_manifest="$(mktemp)"
-trap 'rm -f -- "$gie_manifest"' EXIT
 curl -fsSL --retry 3 "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${gie_version}/v1-manifests.yaml" -o "$gie_manifest"
 printf '%s  %s\n' "$gie_sha256" "$gie_manifest" | sha256sum -c - >/dev/null
 "${kubectl_cmd[@]}" apply --server-side -f "$gie_manifest" >/dev/null

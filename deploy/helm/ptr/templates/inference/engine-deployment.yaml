@@ -13,7 +13,9 @@ metadata:
   name: ptr-{{ $engine.kind }}
   namespace: {{ .Values.namespaces.inference }}
 spec:
+  {{- if not .Values.autoscaling.engine.enabled }}
   replicas: {{ $engine.replicas }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

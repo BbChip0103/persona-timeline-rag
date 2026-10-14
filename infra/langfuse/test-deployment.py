@@ -4,6 +4,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             env = Path(folder) / "new.env"
             subprocess.run(
-                ["python", str(INIT), "--output", str(env)], check=True, capture_output=True
+                [sys.executable, str(INIT), "--output", str(env)], check=True, capture_output=True
             )
             env.write_text(
                 env.read_text().replace(
@@ -43,11 +44,16 @@ class DeploymentTests(unittest.TestCase):
                     self.assertNotIn("PTR_OPENROUTER_API_KEY", service.get("environment", {}))
                     self.assertNotIn("OPENROUTER_API_KEY", service.get("environment", {}))
 
-    def test_openrouter_key_is_mapped_only_into_split_gateway(self):
+    def test_openrouter_key_is_read_from_split_gateway_env_file(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             role_env = root / "role.env"
             role_env.write_text("SYNTHETIC_PLACEHOLDER=1\n")
+            gateway_env = root / "gateway.env"
+            gateway_env.write_text(
+                "SYNTHETIC_PLACEHOLDER=1\n"
+                "PTR_OPENROUTER_API_KEY=synthetic-gateway-sentinel\n"
+            )
             published = root / "published.json"
             published.write_text("{}\n")
             compose_env = root / "compose.env"
@@ -62,9 +68,10 @@ class DeploymentTests(unittest.TestCase):
                 "OPENROUTER_API_KEY=synthetic-compose-sentinel",
                 *[f"{key}={role_env}" for key in (
                     "PTR_FRAMEWORK_APP_ENV_FILE", "PTR_LLM_SERVICE_ENV_FILE",
-                    "PTR_OPERATIONAL_WEB_ENV_FILE", "PTR_OPERATIONAL_GATEWAY_ENV_FILE",
-                    "PTR_OPERATIONAL_GATEWAY_DB_ENV_FILE", "PTR_OPERATIONAL_GATEWAY_REDIS_ENV_FILE",
+                    "PTR_OPERATIONAL_WEB_ENV_FILE", "PTR_OPERATIONAL_GATEWAY_DB_ENV_FILE",
+                    "PTR_OPERATIONAL_GATEWAY_REDIS_ENV_FILE",
                 )],
+                f"PTR_OPERATIONAL_GATEWAY_ENV_FILE={gateway_env}",
                 f"PTR_OPERATIONAL_PUBLISHED_PERSONAS_FILE={published}",
                 f"PTR_OPERATIONAL_GATEWAY_CONFIG={ROOT / 'infra/litellm/config.live.yaml'}",
             ]) + "\n")
@@ -75,6 +82,10 @@ class DeploymentTests(unittest.TestCase):
             )
             services = json.loads(result.stdout)["services"]
             self.assertEqual(
+                services["model-gateway"]["environment"]["PTR_OPENROUTER_API_KEY"],
+                "synthetic-gateway-sentinel",
+            )
+            self.assertNotEqual(
                 services["model-gateway"]["environment"]["PTR_OPENROUTER_API_KEY"],
                 "synthetic-compose-sentinel",
             )
@@ -88,7 +99,7 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             env = Path(folder) / "new.env"
             subprocess.run(
-                ["python", str(INIT), "--output", str(env)], check=True, capture_output=True
+                [sys.executable, str(INIT), "--output", str(env)], check=True, capture_output=True
             )
             before = env.read_bytes()
             self.assertEqual(os.stat(env).st_mode & 0o777, 0o600)
@@ -107,7 +118,7 @@ class DeploymentTests(unittest.TestCase):
             self.assertTrue(fields["PTR_FRAMEWORK_PROJECT"].startswith("ptr-fw-"))
             self.assertEqual(fields["OPENROUTER_API_KEY"], "")
             result = subprocess.run(
-                ["python", str(INIT), "--output", str(env)], capture_output=True
+                [sys.executable, str(INIT), "--output", str(env)], capture_output=True
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(env.read_bytes(), before)
@@ -125,7 +136,7 @@ class DeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             env = Path(folder) / "new.env"
             subprocess.run(
-                ["python", str(INIT), "--output", str(env)], check=True, capture_output=True
+                [sys.executable, str(INIT), "--output", str(env)], check=True, capture_output=True
             )
             subprocess.run(
                 [

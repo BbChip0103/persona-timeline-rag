@@ -7,7 +7,9 @@ metadata:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: worker
 spec:
+  {{- if not .Values.autoscaling.worker.enabled }}
   replicas: {{ .Values.app.worker.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ptr
@@ -162,7 +164,7 @@ spec:
             - name: PTR_LLM_QUEUE_PREFIX
               value: ptr
             - name: PTR_LLM_CONCURRENCY
-              value: "4"
+              value: {{ .Values.app.worker.concurrency | quote }}
             - name: PTR_LLM_LOCK_DURATION_MS
               value: "30000"
             - name: PTR_LLM_STALLED_INTERVAL_MS

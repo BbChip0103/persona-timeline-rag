@@ -2,6 +2,7 @@
 """Fake OpenRouter fixture contracts; synthetic and no network calls."""
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -40,6 +41,97 @@ class FakeOpenRouterTests(unittest.TestCase):
             {"x-ptr-provider-request-id": "synthetic-id"},
         )
         self.assertNotIn("cost", fake._usage())
+
+    def test_json_schema_reply_passes_agent_shape(self):
+        fake = load_fake_openrouter()
+        content = fake._structured_content(
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "agent_reply",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["message", "status", "evidenceRefs", "variableUpdates"],
+                            "properties": {
+                                "message": {"type": "string", "maxLength": 400},
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "answered",
+                                        "insufficient_evidence",
+                                        "needs_clarification",
+                                        "out_of_scope",
+                                    ],
+                                },
+                                "evidenceRefs": {
+                                    "type": "array",
+                                    "maxItems": 2,
+                                    "items": {"$ref": "#/$defs/evidenceRef"},
+                                },
+                                "variableUpdates": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "tone": {
+                                            "type": "string",
+                                            "enum": ["neutral", "warm", "playful"],
+                                        }
+                                    },
+                                },
+                            },
+                            "$defs": {
+                                "evidenceRef": {
+                                    "type": "object",
+                                    "required": ["sourceId", "quote"],
+                                    "properties": {
+                                        "sourceId": {"type": "string", "minLength": 1},
+                                        "quote": {"type": "string", "minLength": 1},
+                                    },
+                                }
+                            },
+                        },
+                    },
+                }
+            }
+        )
+        self.assertEqual(
+            json.loads(content),
+            {
+                "message": "Synthetic OpenRouter spillover reply.",
+                "status": "answered",
+                "evidenceRefs": [],
+                "variableUpdates": {},
+            },
+        )
+
+    def test_json_object_reply_uses_timeline_shape_by_default(self):
+        fake = load_fake_openrouter()
+        content = fake._structured_content({"response_format": {"type": "json_object"}})
+        self.assertEqual(
+            json.loads(content),
+            {"status": "insufficient_evidence", "answer": "", "evidenceRefs": []},
+        )
+
+    def test_json_object_reply_uses_agent_shape_for_agent_prompt(self):
+        fake = load_fake_openrouter()
+        content = fake._structured_content(
+            {
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": "AGENT_JSON_REPLY"}],
+            }
+        )
+        self.assertEqual(
+            json.loads(content),
+            {
+                "message": "Synthetic OpenRouter spillover reply.",
+                "status": "answered",
+                "evidenceRefs": [],
+                "variableUpdates": {},
+            },
+        )
 
 
 if __name__ == "__main__":

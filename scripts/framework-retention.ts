@@ -1,6 +1,4 @@
 import type { LangfuseClient } from '../packages/ops/src/langfuse';
-import { createLangfuseClient } from '../packages/ops/src/langfuse';
-import { evaluationConfig } from './framework-evaluate';
 
 export interface RetentionOptions {
   environment: string;
@@ -105,11 +103,32 @@ export async function retainFrameworkData(client: LangfuseClient, options: Reten
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args.includes('--synthetic-empty')) {
+    if (args.length !== 1) throw new Error('Synthetic retention usage');
+    console.log(JSON.stringify({
+      projectId: 'synthetic',
+      environment: 'production-review',
+      from: new Date(0).toISOString(),
+      cutoff: new Date(0).toISOString(),
+      traceIds: [],
+      datasetItems: [],
+      queueItems: [],
+      applied: false,
+      deletionSubmitted: false,
+      datasetDeletionSemantics: 'version-tombstone',
+      historicalDatasetErasureVerified: false,
+    }));
+    return;
+  }
   const value = (flag: string) => { const i = args.indexOf(flag); return i < 0 ? undefined : args[i + 1]; };
   const values = (flag: string) => args.flatMap((arg, i) => arg === flag && args[i + 1] ? [args[i + 1]] : []);
   const environment = value('--environment');
   const from = value('--from');
   if (!environment || !from) throw new Error('Explicit --environment and --from required');
+  const [{ createLangfuseClient }, { evaluationConfig }] = await Promise.all([
+    import('../packages/ops/src/langfuse'),
+    import('./framework-evaluate'),
+  ]);
   const client = createLangfuseClient(evaluationConfig());
   try {
     const plan = await retainFrameworkData(client, { environment, from, datasetNames: values('--dataset'), queueIds: values('--queue'),

@@ -59,6 +59,104 @@ def _usage() -> dict[str, int | float]:
     return usage
 
 
+def _resolve_ref(schema: dict[str, object], root: dict[str, object]) -> dict[str, object]:
+    ref = schema.get("$ref")
+    if not isinstance(ref, str) or not ref.startswith("#/$defs/"):
+        return schema
+    current: object = root.get("$defs")
+    for part in ref.removeprefix("#/$defs/").split("/"):
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(part)
+    return current if isinstance(current, dict) else {}
+
+
+def _schema_value(schema: object, root: dict[str, object], depth: int = 0) -> object:
+    if depth > 16 or not isinstance(schema, dict):
+        return {}
+    resolved = _resolve_ref(schema, root)
+    if resolved is not schema:
+        return _schema_value(resolved, root, depth + 1)
+    if "const" in schema:
+        return schema["const"]
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return schema["enum"][0]
+    if "default" in schema:
+        return schema["default"]
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list) and variants:
+            return _schema_value(variants[0], root, depth + 1)
+    types = schema.get("type")
+    type_names = types if isinstance(types, list) else [types]
+    if "object" in type_names:
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict):
+            return {}
+        names = required if isinstance(required, list) else []
+        return {
+            str(name): _schema_value(properties.get(name), root, depth + 1)
+            for name in names
+            if name in properties
+        }
+    if "array" in type_names:
+        min_items = schema.get("minItems")
+        count = min_items if isinstance(min_items, int) and min_items > 0 else 0
+        item = schema.get("items")
+        return [_schema_value(item, root, depth + 1) for _ in range(count)]
+    if "integer" in type_names:
+        return 1
+    if "number" in type_names:
+        return 1.0
+    if "boolean" in type_names:
+        return True
+    return "Synthetic OpenRouter spillover reply."
+
+
+def _structured_content(body: dict[str, object]) -> str:
+    response_format = body.get("response_format")
+    if not isinstance(response_format, dict):
+        return "Synthetic OpenRouter spillover reply."
+    if response_format.get("type") == "json_schema":
+        json_schema = response_format.get("json_schema")
+        schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
+        if isinstance(schema, dict):
+            value = _schema_value(schema, schema)
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("message"), str)
+                and not value["message"].strip()
+                and "function" not in value
+            ):
+                value["message"] = "Synthetic OpenRouter spillover reply."
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if response_format.get("type") == "json_object":
+        agent = any(
+            isinstance(item, dict)
+            and item.get("role") == "system"
+            and "AGENT_JSON_REPLY" in str(item.get("content", ""))
+            for item in body.get("messages") or []
+        )
+        if agent:
+            return json.dumps(
+                {
+                    "message": "Synthetic OpenRouter spillover reply.",
+                    "status": "answered",
+                    "evidenceRefs": [],
+                    "variableUpdates": {},
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        return json.dumps(
+            {"status": "insufficient_evidence", "answer": "", "evidenceRefs": []},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return "Synthetic OpenRouter spillover reply."
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args: object) -> None:
         pass
@@ -137,7 +235,7 @@ class Handler(BaseHTTPRequestHandler):
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": "Synthetic OpenRouter spillover reply.",
+                            "content": _structured_content(body),
                         },
                     }
                 ],

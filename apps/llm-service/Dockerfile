@@ -20,5 +20,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/app/apps/llm-service/.ven
 WORKDIR /app
 COPY --from=builder /app/apps/llm-service/.venv ./apps/llm-service/.venv
 COPY --chmod=0755 contracts ./contracts
+COPY --chmod=0755 scripts/split-maintenance.py ./scripts/
 USER 900:2000
 CMD ["python", "-m", "ptr_llm", "worker"]

@@ -1,0 +1,208 @@
+{{- if ne .Values.policy.enabled false }}
+{{- $app := .Values.namespaces.app -}}
+{{- $data := .Values.namespaces.data -}}
+{{- $gateway := .Values.namespaces.gateway -}}
+{{- $inference := .Values.namespaces.inference -}}
+{{- $postgresPort := int .Values.network.postgres.port -}}
+{{- $redisPort := int .Values.network.redis.port -}}
+{{- $pgCidrs := default (list) .Values.policy.managedData.postgres.cidrs -}}
+{{- $redisCidrs := default (list) .Values.policy.managedData.redis.cidrs -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-api-monitoring-ingress
+  namespace: {{ $app }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: api}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 56441}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-maintenance-to-data
+  namespace: {{ $app }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: maintenance}
+  policyTypes: [Egress]
+  egress:
+    {{- if .Values.data.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $data }}}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: postgres}
+      ports: [{protocol: TCP, port: {{ $postgresPort }}}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $data }}}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: redis}
+      ports: [{protocol: TCP, port: {{ $redisPort }}}]
+    {{- else }}
+    {{- range $pgCidrs }}
+    - to: [{ipBlock: {cidr: {{ . | quote }}}}]
+      ports: [{protocol: TCP, port: {{ $postgresPort }}}]
+    {{- end }}
+    {{- range $redisCidrs }}
+    - to: [{ipBlock: {cidr: {{ . | quote }}}}]
+      ports: [{protocol: TCP, port: {{ $redisPort }}}]
+    {{- end }}
+    {{- end }}
+{{- if .Values.data.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-maintenance-data-ingress
+  namespace: {{ $data }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [postgres, redis]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $app }}}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: maintenance}
+      ports:
+        - {protocol: TCP, port: {{ $postgresPort }}}
+        - {protocol: TCP, port: {{ $redisPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-keda-redis-ingress
+  namespace: {{ $data }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: redis}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-keda}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: keda-operator}
+      ports: [{protocol: TCP, port: {{ $redisPort }}}]
+{{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-litellm-monitoring-ingress
+  namespace: {{ $gateway }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: litellm}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 4000}]
+{{- end }}
+{{- if .Values.inference.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-inference-monitoring-ingress
+  namespace: {{ $inference }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [inference-engine]}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 8000}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-epp-monitoring-ingress
+  namespace: {{ $inference }}
+spec:
+  podSelector:
+    matchLabels: {llm-d-router-standalone: {{ .Values.inference.routerService }}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 9090}]
+{{- end }}
+{{- if .Values.inference.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-prometheus-keda-ingress
+  namespace: ptr-monitoring
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: prometheus}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-keda}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: keda-operator}
+      ports: [{protocol: TCP, port: 9090}]
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-prometheus-self-monitoring-ingress
+  namespace: ptr-monitoring
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: prometheus}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 9090}, {protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-prometheus-operator-monitoring-ingress
+  namespace: ptr-monitoring
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: kube-prometheus-stack-prometheus-operator}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 10250}]
+{{- end }}

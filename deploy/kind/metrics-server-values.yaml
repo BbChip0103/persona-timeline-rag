@@ -1,0 +1,5 @@
+# metrics-server chart 3.14.0. kind kubelets use certificates without trusted CA roots.
+args:
+  - --kubelet-insecure-tls
+resources:
+  requests: {cpu: 25m, memory: 64Mi}

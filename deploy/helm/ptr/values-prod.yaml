@@ -4,10 +4,38 @@ data:
 app:
   web: {replicas: 2}
   api: {replicas: 2}
+  worker: {replicas: 2}
+autoscaling:
+  worker:
+    maxReplicaCount: 40
+    redis:
+      caKey: REDIS_CA
+      tlsKey: REDIS_TLS_MODE
+  engine:
+    minReplicaCount: 2
+    # Keep this equal to the GPU pool capacity for the target cluster.
+    maxReplicaCount: 32
+    scaleDownStabilizationSeconds: 600
+maintenance:
+  enabled: true
+  jobs:
+    dailySplitRetention:
+      enabled: true
+    dailyFrameworkRetention:
+      enabled: true
+    weeklyReviewSample:
+      enabled: false
+      syntheticSmoke: false
+    weeklyProductionReview:
+      enabled: false
+      syntheticSmoke: false
 gateway:
   bootstrap:
     # Documentation placeholder only: replace with the cluster API endpoint CIDR.
     apiServerCIDRs: ["192.0.2.1/32"]
+    # Minimum floor: 40 max workers * 4 concurrent turns * 1.25 headroom = 200.
+    # This higher limit leaves room for multiple short turns per worker per minute.
+    rpm: 5000
   data:
     enabled: false
   managedData:

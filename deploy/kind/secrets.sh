@@ -26,6 +26,7 @@ postgres_app_password="$(rand_hex)"
 postgres_worker_password="$(rand_hex)"
 app_database_url="postgresql://ptr_split_app:${postgres_app_password}@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
 worker_database_url="postgresql://ptr_split_llm:${postgres_worker_password}@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
+maintenance_database_url="postgresql://ptr_split_owner:${postgres_owner_password}@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
 redis_password="$(rand_hex)"
 redis_keda_password="$(rand_hex)"
 redis_url="redis://ptr:${redis_password}@ptr-redis.ptr-data.svc:6379/0"
@@ -56,6 +57,51 @@ if [ "$existing" -gt 0 ] && [ "$existing" -lt 5 ]; then
   printf 'Refusing to replace a partial synthetic Secret set\n' >&2
   exit 1
 fi
+
+apply_keda_redis_secret() {
+  if "${kubectl_cmd[@]}" get secret ptr-keda-redis -n ptr-app >/dev/null 2>&1; then
+    return
+  fi
+  local password="$1"
+  if ! "${kubectl_cmd[@]}" apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ptr-keda-redis
+  namespace: ptr-app
+type: Opaque
+stringData:
+  REDIS_ADDRESS: "ptr-redis.ptr-data.svc:6379"
+  REDIS_USERNAME: "keda"
+  REDIS_PASSWORD: "$password"
+EOF
+  then
+    printf 'Synthetic KEDA Redis Secret apply failed (values withheld)\n' >&2
+    exit 1
+  fi
+}
+
+patch_existing_maintenance_secret() {
+  if ! "${kubectl_cmd[@]}" get secret ptr-maintenance -n ptr-app >/dev/null 2>&1; then
+    return
+  fi
+  local owner_database_url="$1"
+  if ! "${kubectl_cmd[@]}" get secret ptr-maintenance -n ptr-app -o json |
+    OWNER_DATABASE_URL="$owner_database_url" jq '
+      .data.PTR_LLM_MAINTENANCE_DATABASE_URL = (env.OWNER_DATABASE_URL | @base64) |
+      .data.PTR_MAINTENANCE_DATABASE_URL = (env.OWNER_DATABASE_URL | @base64) |
+      .data.PTR_MAINTENANCE_SYNTHETIC_ONLY = ("1" | @base64) |
+      .data.PTR_MAINTENANCE_APPLY = ("0" | @base64) |
+      .data.PTR_MAINTENANCE_TIMEOUT_SECONDS = ("300" | @base64) |
+      .data.PTR_MAINTENANCE_DAILY_LIMIT = ("100" | @base64) |
+      .data.PTR_MAINTENANCE_WEEKLY_SINCE_DAYS = ("7" | @base64)
+    ' |
+    "${kubectl_cmd[@]}" replace -f - >/dev/null 2>&1
+  then
+    printf 'Synthetic maintenance Secret patch failed (values withheld)\n' >&2
+    exit 1
+  fi
+}
 
 if [ "$existing" -eq 0 ]; then
 if ! "${kubectl_cmd[@]}" apply -f - >/dev/null 2>&1 <<EOF
@@ -92,9 +138,15 @@ metadata:
   namespace: ptr-app
 type: Opaque
 stringData:
-  PTR_MAINTENANCE_DATABASE_URL: "$app_database_url"
+  PTR_LLM_MAINTENANCE_DATABASE_URL: "$maintenance_database_url"
+  PTR_MAINTENANCE_DATABASE_URL: "$maintenance_database_url"
   PTR_MAINTENANCE_REDIS_URL: "$redis_url"
   PTR_MAINTENANCE_TOKEN: "$maintenance_token"
+  PTR_MAINTENANCE_SYNTHETIC_ONLY: "1"
+  PTR_MAINTENANCE_APPLY: "0"
+  PTR_MAINTENANCE_TIMEOUT_SECONDS: "300"
+  PTR_MAINTENANCE_DAILY_LIMIT: "100"
+  PTR_MAINTENANCE_WEEKLY_SINCE_DAYS: "7"
 ---
 apiVersion: v1
 kind: Secret
@@ -124,6 +176,14 @@ then
   printf 'Synthetic Secret apply failed (values withheld)\n' >&2
   exit 1
 fi
+apply_keda_redis_secret "$redis_keda_password"
+patch_existing_maintenance_secret "$maintenance_database_url"
+else
+  existing_redis_keda_password="$("${kubectl_cmd[@]}" get secret ptr-data -n ptr-data -o jsonpath='{.data.REDIS_KEDA_PASSWORD}' | base64 -d)"
+  existing_postgres_owner_password="$("${kubectl_cmd[@]}" get secret ptr-data -n ptr-data -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)"
+  existing_maintenance_database_url="postgresql://ptr_split_owner:${existing_postgres_owner_password}@ptr-postgres.ptr-data.svc:5432/ptr_split_test"
+  apply_keda_redis_secret "$existing_redis_keda_password"
+  patch_existing_maintenance_secret "$existing_maintenance_database_url"
 fi
 
 if ! "${kubectl_cmd[@]}" get secret ptr-litellm -n ptr-gateway >/dev/null 2>&1; then
@@ -193,14 +253,26 @@ synthetic_secret_keys:
 - namespace: ptr-app
   name: ptr-maintenance
   keys:
+  - PTR_LLM_MAINTENANCE_DATABASE_URL
   - PTR_MAINTENANCE_DATABASE_URL
   - PTR_MAINTENANCE_REDIS_URL
   - PTR_MAINTENANCE_TOKEN
+  - PTR_MAINTENANCE_SYNTHETIC_ONLY
+  - PTR_MAINTENANCE_APPLY
+  - PTR_MAINTENANCE_TIMEOUT_SECONDS
+  - PTR_MAINTENANCE_DAILY_LIMIT
+  - PTR_MAINTENANCE_WEEKLY_SINCE_DAYS
 - namespace: ptr-app
   name: ptr-personas
   keys:
   - PTR_PERSONA_FIXTURE
   - PTR_LLM_PUBLISHED_PERSONAS_JSON
+- namespace: ptr-app
+  name: ptr-keda-redis
+  keys:
+  - REDIS_ADDRESS
+  - REDIS_USERNAME
+  - REDIS_PASSWORD
 - namespace: ptr-data
   name: ptr-data
   keys:

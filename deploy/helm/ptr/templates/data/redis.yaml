@@ -44,6 +44,13 @@ spec:
         app.kubernetes.io/component: redis
     spec:
       automountServiceAccountToken: false
+      {{- if .Values.data.redis.tolerateFakeGpu }}
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: synthetic
+          effect: NoSchedule
+      {{- end }}
       securityContext:
         fsGroup: 999
         fsGroupChangePolicy: OnRootMismatch
@@ -77,10 +84,13 @@ spec:
               umask 077
               REDIS_APP_PASSWORD_SHA256="$(printf '%s' "$REDIS_APP_PASSWORD" | sha256sum | awk '{print $1}')"
               REDIS_KEDA_PASSWORD_SHA256="$(printf '%s' "$REDIS_KEDA_PASSWORD" | sha256sum | awk '{print $1}')"
+              # EVAL is classified as write-capable for declared KEYS even when
+              # KEDA's script only reads. Its selector permits EVAL on queue
+              # keys; no write command is granted in either selector.
               cat > /tmp/users.acl <<EOF
               user default off
               user ${REDIS_APP_USER} on #${REDIS_APP_PASSWORD_SHA256} allcommands allkeys
-              user keda on #${REDIS_KEDA_PASSWORD_SHA256} +ping +llen ~ptr:turns:*
+              user keda on #${REDIS_KEDA_PASSWORD_SHA256} +ping +type +llen %R~ptr:turns:* (+eval +evalsha +type +llen ~ptr:turns:*)
               EOF
               exec redis-server --appendonly yes --maxmemory-policy noeviction --dir /data --aclfile /tmp/users.acl
           securityContext:

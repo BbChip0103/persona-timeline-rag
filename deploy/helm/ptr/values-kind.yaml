@@ -1,17 +1,25 @@
 data:
   enabled: true
+  redis:
+    # Its existing local PV may be on a node subsequently tainted for fake GPU.
+    tolerateFakeGpu: true
 app:
   web: {replicas: 2}
-  api: {replicas: 2}
-  worker: {replicas: 2}
+  # The 200-turn synthetic burst may wait behind the two simulated engines.
+  api: {replicas: 2, maxQueueMs: 600000}
+  worker: {replicas: 2, concurrency: 4}
 gateway:
   billing:
     maxOutputTokens: 4096
-    # Keep synthetic turns reservable as the fixed research ledger fills.
-    maxCallMicrousd: 20000
+    # 200 synthetic V5 admissions reserve at most 1.00 USD even if all receipts
+    # become unknown; the ordinary 1 USD cumulative ledger rule stays intact.
+    maxCallMicrousd: 5000
   bootstrap:
     apiServerCIDRs: ["10.96.0.1/32", "172.29.0.4/32"]
     apiServerPorts: [443, 6443]
+    # V5 submits 200 synthetic turns with high host-side concurrency; keep the
+    # app key above that burst so worker autoscaling, not LiteLLM RPM, is tested.
+    rpm: 1000
   data:
     enabled: true
   fakeOpenRouter:
@@ -19,7 +27,7 @@ gateway:
 inference:
   engine:
     kind: sim
-    replicas: 2
+    replicas: 1
     maxNumSeqs: 2
     maxModelLen: 16384
     mode: echo
@@ -29,3 +37,27 @@ inference:
   testClient:
     enabled: true
   apiServerCIDRs: ["10.96.0.1/32"]
+autoscaling:
+  hpa:
+    web: {minReplicas: 2, maxReplicas: 3}
+    api: {minReplicas: 2, maxReplicas: 4}
+    litellm: {minReplicas: 2, maxReplicas: 3}
+  worker:
+    maxReplicaCount: 6
+  engine:
+    maxReplicaCount: 2
+    # Kind uses a short window so V6 can prove scale-up and return-to-min quickly.
+    scaleDownStabilizationSeconds: 60
+maintenance:
+  enabled: true
+  jobs:
+    dailySplitRetention:
+      enabled: true
+    dailyFrameworkRetention:
+      enabled: true
+    weeklyReviewSample:
+      enabled: true
+      syntheticSmoke: true
+    weeklyProductionReview:
+      enabled: true
+      syntheticSmoke: true

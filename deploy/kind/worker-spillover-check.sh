@@ -12,7 +12,8 @@ worker_deployment="${PTR_WORKER_DEPLOYMENT:-ptr-worker}"
 api_label="${PTR_API_LABEL:-app.kubernetes.io/component=api}"
 worker_label="${PTR_WORKER_LABEL:-app.kubernetes.io/component=worker}"
 fake_label="${PTR_FAKE_OPENROUTER_LABEL:-app.kubernetes.io/component=fake-openrouter}"
-count="${TURN_COUNT:-16}"
+# With four concurrent calls per kind worker, the smaller burst can stay local.
+count="${TURN_COUNT:-100}"
 reservation="${PTR_LLM_MAX_CALL_MICROUSD:-5000}"
 prefix="worker-spill-$(date +%s)"
 host_python="$(if command -v python3 >/dev/null 2>&1; then command -v python3; else command -v python; fi)"
@@ -81,7 +82,7 @@ async function request(path, body) {
   if (!response.ok) throw new Error('HTTP_' + response.status);
   return response.json();
 }
-async function one(index) {
+async function prepare(index) {
   const session = await request('sessions', {
     personId: 'synthetic-split-person',
     retrievalMode: 'off',
@@ -89,7 +90,10 @@ async function one(index) {
     executionProfile: 'agent_loop',
   });
   const marker = prefix + '-' + String(index).padStart(2, '0');
-  const turn = await request('sessions/' + session.session.id + '/turns', {
+  return { sessionId: session.session.id, marker };
+}
+async function one({sessionId, marker}) {
+  const turn = await request('sessions/' + sessionId + '/turns', {
     clientRequestId: marker,
     text: JSON.stringify({
       message: 'K4_ID:' + marker,
@@ -106,7 +110,10 @@ async function one(index) {
   }
   return {state: final?.state || 'timeout', errorCode: final?.errorCode || null};
 }
-const settled = await Promise.allSettled(Array.from({length: count}, (_, index) => one(index)));
+// Keep catalogue RPCs out of the burst; only turn submissions exercise spillover.
+const prepared = [];
+for (let index = 0; index < count; index++) prepared.push(await prepare(index));
+const settled = await Promise.allSettled(prepared.map(one));
 const results = {};
 for (const item of settled) {
   const key = item.status === 'fulfilled'

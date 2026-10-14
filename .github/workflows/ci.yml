@@ -8,9 +8,9 @@ name: ci
 
 on:
   push:
-    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'tests/**', 'pyproject.toml']
+    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py']
   pull_request:
-    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py', 'src/persona_timeline_rag/**', 'tests/**', 'pyproject.toml']
+    paths-ignore: ['apps/llm-service/**', 'scripts/split-memory-proof.py']
   workflow_dispatch:
 
 permissions:
@@ -38,6 +38,9 @@ jobs:
           node-version: 24.14.0
       - name: Enable pnpm (packageManager in package.json)
         run: corepack enable pnpm
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v4.3.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - name: Compose file renders
@@ -50,6 +53,12 @@ jobs:
         run: |
           python3 infra/langfuse/test-deployment.py
           python3 infra/litellm/test-fixture.py
+      - name: Root pytest suite
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ptr-root-tests-venv"
+          "$RUNNER_TEMP/ptr-root-tests-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/ptr-root-tests-venv/bin/python" -m pip install -e '.[dev]'
+          PYTHONPATH=src "$RUNNER_TEMP/ptr-root-tests-venv/bin/python" -m pytest tests
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
       - name: Remove this check's private generated configuration
@@ -117,11 +126,38 @@ jobs:
       - name: Kubernetes schema validation
         run: |
           set -euo pipefail
-          inference_schema="file://$PWD/deploy/helm/ptr/schemas/InferencePool-v1.json"
-          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml | kubeconform -strict -summary -schema-location default -schema-location "$inference_schema"
-          helm template ptr deploy/helm/ptr --namespace ptr-system --values deploy/helm/ptr/values-prod.yaml | kubeconform -strict -summary -schema-location default -schema-location "$inference_schema"
-          helm template chat-primary deploy/helm/ptr-router --namespace ptr-inference --values deploy/helm/ptr-router/values-kind.yaml | kubeconform -strict -summary
-          helm template chat-primary deploy/helm/ptr-router --namespace ptr-inference --values deploy/helm/ptr-router/values-prod.yaml | kubeconform -strict -summary
+          validate_crd_kind() {
+            local rendered="$1"
+            local kind="$2"
+            local schema="${3:-$kind}"
+            local docs="$RUNNER_TEMP/${kind}.yaml"
+            awk -v kind="$kind" 'BEGIN{RS="---"; ORS="\n---\n"} $0 ~ ("(^|\n)kind: " kind "(\n|$)") {print $0}' "$rendered" > "$docs"
+            if ! [ -s "$docs" ]; then
+              printf 'missing expected CRD kind: %s\n' "$kind" >&2
+              exit 1
+            fi
+            kubeconform -strict -summary -schema-location "file://$PWD/deploy/helm/ptr/schemas/${schema}.json" "$docs"
+          }
+          validate_render() {
+            local chart="$1"
+            local release="$2"
+            local namespace="$3"
+            local values="$4"
+            shift 4
+            local rendered
+            rendered="$RUNNER_TEMP/${release}-${namespace}-$(basename "$values").yaml"
+            helm template "$release" "$chart" --namespace "$namespace" --values "$values" > "$rendered"
+            kubeconform -strict -summary -skip InferencePool,ScaledObject,TriggerAuthentication,ServiceMonitor -schema-location default "$rendered"
+            for expected in "$@"; do
+              local kind="${expected%%:*}"
+              local schema="${expected#*:}"
+              validate_crd_kind "$rendered" "$kind" "$schema"
+            done
+          }
+          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-kind.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor
+          validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-prod.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor
+          validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-kind.yaml ServiceMonitor
+          validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-prod.yaml ServiceMonitor
 
   integration:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')

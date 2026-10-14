@@ -33,6 +33,7 @@ ENV NODE_ENV=production \
     HOME=/tmp \
     TMPDIR=/tmp \
     XDG_CACHE_HOME=/tmp/.cache
+RUN apt-get update && apt-get install -y --no-install-recommends python3=3.11.2-1+b1 && rm -rf /var/lib/apt/lists/*
 COPY --from=backend-deps /app/node_modules ./node_modules
 COPY --chmod=0755 infra/backend/package.json infra/backend/pnpm-lock.yaml ./
 COPY --chmod=0755 tsconfig.json tsconfig.base.json ./
@@ -41,12 +42,16 @@ COPY --chmod=0755 packages/core/src/ports.ts packages/core/src/safety.ts package
 COPY --chmod=0755 packages/storage/src/pool.ts packages/storage/src/local-guard.ts packages/storage/src/conversations.ts packages/storage/src/creative-artifacts.ts packages/storage/src/database.ts packages/storage/src/llm-control.ts ./packages/storage/src/
 COPY --chmod=0755 packages/messaging/src/bullmq-delivery.ts packages/messaging/src/turn-events.ts packages/messaging/src/redis.ts packages/messaging/src/local-guard.ts ./packages/messaging/src/
 COPY --chmod=0755 packages/ops/src/log.ts packages/ops/src/bounded.ts packages/ops/src/http-metrics.ts packages/ops/src/metrics.ts ./packages/ops/src/
+COPY --chmod=0755 packages/ops/src/langfuse.ts packages/ops/src/production-review-transport.ts ./packages/ops/src/
 COPY --chmod=0755 packages/ops/src/config/web.ts ./packages/ops/src/config/
 COPY --chmod=0755 infra/backend/ops-package.json ./packages/ops/package.json
 COPY --chmod=0755 packages/contracts/package.json ./packages/contracts/
 COPY --chmod=0755 packages/contracts/src/index.ts ./packages/contracts/src/
+COPY --chmod=0755 infra/backend/storage-package.json ./packages/storage/package.json
+COPY --chmod=0755 scripts/split-maintenance.py scripts/framework-retention.ts scripts/framework-evaluate.ts scripts/review-sample.ts scripts/production-review.ts ./scripts/
+COPY --chmod=0755 infra/backend/storage-index.ts ./packages/storage/src/index.ts
 COPY --chmod=0755 contracts/llm/v1 ./contracts/llm/v1
-RUN mkdir -p node_modules/@ptr && ln -s ../../packages/contracts node_modules/@ptr/contracts && ln -s ../../packages/ops node_modules/@ptr/ops
+RUN mkdir -p node_modules/@ptr && ln -s ../../packages/contracts node_modules/@ptr/contracts && ln -s ../../packages/ops node_modules/@ptr/ops && ln -s ../../packages/storage node_modules/@ptr/storage
 COPY --from=web-builder --chmod=0755 /app/apps/web/.next ./apps/web/.next
 COPY --chmod=0755 apps/web/package.json apps/web/next.config.mjs ./apps/web/
 COPY --chmod=0755 infra/backend/image-smoke.ts ./infra/backend/

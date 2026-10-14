@@ -330,3 +330,9 @@ llm-d-router-standalone:
                                   port_value: 9002
                             load_balancing_weight: 1
                       {{- end }}
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    path: /metrics

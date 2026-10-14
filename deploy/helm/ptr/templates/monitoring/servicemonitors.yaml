@@ -1,0 +1,63 @@
+{{- if .Values.monitoring.serviceMonitors.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ptr-api
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Values.namespaces.app | quote }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: api
+      ptr.io/monitoring: "true"
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.serviceMonitors.api.path | quote }}
+      interval: {{ .Values.monitoring.serviceMonitors.interval }}
+---
+{{- if .Values.gateway.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ptr-litellm
+  namespace: {{ .Values.namespaces.gateway }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Values.namespaces.gateway | quote }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: litellm
+      ptr.io/monitoring: "true"
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.serviceMonitors.litellm.path | quote }}
+      interval: {{ .Values.monitoring.serviceMonitors.interval }}
+---
+{{- end }}
+{{- if .Values.inference.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ptr-engine
+  namespace: {{ .Values.namespaces.inference }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Values.namespaces.inference | quote }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: inference-engine
+      ptr.io/monitoring: "true"
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.serviceMonitors.engine.path | quote }}
+      interval: {{ .Values.monitoring.serviceMonitors.interval }}
+      metricRelabelings:
+        - action: replace
+          targetLabel: pool
+          replacement: {{ .Values.inference.pool | quote }}
+{{- end }}
+{{- end }}

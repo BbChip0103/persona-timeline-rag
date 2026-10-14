@@ -1,0 +1,5 @@
+# V5 worker-load overlay. Keep two synthetic engines warm while 200 turns queue.
+# The normal kind profile remains at one engine minimum for V6 scale-up checks.
+autoscaling:
+  engine:
+    minReplicaCount: 2

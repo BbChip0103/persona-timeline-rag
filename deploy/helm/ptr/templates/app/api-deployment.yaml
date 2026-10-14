@@ -7,7 +7,9 @@ metadata:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: api
 spec:
+  {{- if not .Values.autoscaling.hpa.enabled }}
   replicas: {{ .Values.app.api.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ptr
@@ -154,6 +156,8 @@ spec:
             {{- end }}
             - name: PTR_TURN_QUEUE
               value: turns
+            - name: PTR_TURN_MAX_QUEUE_MS
+              value: {{ .Values.app.api.maxQueueMs | quote }}
             - name: PTR_EVENTS_NAMESPACE
               value: events
             - name: PTR_DB_POOL_MAX

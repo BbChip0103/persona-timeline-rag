@@ -6,6 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: api
+    ptr.io/monitoring: "true"
 spec:
   type: ClusterIP
   selector:

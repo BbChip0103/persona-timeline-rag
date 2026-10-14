@@ -12,6 +12,7 @@ metadata:
   labels:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: litellm
+    ptr.io/monitoring: "true"
 spec:
   type: ClusterIP
   ports:
@@ -31,7 +32,9 @@ metadata:
     app.kubernetes.io/name: ptr
     app.kubernetes.io/component: litellm
 spec:
+  {{- if not .Values.autoscaling.hpa.enabled }}
   replicas: {{ .Values.gateway.litellm.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ptr
