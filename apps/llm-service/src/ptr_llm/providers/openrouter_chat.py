@@ -78,6 +78,7 @@ class _MeteredChat:
             "temperature": payload["temperature"],
             "stream": False,
             "provider": payload["provider"],
+            **({"usage": payload["usage"]} if "usage" in payload else {}),
             **({"reasoning": payload["reasoning"]} if "reasoning" in payload else {}),
             **(
                 {"response_format": payload["response_format"]}
@@ -123,7 +124,7 @@ class OpenRouterChat:
         self.sdk = ChatOpenAI(
             model=client.model,
             api_key=SecretStr("metered-bridge-no-sdk-credential"),
-            base_url="https://openrouter.ai/api/v1",
+            base_url=client.base_url + "/api/v1",
             temperature=0,
             max_retries=0,
             streaming=False,

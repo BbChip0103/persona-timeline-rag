@@ -1,10 +1,11 @@
-"""Genuine LangChain ChatOpenAI transport to the sole LiteLLM gateway."""
+"""Bounded LangChain ChatOpenAI transport for LiteLLM and direct local models."""
 
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import logging
 import math
 import time
 from contextvars import ContextVar
@@ -16,6 +17,7 @@ from urllib.parse import urlsplit
 from persona_timeline_rag.gateway_budget import HEADER, sign_request, sign_spillover_request
 
 from ptr_llm.billing import ProviderError, provider_request_scope
+from ptr_llm.config import _svc_host
 
 from .common import (
     bounded,
@@ -30,6 +32,7 @@ from .control_tokens import neutralize_json_strings, neutralize_messages
 from .transport import LimitedTransport
 
 _ALLOWED_CAPACITY_DROP_REASONS = frozenset(("rejected-saturated", "rejected-ttl-expired"))
+logger = logging.getLogger(__name__)
 
 
 class _NoCookies(DefaultCookiePolicy):
@@ -37,7 +40,7 @@ class _NoCookies(DefaultCookiePolicy):
         return False
 
 
-class LiteLLMTextProvider:
+class _ChatOpenAITextProvider:
     def __init__(
         self,
         *,
@@ -53,6 +56,11 @@ class LiteLLMTextProvider:
         on_metrics: Any = None,
         pricing_ceiling: dict[str, float] | None = None,
         capacity_spillover_key: str | None = None,
+        direct_local: bool = False,
+        paid_spillover: Any = None,
+        on_spillover_check_failure: Any = None,
+        spillover_min_remaining_ms: int = 10000,
+        cluster_mode: bool = False,
     ):
         import httpx
 
@@ -63,6 +71,16 @@ class LiteLLMTextProvider:
             or len(capacity_spillover_key.encode()) < 32
         ):
             raise ProviderError("BUDGET_AUTHORITY_REQUIRED")
+        if direct_local and (ledger is not None or capacity_spillover_key is not None):
+            raise ProviderError("INVALID_PROVIDER_CONFIG")
+        if type(spillover_min_remaining_ms) is not int or spillover_min_remaining_ms < 0:
+            raise ProviderError("INVALID_PROVIDER_CONFIG")
+        self.direct_local = direct_local
+        self.paid_spillover = paid_spillover
+        self.on_spillover_check_failure = on_spillover_check_failure
+        self.spillover_min_remaining_ms = spillover_min_remaining_ms
+        self.spillover_enabled = False
+        self._spillover_check_failed = False
         self.capacity_spillover_key = capacity_spillover_key
         try:
             if not isinstance(base_url, str):
@@ -80,9 +98,18 @@ class LiteLLMTextProvider:
             or url.fragment
         ):
             raise ProviderError("INVALID_PROXY_URL")
+        if direct_local and (
+            url.path not in ("", "/", "/v1", "/v1/")
+            or (
+                not _svc_host(url.hostname)
+                if cluster_mode
+                else url.hostname not in ("localhost", "127.0.0.1", "::1")
+            )
+        ):
+            raise ProviderError("LOCAL_URL_NOT_ALLOWED")
         if (
             not model.strip()
-            or not api_key.strip()
+            or not (api_key.strip() or direct_local)
             or any(
                 type(x) is not int or x < 1
                 for x in (max_output_tokens, timeout_ms, input_bytes, reservation_microusd)
@@ -128,6 +155,7 @@ class LiteLLMTextProvider:
         self._active: set[asyncio.Task[Any]] = set()
         self._closed = False
         self._close_lock = asyncio.Lock()
+        self._spillover_check_task: asyncio.Task[None] | None = None
 
     async def _observe_request(self, request: Any) -> None:
         hooks = self._hook_context.get()
@@ -160,7 +188,7 @@ class LiteLLMTextProvider:
             )
             self._sdk = ChatOpenAI(
                 model=self.model,
-                api_key=SecretStr(self.api_key),
+                api_key=SecretStr(self.api_key or "local-no-api-key"),
                 base_url=self.base_url,
                 temperature=0,
                 max_completion_tokens=self.max_output_tokens,
@@ -171,6 +199,9 @@ class LiteLLMTextProvider:
                 cache=False,
                 verbose=False,
                 http_async_client=self._client,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+                if self.direct_local
+                else None,
             )
             self._runnables["plain"] = self._sdk
         sdk = self._sdk
@@ -206,6 +237,9 @@ class LiteLLMTextProvider:
     async def aclose(self) -> None:
         async with self._close_lock:
             self._closed = True
+            if self._spillover_check_task is not None:
+                self._spillover_check_task.cancel()
+                await asyncio.gather(self._spillover_check_task, return_exceptions=True)
             current = asyncio.current_task()
             active = [task for task in self._active if task is not current]
             for task in active:
@@ -213,6 +247,51 @@ class LiteLLMTextProvider:
             await asyncio.gather(*active, return_exceptions=True)
             if self._client is not None:
                 await self._client.aclose()
+
+    async def start_spillover_checks(
+        self, max_limit_usd: float, *, interval_seconds: float = 60
+    ) -> None:
+        """Fail on key misconfiguration; suspend paid calls during provider outages."""
+        if self.paid_spillover is None:
+            return
+
+        def update_status(available: bool) -> None:
+            if available:
+                if not self.spillover_enabled:
+                    logger.warning("OPENROUTER_SPILLOVER_ENABLED")
+            elif not self._spillover_check_failed:
+                logger.warning("OPENROUTER_SPILLOVER_CHECK_FAILED")
+                if self.on_spillover_check_failure is not None:
+                    self.on_spillover_check_failure("OPENROUTER_SPILLOVER_CHECK_FAILED")
+                if self.spillover_enabled:
+                    logger.warning("OPENROUTER_SPILLOVER_DISABLED")
+            self.spillover_enabled = available
+            self._spillover_check_failed = not available
+
+        try:
+            available = await self.paid_spillover.verify_key_limit(max_limit_usd)
+        except ProviderError:
+            update_status(False)
+            raise
+        if available:
+            try:
+                await self.paid_spillover.verify_pricing()
+            except ProviderError:
+                available = False
+        update_status(available)
+
+        async def recheck() -> None:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    ready = await self.paid_spillover.verify_key_limit(max_limit_usd)
+                    if ready:
+                        await self.paid_spillover.verify_pricing()
+                    update_status(ready)
+                except ProviderError:
+                    update_status(False)
+
+        self._spillover_check_task = asyncio.create_task(recheck())
 
     def request_fingerprint(
         self,
@@ -223,7 +302,7 @@ class LiteLLMTextProvider:
     ) -> str:
         return fingerprint(
             {
-                "revision": "litellm-langchain-v1",
+                "revision": "local-langchain-v1" if self.direct_local else "litellm-langchain-v1",
                 "baseUrl": self.base_url,
                 "model": self.model,
                 "messages": neutralize_messages(messages),
@@ -237,6 +316,7 @@ class LiteLLMTextProvider:
                 ),
                 "requestKey": request_key,
                 **({"capacitySpillover": "budgeted-v1"} if self.capacity_spillover_key else {}),
+                **({"directSpillover": "openrouter-v1"} if self.paid_spillover else {}),
                 **(
                     {"responseSchema": neutralize_json_strings(response_schema)}
                     if response_schema is not None
@@ -256,6 +336,7 @@ class LiteLLMTextProvider:
         on_served: Any = None,
         on_usage: Any = None,
         response_schema: dict[str, Any] | None = None,
+        on_metrics: Any = None,
     ) -> str:
         import httpx
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -299,6 +380,11 @@ class LiteLLMTextProvider:
                             "max_completion_tokens": self.max_output_tokens,
                             "temperature": 0,
                             "stream": False,
+                            **(
+                                {"chat_template_kwargs": {"enable_thinking": False}}
+                                if self.direct_local
+                                else {}
+                            ),
                         }
                     ).encode()
                 )
@@ -319,14 +405,16 @@ class LiteLLMTextProvider:
         if effective_deadline <= now:
             raise ProviderError(timeout_code)
         started = time.perf_counter()
+        metrics_callback = on_metrics if on_metrics is not None else self.on_metrics
         attempts = 0
         usage: dict[str, int | None] = {"promptTokens": None, "completionTokens": None}
-        upstream, cost, generation_id = "litellm", None, None
+        upstream, cost, generation_id = ("local" if self.direct_local else "litellm"), None, None
         primary_cost: int | None = None
         paid_cost: int | None = None
         submitted = finished = False
         transport_error_code: str | None = None
         drop_reason: str | None = None
+        local_status: int | None = None
         current_request_model = self.model
         paid_authorized = False
         key = self.request_fingerprint(messages, request_key, response_schema=response_schema)
@@ -367,8 +455,8 @@ class LiteLLMTextProvider:
                 raise ProviderError("RESERVATION_BELOW_MAXIMUM_COST")
 
         def report(ok: bool, error: str | None = None) -> None:
-            if self.on_metrics:
-                self.on_metrics(
+            if metrics_callback:
+                metrics_callback(
                     {
                         "model": self.model,
                         "ok": ok,
@@ -402,6 +490,8 @@ class LiteLLMTextProvider:
 
         async def observe_request(request: httpx.Request) -> None:
             nonlocal attempts, transport_error_code, current_request_model
+            if self.direct_local and not self.api_key:
+                request.headers.pop("authorization", None)
             if (signal is not None and signal.is_set()) or time.time() * 1000 >= effective_deadline:
                 transport_error_code = (
                     "CANCELLED" if signal is not None and signal.is_set() else timeout_code
@@ -429,9 +519,14 @@ class LiteLLMTextProvider:
 
         async def observe_response(response: httpx.Response) -> None:
             nonlocal upstream, cost, primary_cost, paid_cost, generation_id, usage
-            nonlocal transport_error_code, drop_reason
-            served = response.headers.get("x-litellm-model-id") or response.headers.get(
-                "x-ptr-upstream"
+            nonlocal transport_error_code, drop_reason, local_status
+            if self.direct_local:
+                local_status = response.status_code
+            served = (
+                None
+                if self.direct_local
+                else response.headers.get("x-litellm-model-id")
+                or response.headers.get("x-ptr-upstream")
             )
             is_paid_call = (
                 current_request_model == "openrouter-primary" or served == "openrouter-primary"
@@ -440,14 +535,6 @@ class LiteLLMTextProvider:
                 upstream = "openrouter-primary"
             elif served in ("primary", "secondary", "local-pool", "fake", "openrouter-primary"):
                 upstream = served
-            if not response.is_success:
-                candidate = response.headers.get("llm_provider-x-llm-d-request-dropped-reason")
-                drop_reason = (
-                    candidate
-                    if response.status_code == 429
-                    and candidate in _ALLOWED_CAPACITY_DROP_REASONS
-                    else None
-                )
             if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
                 raise ProviderError("PROVIDER_RESPONSE_LIMIT")
             try:
@@ -457,6 +544,18 @@ class LiteLLMTextProvider:
                 raise
             if len(raw_bytes) > 2 * 1024 * 1024:
                 raise ProviderError("PROVIDER_RESPONSE_LIMIT")
+            if not response.is_success:
+                candidate = response.headers.get(
+                    "x-llm-d-request-dropped-reason"
+                    if self.direct_local
+                    else "llm_provider-x-llm-d-request-dropped-reason"
+                )
+                drop_reason = (
+                    candidate
+                    if response.status_code == 429
+                    and candidate in _ALLOWED_CAPACITY_DROP_REASONS
+                    else None
+                )
             if self.ledger and response.is_success:
                 call_cost: int | None = None
                 try:
@@ -563,6 +662,37 @@ class LiteLLMTextProvider:
                     timeout_code=timeout_code,
                 )
             except Exception:
+                remaining_ms = effective_deadline - time.time() * 1000
+                if (
+                    self.direct_local
+                    and self.spillover_enabled
+                    and self.paid_spillover is not None
+                    and local_status == 429
+                    and drop_reason in _ALLOWED_CAPACITY_DROP_REASONS
+                    and attempts == 1
+                    and remaining_ms >= self.spillover_min_remaining_ms
+                ):
+                    paid_usage: dict[str, int | None] = {}
+
+                    def receive_paid_cost(value: int | None) -> None:
+                        nonlocal cost
+                        cost = value
+
+                    def paid_used(value: dict[str, int | None]) -> None:
+                        paid_usage.update(value)
+
+                    text = await self.paid_spillover.generate(
+                        messages,
+                        signal=signal,
+                        request_key=request_key,
+                        deadline_at=effective_deadline,
+                        response_schema=response_schema,
+                        on_cost=receive_paid_cost,
+                        on_usage=paid_used,
+                    )
+                    upstream = "openrouter"
+                    receipt = {"text": text, "usage": paid_usage, "upstream": upstream}
+                    return success(receipt)
                 if (
                     self.capacity_spillover_key is None
                     or drop_reason not in _ALLOWED_CAPACITY_DROP_REASONS
@@ -599,6 +729,8 @@ class LiteLLMTextProvider:
                 "promptTokens": count((raw.usage_metadata or {}).get("input_tokens")),
                 "completionTokens": count((raw.usage_metadata or {}).get("output_tokens")),
             }
+            if self.direct_local:
+                cost = 0
             receipt = {"text": checked_text(raw.content), "usage": usage, "upstream": upstream}
             if self.ledger:
                 cost = paid_cost if paid_authorized else primary_cost
@@ -613,6 +745,9 @@ class LiteLLMTextProvider:
             for _ in range(8):
                 if isinstance(cause, ProviderError):
                     transport_error_code = cause.code
+                    break
+                if self.direct_local and isinstance(cause, httpx.TimeoutException):
+                    transport_error_code = "PROVIDER_TIMEOUT"
                     break
                 nested = cause.__cause__ or cause.__context__
                 if nested is None:
@@ -651,3 +786,43 @@ class LiteLLMTextProvider:
         finally:
             self._hook_context.reset(token)
             self._active.discard(task)
+
+
+class LiteLLMTextProvider(_ChatOpenAITextProvider):
+    """The retained gateway path during the staged migration."""
+
+
+class DirectLocalTextProvider(_ChatOpenAITextProvider):
+    """Direct local ChatOpenAI calls using the shared bounded text contract."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str = "",
+        cluster_mode: bool = False,
+        paid_spillover: Any = None,
+        on_spillover_check_failure: Any = None,
+        spillover_min_remaining_ms: int = 10000,
+        max_output_tokens: int = 512,
+        timeout_ms: int = 30000,
+        input_bytes: int = 65536,
+        transport: Any = None,
+        on_metrics: Any = None,
+    ):
+        super().__init__(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            max_output_tokens=max_output_tokens,
+            timeout_ms=timeout_ms,
+            input_bytes=input_bytes,
+            transport=transport,
+            on_metrics=on_metrics,
+            direct_local=True,
+            cluster_mode=cluster_mode,
+            paid_spillover=paid_spillover,
+            on_spillover_check_failure=on_spillover_check_failure,
+            spillover_min_remaining_ms=spillover_min_remaining_ms,
+        )

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -124,6 +125,7 @@ class FrameworkTelemetry:
     def __init__(self, config: TelemetryConfig | None = None) -> None:
         self.config = config or TelemetryConfig.from_env()
         self.config.validate()
+        self.counters: Counter[str] = Counter()
         self.client: Any = None
         self.provider: Any = None
         if self.config.enabled:
@@ -146,6 +148,14 @@ class FrameworkTelemetry:
                 should_export_span=lambda span: span.instrumentation_scope is not None
                 and span.instrumentation_scope.name == "langfuse-sdk",
             )
+
+    def count(self, code: str) -> None:
+        """Count fixed worker policy events without recording request content."""
+        self.counters[code] += 1
+        with self.observation(
+            "provider_policy", metadata={"code": code, "count": self.counters[code]}
+        ):
+            pass
 
     @contextmanager
     def observation(self, name: str, as_type: str = "span", **kwargs: Any) -> Iterator[Any]:

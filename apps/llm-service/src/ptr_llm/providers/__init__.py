@@ -1,7 +1,7 @@
 from .checkpoints import CheckpointedTextProvider, setup_call_checkpoints
 from .fake import FakeEmbeddingProvider, FakeTextProvider
 from .jev import JevInputSafetyClassifier, JevIntentClassifier
-from .langchain import LiteLLMTextProvider
+from .langchain import DirectLocalTextProvider, LiteLLMTextProvider
 from .openrouter import OpenRouterClient, OpenRouterEmbeddingProvider
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "JevInputSafetyClassifier",
     "JevIntentClassifier",
     "LiteLLMTextProvider",
+    "DirectLocalTextProvider",
     "OpenRouterClient",
     "OpenRouterEmbeddingProvider",
 ]

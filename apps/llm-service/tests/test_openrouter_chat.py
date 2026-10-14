@@ -2,16 +2,19 @@
 
 import asyncio
 import copy
+import logging
 import math
 
 import httpx
 import pytest
 from langchain_openai import ChatOpenAI
+from zdr_fixture import zdr_endpoint
 
 from ptr_llm.billing import MemoryBudgetLedger, ProviderError
 from ptr_llm.providers.common import fingerprint, js_json
 from ptr_llm.providers.control_tokens import neutralize_messages
-from ptr_llm.providers.openrouter import TEXT_MODELS, OpenRouterClient
+from ptr_llm.providers.openrouter import EMBEDDING_MODEL, TEXT_MODELS, OpenRouterClient
+from ptr_llm.telemetry import FrameworkTelemetry, TelemetryConfig
 
 
 def make_client(handler, *, model="google/gemma-4-26b-a4b-it"):
@@ -192,6 +195,248 @@ async def test_original_malformed_usage_and_nonstandard_receipt_are_not_sdk_vali
         ]
     else:
         assert seen == []
+    await client.aclose()
+
+
+@pytest.mark.parametrize("limit_reset", ["daily", "monthly"])
+async def test_key_limit_rejects_reset_based_openrouter_caps(limit_reset):
+    def handler(request):
+        assert request.url.path == "/api/v1/key"
+        return httpx.Response(200, json={"data": {"limit": 5, "limit_reset": limit_reset}})
+
+    client = make_client(handler)
+    with pytest.raises(ProviderError, match="OPENROUTER_KEY_LIMIT"):
+        await client.verify_key_limit(10)
+    await client.aclose()
+
+
+def _pricing_handler(
+    *,
+    zdr_rows: list[dict[str, object]],
+    zdr_status: int = 200,
+    deepinfra_tags: tuple[str, ...] = ("deepinfra",),
+):
+    text_pricing = {"prompt": "0.0000001", "completion": "0.0000005", "request": "0"}
+    embedding_pricing = {"prompt": "0.00000002", "completion": "0", "request": "0"}
+    deepinfra = [
+        {
+            "provider_name": "DeepInfra",
+            "tag": tag,
+            "pricing": text_pricing,
+            "supported_parameters": ["structured_outputs"],
+        }
+        for tag in deepinfra_tags
+    ]
+
+    def handler(request):
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "google/gemma-4-26b-a4b-it",
+                            "pricing": text_pricing,
+                            "supported_parameters": ["structured_outputs"],
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/api/v1/embeddings/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": EMBEDDING_MODEL, "pricing": embedding_pricing}]},
+            )
+        if request.url.path == "/api/v1/models/google/gemma-4-26b-a4b-it/endpoints":
+            return httpx.Response(
+                200,
+                json={"data": {"endpoints": deepinfra}},
+            )
+        if request.url.path == "/api/v1/endpoints/zdr":
+            return httpx.Response(zdr_status, json={"data": zdr_rows})
+        return httpx.Response(404, json={"error": "unexpected path"})
+
+    return handler
+
+
+async def test_zdr_list_match_keeps_chat_zdr_provider_constraint():
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(
+            _pricing_handler(
+                zdr_rows=[zdr_endpoint()]
+            )
+        ),
+    )
+    await client.verify_pricing()
+    assert client._provider()["zdr"] is True
+    await client.aclose()
+
+
+async def test_malformed_zdr_row_for_other_model_does_not_block_verified_chat():
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(
+            _pricing_handler(
+                zdr_rows=[
+                    {"model_id": "unrelated/model", "provider_name": None},
+                    zdr_endpoint(),
+                ]
+            )
+        ),
+    )
+    try:
+        await client.verify_pricing()
+        assert client._text_verified is True
+        assert client._provider()["zdr"] is True
+    finally:
+        await client.aclose()
+
+
+async def test_zdr_list_other_provider_drops_only_chat_zdr_and_logs_compared_values(caplog):
+    telemetry = FrameworkTelemetry(TelemetryConfig())
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        on_zdr_unavailable=lambda: telemetry.count("OPENROUTER_ZDR_UNAVAILABLE"),
+        transport=httpx.MockTransport(
+            _pricing_handler(
+                zdr_rows=[zdr_endpoint(provider_name="OpenAI", tag="openai")]
+            )
+        ),
+    )
+    caplog.set_level(logging.WARNING)
+    await client.verify_pricing()
+    await client.verify_pricing()
+    assert "zdr" not in client._provider()
+    assert client._provider(embedding=True)["zdr"] is True
+    assert "OPENROUTER_ZDR_UNAVAILABLE" in caplog.text
+    assert "DeepInfra" in caplog.text and "deepinfra" in caplog.text
+    assert "OpenAI" in caplog.text and "openai" in caplog.text
+    assert telemetry.counters["OPENROUTER_ZDR_UNAVAILABLE"] == 1
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "zdr_rows,zdr_status",
+    [
+        ([], 200),
+        ([{"unexpected": "shape"}], 200),
+        ([zdr_endpoint(provider_name="")], 200),
+        (None, 200),
+        ([], 503),
+    ],
+)
+async def test_zdr_unverifiable_fails_closed(zdr_rows, zdr_status):
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(_pricing_handler(zdr_rows=zdr_rows, zdr_status=zdr_status)),
+    )
+    try:
+        with pytest.raises(ProviderError, match="PRICING_UNVERIFIED"):
+            await client.verify_pricing()
+        assert client._text_verified is False
+    finally:
+        await client.aclose()
+
+
+async def test_second_deepinfra_endpoint_on_zdr_list_keeps_constraint():
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(
+            _pricing_handler(
+                deepinfra_tags=("first", "second"),
+                zdr_rows=[zdr_endpoint(tag="second")],
+            )
+        ),
+    )
+    try:
+        await client.verify_pricing()
+        assert client._provider()["zdr"] is True
+    finally:
+        await client.aclose()
+
+
+async def test_zdr_deepinfra_row_with_unknown_tag_keeps_constraint():
+    client = OpenRouterClient(
+        api_key="synthetic",
+        ledger=MemoryBudgetLedger(),
+        live_enabled=True,
+        allow_external_data=True,
+        text_model="google/gemma-4-26b-a4b-it",
+        transport=httpx.MockTransport(
+            _pricing_handler(
+                zdr_rows=[zdr_endpoint(tag="unrecognized-endpoint")]
+            )
+        ),
+    )
+    try:
+        await client.verify_pricing()
+        assert client._text_verified is True
+        assert client._provider()["zdr"] is True
+    finally:
+        await client.aclose()
+
+
+async def test_rejected_http_4xx_without_generation_or_cost_settles_zero_not_unknown():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            400,
+            json={"error": {"code": "provider_mismatch"}, "usage": {"cost": 0}},
+        )
+
+    client = make_client(handler)
+    with pytest.raises(ProviderError, match="PROVIDER_HTTP_400"):
+        await client.generate([{"role": "user", "content": "synthetic"}], request_key="synthetic")
+    receipt = next(iter(client.ledger.requests.values()))
+    assert len(calls) == 1
+    assert receipt.state == "settled"
+    assert receipt.actual_microusd == 0
+    with pytest.raises(ProviderError, match="PROVIDER_HTTP_400"):
+        await client.generate([{"role": "user", "content": "synthetic"}], request_key="synthetic")
+    assert len(calls) == 1
+    await client.aclose()
+
+
+async def test_ambiguous_http_4xx_without_explicit_zero_cost_stays_unknown():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(400, json={"error": {"code": "provider_mismatch"}})
+
+    client = make_client(handler)
+    with pytest.raises(ProviderError, match="PROVIDER_HTTP_400"):
+        await client.generate([{"role": "user", "content": "synthetic"}], request_key="synthetic")
+    receipt = next(iter(client.ledger.requests.values()))
+    assert len(calls) == 1
+    assert receipt.state == "unknown"
+    assert receipt.actual_microusd is None
+    with pytest.raises(ProviderError, match="REQUEST_UNRESOLVED_NO_RESUBMIT"):
+        await client.generate([{"role": "user", "content": "synthetic"}], request_key="synthetic")
+    assert len(calls) == 1
     await client.aclose()
 
 

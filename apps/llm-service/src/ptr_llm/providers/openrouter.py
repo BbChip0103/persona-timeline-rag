@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from typing import Any
+from urllib.parse import urlsplit
 
 from langchain_openai import OpenAIEmbeddings
 from pydantic import SecretStr
 
 from ptr_llm.billing import ProviderError, provider_request_scope
+from ptr_llm.config import _svc_host
 
 from .common import (
     bounded,
@@ -23,6 +27,8 @@ from .common import (
     js_json,
 )
 from .control_tokens import neutralize_json_strings, neutralize_messages
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TEXT_MODEL = "google/gemini-3-flash-preview"
 DEFAULT_JEV_MODEL = "typesafe/jev-1.13"
@@ -37,8 +43,8 @@ TEXT_MODELS: dict[str, dict[str, Any]] = {
     },
     "openai/gpt-4.1-nano": {"prompt": 0.1, "completion": 0.4},
     "google/gemma-4-26b-a4b-it": {
-        "prompt": 0.09,
-        "completion": 0.3,
+        "prompt": 0.1,
+        "completion": 0.5,
         "reasoning": {"enabled": False},
         "agentSchema": True,
     },
@@ -96,6 +102,10 @@ def reported_cost(result: dict[str, Any]) -> int | None:
     )
 
 
+class _CleanProviderHTTPError(ProviderError):
+    pass
+
+
 class OpenRouterClient:
     def __init__(
         self,
@@ -110,6 +120,10 @@ class OpenRouterClient:
         timeout_ms: int = 30000,
         decision_reserved_call_fraction: float = 0.2,
         transport: Any = None,
+        base_url_override: str | None = None,
+        fixture_enabled: bool = False,
+        cluster_mode: bool = False,
+        on_zdr_unavailable: Callable[[], None] | None = None,
     ):
         import httpx
 
@@ -122,6 +136,26 @@ class OpenRouterClient:
             or not 0 <= decision_reserved_call_fraction <= 1
         ):
             raise ProviderError("INVALID_LIMIT")
+        self.base_url = "https://openrouter.ai"
+        if base_url_override is not None:
+            try:
+                parsed = urlsplit(base_url_override)
+                _ = parsed.port
+            except (TypeError, ValueError):
+                raise ProviderError("OPENROUTER_URL_NOT_ALLOWED") from None
+            if not (
+                fixture_enabled
+                and cluster_mode
+                and parsed.scheme in ("http", "https")
+                and _svc_host(parsed.hostname)
+                and not parsed.username
+                and not parsed.password
+                and parsed.path in ("", "/")
+                and not parsed.query
+                and not parsed.fragment
+            ):
+                raise ProviderError("OPENROUTER_URL_NOT_ALLOWED")
+            self.base_url = base_url_override.rstrip("/")
         self.api_key, self.ledger, self.model = api_key, ledger, text_model
         self.max_output_tokens, self.input_bytes, self.timeout_ms = (
             max_output_tokens,
@@ -134,6 +168,8 @@ class OpenRouterClient:
         )
         self._text_verified = False
         self._decisions_verified: set[str] = set()
+        self._chat_zdr_available = True
+        self.on_zdr_unavailable = on_zdr_unavailable
         self.structured_outputs = False
         self.ssl_context = (
             httpx.create_ssl_context(verify=True, trust_env=True) if transport is None else None
@@ -221,7 +257,7 @@ class OpenRouterClient:
         from .transport import LimitedTransport
 
         check_cancel(signal)
-        url = f"https://openrouter.ai{path}"
+        url = f"{self.base_url}{path}"
         headers = (
             {"Authorization": f"Bearer {self.api_key}"} if body is not None or authenticated else {}
         )
@@ -246,8 +282,6 @@ class OpenRouterClient:
                 headers=headers,
                 content=js_json(body).encode() if body is not None else None,
             ) as response:
-                if not response.is_success:
-                    raise ProviderError(f"PROVIDER_HTTP_{response.status_code}")
                 if int(response.headers.get("content-length", "0")) > 2 * 1024 * 1024:
                     raise ProviderError("PROVIDER_RESPONSE_LIMIT")
                 chunks = bytearray()
@@ -258,9 +292,25 @@ class OpenRouterClient:
                         raise ProviderError("PROVIDER_RESPONSE_LIMIT")
                 import json
 
-                result = json.loads(chunks)
+                try:
+                    result = json.loads(chunks)
+                except (ValueError, TypeError):
+                    if not response.is_success:
+                        raise ProviderError(f"PROVIDER_HTTP_{response.status_code}") from None
+                    raise
                 if not isinstance(result, dict):
+                    if not response.is_success:
+                        raise ProviderError(f"PROVIDER_HTTP_{response.status_code}")
                     raise ProviderError("INVALID_PROVIDER_RESPONSE")
+                if not response.is_success:
+                    code = f"PROVIDER_HTTP_{response.status_code}"
+                    if (
+                        400 <= response.status_code < 500
+                        and not isinstance(result.get("id"), str)
+                        and reported_cost(result) == 0
+                    ):
+                        raise _CleanProviderHTTPError(code)
+                    raise ProviderError(code)
                 return result
 
         try:
@@ -276,6 +326,37 @@ class OpenRouterClient:
 
     async def verify_pricing(self, signal: asyncio.Event | None = None) -> None:
         await self._owned(lambda: self._verify_pricing(signal))
+
+    async def verify_key_limit(self, max_limit_usd: float) -> bool:
+        """Return false on provider outages; reject a real uncapped paid key."""
+        if (
+            type(max_limit_usd) not in (int, float)
+            or not math.isfinite(max_limit_usd)
+            or max_limit_usd <= 0
+        ):
+            raise ProviderError("INVALID_LIMIT")
+        try:
+            result = await self._fetch("/api/v1/key", authenticated=True)
+        except ProviderError as error:
+            if error.code == "PROVIDER_CLOSED":
+                raise
+            return False
+        data = result.get("data")
+        raw_limit = data.get("limit") if isinstance(data, dict) else None
+        raw_reset = data.get("limit_reset") if isinstance(data, dict) else None
+        if (
+            not isinstance(data, dict)
+            or "limit_reset" not in data
+            or not isinstance(raw_limit, (int, float))
+            or isinstance(raw_limit, bool)
+            or raw_reset is not None
+        ):
+            raise ProviderError("OPENROUTER_KEY_LIMIT")
+        # OpenRouter reports key caps in credits; this research budget treats one credit as USD 1.
+        limit = float(raw_limit)
+        if not math.isfinite(limit) or limit < 0 or limit > max_limit_usd:
+            raise ProviderError("OPENROUTER_KEY_LIMIT")
+        return True
 
     async def _verify_pricing(self, signal: asyncio.Event | None = None) -> None:
         if self._text_verified:
@@ -323,8 +404,101 @@ class OpenRouterClient:
                     if key in ("completion", "internal_reasoning")
                     else 0
                 )
-                if not math.isfinite(amount) or amount < 0 or not disabled and amount > limit:
+                pinned_gemma_catalog = model == self.model == "google/gemma-4-26b-a4b-it"
+                if (
+                    not math.isfinite(amount)
+                    or amount < 0
+                    or not pinned_gemma_catalog and not disabled and amount > limit
+                ):
                     raise ProviderError("PRICING_CHANGED_OR_UNKNOWN_FEE")
+        if self.model == "google/gemma-4-26b-a4b-it":
+            data = catalog.get("data")
+            metadata = next(
+                (m for m in data if isinstance(m, dict) and m.get("id") == self.model),
+                None,
+            ) if isinstance(data, list) else None
+            endpoints = metadata.get("endpoints") if isinstance(metadata, dict) else None
+            if not isinstance(endpoints, list) or not endpoints:
+                endpoint_data = await self._fetch(
+                    f"/api/v1/models/{self.model}/endpoints", signal=signal
+                )
+                endpoint_rows = endpoint_data.get("data")
+                endpoints = (
+                    endpoint_rows.get("endpoints") if isinstance(endpoint_rows, dict) else None
+                )
+            deepinfra_endpoints = (
+                [
+                    entry
+                    for entry in endpoints
+                    if isinstance(entry, dict) and entry.get("provider_name") == "DeepInfra"
+                ]
+                if isinstance(endpoints, list)
+                else []
+            )
+            if not deepinfra_endpoints:
+                raise ProviderError("PRICING_UNVERIFIED")
+            deepinfra_tags: set[str] = set()
+            for deepinfra in deepinfra_endpoints:
+                tag = deepinfra.get("tag")
+                pricing = deepinfra.get("pricing")
+                if not isinstance(tag, str) or not tag or not isinstance(pricing, dict):
+                    raise ProviderError("PRICING_UNVERIFIED")
+                deepinfra_tags.add(tag)
+                if "supported_parameters" in deepinfra:
+                    supported = deepinfra["supported_parameters"]
+                    self.structured_outputs = self.structured_outputs and (
+                        isinstance(supported, list) and "structured_outputs" in supported
+                    )
+                if not {"prompt", "completion"} <= pricing.keys():
+                    raise ProviderError("PRICING_UNVERIFIED")
+                for key, value in pricing.items():
+                    try:
+                        amount = float(value)
+                    except (TypeError, ValueError):
+                        raise ProviderError("PRICING_UNVERIFIED") from None
+                    cap = (
+                        policy["prompt"] * 1e-6
+                        if key in ("prompt", "input_cache_read", "input_cache_write")
+                        else policy["completion"] * 1e-6
+                        if key in ("completion", "internal_reasoning")
+                        else 0
+                    )
+                    if not math.isfinite(amount) or amount < 0 or amount > cap:
+                        raise ProviderError("PRICING_CHANGED_OR_UNKNOWN_FEE")
+            try:
+                zdr_result = await self._fetch(
+                    "/api/v1/endpoints/zdr", signal=signal, authenticated=True
+                )
+            except ProviderError:
+                raise ProviderError("PRICING_UNVERIFIED") from None
+            zdr_rows = zdr_result.get("data")
+            if not isinstance(zdr_rows, list):
+                raise ProviderError("PRICING_UNVERIFIED")
+            model_rows = [
+                row for row in zdr_rows
+                if isinstance(row, dict) and row.get("model_id") == self.model
+            ]
+            if not model_rows or any(
+                any(
+                    not isinstance(row.get(key), str) or not row[key]
+                    for key in ("model_id", "provider_name", "tag")
+                )
+                for row in model_rows
+            ):
+                raise ProviderError("PRICING_UNVERIFIED")
+            deepinfra_rows = [row for row in model_rows if row["provider_name"] == "DeepInfra"]
+            zdr_available = bool(deepinfra_rows)
+            if not zdr_available:
+                logger.warning(
+                    "OPENROUTER_ZDR_UNAVAILABLE endpoint_provider=%s endpoint_tags=%s "
+                    "zdr_provider_tags=%s",
+                    "DeepInfra",
+                    sorted(deepinfra_tags),
+                    sorted((row["provider_name"], row["tag"]) for row in model_rows),
+                )
+                if self.on_zdr_unavailable is not None:
+                    self.on_zdr_unavailable()
+            self._chat_zdr_available = zdr_available
         self._text_verified = True
 
     async def _verify_decision_pricing(self, model: str, signal: asyncio.Event | None) -> None:
@@ -353,10 +527,9 @@ class OpenRouterClient:
 
     def _provider(self, embedding: bool = False) -> dict[str, Any]:
         policy = TEXT_MODELS[self.model]
-        return {
+        result = {
             "require_parameters": True,
             "data_collection": "deny",
-            "zdr": True,
             "allow_fallbacks": False,
             "max_price": {
                 "prompt": 0.02 if embedding else policy["prompt"],
@@ -364,6 +537,11 @@ class OpenRouterClient:
                 "request": 0,
             },
         }
+        if embedding or self.model != "google/gemma-4-26b-a4b-it" or self._chat_zdr_available:
+            result["zdr"] = True
+        if not embedding and self.model == "google/gemma-4-26b-a4b-it":
+            result["order"] = ["DeepInfra"]
+        return result
 
     async def _request(
         self,
@@ -402,6 +580,8 @@ class OpenRouterClient:
             if saved.response is not None:
                 if not isinstance(saved.response, dict):
                     raise ProviderError("INVALID_PROVIDER_RESPONSE")
+                if isinstance(saved.response.get("_provider_error_code"), str):
+                    raise ProviderError(saved.response["_provider_error_code"])
                 cost = reported_cost(saved.response)
                 if saved.state == "unknown" and cost is not None:
                     await self.ledger.finish(key, cost, None, saved.generation_id)
@@ -432,6 +612,13 @@ class OpenRouterClient:
             if cost is not None and cost > reservation:
                 raise ProviderError("PROVIDER_COST_EXCEEDS_RESERVATION")
             return result
+        except _CleanProviderHTTPError as error:
+            await _drain(
+                asyncio.create_task(
+                    self.ledger.finish(key, 0, {"_provider_error_code": error.code}, None)
+                )
+            )
+            raise
         except BaseException:
             # Signal/deadline cancellation can race runtime shutdown. Shielding
             # alone permits a second cancellation to abandon the ledger write.
@@ -508,6 +695,7 @@ class OpenRouterClient:
         on_cost: Any = None,
         max_output_tokens: int | None = None,
         deadline_at: float | None = None,
+        response_schema: dict[str, Any] | None = None,
         **_: Any,
     ) -> str:
         check_cancel(signal)
@@ -518,10 +706,24 @@ class OpenRouterClient:
             raise ProviderError("PROVIDER_DEADLINE")
         await self.verify_pricing(signal)
         agent = any(m["role"] == "system" and "AGENT_JSON_REPLY" in m["content"] for m in messages)
+        if response_schema is not None:
+            from jsonschema import Draft202012Validator
+
+            if not agent or not isinstance(response_schema, dict):
+                raise ProviderError("INVALID_INPUT")
+            response_schema = neutralize_json_strings(response_schema)
+            try:
+                Draft202012Validator.check_schema(response_schema)
+            except Exception:
+                raise ProviderError("INVALID_INPUT") from None
         timeline = any(
             m["role"] == "system" and "TIMELINE_JSON_REPLY" in m["content"] for m in messages
         )
         policy = TEXT_MODELS[self.model]
+        if response_schema is not None and not (
+            policy.get("agentSchema") and self.structured_outputs
+        ):
+            raise ProviderError("STRUCTURED_OUTPUT_UNAVAILABLE")
         response_format = None
         if agent and policy.get("agentSchema") and self.structured_outputs:
             from ptr_llm.core.protocol import AGENT_RESPONSE_JSON_SCHEMA
@@ -531,7 +733,9 @@ class OpenRouterClient:
                 "json_schema": {
                     "name": "agent_reply",
                     "strict": True,
-                    "schema": AGENT_RESPONSE_JSON_SCHEMA,
+                    "schema": response_schema
+                    if response_schema is not None
+                    else AGENT_RESPONSE_JSON_SCHEMA,
                 },
             }
         elif timeline:
@@ -551,8 +755,12 @@ class OpenRouterClient:
             **({"reasoning": policy["reasoning"]} if "reasoning" in policy else {}),
             **({"response_format": response_format} if response_format else {}),
         }
+        # OpenRouter always returns usage.cost, so no deprecated usage include flag is sent.
+        body_bytes = len(js_json(body).encode())
+        if body_bytes > self.input_bytes:
+            raise ProviderError("INPUT_LIMIT")
         reservation = math.ceil(
-            (len(js_json(body).encode()) + len(messages) * 64 + 2048) * 2 * policy["prompt"]
+            (body_bytes + len(messages) * 64 + 2048) * 2 * policy["prompt"]
             + output * policy["completion"]
         )
         if self._chat is None:
@@ -567,6 +775,13 @@ class OpenRouterClient:
             deadline_at=deadline_at,
             on_cost=on_cost,
         )
+        if response_schema is not None:
+            from jsonschema import Draft202012Validator
+
+            try:
+                Draft202012Validator(response_schema).validate(json.loads(text))
+            except Exception:
+                raise ProviderError("INVALID_PROVIDER_RESPONSE") from None
         if on_usage and isinstance(result.get("usage"), dict):
             on_usage(
                 {

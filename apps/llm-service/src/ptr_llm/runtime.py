@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from .billing import PostgresBudgetLedger, ProviderError
-from .config import Settings
+from .config import Settings, _cluster_network
 from .core.errors import CoreError
 from .core.persona import validate_persona
 from .core.runtime import LLMEngine
@@ -34,6 +34,7 @@ from .prompt_management import (
 )
 from .providers import (
     CheckpointedTextProvider,
+    DirectLocalTextProvider,
     FakeTextProvider,
     JevInputSafetyClassifier,
     JevIntentClassifier,
@@ -360,6 +361,29 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
     # Paid proxy routes preserve the explicit live/data gates from the TS
     # runtime. Validate before opening a pool or constructing any provider.
     pricing = None
+    provider_choice = env.get("PTR_LLM_PROVIDER", "fake")
+    spillover_mode = env.get("PTR_LLM_SPILLOVER", "off")
+    if (
+        provider_choice == "local"
+        and env.get("PTR_LLM_LOCAL_API_KEY")
+        and env.get("PTR_LLM_LOCAL_API_KEY") == env.get("OPENROUTER_API_KEY")
+    ):
+        raise ProviderError("PAID_KEY_ON_LOCAL_URL")
+    if spillover_mode not in ("off", "openrouter") or (
+        spillover_mode == "openrouter"
+        and (provider_choice != "local" or not _cluster_network(env))
+    ):
+        raise ProviderError("INVALID_SPILLOVER_CONFIG")
+    key_max_limit_usd = 1.0
+    if spillover_mode == "openrouter":
+        if not env.get("OPENROUTER_API_KEY", "").strip():
+            raise ProviderError("OPENROUTER_KEY_REQUIRED")
+        try:
+            key_max_limit_usd = float(env.get("PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD", "1"))
+        except ValueError:
+            raise ProviderError("INVALID_RUNTIME_CONFIG") from None
+        if not math.isfinite(key_max_limit_usd) or key_max_limit_usd <= 0:
+            raise ProviderError("INVALID_RUNTIME_CONFIG")
     spillover_key = env.get("PTR_LLM_CAPACITY_SPILLOVER_KEY")
     if spillover_key is not None and (
         len(spillover_key.encode()) < 32
@@ -444,7 +468,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         input_bytes = _integer(
             env,
             "PTR_LLM_INPUT_BYTES",
-            65536 if provider_name == "litellm" else 32768,
+            65536 if provider_name in ("litellm", "local") else 32768,
             1,
             1048576,
         )
@@ -454,6 +478,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         client = None
         need_openrouter = (
             provider_name == "openrouter"
+            or spillover_mode == "openrouter"
             or env.get("PTR_LLM_INTENT_CLASSIFIER", "off") == "jev"
             or env.get("PTR_LLM_SAFETY_FILTER", "off") == "jev"
             or env.get("PTR_LLM_EMBEDDING_PROVIDER", "off") == "openrouter"
@@ -468,6 +493,10 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 max_output_tokens=tokens,
                 timeout_ms=timeout_ms,
                 input_bytes=input_bytes,
+                base_url_override=env.get("PTR_LLM_OPENROUTER_BASE_URL"),
+                fixture_enabled=env.get("PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE") == "1",
+                cluster_mode=_cluster_network(env),
+                on_zdr_unavailable=lambda: telemetry.count("OPENROUTER_ZDR_UNAVAILABLE"),
             )
         if provider_name == "fake":
             model = "synthetic/fake-text-v1"
@@ -488,6 +517,25 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 on_metrics=_observe_provider_metrics,
                 reservation_microusd=_integer(env, "PTR_LLM_MAX_CALL_MICROUSD", 100000, 1, 1000000),
             )
+        elif provider_name == "local":
+            model = env.get("PTR_LLM_LOCAL_MODEL", "")
+            provider = DirectLocalTextProvider(
+                base_url=env.get("PTR_LLM_LOCAL_BASE_URL", ""),
+                model=model,
+                api_key=env.get("PTR_LLM_LOCAL_API_KEY", ""),
+                max_output_tokens=tokens,
+                timeout_ms=timeout_ms,
+                input_bytes=input_bytes,
+                cluster_mode=_cluster_network(env),
+                paid_spillover=client if spillover_mode == "openrouter" else None,
+                on_spillover_check_failure=telemetry.count,
+                spillover_min_remaining_ms=_integer(
+                    env, "PTR_LLM_SPILLOVER_MIN_REMAINING_MS", 10000, 0, 300000
+                ),
+                on_metrics=_observe_provider_metrics,
+            )
+            if spillover_mode == "openrouter":
+                await provider.start_spillover_checks(key_max_limit_usd)
         elif provider_name == "openrouter" and client is not None:
             model, provider = client.model, client
         else:
