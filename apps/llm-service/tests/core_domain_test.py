@@ -3,11 +3,14 @@
 import asyncio
 import copy
 import json
+import logging
 import time
 from pathlib import Path
 
 import pytest
 
+from ptr_llm.billing import ProviderError
+from ptr_llm.control import ControlRejected, ControlUnavailable
 from ptr_llm.core.context import retrieval_context
 from ptr_llm.core.errors import CoreError
 from ptr_llm.core.evidence import filter_evidence, formatted_quote, validate_experiment_reply
@@ -22,6 +25,7 @@ from ptr_llm.core.persona import (
 from ptr_llm.core.prompts import build_experiment_context
 from ptr_llm.core.routing import safety_windows
 from ptr_llm.core.runtime import LLMEngine
+from ptr_llm.worker import ExecutionStopped
 
 GOLDENS = json.loads(Path(__file__).with_name("core_domain_golden.json").read_text())
 PERSONA = next(c["input"] for c in GOLDENS if c["kind"] == "persona")
@@ -72,6 +76,11 @@ class Provider:
         self.messages.append(copy.deepcopy(messages))
         kwargs.get("on_served", lambda _: None)("primary")
         return self.responses.pop(0)
+
+
+class FailingProvider:
+    async def generate(self, *_args, **_kwargs):
+        raise ProviderError("RESERVATION_BELOW_MAXIMUM_COST")
 
 
 class Retrieval:
@@ -231,6 +240,91 @@ async def test_repeated_tool_rejected_without_model_retry():
     )
     assert result == {"kind": "failed", "errorCode": "TURN_FAILED"}
     assert len(provider.messages) == 2
+
+
+async def test_reservation_below_minimum_cost_maps_to_provider_budget_exceeded():
+    result = await LLMEngine(provider=FailingProvider(), personas=Personas()).handle(
+        grant(), before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert result == {"kind": "failed", "errorCode": "PROVIDER_BUDGET_EXCEEDED"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ControlUnavailable(), ControlRejected(), ExecutionStopped("EXECUTION_LOST")],
+    ids=lambda error: error.__class__.__name__,
+)
+async def test_control_errors_escape_before_costly_without_provider_submission(error):
+    provider = Provider([response()])
+
+    async def lost_control():
+        raise error
+
+    with pytest.raises(error.__class__):
+        await LLMEngine(provider=provider, personas=Personas()).handle(
+            grant(), before_costly=lost_control, cancelled=asyncio.Event()
+        )
+    assert not provider.messages
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            ProviderError("BUDGET_EXCEEDED"),
+            {
+                "error_code": "PROVIDER_BUDGET_EXCEEDED",
+                "exception_class": "ProviderError",
+                "provider_code": "BUDGET_EXCEEDED",
+                "core_reason": "UNSPECIFIED",
+            },
+        ),
+        (
+            CoreError("TURN_FAILED", "REPLY_REJECTED"),
+            {
+                "error_code": "TURN_FAILED",
+                "exception_class": "CoreError",
+                "provider_code": "UNSPECIFIED",
+                "core_reason": "REPLY_REJECTED",
+            },
+        ),
+        (
+            RuntimeError("private upstream content"),
+            {
+                "error_code": "TURN_FAILED",
+                "exception_class": "RuntimeError",
+                "provider_code": "UNSPECIFIED",
+                "core_reason": "UNSPECIFIED",
+            },
+        ),
+    ],
+    ids=lambda case: case.__class__.__name__ if isinstance(case, Exception) else case["error_code"],
+)
+async def test_failure_logging_uses_fixed_classification_without_exception_text(
+    caplog, error, expected
+):
+    class BrokenProvider:
+        async def generate(self, *_args, **_kwargs):
+            raise error
+
+    caplog.set_level(logging.INFO, logger="ptr_llm.core.runtime")
+    result = await LLMEngine(provider=BrokenProvider(), personas=Personas()).handle(
+        grant(), before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert result == {"kind": "failed", "errorCode": expected["error_code"]}
+
+    records = [
+        record for record in caplog.records if record.message.startswith("turn_failed_classified")
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.error_code == expected["error_code"]
+    assert record.exception_class == expected["exception_class"]
+    assert record.provider_code == expected["provider_code"]
+    assert record.core_reason == expected["core_reason"]
+    assert f"error_code={expected['error_code']}" in record.message
+    assert f"exception_class={expected['exception_class']}" in record.message
+    assert "private upstream content" not in caplog.text
 
 
 async def test_fence_failure_blocks_provider_submission():

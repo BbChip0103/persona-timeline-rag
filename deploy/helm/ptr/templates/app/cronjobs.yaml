@@ -84,6 +84,14 @@ spec:
   successfulJobsHistoryLimit: {{ $.Values.maintenance.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ $.Values.maintenance.failedJobsHistoryLimit }}
   jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: maintenance
+        {{- if $job.syntheticSmoke }}
+        ptr.io/synthetic-smoke: "true"
+        ptr.io/host-only-production-step: "true"
+        {{- end }}
     spec:
       backoffLimit: 0
       activeDeadlineSeconds: {{ $.Values.maintenance.activeDeadlineSeconds }}

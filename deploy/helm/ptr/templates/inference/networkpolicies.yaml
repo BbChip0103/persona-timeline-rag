@@ -95,7 +95,9 @@ spec:
         - ipBlock:
             cidr: {{ . | quote }}
       ports:
-        - {protocol: TCP, port: {{ $apiServerPort }}}
+        {{- range (default (list $apiServerPort) $.Values.inference.apiServerPorts) }}
+        - {protocol: TCP, port: {{ . }}}
+        {{- end }}
     {{- end }}
 {{- if .Values.inference.testClient.enabled }}
 ---

@@ -63,6 +63,10 @@ spec:
         app.kubernetes.io/component: postgres
     spec:
       automountServiceAccountToken: false
+      {{- with .Values.data.postgres.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | indent 8 }}
+      {{- end }}
       securityContext:
         fsGroup: 999
         fsGroupChangePolicy: OnRootMismatch

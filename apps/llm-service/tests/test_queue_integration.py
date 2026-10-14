@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -28,7 +29,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def docker(*args: str) -> str:
-    return subprocess.check_output(["docker", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    return subprocess.check_output(
+        ["docker", *args], text=True, stderr=subprocess.DEVNULL, timeout=30
+    ).strip()
 
 
 @pytest.fixture(scope="module")
@@ -96,6 +99,48 @@ class Results:
 
     async def mark_result_ack(self, _):
         self.acks += 1
+
+
+async def test_sigterm_drains_real_bullmq_job_before_ack(owned_redis, tmp_path):
+    _, url = owned_redis
+    prefix = "proof-" + uuid4().hex[:12]
+    marker = tmp_path / "real-drain.log"
+    queue = Queue("turns", {"connection": queue_connection_url(url), "prefix": prefix})
+    child = Path(__file__).with_name("real_queue_drain_child.py")
+    process = None
+    turn_id = str(uuid4())
+    job_id = f"t-{turn_id}-0"
+    try:
+        await queue.add(
+            "turn",
+            {"contractVersion": 1, "turnId": turn_id, "dispatchSeq": 0},
+            {"jobId": job_id, "attempts": 1},
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(child), url, prefix, str(marker),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        until = time.monotonic() + 8
+        while time.monotonic() < until:
+            if marker.exists() and "started" in marker.read_text().splitlines():
+                break
+            assert process.returncode is None, "REAL_WORKER_EXITED_BEFORE_START"
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("REAL_WORKER_DID_NOT_START")
+        process.send_signal(signal.SIGTERM)
+        assert await asyncio.wait_for(process.wait(), 10) == 0
+        job = await terminal(queue, job_id, timeout=3)
+        assert job.returnvalue == {"status": "committed"}
+        assert marker.read_text().splitlines() == [
+            "started", "sigterm", "completed", "acked", "closed"
+        ]
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await asyncio.wait_for(process.wait(), 5)
+        await queue.close()
 
 
 async def test_two_python_workers_saturation_drain_and_backpressure(owned_redis):

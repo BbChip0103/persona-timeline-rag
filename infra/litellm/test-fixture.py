@@ -3,6 +3,8 @@
 
 import importlib.util
 import json
+import os
+import socket
 import threading
 import unittest
 import urllib.request
@@ -29,7 +31,15 @@ class FixtureTests(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join()
 
-    def call(self, source="fixture-source", stream=False, agent=True):
+    def call(
+        self,
+        source="fixture-source",
+        stream=False,
+        agent=True,
+        request_id=None,
+        user=None,
+        timeout=2,
+    ):
         messages = [
             {"role": "system", "content": "AGENT_JSON_REPLY" if agent else "TIMELINE_JSON_REPLY"},
             {
@@ -45,7 +55,7 @@ class FixtureTests(unittest.TestCase):
                     ]
                 ),
             },
-            {"role": "user", "content": "Synthetic question"},
+            {"role": "user", "content": user or "Synthetic question"},
         ]
         body = {
             "model": "ptr-synthetic",
@@ -53,12 +63,15 @@ class FixtureTests(unittest.TestCase):
             "response_format": {"type": "json_schema"},
             "stream": stream,
         }
+        headers = {"Content-Type": "application/json"}
+        if request_id:
+            headers["X-Request-Id"] = request_id
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
-        with urllib.request.urlopen(req, timeout=2) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.read().decode()
 
     def test_json_and_sse_have_identical_content_and_usage(self):
@@ -96,6 +109,8 @@ class FixtureTests(unittest.TestCase):
         self.assertNotIn("real-person-post", json.dumps(result))
 
     def test_counts_report_fixed_model_configuration_not_prompts(self):
+        self.call(request_id="fixture-duplicate")
+        self.call(request_id="fixture-duplicate")
         with urllib.request.urlopen(self.base + "/counts", timeout=2) as response:
             counts = json.load(response)
         self.assertEqual(counts["effective_delay_ms"], 100)
@@ -103,6 +118,69 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(counts["completion_tokens"], 12)
         self.assertNotIn("messages", counts)
         self.assertNotIn("authorization", counts)
+        self.assertIn("fixture-duplicate", counts["request_ids"])
+        self.assertEqual(counts["duplicates"]["fixture-duplicate"], 2)
+
+    def test_chunked_request_without_content_length_is_accepted(self):
+        body = json.dumps(
+            {
+                "model": "ptr-synthetic",
+                "messages": [
+                    {"role": "system", "content": "TIMELINE_JSON_REPLY"},
+                    {"role": "user", "content": "Synthetic chunked question"},
+                ],
+            }
+        ).encode()
+        chunks = [body[:17], body[17:]]
+        request = [
+            b"POST /v1/chat/completions HTTP/1.1\r\n",
+            f"Host: 127.0.0.1:{self.server.server_port}\r\n".encode(),
+            b"Content-Type: application/json\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"Connection: close\r\n\r\n",
+        ]
+        for chunk in chunks:
+            request.extend([f"{len(chunk):x}\r\n".encode(), chunk, b"\r\n"])
+        request.append(b"0\r\n\r\n")
+        with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=2) as sock:
+            sock.sendall(b"".join(request))
+            response = b""
+            while True:
+                part = sock.recv(8192)
+                if not part:
+                    break
+                response += part
+        self.assertTrue(response.startswith(b"HTTP/1.0 200 OK"), response[:80])
+
+    def test_generation_stall_marker_leaves_health_ok(self):
+        os.environ["PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS"] = "250"
+        try:
+            with self.assertRaises(TimeoutError):
+                self.call(
+                    user="__STALL_GENERATION__",
+                    request_id="fixture-stall-generation",
+                    timeout=0.05,
+                )
+            with urllib.request.urlopen(self.base + "/health", timeout=2) as response:
+                self.assertEqual(response.status, 200)
+            with urllib.request.urlopen(self.base + "/counts", timeout=2) as response:
+                counts = json.load(response)
+            self.assertGreaterEqual(counts["stalled_generation"], 1)
+        finally:
+            os.environ.pop("PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS", None)
+
+    def test_health_stall_mode_is_opt_in(self):
+        os.environ["PTR_SYNTHETIC_ENGINE_STALL_MODE"] = "health"
+        os.environ["PTR_SYNTHETIC_ENGINE_HEALTH_STALL_MS"] = "250"
+        try:
+            with self.assertRaises(TimeoutError):
+                urllib.request.urlopen(self.base + "/health", timeout=0.05)
+            with urllib.request.urlopen(self.base + "/counts", timeout=2) as response:
+                counts = json.load(response)
+            self.assertGreaterEqual(counts["stalled_health"], 1)
+        finally:
+            os.environ.pop("PTR_SYNTHETIC_ENGINE_STALL_MODE", None)
+            os.environ.pop("PTR_SYNTHETIC_ENGINE_HEALTH_STALL_MS", None)
 
 
 if __name__ == "__main__":

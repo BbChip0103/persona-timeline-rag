@@ -207,11 +207,16 @@ class WorkerRunner:
         self.ready = True
 
     def _worker_done(self, task: asyncio.Task) -> None:
+        # BullMQ's run loop can finish while close() still waits for active jobs.
+        # Readiness was already cleared by close() in that case; their guards
+        # must remain live until the jobs finish and ACK.
+        unexpected_exit = self.ready
         self.ready = False
         if not task.cancelled():
             task.exception()  # consume without logging private Redis exception text
-        for guard in tuple(self._guards.values()):
-            guard.stop("CONTROL_UNAVAILABLE")
+        if unexpected_exit:
+            for guard in tuple(self._guards.values()):
+                guard.stop("CONTROL_UNAVAILABLE")
 
     def _lock_renewal_failed(self, job_ids: list[str]) -> None:
         for job_id in job_ids:

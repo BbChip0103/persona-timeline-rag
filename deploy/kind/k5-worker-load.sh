@@ -19,6 +19,7 @@ timeout_seconds="${TIMEOUT_SECONDS:-900}"
 scale_down_wait_seconds="${SCALE_DOWN_WAIT_SECONDS:-900}"
 prefix="${K5_PREFIX:-k5-load-$(date +%s)}"
 host_python="$(if command -v python3 >/dev/null 2>&1; then command -v python3; else command -v python; fi)"
+job_name="k5-worker-load-$(date +%s)"
 
 engine_min="$(timeout 20s kubectl --context "$context" -n "$engine_namespace" get scaledobject "$engine_deployment" -o jsonpath='{.spec.minReplicaCount}')"
 engine_ready="$(timeout 20s kubectl --context "$context" -n "$engine_namespace" get deployment "$engine_deployment" -o jsonpath='{.status.readyReplicas}')"
@@ -44,57 +45,31 @@ fi
 work_dir="$(mktemp -d)"
 node_out="$work_dir/node.out"
 node_err="$work_dir/node.err"
-replicas_jsonl="$work_dir/worker-replicas.jsonl"
-started_epoch="$(date +%s)"
 
 cleanup() {
+  timeout 30s kubectl --context "$context" -n "$app_namespace" delete \
+    job "$job_name" \
+    configmap "$job_name" \
+    serviceaccount "$job_name" \
+    role "$job_name" \
+    rolebinding "$job_name" \
+    networkpolicy "$job_name" \
+    --ignore-not-found >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }
 trap cleanup EXIT
 
-sample_worker_replicas() {
-  local elapsed
-  local sample
-  local desired
-  local replicas
-  local ready
-  local available
-  elapsed="$(($(date +%s) - started_epoch))"
-  sample="$(
-    timeout 20s kubectl --context "$context" -n "$app_namespace" get "deployment/$worker_deployment" -o jsonpath='{.spec.replicas}{" "}{.status.replicas}{" "}{.status.readyReplicas}{" "}{.status.availableReplicas}' 2>/dev/null || true
-  )"
-  if [[ -z "$sample" ]]; then
-    return 1
-  fi
-  read -r desired replicas ready available <<<"$sample"
-  "$host_python" - "$elapsed" "${desired:-0}" "${replicas:-0}" "${ready:-0}" "${available:-0}" >>"$replicas_jsonl" <<'PY'
-import json
-import sys
-elapsed, desired, replicas, ready, available = sys.argv[1:]
-def number(value):
-    try:
-        return int(value)
-    except ValueError:
-        return 0
-print(json.dumps({
-    "elapsedSeconds": int(elapsed),
-    "desired": number(desired),
-    "replicas": number(replicas),
-    "ready": number(ready),
-    "available": number(available),
-}))
-PY
-  printf '%s\n' "${desired:-0}"
-}
+api_image="$(timeout 20s kubectl --context "$context" -n "$app_namespace" get deployment -l "$api_label" -o jsonpath='{.items[0].spec.template.spec.containers[?(@.name=="api")].image}')"
+api_secret="$(timeout 20s kubectl --context "$context" -n "$app_namespace" get deployment -l "$api_label" -o jsonpath='{.items[0].spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="PTR_API_SYNTHETIC_TOKEN")].valueFrom.secretKeyRef.name}')"
+if [[ -z "$api_image" || -z "$api_secret" ]]; then
+  echo "missing api image or secret reference" >&2
+  exit 1
+fi
 
-run_node_probe() {
-  timeout "${timeout_seconds}s" kubectl --context "$context" -n "$app_namespace" exec -i "$api_pod" -- \
-    env \
-      K5_PREFIX="$prefix" \
-      TURN_COUNT="$turn_count" \
-      SUBMIT_CONCURRENCY="$submit_concurrency" \
-      POLL_MS="$poll_ms" \
-      node --input-type=module - <<'NODE'
+timeout 30s kubectl --context "$context" -n "$app_namespace" create configmap "$job_name" \
+  --from-file=probe.mjs=/dev/stdin <<'NODE'
+import fs from 'node:fs';
+import https from 'node:https';
 import net from 'node:net';
 import pg from 'pg';
 
@@ -105,8 +80,13 @@ const prefix = process.env.K5_PREFIX;
 const turnCount = Number(process.env.TURN_COUNT || '200');
 const submitConcurrency = Number(process.env.SUBMIT_CONCURRENCY || '80');
 const pollMs = Number(process.env.POLL_MS || '1000');
+const scaleDownWaitSeconds = Number(process.env.SCALE_DOWN_WAIT_SECONDS || '900');
+const appNamespace = process.env.PTR_K8S_NAMESPACE || 'ptr-app';
+const workerDeployment = process.env.PTR_WORKER_DEPLOYMENT || 'ptr-worker';
 const owner = 'lt-k5-synthetic';
 const started = Date.now();
+const serviceAccountToken = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/token', 'utf8');
+const serviceAccountCa = fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt');
 
 function elapsedSeconds() {
   return Number(((Date.now() - started) / 1000).toFixed(3));
@@ -121,10 +101,11 @@ function assertSafeConfig() {
   if (!Number.isInteger(turnCount) || turnCount < 1 || turnCount > 1000) throw new Error('INVALID_TURN_COUNT');
   if (!Number.isInteger(submitConcurrency) || submitConcurrency < 1 || submitConcurrency > 200) throw new Error('INVALID_SUBMIT_CONCURRENCY');
   if (!Number.isInteger(pollMs) || pollMs < 250 || pollMs > 10000) throw new Error('INVALID_POLL_MS');
+  if (!Number.isInteger(scaleDownWaitSeconds) || scaleDownWaitSeconds < 1 || scaleDownWaitSeconds > 1800) throw new Error('INVALID_SCALE_DOWN_WAIT_SECONDS');
 }
 
 async function request(path, body) {
-  const response = await fetch(`http://127.0.0.1:56441/api/${path}`, {
+  const response = await fetch(`${process.env.PTR_API_BASE_URL}/api/${path}`, {
     method: body === undefined ? 'GET' : 'POST',
     headers: {
       Authorization: `Bearer ${process.env.PTR_API_SYNTHETIC_TOKEN}`,
@@ -148,6 +129,57 @@ async function mapLimit(items, limit, worker) {
   });
   await Promise.all(runners);
   return results;
+}
+
+async function kubernetesJson(path) {
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: 'kubernetes.default.svc',
+      port: 443,
+      path,
+      method: 'GET',
+      ca: serviceAccountCa,
+      headers: {
+        Authorization: `Bearer ${serviceAccountToken}`,
+        Accept: 'application/json',
+      },
+      timeout: 5000,
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => {
+        if (response.statusCode < 200 || response.statusCode > 299) {
+          reject(new Error(`K8S_HTTP_${response.statusCode}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          reject(new Error('K8S_INVALID_JSON'));
+        }
+      });
+    });
+    request.on('timeout', () => {
+      request.destroy(new Error('K8S_TIMEOUT'));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function sampleWorkerReplicas() {
+  const deployment = await kubernetesJson(
+    `/apis/apps/v1/namespaces/${appNamespace}/deployments/${workerDeployment}`,
+  );
+  const sample = {
+    desired: Number(deployment.spec?.replicas ?? 0),
+    replicas: Number(deployment.status?.replicas ?? 0),
+    ready: Number(deployment.status?.readyReplicas ?? 0),
+    available: Number(deployment.status?.availableReplicas ?? 0),
+  };
+  event('replica_sample', sample);
+  return sample;
 }
 
 async function submitTurn(index) {
@@ -315,9 +347,11 @@ async function proof(client, turnIds) {
 async function main() {
   assertSafeConfig();
   event('start', { prefix, turnCount, submitConcurrency });
+  await sampleWorkerReplicas();
   await sampleQueues();
   const turnIds = await mapLimit(Array.from({ length: turnCount }, (_, index) => index), submitConcurrency, submitTurn);
   event('submitted', { submitted: turnIds.length });
+  await sampleWorkerReplicas();
 
   const client = new Client({ connectionString: process.env.PTR_APP_DATABASE_URL });
   await client.connect();
@@ -326,10 +360,17 @@ async function main() {
     let current = { counts: {}, terminal: 0 };
     while (Date.now() < deadline) {
       current = await states(client, turnIds);
+      await sampleWorkerReplicas();
       await sampleQueues();
       event('state_sample', { terminal: current.terminal, states: current.counts });
       if (current.terminal === turnIds.length) break;
       await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    const scaleDownDeadline = Date.now() + scaleDownWaitSeconds * 1000;
+    while (Date.now() < scaleDownDeadline) {
+      const sample = await sampleWorkerReplicas();
+      if (sample.desired <= 2) break;
+      await new Promise(resolve => setTimeout(resolve, 5000));
     }
     const final = await proof(client, turnIds);
     const passed = final.observed === turnIds.length
@@ -367,46 +408,166 @@ main().catch(error => {
   process.exitCode = 1;
 });
 NODE
-}
 
-run_node_probe >"$node_out" 2>"$node_err" &
-probe_pid="$!"
-
-while ps -p "$probe_pid" >/dev/null 2>&1; do
-  sample_worker_replicas >/dev/null || true
-  sleep 2
-done
+timeout 30s kubectl --context "$context" -n "$app_namespace" apply -f - <<YAML
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: $job_name
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: $job_name
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["$worker_deployment"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: $job_name
+subjects:
+  - kind: ServiceAccount
+    name: $job_name
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: $job_name
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $job_name
+spec:
+  podSelector:
+    matchLabels:
+      ptr.io/probe: k5-worker-load
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: api
+      ports:
+        - {protocol: TCP, port: 56441}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ptr-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: postgres
+      ports:
+        - {protocol: TCP, port: 5432}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ptr-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: redis
+      ports:
+        - {protocol: TCP, port: 6379}
+    - to:
+        - ipBlock: {cidr: 10.96.0.1/32}
+        - ipBlock: {cidr: 172.29.0.4/32}
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job_name
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: $timeout_seconds
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ptr
+        app.kubernetes.io/component: worker
+        ptr.network/role: app
+        ptr.io/probe: k5-worker-load
+    spec:
+      restartPolicy: Never
+      serviceAccountName: $job_name
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 900
+        runAsGroup: 2000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: "$api_image"
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/app/probe/probe.mjs"]
+          env:
+            - {name: K5_PREFIX, value: "$prefix"}
+            - {name: TURN_COUNT, value: "$turn_count"}
+            - {name: SUBMIT_CONCURRENCY, value: "$submit_concurrency"}
+            - {name: POLL_MS, value: "$poll_ms"}
+            - {name: SCALE_DOWN_WAIT_SECONDS, value: "$scale_down_wait_seconds"}
+            - {name: PTR_K8S_NAMESPACE, value: "$app_namespace"}
+            - {name: PTR_WORKER_DEPLOYMENT, value: "$worker_deployment"}
+            - {name: PTR_API_BASE_URL, value: "http://ptr-api.$app_namespace.svc.cluster.local:56441"}
+            - name: PTR_API_SYNTHETIC_TOKEN
+              valueFrom:
+                secretKeyRef: {name: "$api_secret", key: PTR_API_SYNTHETIC_TOKEN}
+            - name: PTR_APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: "$api_secret", key: PTR_APP_DATABASE_URL}
+            - name: PTR_REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: "$api_secret", key: PTR_REDIS_URL}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: probe, mountPath: /app/probe, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: probe
+          configMap: {name: "$job_name"}
+        - name: tmp
+          emptyDir: {}
+YAML
 
 set +e
-wait "$probe_pid"
+timeout "$((timeout_seconds + 60))s" kubectl --context "$context" -n "$app_namespace" wait --for=condition=complete "job/$job_name" "--timeout=${timeout_seconds}s"
 probe_status="$?"
 set -e
 
-scale_down_deadline="$(($(date +%s) + scale_down_wait_seconds))"
-while [[ "$(date +%s)" -lt "$scale_down_deadline" ]]; do
-  desired="$(sample_worker_replicas || true)"
-  if [[ "${desired:-0}" =~ ^[0-9]+$ ]] && [[ "$desired" -le 2 ]]; then
-    break
-  fi
-  sleep 5
-done
+timeout 60s kubectl --context "$context" -n "$app_namespace" logs "job/$job_name" >"$node_out" 2>"$node_err" || true
 
-cat "$node_out"
+timeout 30s cat "$node_out"
 if [[ -s "$node_err" ]]; then
-  sed 's/^/stderr /' "$node_err" >&2
+  timeout 30s sed 's/^/stderr /' "$node_err" >&2
 fi
 
-"$host_python" - "$replicas_jsonl" "$node_out" "$probe_status" <<'PY'
+timeout 30s "$host_python" - "$node_out" "$probe_status" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-replicas_path = Path(sys.argv[1])
-node_path = Path(sys.argv[2])
-probe_status = int(sys.argv[3])
+node_path = Path(sys.argv[1])
+probe_status = int(sys.argv[2])
 
-replicas = [json.loads(line) for line in replicas_path.read_text().splitlines() if line.strip()] if replicas_path.exists() else []
 events = [json.loads(line) for line in node_path.read_text().splitlines() if line.strip()]
+replicas = [event for event in events if event.get("event") == "replica_sample"]
 submitted = next((event for event in events if event.get("event") == "submitted"), None)
 result = next((event for event in events if event.get("event") == "result"), None)
 queue_samples = [event for event in events if event.get("event") == "queue_sample"]

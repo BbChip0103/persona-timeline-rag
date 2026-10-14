@@ -5,6 +5,7 @@ owner of durable costly-call receipts; these LangGraph graphs have no saver.
 """
 
 import copy
+import logging
 import time
 import uuid
 from contextlib import nullcontext
@@ -13,6 +14,10 @@ from typing import Any, TypedDict
 import regex
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
+
+from ptr_llm.billing import ProviderError
+from ptr_llm.control import ControlRejected, ControlUnavailable
+from ptr_llm.worker import ExecutionStopped
 
 from .agent import AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION, run_character_agent
 from .context import RETRIEVAL_CONTEXT_REVISION, remember_source_context, retrieval_context
@@ -40,6 +45,8 @@ from .routing import (
 from .safety import contains_credential, contains_internal_path, contains_ungrounded_biography
 from .texts import reply_text, speech_level, utterance_language, voice_text
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class TurnState(TypedDict):
     frame: dict
@@ -47,6 +54,63 @@ class TurnState(TypedDict):
 
 class TurnContext(TypedDict):
     stages: dict[str, Any]
+
+
+def _fixed_constant(value: Any) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return "UNSPECIFIED"
+    if any(not (ch == "_" or "A" <= ch <= "Z" or "0" <= ch <= "9") for ch in value):
+        return "UNSPECIFIED"
+    return value
+
+
+def _fixed_exception_class(error: Exception) -> str:
+    name = type(error).__name__
+    if not 1 <= len(name) <= 64:
+        return "Exception"
+    if any(not (ch == "_" or ch.isascii() and ch.isalnum()) for ch in name):
+        return "Exception"
+    return name
+
+
+def _failed_error_code(error: Exception) -> str:
+    code = getattr(error, "code", "TURN_FAILED")
+    if isinstance(error, CoreError) and error.reason in ("TURN_TIMEOUT", "TURN_ABORTED"):
+        return error.reason
+    if isinstance(error, CoreError) and error.code in (
+        "CONTEXT_LIMIT",
+        "PERSONA_UNAVAILABLE",
+    ):
+        return error.code
+    mapped = {
+        "PROVIDER_DEADLINE": "TURN_TIMEOUT",
+        "BUDGET_EXCEEDED": "PROVIDER_BUDGET_EXCEEDED",
+        "DECISION_SUBCAP": "PROVIDER_BUDGET_EXCEEDED",
+        "RESERVATION_BELOW_MAXIMUM_COST": "PROVIDER_BUDGET_EXCEEDED",
+        "REQUEST_UNRESOLVED_NO_RESUBMIT": "PROVIDER_REQUEST_UNRESOLVED",
+        "PROVIDER_REQUEST_FAILED": "PROVIDER_UNAVAILABLE",
+    }
+    return mapped.get(code, "TURN_FAILED")
+
+
+def _log_turn_failure(error: Exception, error_code: str) -> None:
+    fixed_error_code = _fixed_constant(error_code)
+    exception_class = _fixed_exception_class(error)
+    core_reason = _fixed_constant(error.reason if isinstance(error, CoreError) else None)
+    provider_code = _fixed_constant(error.code if isinstance(error, ProviderError) else None)
+    _LOGGER.warning(
+        "turn_failed_classified error_code=%s exception_class=%s core_reason=%s provider_code=%s",
+        fixed_error_code,
+        exception_class,
+        core_reason,
+        provider_code,
+        extra={
+            "error_code": fixed_error_code,
+            "exception_class": exception_class,
+            "core_reason": core_reason,
+            "provider_code": provider_code,
+        },
+    )
 
 
 def _compiled_turn_graph():
@@ -124,23 +188,12 @@ class LLMEngine:
         try:
             reply = await self.execute(grant, before_costly=before_costly, cancelled=cancelled)
             return {"kind": "completed", "reply": reply}
+        except (ControlUnavailable, ControlRejected, ExecutionStopped):
+            raise
         except Exception as error:
-            code = getattr(error, "code", "TURN_FAILED")
-            if isinstance(error, CoreError) and error.reason in ("TURN_TIMEOUT", "TURN_ABORTED"):
-                return {"kind": "failed", "errorCode": error.reason}
-            if isinstance(error, CoreError) and error.code in (
-                "CONTEXT_LIMIT",
-                "PERSONA_UNAVAILABLE",
-            ):
-                return {"kind": "failed", "errorCode": error.code}
-            mapped = {
-                "PROVIDER_DEADLINE": "TURN_TIMEOUT",
-                "BUDGET_EXCEEDED": "PROVIDER_BUDGET_EXCEEDED",
-                "DECISION_SUBCAP": "PROVIDER_BUDGET_EXCEEDED",
-                "REQUEST_UNRESOLVED_NO_RESUBMIT": "PROVIDER_REQUEST_UNRESOLVED",
-                "PROVIDER_REQUEST_FAILED": "PROVIDER_UNAVAILABLE",
-            }
-            return {"kind": "failed", "errorCode": mapped.get(code, "TURN_FAILED")}
+            error_code = _failed_error_code(error)
+            _log_turn_failure(error, error_code)
+            return {"kind": "failed", "errorCode": error_code}
 
     async def execute(self, grant, *, before_costly, cancelled):
         context = copy.deepcopy(grant["context"])

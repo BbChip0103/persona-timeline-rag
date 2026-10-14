@@ -17,7 +17,11 @@ from ptr_llm.providers import (
     OpenRouterClient,
 )
 from ptr_llm.providers.common import js_json
-from ptr_llm.providers.control_tokens import GEMMA4_SPECIAL_TOKENS, neutralize_control_tokens
+from ptr_llm.providers.control_tokens import (
+    GEMMA4_SPECIAL_TOKENS,
+    neutralize_control_tokens,
+    neutralize_messages,
+)
 from ptr_llm.providers.jev import (
     jev_intent_question,
     jev_safety_questions,
@@ -58,6 +62,27 @@ def response(text="합성 답변", cost=0.0001):
         ],
         "usage": {"prompt_tokens": 16, "completion_tokens": 12, "total_tokens": 28, "cost": cost},
     }
+
+
+def reservation_upper_bound_bytes(messages, *, max_output_tokens):
+    safe_body = {
+        "model": "primary",
+        "messages": neutralize_messages(messages),
+        "max_completion_tokens": max_output_tokens,
+        "temperature": 0,
+        "stream": False,
+    }
+    return len(js_json(safe_body).encode()) + len(messages) * 64 + 2048
+
+
+def reservation_estimate_microusd(messages, *, max_output_tokens, pricing_ceiling):
+    input_upper_bound = reservation_upper_bound_bytes(
+        messages, max_output_tokens=max_output_tokens
+    )
+    return math.ceil(
+        input_upper_bound * 2 * pricing_ceiling["prompt"]
+        + max_output_tokens * pricing_ceiling["completion"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -514,6 +539,95 @@ async def test_reservation_under_maximum_rejected_before_ledger_and_network():
     with pytest.raises(ProviderError, match="RESERVATION_BELOW_MAXIMUM_COST"):
         await provider.generate(MESSAGES, request_key=TURN)
     assert not ledger.requests and not calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "messages"),
+    [
+        (
+            "k5",
+            [
+                {
+                    "role": "system",
+                    "content": "Synthetic policy/schema/context for kind reservation probe",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "K5_ID=synthetic-load-turn-001\n"
+                        + "".join(
+                            f"synthetic timeline fact {i:03d}: persona says hello during "
+                            "recovery validation.\n"
+                            for i in range(161)
+                        )
+                    ),
+                },
+            ],
+        ),
+        (
+            "recovery",
+            [
+                {
+                    "role": "system",
+                    "content": "Synthetic policy/schema/context for kind reservation probe",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "K4_ID=00000000-0000-4000-8000-000000000001\n"
+                        + "".join(
+                            f"synthetic timeline fact {i:03d}: persona says hello during "
+                            "recovery validation.\n"
+                            for i in range(161)
+                        )
+                    ),
+                },
+            ],
+        ),
+    ],
+)
+async def test_kind_budget_reserves_k5_and_recovery_prompts_under_cap(name, messages):
+    max_output_tokens = 2048
+    max_call_microusd = 5000
+    pricing_ceiling = {"prompt": 0.10, "completion": 0.50}
+    input_upper_bound = reservation_upper_bound_bytes(
+        messages, max_output_tokens=max_output_tokens
+    )
+    assert 14000 <= input_upper_bound <= 16000
+    estimate = reservation_estimate_microusd(
+        messages, max_output_tokens=max_output_tokens, pricing_ceiling=pricing_ceiling
+    )
+    assert estimate < max_call_microusd, (
+        f"{name} estimate={estimate} headroom={max_call_microusd - estimate}"
+    )
+    if name == "recovery":
+        old_estimate = reservation_estimate_microusd(
+            messages, max_output_tokens=4096, pricing_ceiling=pricing_ceiling
+        )
+        assert old_estimate > max_call_microusd
+
+    calls = []
+
+    async def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=response(), headers={"x-litellm-model-id": "primary"})
+
+    ledger = MemoryBudgetLedger()
+    provider = LiteLLMTextProvider(
+        base_url="http://synthetic.invalid/v1",
+        model="primary",
+        api_key="synthetic",
+        ledger=ledger,
+        pricing_ceiling=pricing_ceiling,
+        max_output_tokens=max_output_tokens,
+        reservation_microusd=max_call_microusd,
+        transport=httpx.MockTransport(handler),
+    )
+    request_key = f"{TURN[:-1]}{1 if name == 'k5' else 2}"
+    assert await provider.generate(messages, request_key=request_key) == "합성 답변"
+    assert calls[0]["max_completion_tokens"] == max_output_tokens
+    assert next(iter(ledger.requests.values())).reserved_microusd == max_call_microusd
 
 
 @pytest.mark.asyncio

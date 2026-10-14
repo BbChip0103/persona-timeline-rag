@@ -136,10 +136,16 @@ for node in "${gpu_nodes[@]}"; do
     -p='{"status":{"capacity":{"ptr.io/fake-gpu":"1","nvidia.com/gpu":"1"},"allocatable":{"ptr.io/fake-gpu":"1","nvidia.com/gpu":"1"}}}' >/dev/null
 done
 
+control_plane_ip="$("$docker_bin" inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${cluster_name}-control-plane")"
+if [ -z "$control_plane_ip" ]; then
+  printf 'Could not determine kind control-plane IP\n' >&2
+  exit 1
+fi
+
 cat <<EOF
 cluster=$cluster_name
 backend_image=$backend_image
 worker_image=$worker_image
 helm_namespace=ptr-system
-helm_set_args=--set images.backend.repository=ptr-backend --set images.backend.tag=$backend_tag --set images.worker.repository=ptr-worker --set images.worker.tag=$worker_tag
+helm_set_args=--set images.backend.repository=ptr-backend --set images.backend.tag=$backend_tag --set images.worker.repository=ptr-worker --set images.worker.tag=$worker_tag --set-string gateway.bootstrap.apiServerCIDRs[1]=$control_plane_ip/32 --set-string inference.apiServerCIDRs[1]=$control_plane_ip/32
 EOF

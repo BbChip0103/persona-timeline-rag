@@ -1,11 +1,31 @@
 {{- if .Values.inference.enabled }}
 {{- $engine := .Values.inference.engine }}
+{{- $dataset := default dict $engine.dataset }}
+{{- $datasetEnabled := and (eq $engine.kind "sim") (default false $dataset.enabled) }}
+{{- $datasetMountPath := default "/fixtures" $dataset.mountPath }}
+{{- $datasetFileName := default "responses.sqlite" $dataset.fileName }}
+{{- $datasetPath := printf "%s/%s" (trimSuffix "/" $datasetMountPath) $datasetFileName }}
+{{- $datasetTableName := default "llmd" $dataset.tableName }}
 {{- if not (has $engine.kind (list "sim" "vllm")) }}{{ fail "inference.engine.kind must be sim or vllm" }}{{- end }}
+{{- if and $datasetEnabled (not $dataset.sqliteBase64) }}{{ fail "inference.engine.dataset.sqliteBase64 is required when inference.engine.dataset.enabled=true" }}{{- end }}
 {{- $image := printf "%s:%s" $engine.image.repository $engine.image.tag }}
 {{- if $engine.image.digest }}{{- $image = printf "%s@%s" $image $engine.image.digest }}{{- end }}
 {{- if eq $engine.kind "vllm" }}
 {{- $_ := required "inference.engine.weights.existingClaim is required when inference.engine.kind=vllm" $engine.weights.existingClaim }}
 {{- $_ = required "inference.engine.modelPath is required when inference.engine.kind=vllm" $engine.modelPath }}
+{{- end }}
+{{- if $datasetEnabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptr-sim-dataset
+  namespace: {{ .Values.namespaces.inference }}
+  labels:
+    app.kubernetes.io/name: ptr
+    app.kubernetes.io/component: inference-engine
+binaryData:
+  {{ $datasetFileName }}: {{ regexReplaceAll "\\s+" $dataset.sqliteBase64 "" | quote }}
+---
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -57,12 +77,20 @@ spec:
             - --time-to-first-token-std-dev=0s
             - --inter-token-latency={{ $engine.interTokenLatency }}
             - --inter-token-latency-std-dev=0s
+            {{- if $datasetEnabled }}
+            - --dataset-path={{ $datasetPath }}
+            - --dataset-table-name={{ $datasetTableName }}
+            {{- end }}
             {{- if $engine.enableRequestIdHeaders }}
             - --enable-request-id-headers
             {{- end }}
             {{- if $engine.logHttp }}
             - --log-http
             {{- end }}
+          {{- if $datasetEnabled }}
+          volumeMounts:
+            - {name: sim-dataset, mountPath: {{ $datasetMountPath }}, readOnly: true}
+          {{- end }}
           {{- else }}
           args:
             - --model
@@ -115,17 +143,23 @@ spec:
             httpGet: {path: /health, port: http}
             periodSeconds: 10
             failureThreshold: 3
-          lifecycle:
-            preStop:
-              sleep:
-                seconds: 15
           {{- else }}
           readinessProbe:
             httpGet: {path: /health/ready, port: http}
             periodSeconds: 5
           {{- end }}
-      {{- if eq $engine.kind "vllm" }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 15
+      {{- if or (eq $engine.kind "vllm") $datasetEnabled }}
       volumes:
+        {{- if $datasetEnabled }}
+        - name: sim-dataset
+          configMap:
+            name: ptr-sim-dataset
+        {{- end }}
+        {{- if eq $engine.kind "vllm" }}
         - name: model-weights
           persistentVolumeClaim:
             claimName: {{ $engine.weights.existingClaim }}
@@ -133,5 +167,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ $engine.weights.shmSizeLimit }}
+        {{- end }}
       {{- end }}
 {{- end }}

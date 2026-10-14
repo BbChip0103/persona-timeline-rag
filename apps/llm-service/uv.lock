@@ -1436,8 +1436,11 @@ dependencies = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = "==6.0.2" },
     { name = "tenacity", specifier = "==9.2.1" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "pip"

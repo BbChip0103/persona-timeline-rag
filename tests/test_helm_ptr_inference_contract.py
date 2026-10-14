@@ -1,5 +1,9 @@
+import base64
+import json
 import re
+import sqlite3
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,19 +38,104 @@ def parsed_document(rendered: str, kind: str, name: str) -> dict:
 
 
 class InferenceChartContractTest(unittest.TestCase):
+    def test_kind_budget_and_router_ttl_match_fixed_acceptance_bounds(self) -> None:
+        kind = helm_template("kind")
+        self.assertEqual(kind.returncode, 0, kind.stderr)
+        worker = parsed_document(kind.stdout, "Deployment", "ptr-worker")
+        env = {
+            item["name"]: item.get("value")
+            for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(env["PTR_LLM_MAX_OUTPUT_TOKENS"], "2048")
+        self.assertEqual(env["PTR_LLM_MAX_CALL_MICROUSD"], "5000")
+        self.assertLessEqual(200 * int(env["PTR_LLM_MAX_CALL_MICROUSD"]), 1_000_000)
+        router = yaml.safe_load(
+            (ROOT / "deploy/helm/ptr-router/values-kind.yaml").read_text()
+        )
+        self.assertEqual(
+            router["llm-d-router-standalone"]["router"]["epp"]["pluginsConfig"]
+            ["flowControl"]["defaultRequestTTL"],
+            "2s",
+        )
+
+    def test_kind_postgres_is_pinned_to_non_gpu_node_without_gpu_toleration(self) -> None:
+        kind = helm_template("kind")
+        prod = helm_template("prod")
+        self.assertEqual(kind.returncode, 0, kind.stderr)
+        self.assertEqual(prod.returncode, 0, prod.stderr)
+        kind_pg = parsed_document(kind.stdout, "StatefulSet", "ptr-postgres")
+        pod_spec = kind_pg["spec"]["template"]["spec"]
+        self.assertEqual(pod_spec["nodeSelector"], {"ptr.io/non-gpu": "true"})
+        self.assertNotIn("tolerations", pod_spec)
+        self.assertNotIn("ptr-postgres", prod.stdout)
+
     def test_kind_simulator_has_fixed_ttft_without_kv_transfer(self) -> None:
         result = helm_template("kind")
         self.assertEqual(result.returncode, 0, result.stderr)
         deployment = document(result.stdout, "Deployment", "ptr-sim")
+        dataset = parsed_document(result.stdout, "ConfigMap", "ptr-sim-dataset")
 
         for arg in (
+            "--mode=random",
+            "--dataset-path=/fixtures/responses.sqlite",
+            "--dataset-table-name=llmd",
             "--time-to-first-token=8s",
             "--time-to-first-token-std-dev=0s",
             "--inter-token-latency-std-dev=0s",
         ):
             self.assertIn(arg, deployment)
+        self.assertIn("lifecycle:", deployment)
+        self.assertIn("preStop:", deployment)
+        self.assertIn("seconds: 15", deployment)
+        self.assertIn("name: sim-dataset", deployment)
+        self.assertIn("mountPath: /fixtures", deployment)
+        self.assertIn("name: ptr-sim-dataset", deployment)
         self.assertNotIn("--kv-cache-transfer-latency", deployment)
         self.assertNotIn("--time-factor-under-load", deployment)
+        fixture = base64.b64decode(dataset["binaryData"]["responses.sqlite"], validate=True)
+        with tempfile.NamedTemporaryFile() as db:
+            db.write(fixture)
+            db.flush()
+            connection = sqlite3.connect(db.name)
+            columns = [
+                (row[1], row[2], bool(row[3]))
+                for row in connection.execute("PRAGMA table_info(llmd)")
+            ]
+            rows = list(
+                connection.execute(
+                    "SELECT length(prompt_hash), gen_tokens, n_gen_tokens FROM llmd"
+                )
+            )
+            connection.close()
+        self.assertEqual(
+            columns,
+            [
+                ("id", "INTEGER", False),
+                ("prompt_hash", "BLOB", True),
+                ("gen_tokens", "JSON", True),
+                ("n_gen_tokens", "INTEGER", True),
+            ],
+        )
+        self.assertEqual(len(rows), 1)
+        prompt_hash_len, gen_tokens, n_gen_tokens = rows[0]
+        self.assertEqual(prompt_hash_len, 32)
+        self.assertEqual(n_gen_tokens, 1)
+        token_payload = json.loads(gen_tokens)
+        self.assertEqual(token_payload["Tokens"], [1])
+        [raw_reply] = token_payload["Strings"]
+        reply = json.loads(raw_reply)
+        self.assertEqual(
+            reply,
+            {
+                "message": "Synthetic local engine reply.",
+                "status": "answered",
+                "evidenceRefs": [],
+                "variableUpdates": {},
+            },
+        )
+        long_prompt = "full agent prompt " * 2050
+        self.assertGreater(len(long_prompt.split()), 2048)
+        self.assertNotIn(long_prompt[:128], raw_reply)
 
     def test_prod_vllm_is_pinned_offline_and_uses_local_weights(self) -> None:
         result = helm_template("prod")
@@ -138,6 +227,18 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertIn("targetLabel: pool", engine_monitor)
         self.assertIn('replacement: "chat-primary"', engine_monitor)
         self.assertNotIn("kind: PodDisruptionBudget\nmetadata:\n  name: ptr-sim", result.stdout)
+
+        v2 = helm_template("kind", "--set", "autoscaling.engine.minReplicaCount=2")
+        self.assertEqual(v2.returncode, 0, v2.stderr)
+        engine_pdb = parsed_document(v2.stdout, "PodDisruptionBudget", "ptr-sim")
+        self.assertEqual(engine_pdb["spec"]["maxUnavailable"], 1)
+        self.assertEqual(
+            engine_pdb["spec"]["selector"]["matchLabels"],
+            {
+                "app.kubernetes.io/name": "ptr",
+                "app.kubernetes.io/component": "inference-engine",
+            },
+        )
 
     def test_prod_autoscaling_limits_and_engine_pdb_match_k5_contract(self) -> None:
         result = helm_template("prod")
@@ -290,6 +391,21 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertNotIn("authorization:", monitor)
         self.assertNotIn("PTR_LITELLM_MASTER_KEY", monitor)
         self.assertIn("require_auth_for_metrics_endpoint: false", config)
+
+    def test_fake_openrouter_code_is_only_rendered_when_fake_gateway_is_enabled(self) -> None:
+        kind = helm_template("kind")
+        self.assertEqual(kind.returncode, 0, kind.stderr)
+        kind_config = parsed_document(kind.stdout, "ConfigMap", "ptr-litellm-files")
+        self.assertIn("fake-openrouter.py", kind_config["data"])
+        self.assertIn("fake_openrouter_request", kind_config["data"]["fake-openrouter.py"])
+
+        prod = helm_template("prod")
+        self.assertEqual(prod.returncode, 0, prod.stderr)
+        prod_config = parsed_document(prod.stdout, "ConfigMap", "ptr-litellm-files")
+        self.assertNotIn("fake-openrouter.py", prod_config["data"])
+        self.assertNotIn(
+            "fake_openrouter_request", document(prod.stdout, "ConfigMap", "ptr-litellm-files")
+        )
 
     def test_k5_monitoring_and_keda_namespaces_are_default_deny(self) -> None:
         result = helm_template("kind")
