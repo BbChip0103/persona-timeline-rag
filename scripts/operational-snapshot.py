@@ -59,6 +59,7 @@ CONFIG_MOUNT_TARGETS = {
     "/app/ptr-config.yaml",
 }
 EXCLUDED_TREE_NAMES = {"node_modules", ".venv", "__pycache__", ".next", "dist", "build"}
+MIN_COMPOSE_VERSION = (5, 0, 0)
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,13 @@ def docker(args: list[str]) -> str:
         timeout=120,
     )
     return result.stdout
+
+
+def require_supported_compose() -> None:
+    version = docker(["compose", "version", "--short"]).strip()
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version)
+    if match is None or tuple(map(int, match.groups())) < MIN_COMPOSE_VERSION:
+        fail("Docker Compose v5.0.0 or later is required to preserve env_file references")
 
 
 def docker_inspections(project: str) -> list[dict[str, Any]]:
@@ -280,6 +288,7 @@ def compose_hashes(
 
 def compose_file_references(
     project: str, env_file: Path, config_files: list[Path], working_dir: Path,
+    expected_services: list[str],
 ) -> list[Path]:
     """Read resolved file paths only; never log Compose's expanded JSON or environment."""
     command = ["docker", "compose", "--env-file", str(env_file), "-p", project]
@@ -297,10 +306,18 @@ def compose_file_references(
     definitions = config.get("configs") or {}
     if not isinstance(services, dict) or not isinstance(definitions, dict):
         fail("invalid Compose file references")
-    for service in services.values():
+    if not services:
+        fail("Compose config missing services and env_file references")
+    missing_services = set(expected_services) - services.keys()
+    if missing_services:
+        fail(f"Compose config missing deployed services: {', '.join(sorted(missing_services))}")
+    for service_name, service in services.items():
         if not isinstance(service, dict):
             fail("invalid Compose service")
-        for entry in service.get("env_file") or []:
+        env_files = service.get("env_file")
+        if not isinstance(env_files, list) or not env_files:
+            fail(f"Compose config missing env_file references for service: {service_name}")
+        for entry in env_files:
             raw = entry if isinstance(entry, str) else entry.get("path") if isinstance(entry, dict) else None
             if not isinstance(raw, str):
                 fail("invalid Compose env_file reference")
@@ -493,6 +510,9 @@ def check_data_mounts(args: argparse.Namespace) -> int:
                 fail("unexpected API or worker mount type")
             if not isinstance(mount.get("source"), str) or not isinstance(mount.get("target"), str):
                 fail("rendered operational bind source or target missing")
+            bind = mount.get("bind")
+            if not isinstance(bind, dict) or bind.get("create_host_path") is not False:
+                fail("rendered operational bind must set create_host_path: false")
             actual.append((service, mount["target"], mount["source"]))
     expected_sources = [(row["service"], row["target"], row["source"]) for row in expected]
     if sorted(actual) != sorted(expected_sources):
@@ -573,6 +593,7 @@ def capture(args: argparse.Namespace) -> int:
     if not isinstance(inspections, list):
         fail("inspect fixture must be a JSON array")
     services = validate_services(inspections, args.project, args.owner)
+    require_supported_compose()
 
     files: dict[Path, CapturedFile] = {}
     directories: set[Path] = set()
@@ -627,7 +648,7 @@ def capture(args: argparse.Namespace) -> int:
             fail(HASH_MISMATCH)
         hashes.update(group_hashes)
         for path in compose_file_references(
-            args.project, env_path, list(service_configs), working_dir
+            args.project, env_path, list(service_configs), working_dir, expected
         ):
             add_unique(referenced_files, path)
 

@@ -116,6 +116,8 @@ class OperationalSnapshotTests(unittest.TestCase):
     def fake_docker(
         self, folder: Path, fixture: Path, mismatch: bool = False,
         mismatch_service: str = "api",
+        compose_version: str = "v5.5.1", missing_env_file_service: str | None = None,
+        missing_config_service: str | None = None,
     ) -> dict[str, str]:
         rows = json.loads(fixture.read_text())
         hashes = {
@@ -150,6 +152,11 @@ class OperationalSnapshotTests(unittest.TestCase):
         executable.write_text(
             "#!/usr/bin/env python3\nimport os,sys\n"
             f"groups = {groups!r}\n"
+            f"compose_version = {compose_version!r}\n"
+            f"missing_env_file_service = {missing_env_file_service!r}\n"
+            f"missing_config_service = {missing_config_service!r}\n"
+            "if sys.argv[1:] == ['compose', 'version', '--short']:\n"
+            " print(compose_version); sys.exit(0)\n"
             "group = groups[os.getcwd()]\n"
             "assert sys.argv[1:3] == ['compose', '--env-file']\n"
             "assert sys.argv[3] == group['env']\n"
@@ -158,8 +165,10 @@ class OperationalSnapshotTests(unittest.TestCase):
             "[part for file in group['files'] for part in ('-f', file)]\n"
             "tail = sys.argv[6+2*len(group['files']):]\n"
             "if tail == ['config', '--format', 'json', '--no-env-resolution']:\n"
-            " print(__import__('json').dumps({'services': {s: {'env_file': "
-            "[{'path': group['referenced_env']}]} for s in group['services']}, "
+            " print(__import__('json').dumps({'services': {s: "
+            "({} if s == missing_env_file_service else {'env_file': "
+            "[{'path': group['referenced_env']}]}) for s in group['services'] "
+            "if s != missing_config_service}, "
             "'configs': {'site': {'file': group['referenced_config']}}})); sys.exit(0)\n"
             "assert tail[:2] == ['config', '--hash']\n"
             "assert len(tail) == 3\n"
@@ -251,18 +260,29 @@ class OperationalSnapshotTests(unittest.TestCase):
             self.assertEqual(source_result.returncode, 0, source_result.stderr)
             self.assertEqual(source_result.stdout.strip(), str(deployed / "data"))
             rendered = {"services": {
-                "api": {"volumes": [{"type": "bind", "source": str(deployed / "data" / "generated"), "target": "/app/data/generated"}]},
-                "worker": {"volumes": [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json"}]},
+                "api": {"volumes": [{"type": "bind", "source": str(deployed / "data" / "generated"), "target": "/app/data/generated", "bind": {"create_host_path": False}}]},
+                "worker": {"volumes": [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json", "bind": {"create_host_path": False}}]},
             }}
             config = folder / "rendered.json"
             config.write_text(json.dumps(rendered))
             matched = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
             self.assertEqual(matched.returncode, 0, matched.stderr)
             self.assertEqual(matched.stdout.strip(), "data_mounts_match=true")
+            del rendered["services"]["api"]["volumes"][0]["bind"]["create_host_path"]
+            config.write_text(json.dumps(rendered))
+            absent = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
+            self.assertNotEqual(absent.returncode, 0)
+            self.assertIn("create_host_path", absent.stderr)
+            rendered["services"]["api"]["volumes"][0]["bind"]["create_host_path"] = True
+            config.write_text(json.dumps(rendered))
+            enabled = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
+            self.assertNotEqual(enabled.returncode, 0)
+            self.assertIn("create_host_path", enabled.stderr)
+            rendered["services"]["api"]["volumes"][0]["bind"]["create_host_path"] = False
             rendered["services"]["worker"]["volumes"] = []
             config.write_text(json.dumps(rendered))
             self.assertNotEqual(run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config).returncode, 0)
-            rendered["services"]["worker"]["volumes"] = [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json"}]
+            rendered["services"]["worker"]["volumes"] = [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json", "bind": {"create_host_path": False}}]
             rendered["services"]["api"]["volumes"][0]["source"] = str(folder / "wrong")
             config.write_text(json.dumps(rendered))
             mismatch = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
@@ -415,6 +435,50 @@ class OperationalSnapshotTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("owner label mismatch", result.stderr)
+
+    def test_capture_refuses_unsupported_compose_before_writing_snapshot(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder)
+            snapshot = folder / "snapshot"
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--output", snapshot, "--inspect-fixture", fixture,
+                env=self.fake_docker(folder, fixture, compose_version="v2.40.3"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Docker Compose", result.stderr)
+            self.assertIn("required", result.stderr)
+            self.assertFalse(snapshot.exists())
+
+    def test_capture_refuses_missing_env_file_record_before_writing_snapshot(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder)
+            snapshot = folder / "snapshot"
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--output", snapshot, "--inspect-fixture", fixture,
+                env=self.fake_docker(folder, fixture, missing_env_file_service="api"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("env_file", result.stderr)
+            self.assertIn("api", result.stderr)
+            self.assertFalse(snapshot.exists())
+
+    def test_capture_refuses_missing_deployed_service_in_compose_config(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder)
+            snapshot = folder / "snapshot"
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--output", snapshot, "--inspect-fixture", fixture,
+                env=self.fake_docker(folder, fixture, missing_config_service="api"),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing deployed services: api", result.stderr)
+            self.assertFalse(snapshot.exists())
 
     def test_two_groups_refuse_missing_service(self) -> None:
         with self.tempdir() as raw:

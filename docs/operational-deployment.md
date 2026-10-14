@@ -211,7 +211,8 @@ APP_BASE='http://127.0.0.1:<api-port>'
 WORKER_BASE='http://127.0.0.1:<worker-port>'
 ```
 
-Before step 1, check the required host tools. Compose must be v2.24 or later.
+Before step 1, check the required host tools. Compose must be v5.0.0 or later
+so the rollback snapshot can read service `env_file` paths from `config --no-env-resolution`.
 This preflight reads no private configuration and stops before changing the stack.
 
 ```sh
@@ -224,9 +225,9 @@ This preflight reads no private configuration and stops before changing the stac
   python3 - "${COMPOSE_VERSION}" <<'PY'
 import re
 import sys
-match = re.fullmatch(r'v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?', sys.argv[1])
-if match is None or tuple(map(int, match.groups())) < (2, 24):
-    raise SystemExit('Docker Compose v2.24 or later is required')
+match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', sys.argv[1])
+if match is None or tuple(map(int, match.groups())) < (5, 0, 0):
+    raise SystemExit('Docker Compose v5.0.0 or later is required for rollback snapshots')
 PY
   echo host_tools_ok
 )

@@ -41,6 +41,16 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v4.3.0
+      - name: Install verified Docker Compose v5.5.1
+        run: |
+          compose_binary="$RUNNER_TEMP/docker-compose-linux-x86_64"
+          timeout 60s curl --fail --silent --show-error --location --max-time 55 \
+            https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64 \
+            --output "$compose_binary"
+          printf '%s  %s\n' 'db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576' "$compose_binary" | sha256sum --check --status
+          install -d "$HOME/.docker/cli-plugins"
+          install -m 0755 "$compose_binary" "$HOME/.docker/cli-plugins/docker-compose"
+          test "$(timeout 10s docker compose version --short)" = '5.5.1'
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - name: Compose file renders

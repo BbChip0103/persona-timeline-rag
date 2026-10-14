@@ -89,10 +89,23 @@ class DeploymentTests(unittest.TestCase):
         command = preflight.split("```sh", 1)[1].split("```", 1)[0]
         for required in ("command -v python3", "command -v docker", "docker compose version --short"):
             self.assertIn(required, command)
-        self.assertIn("(2, 24)", command)
+        self.assertIn("(5, 0, 0)", command)
         result = subprocess.run(["bash", "-n"], input=command, text=True,
                                 capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as folder:
+            fake_docker = Path(folder) / "docker"
+            fake_docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$FAKE_COMPOSE_VERSION\"\n")
+            fake_docker.chmod(0o755)
+            for version, accepted in (("v2.38.2", False), ("v5.0.0", True),
+                                      ("v5.5.1", True), ("5.5.1", True)):
+                env = {**os.environ, "PATH": f"{folder}:{os.environ['PATH']}",
+                       "FAKE_COMPOSE_VERSION": version}
+                check = subprocess.run(["bash", "-c", command], env=env, text=True,
+                                       capture_output=True, timeout=10)
+                self.assertEqual(check.returncode == 0, accepted, check.stderr)
+                if not accepted:
+                    self.assertIn("Docker Compose", check.stderr)
 
     def test_redeploy_migration_uses_pinned_container_and_valid_shell(self):
         runbook = (ROOT / "docs/operational-deployment.md").read_text()
