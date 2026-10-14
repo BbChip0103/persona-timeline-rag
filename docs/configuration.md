@@ -1,5 +1,31 @@
 # Configuration: the production profile and `ops:check-env`
 
+## Kubernetes split-service additions
+
+The current split Kubernetes deployment is described in [kubernetes.md](kubernetes.md).
+`PTR_NETWORK_MODE=cluster` is active only with `KUBERNETES_SERVICE_HOST` present;
+Compose keeps its loopback guards. The API uses
+`PTR_CLUSTER_DATABASE_URL_ALLOWLIST`, `PTR_CLUSTER_DATABASE_IDENTITIES`,
+`PTR_CLUSTER_REDIS_URL_ALLOWLIST` and `PTR_CLUSTER_HTTP_URL_ALLOWLIST` for the
+configured DB identity, Redis and worker service. The web uses
+`PTR_CLUSTER_API_NAMESPACE`, `PTR_CLUSTER_API_URL`,
+`PTR_CLUSTER_REDIS_URL_ALLOWLIST` and required `PTR_WEB_REDIS_URL` for its API
+proxy and shared login limiter. The worker uses `PTR_LLM_DATABASE_URL_ALLOWLIST`,
+`PTR_LLM_REDIS_URL_ALLOWLIST` and `PTR_LLM_BACKEND_URL_ALLOWLIST`.
+
+`PTR_API_HOST`, `PTR_WEB_HOST` and `PTR_LLM_HOST` select service bind addresses;
+the Helm chart sets pod-reachable addresses while Compose retains loopback
+defaults. In the gateway Secret, the operator key name is
+`PTR_OPENROUTER_API_KEY`; do not use the old `OPENROUTER_API_KEY` key name for
+the Kubernetes gateway. Cluster guard failures include
+`DATABASE_HOST_NOT_ALLOWED`, `REDIS_URL_NOT_ALLOWED`,
+`BACKEND_URL_NOT_ALLOWED`, `INVALID_CLUSTER_API_URL` and
+`cluster_service_required`. A submitted call with an uncertain receipt is
+classified `PROVIDER_REQUEST_UNRESOLVED` and must not be retried.
+
+The production variable table below describes the earlier single-host profile;
+the split Kubernetes roles above use additional variables.
+
 Production is one process per role (api, worker, dispatcher, web, and gateway when the chat provider is `gateway`) with
 **19 environment variables**. Every other knob is a constant; the scaling features measured in goal2 stay in the code
 behind `PTR_DEMO_SCALING=1` ([demo-mode.md](demo-mode.md)). Design:  (decisions D3–D9).

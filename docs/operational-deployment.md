@@ -5,6 +5,15 @@ private Linux deployment. The override does not provision or recreate the approv
 research database/queue. Validate their identities, durable storage, schema and
 role grants first. Runtime credentials must never be migration-owner credentials.
 
+For Kubernetes installation and operations, use [kubernetes.md](kubernetes.md).
+The Compose path here remains independent. The K6 fixes to the API `pg.Pool`
+idle-error listener, worker drain, K4 pass-through validation and gateway key
+name `PTR_OPENROUTER_API_KEY` (defined in the private gateway env file) need an operational Compose redeploy before that
+deployment benefits from them; obtain user approval for that redeploy. Apply
+`supabase/split/0005_generated_artifacts.sql` before the API, and roll out the
+API reader before workers that emit the new receipt wire schema. Check durable
+ACKs and readiness after each role rollout.
+
 ## Configuration and supervision
 
 Select a new owned Compose project/nonce, immutable verified backend and worker

@@ -21,6 +21,11 @@
 
 Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker → LiteLLM/model serving**이 기본 경로입니다. Nest는 접수 outbox·DB fencing·최종 atomic commit/SSE를, Python은 LLM 처리·큰 호출 receipt·유료 장부·inline Guardrails/Jev·native Langfuse v4 평가/검수를 맡습니다. 코드/의존성/이미지/CI·app/llm DB 계정과 private env를 분리했습니다. [현재 분리 실행·자료이전 계약](docs/python-llm-split.md)과 [Python CLI](apps/llm-service/README.md)를 먼저 따르세요. [TS 프레임워크 실행](docs/framework-runtime.md)·[이전 배포](docs/framework-deployment.md)·[이전 평가](docs/framework-evaluation.md)는 명시적 legacy 재현 기록입니다. 아래 기존 목표1 결과는 당시의 연구 기록이며 새 구성의 실모델 품질·성능 증거가 아닙니다.
 
+## Kubernetes
+
+The synthetic kind deployment, production template requirements, operations and
+known acceptance limits are documented in [Kubernetes deployment](docs/kubernetes.md).
+
 ## 실행
 
 새 채팅/DB 구성은 [Python 분리 실행 계약](docs/python-llm-split.md)을 따른다. Python 검증은 `pnpm llm:check`와 기존 ingestion `make check`이며, 실제 DB/Redis·메모리/부하는 별도 opt-in proof다. [기존 서비스 runbook](docs/runbook.md)은 이전 버전 재현 기록이다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.

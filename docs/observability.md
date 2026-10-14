@@ -1,5 +1,14 @@
 # Observability: `/metrics/prom`, JSON logs, `reply.serving` and `ops:status`
 
+For the current Kubernetes split path, see [kubernetes.md](kubernetes.md).
+Its ServiceMonitors scrape API `/metrics/prom`, LiteLLM `/metrics`, EPP
+`/metrics` and vLLM `/metrics`; the split worker has no metrics listener.
+Watch durable ACK/outbox age, queue delay, KEDA fallback, EPP drop reasons and
+flow-control failures, engine readiness/restarts, spillover rate and unknown
+paid receipts. `PROVIDER_REQUEST_UNRESOLVED` means submission or cost is
+uncertain: retain the receipt and do not resubmit. The Compose metrics below
+describe the historical single-host stack.
+
 > Historical pre-framework procedure. For current serving, use [framework runtime](framework-runtime.md). Old gateway/dispatcher/local review-sheet commands below are not the default migration path.
 
 
