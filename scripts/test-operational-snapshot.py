@@ -52,15 +52,7 @@ def inspect_row(service: str, project: str, owner: str, root: Path) -> dict[str,
         "Image": f"sha256:{digest}",
         "State": {"Running": True},
         "Config": {"Image": f"example/{service}:deployed", "Labels": labels},
-        "Mounts": [
-            {"Type": "bind", "Source": str(root / "mounted-code"), "Destination": "/app/ptr_routing.py"},
-            {
-                "Type": "bind",
-                "Source": str(root / "private" / f"{service}.env"),
-                "Destination": "/app/published-personas.private.json",
-            },
-            {"Type": "volume", "Source": str(root.parent / "docker-volume-should-not-be-copied")},
-        ],
+        "Mounts": [],
     }
 
 
@@ -77,10 +69,6 @@ class OperationalSnapshotTests(unittest.TestCase):
         (deployed / "private" / "compose-referenced.env").write_text("REFERENCED_SECRET=hidden\n")
         (deployed / "infra" / "split" / "referenced.yaml").write_text("synthetic: true\n")
         (deployed / "mounted-code" / "gateway").mkdir(parents=True)
-        (deployed / "mounted-code" / "empty").mkdir()
-        (deployed / "mounted-code" / "empty").chmod(0o755)
-        (folder / "docker-volume-should-not-be-copied").mkdir()
-        (folder / "docker-volume-should-not-be-copied" / "volume.txt").write_text("skip me\n")
         (deployed / "infra" / "compose.app.yml").write_text("services: {}\n", encoding="utf-8")
         (deployed / "infra" / "split" / "compose.operational.yml").write_text(
             "services: {}\n", encoding="utf-8"
@@ -89,7 +77,6 @@ class OperationalSnapshotTests(unittest.TestCase):
         (deployed / "mounted-code" / "gateway" / "router.py").write_text(
             "ROUTER = 'synthetic-private'\n", encoding="utf-8"
         )
-        (deployed / "mounted-code" / "gateway" / "router-link.py").symlink_to("router.py")
         (deployed / "data" / "generated").mkdir(parents=True)
         (deployed / "data" / "generated" / "draft.json").write_text('{"draft":true}\n')
         for service in SERVICES:
@@ -107,6 +94,19 @@ class OperationalSnapshotTests(unittest.TestCase):
                 "Destination": "/app/data/generated",
             }
         )
+        rows[2]["Mounts"].append({"Type": "bind", "Source": str(deployed / "private" / "worker.env"),
+                                    "Destination": "/app/published-personas.private.json"})
+        gateway = rows[3]["Mounts"]
+        gateway.append({"Type": "bind", "Source": str(deployed / "private" / "model-gateway.env"),
+                        "Destination": "/app/ptr-config.yaml"})
+        for name, target in (("router.py", "/app/ptr_routing.py"),
+                             ("state.py", "/app/routing_state.py"),
+                             ("telemetry.py", "/app/routing_telemetry.py"),
+                             ("budget.py", "/app/persona_timeline_rag/gateway_budget.py")):
+            source = deployed / "mounted-code" / "gateway" / name
+            if not source.exists():
+                source.write_text("SYNTHETIC = True\n")
+            gateway.append({"Type": "bind", "Source": str(source), "Destination": target})
         fixture.write_text(
             json.dumps(rows),
             encoding="utf-8",
@@ -197,7 +197,6 @@ class OperationalSnapshotTests(unittest.TestCase):
             if service in ("worker", "model-gateway"):
                 other = inspect_row(service, "ptr-op", "owner-nonce", second)
                 row["Config"]["Labels"] = other["Config"]["Labels"]
-                row["Mounts"] = other["Mounts"]
             row["Config"]["Labels"]["com.docker.compose.project.environment_file"] = str(
                 shared_env
             )
@@ -208,6 +207,17 @@ class OperationalSnapshotTests(unittest.TestCase):
         with self.tempdir() as raw:
             folder = Path(raw)
             deployed, fixture = self.write_fixture(folder)
+            live = {row["Config"]["Labels"]["com.docker.compose.service"]:
+                    {mount["Destination"] for mount in row["Mounts"]}
+                    for row in json.loads(fixture.read_text())}
+            self.assertEqual(live["api"], {"/app/data/generated"})
+            self.assertEqual(live["worker"], {"/app/published-personas.private.json"})
+            self.assertEqual(live["model-gateway"], {
+                "/app/ptr-config.yaml", "/app/ptr_routing.py", "/app/routing_state.py",
+                "/app/routing_telemetry.py", "/app/persona_timeline_rag/gateway_budget.py",
+            })
+            self.assertTrue(all(not live[service] for service in
+                                ("web", "model-gateway-db", "model-gateway-redis")))
             snapshot = folder / "snapshot"
             result = run(
                 "capture",
@@ -230,6 +240,41 @@ class OperationalSnapshotTests(unittest.TestCase):
             self.assertEqual({row["service"] for row in manifest["services"]}, set(SERVICES))
             self.assertTrue(all(len(row["config_hash"]) == 64 for row in manifest["services"]))
             self.assertNotIn("extra_paths", manifest)
+            self.assertEqual(
+                {(row["service"], row["target"], row["source"]) for row in manifest["data_mounts"]},
+                {
+                    ("api", "/app/data/generated", str(deployed / "data" / "generated")),
+                    ("worker", "/app/published-personas.private.json", str(deployed / "private" / "worker.env")),
+                },
+            )
+            source_result = run("data-dir", "--snapshot", snapshot)
+            self.assertEqual(source_result.returncode, 0, source_result.stderr)
+            self.assertEqual(source_result.stdout.strip(), str(deployed / "data"))
+            rendered = {"services": {
+                "api": {"volumes": [{"type": "bind", "source": str(deployed / "data" / "generated"), "target": "/app/data/generated"}]},
+                "worker": {"volumes": [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json"}]},
+            }}
+            config = folder / "rendered.json"
+            config.write_text(json.dumps(rendered))
+            matched = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
+            self.assertEqual(matched.returncode, 0, matched.stderr)
+            self.assertEqual(matched.stdout.strip(), "data_mounts_match=true")
+            rendered["services"]["worker"]["volumes"] = []
+            config.write_text(json.dumps(rendered))
+            self.assertNotEqual(run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config).returncode, 0)
+            rendered["services"]["worker"]["volumes"] = [{"type": "bind", "source": str(deployed / "private" / "worker.env"), "target": "/app/published-personas.private.json"}]
+            rendered["services"]["api"]["volumes"][0]["source"] = str(folder / "wrong")
+            config.write_text(json.dumps(rendered))
+            mismatch = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
+            self.assertNotEqual(mismatch.returncode, 0)
+            rendered["services"]["api"]["volumes"][0]["source"] = str(deployed / "data" / "generated")
+            rendered["services"]["worker"]["volumes"].append({"type": "bind", "source": str(deployed / "data"), "target": "/app/data"})
+            config.write_text(json.dumps(rendered))
+            unexpected = run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config)
+            self.assertNotEqual(unexpected.returncode, 0)
+            rendered["services"]["worker"]["volumes"][-1] = {"type": "volume", "source": "unexpected", "target": "/app/data"}
+            config.write_text(json.dumps(rendered))
+            self.assertNotEqual(run("check-data-mounts", "--snapshot", snapshot, "--rendered-config", config).returncode, 0)
             self.assertEqual(len(manifest["compose_config_files"]), 3)
             self.assertEqual(manifest["compose_env_file"], str(deployed / "private" / "op.env"))
             self.assertEqual(len(manifest["compose_groups"]), 1)
@@ -249,22 +294,8 @@ class OperationalSnapshotTests(unittest.TestCase):
             self.assertIn("ptr-rollback/ptr-op-api:", rollback_images)
             self.assertNotIn('image: "sha256:', rollback_images)
             self.assertTrue(any("@sha256:" in row["config_image"] for row in manifest["services"]))
-            self.assertFalse(
-                (
-                    snapshot
-                    / "root"
-                    / str(folder / "docker-volume-should-not-be-copied").lstrip("/")
-                ).exists()
-            )
             self.assertTrue(
-                (snapshot / "root" / str(deployed / "mounted-code" / "empty").lstrip("/")).is_dir()
-            )
-            self.assertTrue(
-                (
-                    snapshot
-                    / "root"
-                    / str(deployed / "mounted-code" / "gateway" / "router-link.py").lstrip("/")
-                ).is_symlink()
+                (snapshot / "root" / str(deployed / "mounted-code" / "gateway" / "router.py").lstrip("/")).is_file()
             )
             self.assertTrue(
                 all((snapshot / row["snapshot"]).is_file() for row in manifest["files"])
@@ -281,8 +312,6 @@ class OperationalSnapshotTests(unittest.TestCase):
             target.write_text("BROKEN = True\n", encoding="utf-8")
             (deployed / "data" / "generated" / "draft.json").write_text('{"draft":"new"}\n')
             (deployed / "infra" / "split" / "site.yml").unlink()
-            (deployed / "mounted-code" / "empty").rmdir()
-            (deployed / "mounted-code" / "gateway" / "router-link.py").unlink()
             parent_mode = os.stat(target.parent).st_mode & 0o777
             copied_tool = snapshot / "tools" / "operational-snapshot.py"
             dry = subprocess.run(
@@ -323,11 +352,6 @@ class OperationalSnapshotTests(unittest.TestCase):
                 (deployed / "data" / "generated" / "draft.json").read_text(),
                 '{"draft":"new"}\n',
             )
-            self.assertTrue((deployed / "mounted-code" / "empty").is_dir())
-            self.assertEqual(os.stat(deployed / "mounted-code" / "empty").st_mode & 0o777, 0o755)
-            self.assertEqual(
-                os.readlink(deployed / "mounted-code" / "gateway" / "router-link.py"), "router.py"
-            )
             self.assertEqual(os.stat(target.parent).st_mode & 0o777, parent_mode)
 
     def test_capture_excludes_build_trees_and_unreferenced_working_files(self) -> None:
@@ -338,9 +362,6 @@ class OperationalSnapshotTests(unittest.TestCase):
                 path = deployed / name
                 path.mkdir()
                 (path / "esbuild").write_text("generated")
-                mounted = deployed / "mounted-code" / name
-                mounted.mkdir()
-                (mounted / "esbuild").write_text("generated")
             (deployed / "unreferenced.txt").write_text("skip")
             snapshot = folder / "snapshot"
             result = run("capture", "--project", "ptr-op", "--owner", "owner-nonce",

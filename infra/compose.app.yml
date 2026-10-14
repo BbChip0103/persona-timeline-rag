@@ -32,8 +32,9 @@ x-role: &role
 # silently creating root-owned storage.
 x-data: &data
   - type: bind
-    source: ../data/generated
+    source: ${PTR_OPERATIONAL_DATA_DIR:-../data}/generated
     target: /app/data/generated
+    read_only: true
     bind:
       create_host_path: false
 
@@ -70,7 +71,7 @@ services:
         max-file: "5"
     volumes:
       - type: bind
-        source: ../data
+        source: ${PTR_OPERATIONAL_DATA_DIR:-../data}
         target: /app/data
         read_only: true
         bind:

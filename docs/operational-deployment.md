@@ -22,6 +22,8 @@ Reuse the existing owned Compose project name and owner nonce, immutable verifie
 backend and worker image IDs, separate private environment files and loopback ports in a `0600`
 operator Compose environment. Keep its directory `0700`. Do not print resolved
 Compose configuration: it can contain secrets. Validate with `config -q`.
+Set `PTR_OPERATIONAL_DATA_DIR` to the parent of the live API `generated` bind
+source recorded in the rollback snapshot. Keep the research data in place.
 In the worker-only env file set `PTR_LLM_PROVIDER=local`,
 `PTR_LLM_LOCAL_BASE_URL=http://127.0.0.1:<vLLM tunnel port>/v1`,
 `PTR_LLM_LOCAL_MODEL=<served model ID>`, `PTR_LLM_LOCAL_API_KEY=<vLLM key>` and
@@ -258,7 +260,8 @@ PY
    stack to the repository checkout.
 
    The snapshot helper reads Docker labels, bind mount paths, image references
-   and running state. It uses
+   and running state. Use a new private snapshot path: older manifests lack the
+   API and worker bind source records required in step 3. The helper uses
    each service's labeled working directory, Compose file paths and
    `com.docker.compose.project.environment_file` to group services. From each
    group's working directory, it runs
@@ -279,8 +282,9 @@ PY
    `dist` or `build` directories. These sources go into
    `${SNAPSHOT}/root/<absolute-path-without-leading-slash>` with `0700`
    directories and `0600` files, writes a private
-   manifest, copies the restore helper into the snapshot, records each saved
-   image ID with its container `Config.Image` reference, and saves the
+   manifest, including the data bind source paths (which are not copied),
+   copies the restore helper into the snapshot, records each saved image ID
+   with its container `Config.Image` reference, and saves the
    current images by immutable image ID. It also writes
    `rollback-images.yml` with dedicated snapshot tags; rollback tags each saved
    image ID with those tags before Compose starts. This also supports images
@@ -340,7 +344,10 @@ PY
    `PTR_LLM_SAFETY_FILTER=off`. In `NEW_BACKEND_ENV`, fill `PTR_MODEL`
    with that same served model ID; `PTR_CHAT_PROVIDER=local` is set. In
    `NEW_OP_ENV`, fill the two new immutable image IDs and the exact three new
-   role-env paths. Preserve `PTR_OPERATIONAL_PROJECT`, `PTR_OPERATIONAL_OWNER`
+   role-env paths. Set `PTR_OPERATIONAL_DATA_DIR` to the parent of the API's
+   live `/app/data/generated` bind source from the snapshot manifest using
+   the `data-dir` command below. Do not copy or move `research/` or `generated/`.
+   Preserve `PTR_OPERATIONAL_PROJECT`, `PTR_OPERATIONAL_OWNER`
    and `PTR_OPERATIONAL_PUBLISHED_PERSONAS_FILE` from the snapshot; verify the
    first two still match `PROJECT` and `OWNER_NONCE`. If any required old env
    file is absent under `${SNAPSHOT}/root`, stop: the snapshot is incomplete.
@@ -361,17 +368,36 @@ PY
      test ! -e "${NEW_WEB_ENV}"
      install -m 0600 "${SNAPSHOT_WEB_ENV}" "${NEW_WEB_ENV}"
      python3 scripts/operational-env-migrate.py prepare compose "${SNAPSHOT_OP_ENV}" "${NEW_OP_ENV}"
+     timeout 10 python3 scripts/operational-snapshot.py data-dir --snapshot "${SNAPSHOT}"
    )
+   ```
+
+   Set `PTR_OPERATIONAL_DATA_DIR` in `NEW_OP_ENV` to the path printed by
+   `data-dir`; the path itself is the only value this command prints. Then
+   check the files and rendered bind sources:
+
+   ```sh
    ${EDITOR:?select a private editor} "${NEW_WORKER_ENV}" "${NEW_BACKEND_ENV}" "${NEW_OP_ENV}"
    python3 scripts/operational-env-migrate.py check worker "${NEW_WORKER_ENV}"
    python3 scripts/operational-env-migrate.py check backend "${NEW_BACKEND_ENV}"
    python3 scripts/operational-env-migrate.py check compose "${NEW_OP_ENV}"
-   docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
+   timeout 15 docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
      -f infra/compose.app.yml -f "${NEW_COMPOSE}" config -q
+   (
+     set -euo pipefail
+     timeout 15 docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
+       -f infra/compose.app.yml -f "${NEW_COMPOSE}" \
+       config --format json --no-env-resolution \
+       | timeout 15 python3 scripts/operational-snapshot.py check-data-mounts \
+           --snapshot "${SNAPSHOT}" --rendered-config -
+   )
    ```
 
    Check that the `NEW_OP_ENV` path entries point to these new private files.
-   `config -q` must pass without printing expanded configuration. Do not proceed
+   `config -q` and `data_mounts_match=true` must pass without printing expanded
+   configuration. The comparison checks each API and worker bind by service,
+   target and source against the live snapshot: API `generated` and worker
+   published-personas only. Extra binds also fail. Do not proceed
    with blank fields, old image IDs or a mismatched project/owner.
 
 4. Apply `split/0005` with the documented owner role first, then verify it. The

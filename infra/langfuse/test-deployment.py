@@ -17,6 +17,49 @@ APP_COMPOSE = ROOT / "infra/compose.app.yml"
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_redeploy_data_preflight_uses_snapshot_sources(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        step = runbook.split("3. Prepare the new private configuration", 1)[1].split(
+            "4. Apply `split/0005`", 1
+        )[0]
+        self.assertIn("data-dir --snapshot", step)
+        self.assertIn("check-data-mounts", step)
+        self.assertIn("config -q", step)
+        for command in step.split("```sh")[1:]:
+            shell = command.split("```", 1)[0]
+            result = subprocess.run(
+                ["bash", "-n"], input=shell, text=True, capture_output=True, timeout=10
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_app_data_bind_sources_render_with_default_and_override(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            role_env = root / "role.env"
+            role_env.write_text("SYNTHETIC_ONLY=1\n")
+            custom = root / "private-data"
+            for data_dir in (None, custom):
+                env = {
+                    "PATH": os.environ["PATH"],
+                    "PTR_FRAMEWORK_APP_ENV_FILE": str(role_env),
+                    "PTR_LLM_SERVICE_ENV_FILE": str(role_env),
+                }
+                if data_dir is not None:
+                    env["PTR_OPERATIONAL_DATA_DIR"] = str(data_dir)
+                result = subprocess.run(
+                    ["docker", "compose", "-f", str(APP_COMPOSE), "config", "--format", "json",
+                     "--no-env-resolution"], capture_output=True, text=True, check=True,
+                    env=env, timeout=10,
+                )
+                services = json.loads(result.stdout)["services"]
+                expected = data_dir or ROOT / "data"
+                self.assertEqual(services["api"]["volumes"][0]["source"], str(expected / "generated"))
+                self.assertEqual(services["worker"]["volumes"][0]["source"], str(expected))
+                self.assertFalse(services["api"]["volumes"][0]["bind"]["create_host_path"])
+                self.assertTrue(services["api"]["volumes"][0]["read_only"])
+                self.assertFalse(services["worker"]["volumes"][0]["bind"]["create_host_path"])
+                self.assertTrue(services["worker"]["volumes"][0]["read_only"])
+
     def test_compose_config_exposes_referenced_paths_without_env_values(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -122,6 +165,29 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(services["worker"]["environment"]["PTR_LLM_PROVIDER"], "local")
             self.assertEqual(services["worker"]["environment"]["PTR_LLM_SPILLOVER"], "off")
             self.assertEqual(services["worker"]["environment"]["PTR_LLM_LOCAL_MODEL"], "synthetic-vllm")
+            self.assertEqual(
+                [(mount["target"], mount["source"]) for mount in services["worker"]["volumes"]],
+                [("/app/published-personas.private.json", str(published))],
+            )
+            self.assertTrue(services["api"]["volumes"][0]["read_only"])
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "manifest.json").write_text(json.dumps({"data_mounts": [
+                {"service": "api", "target": "/app/data/generated", "source": str(ROOT / "data" / "generated")},
+                {"service": "worker", "target": "/app/published-personas.private.json", "source": str(published)},
+            ]}))
+            helper = ROOT / "scripts/operational-snapshot.py"
+            def matches(config: dict) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, str(helper), "check-data-mounts", "--snapshot", str(snapshot),
+                     "--rendered-config", "-"], input=json.dumps(config), text=True,
+                    capture_output=True, timeout=10,
+                )
+            self.assertEqual(matches({"services": services}).stdout.strip(), "data_mounts_match=true")
+            services["worker"]["volumes"].append({
+                "type": "bind", "target": "/app/data", "source": str(ROOT / "data"),
+            })
+            self.assertNotEqual(matches({"services": services}).returncode, 0)
             self.assertNotIn("PTR_LITELLM_BILLABLE", services["api"]["environment"])
             for name, service in services.items():
                 self.assertNotIn("PTR_OPENROUTER_API_KEY", service.get("environment", {}), name)

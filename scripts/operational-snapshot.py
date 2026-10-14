@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -425,6 +426,81 @@ def mount_sources(row: dict[str, Any]) -> list[Path]:
     return paths
 
 
+def data_mounts(services: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    mounts: list[dict[str, str]] = []
+    for service, row in sorted(services.items()):
+        if service not in {"api", "worker"}:
+            continue
+        for mount in row.get("Mounts", []):
+            if not isinstance(mount, dict) or mount.get("Type") != "bind":
+                continue
+            target = mount.get("Destination")
+            source = mount.get("Source")
+            if not isinstance(source, str) or not Path(source).is_absolute():
+                fail("operational bind source must be absolute")
+            mounts.append({"service": service, "target": target, "source": source})
+    return mounts
+
+
+def snapshot_data_mounts(snapshot: Path) -> list[dict[str, str]]:
+    manifest = read_json(snapshot / "manifest.json")
+    mounts = manifest.get("data_mounts") if isinstance(manifest, dict) else None
+    if not isinstance(mounts, list) or not mounts:
+        fail("snapshot has no recorded data mounts")
+    if any(
+        not isinstance(row, dict)
+        or not all(isinstance(row.get(key), str) for key in ("service", "target", "source"))
+        or row["service"] not in {"api", "worker"}
+        or not row["target"].startswith("/app/")
+        or not Path(row["source"]).is_absolute()
+        for row in mounts
+    ):
+        fail("invalid snapshot data mounts")
+    return mounts
+
+
+def data_dir(args: argparse.Namespace) -> int:
+    mounts = snapshot_data_mounts(args.snapshot)
+    generated = [row["source"] for row in mounts
+                 if row["service"] == "api" and row["target"] == "/app/data/generated"]
+    if len(generated) != 1 or Path(generated[0]).name != "generated":
+        fail("snapshot must have one API /app/data/generated bind source")
+    print(Path(generated[0]).parent)
+    return 0
+
+
+def check_data_mounts(args: argparse.Namespace) -> int:
+    expected = snapshot_data_mounts(args.snapshot)
+    rendered = (
+        json.load(sys.stdin)
+        if args.rendered_config == Path("-")
+        else read_json(args.rendered_config)
+    )
+    services = rendered.get("services") if isinstance(rendered, dict) else None
+    if not isinstance(services, dict):
+        fail("rendered Compose config missing services")
+    actual: list[tuple[str, str, str]] = []
+    for service, config in services.items():
+        if not isinstance(config, dict):
+            continue
+        volumes = config.get("volumes", [])
+        if not isinstance(volumes, list):
+            fail("rendered Compose volumes must be a list")
+        for mount in volumes:
+            if service not in {"api", "worker"}:
+                continue
+            if not isinstance(mount, dict) or mount.get("type") != "bind":
+                fail("unexpected API or worker mount type")
+            if not isinstance(mount.get("source"), str) or not isinstance(mount.get("target"), str):
+                fail("rendered operational bind source or target missing")
+            actual.append((service, mount["target"], mount["source"]))
+    expected_sources = [(row["service"], row["target"], row["source"]) for row in expected]
+    if sorted(actual) != sorted(expected_sources):
+        fail("rendered data bind sources differ from snapshot")
+    print("data_mounts_match=true")
+    return 0
+
+
 def assert_output_outside_sources(output: Path, sources: Iterable[Path]) -> None:
     resolved_output = output.resolve()
     for source in sources:
@@ -616,6 +692,7 @@ def capture(args: argparse.Namespace) -> int:
         "owner": args.owner,
         "expected_services": sorted(EXPECTED_SERVICES),
         "services": service_rows,
+        "data_mounts": data_mounts(services),
         "working_dirs": [str(path) for path in working_dirs],
         "compose_config_files": [str(path) for path in config_files],
         "compose_groups": [
@@ -769,6 +846,13 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--output", required=True, type=Path)
     capture_parser.add_argument("--inspect-fixture", type=Path)
     capture_parser.set_defaults(func=capture)
+    data_parser = sub.add_parser("data-dir")
+    data_parser.add_argument("--snapshot", required=True, type=Path)
+    data_parser.set_defaults(func=data_dir)
+    check_data_parser = sub.add_parser("check-data-mounts")
+    check_data_parser.add_argument("--snapshot", required=True, type=Path)
+    check_data_parser.add_argument("--rendered-config", required=True, type=Path)
+    check_data_parser.set_defaults(func=check_data_mounts)
     restore_parser = sub.add_parser("restore")
     restore_parser.add_argument("--snapshot", required=True, type=Path)
     restore_parser.add_argument("--dry-run", action="store_true")

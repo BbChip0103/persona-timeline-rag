@@ -16,6 +16,7 @@ def run(*args: Path | str) -> subprocess.CompletedProcess[str]:
         text=True,
         capture_output=True,
         check=False,
+        timeout=10,
     )
 
 
@@ -99,6 +100,11 @@ class OperationalEnvMigrationTests(unittest.TestCase):
             self.assertEqual(run("prepare", "compose", source, target).returncode, 0)
             self.assertNotIn("PTR_OPERATIONAL_GATEWAY_PORT=", target.read_text())
             self.assertNotIn("synthetic-secret", target.read_text())
+            self.assertIn("PTR_OPERATIONAL_DATA_DIR=\n", target.read_text())
+            data = root / "data"
+            data.mkdir(mode=0o700)
+            (data / "research").mkdir()
+            (data / "generated").mkdir()
             with target.open("a") as file:
                 file.write("# filled by operator in practice\n")
             content = target.read_text()
@@ -111,9 +117,20 @@ class OperationalEnvMigrationTests(unittest.TestCase):
             ):
                 content = content.replace(f"{key}=\n", f"{key}=synthetic-filled\n")
             target.write_text(content)
+            self.assertNotEqual(run("check", "compose", target).returncode, 0)
+            for bad in ("relative/data", str(root / "missing"), str(source)):
+                target.write_text(content.replace("PTR_OPERATIONAL_DATA_DIR=\n", f"PTR_OPERATIONAL_DATA_DIR={bad}\n"))
+                self.assertNotEqual(run("check", "compose", target).returncode, 0)
+            target.write_text(content.replace("PTR_OPERATIONAL_DATA_DIR=\n", f"PTR_OPERATIONAL_DATA_DIR={data}\n"))
             result = run("check", "compose", target)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("synthetic-filled", result.stdout + result.stderr)
+            data.chmod(0o755)
+            self.assertNotEqual(run("check", "compose", target).returncode, 0)
+            data.chmod(0o700)
+            (data / "generated").rmdir()
+            self.assertNotEqual(run("check", "compose", target).returncode, 0)
+            (data / "generated").mkdir()
             with target.open("a") as file:
                 file.write("OPENROUTER_API_KEY=synthetic-hidden\n")
             result = run("check", "compose", target)

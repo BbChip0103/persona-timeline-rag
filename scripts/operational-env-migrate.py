@@ -23,6 +23,7 @@ LOCAL_KEYS = {
 }
 BACKEND_KEYS = {"PTR_CHAT_PROVIDER": "local", "PTR_MODEL": ""}
 COMPOSE_KEYS = {
+    "PTR_OPERATIONAL_DATA_DIR": "",
     "PTR_OPERATIONAL_BACKEND_IMAGE": "",
     "PTR_OPERATIONAL_WORKER_IMAGE": "",
     "PTR_FRAMEWORK_APP_ENV_FILE": "",
@@ -121,6 +122,17 @@ def check(kind: str, path: Path) -> None:
             + "; wrong fixed value: "
             + ", ".join(wrong)
         )
+    if kind == "compose" and "PTR_OPERATIONAL_DATA_DIR" not in missing:
+        data = Path(values["PTR_OPERATIONAL_DATA_DIR"])
+        if not data.is_absolute():
+            raise ValueError("PTR_OPERATIONAL_DATA_DIR must be absolute")
+        details = data.lstat()
+        if not stat.S_ISDIR(details.st_mode):
+            raise ValueError("PTR_OPERATIONAL_DATA_DIR must be a directory")
+        if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o700:
+            raise ValueError("PTR_OPERATIONAL_DATA_DIR must be owned by the current user with mode 0700")
+        if not (data / "research").is_dir() or not (data / "generated").is_dir():
+            raise ValueError("PTR_OPERATIONAL_DATA_DIR requires research and generated directories")
     print("checked keys: " + ", ".join(sorted(REQUIRED[kind])))
 
 
