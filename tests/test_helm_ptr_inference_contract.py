@@ -758,7 +758,6 @@ class InferenceChartContractTest(unittest.TestCase):
                 self.assertEqual(wait["metadata"]["listLength"], "8")
                 self.assertEqual(active["metadata"]["listName"], "ptr:turns:active")
                 self.assertEqual(active["metadata"]["listLength"], str(concurrency))
-                engine_name = "ptr-sim" if profile == "kind" else "ptr-vllm"
                 self.assertEqual(engines["metadata"]["threshold"], "1")
                 self.assertEqual(scaling_up["metadata"]["threshold"], "1")
 

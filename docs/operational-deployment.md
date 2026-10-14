@@ -230,19 +230,28 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    project contains a different or missing owner label.
 
 2. Create the rollback set before changing anything. The snapshot helper reads
+   Set `SNAPSHOT` to persistent host storage. Never use `/tmp` or a path beneath
+   it: a reboot can remove the only rollback set. The live stack from the
+   2026-10-11 cutover has a group whose working directory and bind mounts are
+   under `/tmp`; a host reboot can wipe those sources. This redeploy moves the
+   stack to the repository checkout.
+
+   The snapshot helper reads
    Docker labels, bind mount paths, image references and running state. It uses
-   the labeled `com.docker.compose.project.environment_file` and Compose file
-   paths to run `docker compose config --hash '*'`, then compares every service
-   hash with its running container's `com.docker.compose.config-hash` label.
-   A mismatch or dirty labeled git checkout stops capture. The checkout HEAD
+   each service's labeled working directory, Compose file paths and
+   `com.docker.compose.project.environment_file` to group services. From each
+   group's working directory, it runs
+   `docker compose --env-file <group-env> -p <project> -f <group-file>... config --hash '<comma-separated-group-services>'`
+   and compares the exact service/hash set with those containers'
+   `com.docker.compose.config-hash` labels. A mismatch or dirty labeled git checkout
+   in any group stops capture. The checkout HEAD
    alone is not evidence of what was deployed. The helper also refuses a missing
    service, unexpected service, owner mismatch, or a snapshot directory inside a
    captured source tree. It skips Docker named volumes and allowlisted data bind
    mounts, including `/app/data/generated`, which remain in place. Unknown bind
    mount targets stop capture until classified in the helper. It copies allowlisted
-   config/code bind mounts, every file from the
-   `com.docker.compose.project.config_files` label, and the labeled
-   `com.docker.compose.project.working_dir` tree except `data/` into
+   config/code bind mounts, every group's labeled Compose files and env file,
+   and every labeled working directory tree except `data/` into
    `${SNAPSHOT}/root/<absolute-path-without-leading-slash>` with `0700`
    directories and `0600` files, writes a private
    manifest, copies the restore helper into the snapshot, records each saved
@@ -257,6 +266,13 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    (
      set -euo pipefail
      umask 077
+     python3 - "${SNAPSHOT}" <<'PY'
+   import sys
+   from pathlib import Path
+   path = Path(sys.argv[1]).resolve()
+   if path == Path('/tmp') or Path('/tmp') in path.parents:
+       raise SystemExit('SNAPSHOT must be on persistent storage outside /tmp')
+   PY
      python3 scripts/operational-snapshot.py capture \
        --project "${PROJECT}" \
        --owner "${OWNER_NONCE}" \
@@ -281,8 +297,10 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
    The rollback source paths are now the manifest, not the current checkout. The
    explicit extra paths capture the private Compose and role env files, which
    Docker does not necessarily expose as bind mounts. Each input path must be
-   absolute. The helper restores these paths from the same manifest.
-   The manifest records the labeled Compose env file separately from extra paths.
+   absolute. The helper restores these paths from the same manifest. The
+   `compose_groups` entries record each group's services, working directory,
+   Compose files, labeled env file and git state (`none` or `clean@<rev>`)
+   separately from extra paths. The capture summary prints rollback order.
    Restore only the snapshot's config/code sources; data mounts stay untouched.
 
    The research DB, ledger, receipts and queue are not snapshotted or reset.
@@ -424,12 +442,13 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
 
 8. Roll back from the snapshot alone. Load the saved images, restore captured
    config/code bind-mounted sources, private env/config files, Compose files and working
-   directory paths to their original absolute locations with the helper copied
-   into the snapshot, then bring the old stack back under the same project name.
+   directory paths for every group to their original absolute locations with the
+   helper copied into the snapshot, then bring each group's services back under
+   the one saved project name.
    Compose reads the restored files at their original paths so its relative bind
    mounts resolve to the same host paths as before cutover. This step needs only
-   the private `SNAPSHOT` path; it reads the old project and Compose env path
-   from the manifest, not the current checkout.
+   the private `SNAPSHOT` path; it reads every group's working directory, files,
+   env path and service list from the manifest, not the current checkout.
    The old gateway named volumes still exist because step 7 did not remove them.
    Ledger, receipts and queue are not reset.
 
@@ -443,24 +462,57 @@ WORKER_BASE='http://127.0.0.1:<worker-port>'
        --snapshot "${SNAPSHOT}" --dry-run >/dev/null
      python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
        --snapshot "${SNAPSHOT}" --apply >/dev/null
-     OLD_PROJECT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["project"])' "${SNAPSHOT}/manifest.json")"
-     OLD_OP_ENV="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["compose_env_file"])' "${SNAPSHOT}/manifest.json")"
-     OLD_WORKDIR="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert len(m["working_dirs"]) == 1; print(m["working_dirs"][0])' "${SNAPSHOT}/manifest.json")"
-     mapfile -d '' -t OLD_CONFIGS < <(python3 -c 'import json,os,sys; m=json.load(open(sys.argv[1])); [sys.stdout.buffer.write(os.fsencode(p)+b"\0") for p in m["compose_config_files"]]' "${SNAPSHOT}/manifest.json")
-     test "${#OLD_CONFIGS[@]}" -ge 2
-     OLD_FLAGS=()
-     for file in "${OLD_CONFIGS[@]}"; do
-       test -s "${file}"
-       OLD_FLAGS+=(-f "${file}")
-     done
-     OLD_FLAGS+=(-f "${SNAPSHOT}/rollback-images.yml")
-     docker compose --env-file "${OLD_OP_ENV}" -p "${OLD_PROJECT}" \
-       --project-directory "${OLD_WORKDIR}" "${OLD_FLAGS[@]}" config -q
-     docker compose --env-file "${OLD_OP_ENV}" -p "${OLD_PROJECT}" \
-       --project-directory "${OLD_WORKDIR}" "${OLD_FLAGS[@]}" \
-       up -d --no-build --remove-orphans
+     python3 - "${SNAPSHOT}" <<'PY'
+   import json
+   import subprocess
+   import sys
+   from pathlib import Path
+
+   snapshot = Path(sys.argv[1]).resolve()
+   manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+   project = manifest["project"]
+   groups = manifest["compose_groups"]
+   primary = {"api", "model-gateway-db", "model-gateway-redis"}
+   first = [group for group in groups if primary <= set(group["services"])]
+   assert len(first) == 1
+   groups = first + sorted(
+       (group for group in groups if group is not first[0]),
+       key=lambda group: (group["working_dir"], group["services"]),
+   )
+   override = snapshot / "rollback-images.yml"
+   assert override.is_file()
+   wait_flags = ["--wait"] if "--wait" in subprocess.run(
+       ["docker", "compose", "up", "--help"], check=True, text=True,
+       capture_output=True, timeout=30,
+   ).stdout else []
+   for group in groups:
+       workdir = Path(group["working_dir"])
+       env_file = Path(group["compose_env_file"])
+       files = [Path(path) for path in group["compose_config_files"]]
+       services = group["services"]
+       assert workdir.is_dir() and env_file.is_file() and files and services
+       assert all(path.is_file() for path in files)
+       command = [
+           "docker", "compose", "--env-file", str(env_file), "-p", project,
+           "--project-directory", str(workdir),
+       ]
+       for path in files:
+           command.extend(["-f", str(path)])
+       command.extend(["-f", str(override)])
+       subprocess.run([*command, "config", "-q"], cwd=workdir, check=True, timeout=120)
+       subprocess.run(
+           [*command, "up", "-d", *wait_flags, "--no-deps", "--no-build", *services],
+           cwd=workdir, check=True, timeout=300,
+       )
+   PY
    )
    ```
+
+   The group with `model-gateway-db`, `model-gateway-redis` and `api` starts first;
+   the other group follows. Compose waits for health where `--wait` is supported.
+   Each `up` uses the same `-p <project>`, that group's restored files and env
+   path, and the saved rollback image tags. `--no-deps` limits it to the group's
+   listed services; do not remove orphans while the other groups share that project.
 
 9. Only after the rollback window closes without a rollback, remove the old
    gateway named volumes by their exact names. Never use `down -v` here.

@@ -187,7 +187,8 @@ def parse_config_files(value: str | None, working_dir: Path | None) -> list[Path
     return paths
 
 
-def assert_clean_checkouts(working_dirs: Iterable[Path]) -> None:
+def checkout_states(working_dirs: Iterable[Path]) -> dict[Path, str]:
+    states: dict[Path, str] = {}
     for directory in working_dirs:
         try:
             root = subprocess.run(
@@ -198,6 +199,7 @@ def assert_clean_checkouts(working_dirs: Iterable[Path]) -> None:
                 timeout=10,
             ).stdout.strip()
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            states[directory] = "none"
             continue
         status = subprocess.run(
             ["git", "-C", root, "status", "--porcelain"],
@@ -211,15 +213,33 @@ def assert_clean_checkouts(working_dirs: Iterable[Path]) -> None:
                 "captured working directory has uncommitted changes; "
                 "check out the deployed revision and re-run"
             )
+        revision = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            check=True, text=True, capture_output=True, timeout=10,
+        ).stdout.strip()
+        states[directory] = f"clean@{revision}"
+    return states
+
+
+def rollback_groups(
+    groups: dict[tuple[Path, tuple[Path, ...], Path], list[str]],
+) -> list[tuple[tuple[Path, tuple[Path, ...], Path], list[str]]]:
+    primary = {"api", "model-gateway-db", "model-gateway-redis"}
+    ordered = sorted(groups.items(), key=lambda item: (str(item[0][0]), sorted(item[1])))
+    first = [item for item in ordered if primary <= set(item[1])]
+    if len(first) != 1:
+        fail("rollback requires api and gateway db/redis in one Compose group")
+    return first + [item for item in ordered if item is not first[0]]
 
 
 def compose_hashes(
-    project: str, env_file: Path, config_files: list[Path], working_dir: Path
+    project: str, env_file: Path, config_files: list[Path], working_dir: Path,
+    services: list[str],
 ) -> dict[str, str]:
     command = ["docker", "compose", "--env-file", str(env_file), "-p", project]
     for path in config_files:
         command.extend(["-f", str(path)])
-    command.extend(["config", "--hash", "*"])
+    command.extend(["config", "--hash", ",".join(services)])
     result = subprocess.run(
         command, check=True, text=True, capture_output=True, timeout=120, cwd=working_dir
     )
@@ -389,6 +409,9 @@ def tag_images(args: argparse.Namespace) -> int:
 
 
 def capture(args: argparse.Namespace) -> int:
+    output = args.output.resolve()
+    if output == Path("/tmp") or Path("/tmp") in output.parents:
+        fail("snapshot output must be on persistent storage, outside /tmp")
     inspections = (
         read_json(args.inspect_fixture)
         if args.inspect_fixture is not None
@@ -401,11 +424,11 @@ def capture(args: argparse.Namespace) -> int:
     files: dict[Path, CapturedFile] = {}
     directories: set[Path] = set()
     links: dict[Path, CapturedLink] = {}
-    output = args.output.resolve()
     working_dirs: list[Path] = []
     config_files: list[Path] = []
     mount_paths: list[Path] = []
     env_files: list[Path] = []
+    groups: dict[tuple[Path, tuple[Path, ...], Path], list[str]] = {}
     if any(not path.is_absolute() for path in args.extra_path):
         fail("extra paths must be absolute")
     extra_paths = [path.absolute() for path in args.extra_path]
@@ -419,34 +442,49 @@ def capture(args: argparse.Namespace) -> int:
         config_label = row_labels.get(CONFIG_FILES_LABEL)
         if not config_label:
             fail(f"missing config_files label: {service}")
-        for config_file in parse_config_files(config_label, working_dir):
-            add_unique(config_files, config_file.resolve())
+        service_configs = tuple(
+            path.resolve() for path in parse_config_files(config_label, working_dir)
+        )
+        if not service_configs:
+            fail(f"empty config_files label: {service}")
+        for config_file in service_configs:
+            add_unique(config_files, config_file)
         env_label = row_labels.get(ENV_FILE_LABEL)
         if not env_label:
             fail(f"missing environment_file label: {service}")
         env_path = Path(env_label)
         if not env_path.is_absolute():
             env_path = working_dir / env_path
-        add_unique(env_files, env_path.resolve())
+        env_path = env_path.resolve()
+        add_unique(env_files, env_path)
+        groups.setdefault((working_dir, service_configs, env_path), []).append(service)
         for mount_path in mount_sources(row):
             mount_paths.append(mount_path)
 
-    if len(working_dirs) != 1 or len(env_files) != 1:
-        fail("services disagree on Compose working directory or environment file")
-    assert_clean_checkouts(working_dirs)
-    hashes = compose_hashes(args.project, env_files[0], config_files, working_dirs[0])
-    if set(hashes) != set(services) or any(
-        hashes[service] != labels(row).get(CONFIG_HASH_LABEL) for service, row in services.items()
-    ):
-        fail(HASH_MISMATCH)
+    git_states = checkout_states(working_dirs)
+    ordered_groups = rollback_groups(groups)
+    hashes: dict[str, str] = {}
+    for (working_dir, service_configs, env_path), group_services in groups.items():
+        expected = sorted(group_services)
+        group_hashes = compose_hashes(
+            args.project, env_path, list(service_configs), working_dir, expected
+        )
+        if set(group_hashes) != set(expected) or any(
+            group_hashes[service] != labels(services[service]).get(CONFIG_HASH_LABEL)
+            for service in expected
+        ):
+            fail(HASH_MISMATCH)
+        hashes.update(group_hashes)
 
     assert_output_outside_sources(
-        output, [*working_dirs, *config_files, *mount_paths, *extra_paths]
+        output, [*working_dirs, *config_files, *env_files, *mount_paths, *extra_paths]
     )
     for working_dir in working_dirs:
         add_source(files, directories, links, working_dir, output, "working_dir", exclude_data=True)
     for config_file in config_files:
         add_source(files, directories, links, config_file, output, "compose_config")
+    for env_file in env_files:
+        add_source(files, directories, links, env_file, output, "compose_env")
     for service, row in services.items():
         for mount_path in mount_sources(row):
             add_source(files, directories, links, mount_path, output, f"mount:{service}")
@@ -495,7 +533,7 @@ def capture(args: argparse.Namespace) -> int:
         save_images(output, sorted(set(image_ids)))
 
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "project": args.project,
         "owner_label": OWNER_LABEL,
         "owner": args.owner,
@@ -503,7 +541,15 @@ def capture(args: argparse.Namespace) -> int:
         "services": service_rows,
         "working_dirs": [str(path) for path in working_dirs],
         "compose_config_files": [str(path) for path in config_files],
-        "compose_env_file": str(env_files[0]),
+        "compose_groups": [
+            {
+                "working_dir": str(working_dir),
+                "compose_config_files": [str(path) for path in service_configs],
+                "compose_env_file": str(env_path),
+                "services": sorted(group_services),
+            }
+            for (working_dir, service_configs, env_path), group_services in ordered_groups
+        ],
         "extra_paths": [str(path) for path in extra_paths],
         "directories": [
             {"source": str(path), "mode": oct(stat.S_IMODE(path.lstat().st_mode))}
@@ -527,6 +573,10 @@ def capture(args: argparse.Namespace) -> int:
             for item in sorted(files.values(), key=lambda item: str(item.source))
         ],
     }
+    if len(groups) == 1:
+        manifest["compose_env_file"] = str(env_files[0])
+    for group in manifest["compose_groups"]:
+        group["git"] = git_states[Path(group["working_dir"])]
     write_json_private(output / "manifest.json", manifest)
     (output / "image-ids.txt").write_text(
         "\n".join(sorted(set(image_ids))) + "\n", encoding="utf-8"
@@ -537,6 +587,9 @@ def capture(args: argparse.Namespace) -> int:
     print(f"files={len(files)}")
     print(f"services={','.join(sorted(services))}")
     print(f"image_ids={len(set(image_ids))}")
+    print("rollback_order=" + " | ".join(
+        ",".join(sorted(group_services)) for _, group_services in ordered_groups
+    ))
     return 0
 
 
