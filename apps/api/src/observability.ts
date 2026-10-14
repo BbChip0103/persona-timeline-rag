@@ -11,7 +11,7 @@ import {bounded} from '../../../packages/ops/src/bounded';
 const CODE=/^[A-Za-z0-9_]{1,40}$/;
 const code=(value:string|undefined)=>value!==undefined&&CODE.test(value)?value:'UNSPECIFIED';
 /** Model upstream kinds as recorded in reply.serving (D21). */
-const UPSTREAM_KINDS=new Set(['primary','secondary','fake','openrouter','direct','litellm']);
+const UPSTREAM_KINDS=new Set(['primary','secondary','local','local-pool','fake','openrouter','openrouter-primary','direct','litellm']);
 const GUARD_ACTIONS=new Set(['none','replaced','edited']);
 const GUARD_REASONS=new Set(['human_impersonation','missing_ai_disclosure','private_life','background_denial','meta_talk']);
 

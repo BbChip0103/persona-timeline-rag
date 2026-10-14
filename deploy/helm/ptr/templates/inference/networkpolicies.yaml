@@ -44,7 +44,11 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: ptr-gateway
+              kubernetes.io/metadata.name: {{ .Values.namespaces.app }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
         {{- if .Values.inference.testClient.enabled }}
         - podSelector:
             matchLabels:

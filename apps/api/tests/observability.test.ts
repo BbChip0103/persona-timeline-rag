@@ -89,7 +89,7 @@ describe('api /metrics/prom and health ',()=>{
     expect(await ready.json()).toEqual(await compatible.json());
     expect(check).toHaveBeenCalledTimes(2);
   });
-  test.each([true,false])('health reports the actual LiteLLM billable flag (%s), not the retired provider route',async billable=>{
+  test.each([true,false])('health reports whether paid spillover is possible (%s), not the provider route',async billable=>{
     runtime.providerName='litellm';runtime.billable=billable;
     expect((await (await call('health')).json()).liveEnabled).toBe(billable);
   });
@@ -102,7 +102,7 @@ describe('worker and outbox observability',()=>{
     expect(names(await observed.render())).toEqual([...WORKER_NAMES].sort());
     const store=new InMemoryConversationStore();
     let fail=false;
-    const provider:TextProvider={generate:async(_messages,options)=>{if(fail) throw Object.assign(new Error(SENTINEL),{code:'PROVIDER_TRANSPORT'});options.onServed?.('secondary');return '반가워요.';}};
+    const provider:TextProvider={generate:async(_messages,options)=>{if(fail) throw Object.assign(new Error(SENTINEL),{code:'PROVIDER_TRANSPORT'});options.onServed?.('local');return '반가워요.';}};
     const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),provider,timeoutMs:1000,leases:store,delivery:{publish:async()=>undefined,backlog:async()=>0},
       ...observed.chatHooks});
     const worker=new TurnWorker({chat,leases:store,workerId:'w',leaseMs:500,onFinished:observed.onFinished});
@@ -116,7 +116,7 @@ describe('worker and outbox observability',()=>{
     expect(value(text,'ptr_turns_finished_total',{outcome:'failed',code:'PROVIDER_TRANSPORT'})).toBe(1);
     expect(value(text,'ptr_turn_duration_seconds_count')).toBe(2);expect(value(text,'ptr_turn_queue_wait_seconds_count')).toBe(2);
     expect(value(text,'ptr_turns_inflight')).toBe(2);
-    expect(value(text,'ptr_model_calls_total',{upstream_kind:'secondary'})).toBe(1);
+    expect(value(text,'ptr_model_calls_total',{upstream_kind:'local'})).toBe(1);
     expect(value(text,'ptr_safety_fallback_total',{scope:'turn',reason:'timeout'})).toBe(1);
     expect(text).not.toContain('SENTINEL');
     const events=lines.map(line=>JSON.parse(line));

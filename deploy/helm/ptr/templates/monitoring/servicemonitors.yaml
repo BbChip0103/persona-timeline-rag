@@ -16,28 +16,8 @@ spec:
     - port: http
       path: {{ .Values.monitoring.serviceMonitors.api.path | quote }}
       interval: {{ .Values.monitoring.serviceMonitors.interval }}
----
-{{- if .Values.gateway.enabled }}
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: ptr-litellm
-  namespace: {{ .Values.namespaces.gateway }}
-spec:
-  namespaceSelector:
-    matchNames: [{{ .Values.namespaces.gateway | quote }}]
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: ptr
-      app.kubernetes.io/component: litellm
-      ptr.io/monitoring: "true"
-  endpoints:
-    - port: http
-      path: {{ .Values.monitoring.serviceMonitors.litellm.path | quote }}
-      interval: {{ .Values.monitoring.serviceMonitors.interval }}
----
-{{- end }}
 {{- if .Values.inference.enabled }}
+---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

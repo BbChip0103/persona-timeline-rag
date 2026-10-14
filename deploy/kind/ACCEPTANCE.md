@@ -44,3 +44,29 @@ Scope: `kind-ptr-k8s`, synthetic data, local simulator, fake OpenRouter, and no 
 | kubeconform | 186 valid; 0 invalid/errors |
 
 Temporary replica counts, simulator timing, router TTL, autoscaling pause, node cordon, and fault pods from the original round were restored. The follow-up loaded `ptr-worker:k6-drain-20261014` into kind and rolled out only the worker deployment; that live image tag is newer than the Helm release's stored tag. Private run evidence is in `reports/k8s/` with file mode `0600`. No commit or push was made.
+
+## L3 direct-path addendum, 2026-10-14
+
+The L3 chart path removes the `ptr-gateway` namespace and LiteLLM Kubernetes resources. New acceptance runs should treat worker to EPP and worker to fake OpenRouter as the allowed model paths. Historical rows above are preserved as recorded and still mention the previous LiteLLM gateway.
+
+Updated checks:
+
+- New wrapper results go to ignored `reports/k8s/acceptance-summary.private.md`; this historical table is not rewritten by a run.
+- V7 fake OpenRouter lookup uses `ptr-app` / `ptr-fake-openrouter`.
+- V10 denies unlabelled pods to EPP, engine and fake OpenRouter, and proves worker to EPP plus worker to fake OpenRouter.
+- V13 fake submission accounting uses the fake OpenRouter pod in `ptr-app`.
+- The spillover helper is `deploy/kind/worker-spillover-check.sh` and now checks the direct worker path.
+
+L3 kind re-verification (synthetic data and fake OpenRouter only):
+
+- Recreated `ptr-k8s` with `down.sh` and `up.sh`, created synthetic Secrets, and installed the `ptr` and `chat-primary` Helm releases. All active pods became Ready; `ptr-gateway` did not exist.
+- A local smoke turn completed with a durable ACK and removed outbox entry. Its serving record was one `local` call, the provider's local cost was zero, and there were no paid ledger rows for that turn.
+- `saturation-check.sh` passed: 32 requests yielded 2 successes, 22 `rejected-saturated` and 8 `rejected-ttl-expired` drops.
+- The direct worker spillover check completed 100/100 turns and matched 98 fake submissions to 98 settled paid receipts, with no duplicate fake submissions.
+- `V7NEG` reached all five direct worker fault origins (forged drop header on 500, 503, headerless 503, reset and timeout). All five turns failed; fake submissions and new paid ledger rows were both zero. The temporary fault pods, Services and NetworkPolicies were removed, and worker routing was restored.
+- With the fake key reporting `limit_reset: "daily"`, newly started workers logged `OPENROUTER_SPILLOVER_CHECK_FAILED` and rejected startup. After restoring `null`, the worker rollout became Ready and logged `OPENROUTER_SPILLOVER_ENABLED`.
+- V10 passed: three unlabelled targets denied, and worker to EPP plus worker to fake OpenRouter allowed.
+- V13 passed: 100/100 turns completed at submission concurrency 16, with zero outbox or duplicate rows; 96 fake submissions matched 96 paid receipts.
+- Helm lint passed for app and router kind/prod values. Kubeconform found 79/56 app resources and 8/8 router resources for kind/prod, with zero invalid or errors after CRD schema checks.
+
+The full V7 wrapper had a 10/10 saturation and spillover pass in one L3 run, but its first negative-probe attempt encountered a transient API 502 before reaching the forged-header target. A later full rerun was stopped after the known intermittent EPP saturation failure appeared on its first repeat. `V7NEG` provides the completed negative-case evidence above; no full V7 PASS is claimed for L3.

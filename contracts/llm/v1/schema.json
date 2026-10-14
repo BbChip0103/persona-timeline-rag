@@ -927,6 +927,7 @@
                   "primary",
                   "secondary",
                   "local-pool",
+                  "local",
                   "fake",
                   "openrouter",
                   "openrouter-primary",

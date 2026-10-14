@@ -57,7 +57,6 @@ test('legacy chat routes are rejected rather than retained as hidden parallel de
   for(const PTR_CHAT_PROVIDER of ['gateway','selfhosted','openrouter','unknown'])
     expect(()=>createRuntime({...framework,PTR_CHAT_PROVIDER})).toThrow();
   expect(()=>createRuntime({...framework,PTR_GUARDRAILS_TOKEN:undefined})).toThrow();
-  expect(()=>createRuntime({...framework,PTR_LITELLM_BILLABLE:'1'})).toThrow();
   expect(()=>createRuntime({...framework,PTR_MODEL:'openrouter-primary'})).toThrow();
 });
 test('real vectors cannot be queried using synthetic hashes',async()=>{
@@ -134,8 +133,8 @@ describe('persona catalogue: generated list + authored list ',()=>{
   });
 });
 
-test('paid model calls use their existing ledger instead of another checkpoint wrapper',async()=>{
-  const runtime=createRuntime({...framework,PTR_LITELLM_BILLABLE:'1',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true'});
+test('paid spillover possible model calls use their existing ledger instead of another checkpoint wrapper',async()=>{
+  const runtime=createRuntime({...framework,PTR_PAID_SPILLOVER:'1',GOAL1_LIVE_ENABLED:'true',GOAL1_ALLOW_EXTERNAL_DATA:'true'});
   const options=(runtime.chat as unknown as {options:Record<string,unknown>}).options;
   expect(options.agentCheckpoint).toBeUndefined();expect(options.provider).toBe(runtime.provider);
   expect(runtime.billable).toBe(true);await runtime.close?.();

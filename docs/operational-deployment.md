@@ -28,9 +28,9 @@ authenticated loopback SSH-tunnel endpoint that the old gateway used for vLLM.
 Keep both OpenRouter key names out of the worker env. Compose has no central EPP
 admission signal, so excess work waits in local vLLM instead of spilling into
 paid calls. Set the backend's `PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to the
-same served model ID. Leave the legacy `PTR_LITELLM_BILLABLE` API switch unset
-(or `0`): local chat costs zero and drafts require `clientRequestId` only when
-billable.
+same served model ID. Set `PTR_PAID_SPILLOVER=0` for this local-only Compose
+path: local chat costs zero and drafts require `clientRequestId` only when paid
+spillover is possible.
 
 ```sh
 docker compose --env-file /private/compose.env \

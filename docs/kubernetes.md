@@ -8,12 +8,9 @@ not authorize real persona data, paid calls, or a production rollout. See the
 
 ```text
 ptr-app:       web -> api -> BullMQ (ptr-data Redis) -> worker
-                                                         |
-ptr-gateway:                                        LiteLLM
-                                                         |
+                                                         | local
 ptr-inference:                            EPP / InferencePool -> vLLM
-                                                         |
-                                EPP drop reasons only -> OpenRouter
+                  worker -> OpenRouter (EPP drop reasons only; fake in kind)
 ptr-data:      kind-only Postgres + Redis; production uses managed services
 ptr-system:    ptr Helm release; ptr-monitoring and ptr-keda run add-ons
 ```
@@ -46,7 +43,6 @@ timeout 900s helm --kube-context kind-ptr-k8s install ptr deploy/helm/ptr \
   --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml \
   --set "images.backend.repository=ptr-backend" --set "images.backend.tag=$backend_tag" \
   --set "images.worker.repository=ptr-worker" --set "images.worker.tag=$worker_tag" \
-  --set-string "gateway.bootstrap.apiServerCIDRs[1]=$control_plane_ip/32" \
   --set-string "inference.apiServerCIDRs[1]=$control_plane_ip/32" \
   --wait --timeout 12m
 timeout 300s helm --kube-context kind-ptr-k8s install chat-primary deploy/helm/ptr-router \
@@ -71,8 +67,8 @@ and session/UI credentials), `ptr-worker` (`PTR_LLM_DATABASE_URL`,
 `PTR_LLM_REDIS_URL`, control token), `ptr-maintenance` (maintenance DB/Redis
 URLs and controls), `ptr-personas` (synthetic fixture), `ptr-keda-redis` (Redis
 address/user/password), `ptr-data` (local DB/Redis credentials), and
-`ptr-litellm` (gateway DB/Redis, model, spillover and `PTR_OPENROUTER_API_KEY`
-credentials). Never inspect or print their values. On success the smoke command
+`ptr-worker-openrouter` (a synthetic worker-only key in kind). Never inspect or
+print their values. On success the smoke command
 prints `{"state":"completed","durableAck":true,"outboxRemoved":true}`.
 
 ## Upgrade and rollback
@@ -85,7 +81,6 @@ timeout 900s helm --kube-context kind-ptr-k8s upgrade ptr deploy/helm/ptr \
   --namespace ptr-system --values deploy/helm/ptr/values-kind.yaml \
   --set "images.backend.repository=ptr-backend" --set "images.backend.tag=$backend_tag" \
   --set "images.worker.repository=ptr-worker" --set "images.worker.tag=$worker_tag" \
-  --set-string "gateway.bootstrap.apiServerCIDRs[1]=$control_plane_ip/32" \
   --set-string "inference.apiServerCIDRs[1]=$control_plane_ip/32" \
   --wait --timeout 12m
 timeout 300s helm --kube-context kind-ptr-k8s history ptr -n ptr-system
@@ -117,7 +112,7 @@ configuration. Before use:
 - Replace managed Postgres and Redis hostnames, ports, TLS/CA settings, DB
   identities, and every `192.0.2.0/24`, `198.51.100.0/24` or
   `203.0.113.0/24` TEST-NET CIDR with verified service/API/egress ranges in
-  `network`, `policy.managedData`, `gateway.managedData`, `gateway.prod` and
+  `network`, `policy.managedData` and
   `inference.apiServerCIDRs`. Keep role DB grants separate.
 - Provision named Secrets through External Secrets per role. `ptr-api` supplies
   `PTR_APP_DATABASE_URL`, `PTR_REDIS_URL`, `PTR_API_TOKEN`,
@@ -125,17 +120,14 @@ configuration. Before use:
   `PTR_UI_PASSWORD` (the web reads Redis, API token, session secret and UI
   password from this Secret).
   `ptr-worker` supplies `PTR_LLM_DATABASE_URL`, `PTR_LLM_REDIS_URL`,
-  `PTR_LLM_CONTROL_TOKEN`, and the bootstrap-managed
-  `PTR_LLM_LITELLM_API_KEY` and `PTR_LLM_CAPACITY_SPILLOVER_KEY`; coordinate
-  External Secrets refresh with that bootstrap writer. `ptr-personas` supplies
+  `PTR_LLM_CONTROL_TOKEN`. `ptr-worker-openrouter` supplies a dedicated
+  `OPENROUTER_API_KEY` with a provider-side credit limit no greater than
+  `PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD`. `ptr-personas` supplies
   `PTR_LLM_PUBLISHED_PERSONAS_JSON`. `ptr-maintenance` supplies
   `PTR_LLM_MAINTENANCE_DATABASE_URL` and approved maintenance controls/Redis
   URL. `ptr-keda-redis` supplies `REDIS_ADDRESS`, `REDIS_USERNAME`,
   `REDIS_PASSWORD`, plus `REDIS_CA` and `REDIS_TLS_MODE=enable` for a private
-  CA. `ptr-litellm` supplies `DATABASE_URL`, `PTR_LITELLM_MASTER_KEY`,
-  `LITELLM_SALT_KEY`, `PTR_LITELLM_REDIS_PASSWORD`, `PTR_VLLM_API_KEY`,
-  `PTR_LLM_CAPACITY_SPILLOVER_KEY` and `PTR_OPENROUTER_API_KEY`; only the
-  gateway gets the OpenRouter key. No `ptr-data` Secret is needed when
+  CA. No `ptr-data` Secret is needed when
   `data.enabled=false`.
 - Install NVIDIA GPU Operator, create a dedicated GPU node pool with
   `ptr.io/gpu-pool=true` and `nvidia.com/gpu` taint, and provide the model
@@ -144,30 +136,25 @@ configuration. Before use:
 - Authorize OpenRouter egress through an egress proxy or hostname-aware policy
   if host pinning is required. A CIDR NetworkPolicy is not host pinning. Keep
   the fake OpenRouter disabled and require explicit paid-call authorization.
-- Set gateway key RPM at least `max worker replicas × worker concurrency ×
-  headroom`: the current floor is `40 × 4 × 1.25 = 200`; template RPM is 5000.
-  Check the separate shared USD ledger cap and receipt policy.
+- Verify the worker-only OpenRouter key credit limit and the separate shared
+  USD ledger cap before enabling paid spillover. Provider API unavailability
+  disables spillover until the next key check; local serving remains available.
 - Install KEDA, Prometheus Operator/Prometheus, and metrics-server; install the
   GIE v1 `InferencePool` CRD before rendering the app chart. Provide matching
   ServiceMonitor discovery and alert rules.
 - Keep weekly human review on the host/systemd timers with durable private
   lock, journal and review directory. Production disables both weekly CronJobs.
 
-The current LiteLLM Deployment still sets `PTR_ROUTING_REDIS_HOST` to the
-kind-local `ptr-litellm-redis` service. A managed gateway Redis endpoint needs
-a chart change before this production template can be deployed; replacing CIDRs
-and the Redis Secret alone is insufficient.
-
 ## Operations
 
-Web/API/worker, LiteLLM and engine have startup, readiness and liveness probes.
+Web/API/worker and engine have startup, readiness and liveness probes.
 API readiness checks Postgres and Redis. API/web use a 30 s termination grace;
 worker has 100 s to finish and ACK in-flight BullMQ jobs; engine has 60 s plus
 `preStop` drain. Keep PDBs and probe budgets aligned with actual model startup.
 The single EPP replica has no leader election or PDB; losing it produces an
 approximately 2 s routing gap during replacement, even though readiness recovers.
 
-HPA targets 70% CPU for web, API and LiteLLM. KEDA polls every 10 s: worker
+HPA targets 70% CPU for web and API. KEDA polls every 10 s: worker
 Redis wait-list threshold 8 and active-list trigger tied to worker concurrency
 (4 in kind); fallback uses 4 workers after 3 failures. Engine scaling watches
 EPP queue-size threshold 4 and vLLM KV cache usage threshold 0.8, subject to GPU pool
@@ -177,7 +164,7 @@ Daily split and framework retention are CronJobs. Kind runs weekly review jobs
 as synthetic smoke only; production runs them on the host. `Forbid` stops
 scheduled overlap only: operators must serialize manual Jobs themselves.
 
-ServiceMonitors scrape API `/metrics/prom`, LiteLLM `/metrics`, EPP `/metrics`
+ServiceMonitors scrape API `/metrics/prom`, EPP `/metrics`
 and vLLM `/metrics`. The worker has no metrics HTTP endpoint in this deployment.
 Alert on nonterminal turn age/outbox growth, API readiness, queue wait and KEDA
 fallback, EPP drops versus saturation/timeouts, engine readiness/restarts,
@@ -186,8 +173,10 @@ spillover rate, and paid budget/unknown receipts. Keep telemetry redacted.
 Spillover is allowed only for EPP `rejected-saturated` or
 `rejected-ttl-expired` drop reasons. A bare 503, engine 5xx, timeout or reset is
 not a spillover grant. A paid result with unclear cost becomes `unknown` in the
-durable ledger; never resubmit it. The gateway key limit is not the shared USD
-budget.
+durable ledger; never resubmit it. The provider key limit is separate from the
+shared USD budget. Production worker egress uses an OpenRouter CIDR list on 443;
+CIDR policy does not pin a hostname. Kind permits only its fake OpenRouter
+Service for spillover.
 
 ## Known limits
 

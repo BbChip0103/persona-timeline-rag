@@ -46,6 +46,19 @@ class InferenceChartContractTest(unittest.TestCase):
             item["name"]: item.get("value")
             for item in worker["spec"]["template"]["spec"]["containers"][0]["env"]
         }
+        self.assertEqual(env["PTR_LLM_PROVIDER"], "local")
+        self.assertEqual(
+            env["PTR_LLM_LOCAL_BASE_URL"],
+            "http://chat-primary-epp.ptr-inference.svc.cluster.local:8081/v1",
+        )
+        self.assertEqual(env["PTR_LLM_SPILLOVER"], "openrouter")
+        self.assertEqual(env["PTR_LLM_OPENROUTER_MODEL"], "google/gemma-4-26b-a4b-it")
+        self.assertEqual(env["PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE"], "1")
+        self.assertEqual(
+            env["PTR_LLM_OPENROUTER_BASE_URL"],
+            "http://ptr-fake-openrouter.ptr-app.svc.cluster.local:8000",
+        )
+        self.assertEqual(env["PTR_PAID_SPILLOVER"], "1")
         self.assertEqual(env["PTR_LLM_MAX_OUTPUT_TOKENS"], "2048")
         self.assertEqual(env["PTR_LLM_MAX_CALL_MICROUSD"], "5000")
         self.assertLessEqual(200 * int(env["PTR_LLM_MAX_CALL_MICROUSD"]), 1_000_000)
@@ -246,8 +259,6 @@ class InferenceChartContractTest(unittest.TestCase):
         worker = document(result.stdout, "ScaledObject", "ptr-worker")
         engine = document(result.stdout, "ScaledObject", "ptr-vllm")
         engine_pdb = document(result.stdout, "PodDisruptionBudget", "ptr-vllm")
-        litellm_hpa = document(result.stdout, "HorizontalPodAutoscaler", "ptr-litellm")
-        bootstrap = document(result.stdout, "Job", "ptr-litellm-bootstrap-app-key")
         prod_values = (CHART / "values-prod.yaml").read_text()
 
         self.assertIn("maxReplicaCount: 40", worker)
@@ -267,12 +278,9 @@ class InferenceChartContractTest(unittest.TestCase):
         )
         self.assertIn("stabilizationWindowSeconds: 600", engine)
         self.assertIn("maxUnavailable: 1", engine_pdb)
-        self.assertIn("maxReplicas: 6", litellm_hpa)
-        self.assertIn('value: "5000"', bootstrap)
-        self.assertIn(
-            "Minimum floor: 40 max workers * 4 concurrent turns * 1.25 headroom = 200.",
-            prod_values,
-        )
+        self.assertNotIn("ptr-litellm", result.stdout)
+        self.assertNotIn("ptr-gateway", result.stdout)
+        self.assertIn("externalHttpsCidrs", prod_values)
 
     def test_kind_worker_redis_scaler_does_not_enable_tls_for_plain_redis(self) -> None:
         result = helm_template("kind")
@@ -294,7 +302,7 @@ class InferenceChartContractTest(unittest.TestCase):
     def test_autoscaled_deployments_leave_replica_ownership_to_hpa(self) -> None:
         result = helm_template("kind")
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ("ptr-api", "ptr-web", "ptr-worker", "ptr-litellm", "ptr-sim"):
+        for name in ("ptr-api", "ptr-web", "ptr-worker", "ptr-sim"):
             self.assertNotRegex(document(result.stdout, "Deployment", name), r"(?m)^  replicas:")
 
         result = helm_template(
@@ -303,7 +311,7 @@ class InferenceChartContractTest(unittest.TestCase):
             "--set", "autoscaling.engine.enabled=false",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ("ptr-api", "ptr-web", "ptr-worker", "ptr-litellm", "ptr-sim"):
+        for name in ("ptr-api", "ptr-web", "ptr-worker", "ptr-sim"):
             self.assertRegex(document(result.stdout, "Deployment", name), r"(?m)^  replicas: [12]$")
 
     def test_api_server_egress_port_is_value_driven(self) -> None:
@@ -318,7 +326,6 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for name, port in (
             ("ptr-api-monitoring-ingress", 56441),
-            ("ptr-litellm-monitoring-ingress", 4000),
             ("ptr-inference-monitoring-ingress", 8000),
             ("ptr-epp-monitoring-ingress", 9090),
             ("ptr-keda-redis-ingress", 6379),
@@ -332,7 +339,6 @@ class InferenceChartContractTest(unittest.TestCase):
             self.assertIn(f"port: {port}", policy)
         for name in (
             "ptr-api-monitoring-ingress",
-            "ptr-litellm-monitoring-ingress",
             "ptr-inference-monitoring-ingress",
             "ptr-epp-monitoring-ingress",
         ):
@@ -383,29 +389,19 @@ class InferenceChartContractTest(unittest.TestCase):
             any(rule["ports"] == webhook_ports for rule in api_ingress["spec"]["ingress"])
         )
 
-    def test_litellm_service_monitor_does_not_copy_master_key_to_prometheus(self) -> None:
-        result = helm_template("kind")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        monitor = document(result.stdout, "ServiceMonitor", "ptr-litellm")
-        config = document(result.stdout, "ConfigMap", "ptr-litellm-files")
-        self.assertNotIn("authorization:", monitor)
-        self.assertNotIn("PTR_LITELLM_MASTER_KEY", monitor)
-        self.assertIn("require_auth_for_metrics_endpoint: false", config)
-
-    def test_fake_openrouter_code_is_only_rendered_when_fake_gateway_is_enabled(self) -> None:
+    def test_fake_openrouter_code_is_only_rendered_for_kind_fixture(self) -> None:
         kind = helm_template("kind")
         self.assertEqual(kind.returncode, 0, kind.stderr)
-        kind_config = parsed_document(kind.stdout, "ConfigMap", "ptr-litellm-files")
+        kind_config = parsed_document(kind.stdout, "ConfigMap", "ptr-fake-openrouter")
         self.assertIn("fake-openrouter.py", kind_config["data"])
         self.assertIn("fake_openrouter_request", kind_config["data"]["fake-openrouter.py"])
 
         prod = helm_template("prod")
         self.assertEqual(prod.returncode, 0, prod.stderr)
-        prod_config = parsed_document(prod.stdout, "ConfigMap", "ptr-litellm-files")
-        self.assertNotIn("fake-openrouter.py", prod_config["data"])
-        self.assertNotIn(
-            "fake_openrouter_request", document(prod.stdout, "ConfigMap", "ptr-litellm-files")
-        )
+        with self.assertRaises(AssertionError):
+            document(prod.stdout, "ConfigMap", "ptr-fake-openrouter")
+        self.assertNotIn("PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE", prod.stdout)
+        self.assertNotIn("PTR_LLM_OPENROUTER_BASE_URL", prod.stdout)
 
     def test_k5_monitoring_and_keda_namespaces_are_default_deny(self) -> None:
         result = helm_template("kind")
@@ -424,7 +420,6 @@ class InferenceChartContractTest(unittest.TestCase):
 
         for name, port in (
             ("ptr-api-monitoring-ingress", 56441),
-            ("ptr-litellm-monitoring-ingress", 4000),
             ("ptr-inference-monitoring-ingress", 8000),
             ("ptr-epp-monitoring-ingress", 9090),
         ):
@@ -450,7 +445,6 @@ class InferenceChartContractTest(unittest.TestCase):
 
         for allowed in (
             "app.kubernetes.io/component: api",
-            "app.kubernetes.io/component: litellm",
             "app.kubernetes.io/component: inference-engine",
             "llm-d-router-standalone: chat-primary-epp",
         ):
@@ -467,7 +461,6 @@ class InferenceChartContractTest(unittest.TestCase):
 
         expected = {
             "ptr-api-monitoring-ingress": 56441,
-            "ptr-litellm-monitoring-ingress": 4000,
             "ptr-inference-monitoring-ingress": 8000,
             "ptr-epp-monitoring-ingress": 9090,
         }
@@ -505,14 +498,6 @@ class InferenceChartContractTest(unittest.TestCase):
             for rule in policy["spec"]["egress"]:
                 for peer in rule.get("to", []):
                     self.assertNotEqual({}, peer.get("podSelector"))
-
-    def test_litellm_servicemonitor_does_not_copy_master_key_to_prometheus(self) -> None:
-        result = helm_template("kind")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        monitor = document(result.stdout, "ServiceMonitor", "ptr-litellm")
-
-        self.assertNotIn("authorization:", monitor)
-        self.assertNotIn("PTR_LITELLM_MASTER_KEY", monitor)
 
     def test_maintenance_cronjobs_are_split_and_secret_backed(self) -> None:
         result = helm_template("kind")
@@ -553,24 +538,20 @@ class InferenceChartContractTest(unittest.TestCase):
                 self.assertNotIn("ptr.io/synthetic-smoke", cronjob)
                 self.assertNotIn("ptr.io/host-only-production-step", cronjob)
 
-    def test_prometheus_address_and_gateway_rpm_are_value_driven(self) -> None:
+    def test_prometheus_address_is_value_driven(self) -> None:
         result = helm_template(
             "kind",
             "--set",
             "monitoring.prometheus.releaseName=custom-mon",
             "--set",
             "monitoring.prometheus.namespace=custom-monitoring",
-            "--set",
-            "gateway.bootstrap.rpm=777",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         engine = document(result.stdout, "ScaledObject", "ptr-sim")
-        bootstrap = document(result.stdout, "Job", "ptr-litellm-bootstrap-app-key")
         self.assertIn(
             'serverAddress: "http://custom-mon-kube-promet-prometheus.custom-monitoring.svc:9090"',
             engine,
         )
-        self.assertIn('value: "777"', bootstrap)
 
     def test_kind_worker_load_stays_within_engine_flow_capacity(self) -> None:
         kind = helm_template("kind")

@@ -7,7 +7,6 @@ if [[ "$context" != "kind-ptr-k8s" ]]; then
   exit 1
 fi
 app_namespace="${PTR_APP_NAMESPACE:-ptr-app}"
-gateway_namespace="${PTR_GATEWAY_NAMESPACE:-ptr-gateway}"
 worker_deployment="${PTR_WORKER_DEPLOYMENT:-ptr-worker}"
 api_label="${PTR_API_LABEL:-app.kubernetes.io/component=api}"
 worker_label="${PTR_WORKER_LABEL:-app.kubernetes.io/component=worker}"
@@ -44,7 +43,7 @@ pod_name() {
 
 api_pod="$(pod_name "$app_namespace" "$api_label")"
 worker_pod="$(pod_name "$app_namespace" "$worker_label")"
-fake_pod="$(pod_name "$gateway_namespace" "$fake_label")"
+fake_pod="$(pod_name "$app_namespace" "$fake_label")"
 if [[ -z "$api_pod" || -z "$worker_pod" || -z "$fake_pod" ]]; then
   echo "missing running api/worker/fake-openrouter pod" >&2
   exit 1
@@ -129,9 +128,9 @@ ledger_json="$(
   timeout 30s kubectl --context "$context" -n "$app_namespace" exec "$worker_pod" -- python -c \
     "import os,json,psycopg; before='$before_ts'; conn=psycopg.connect(os.environ['PTR_LLM_DATABASE_URL']); cur=conn.cursor(); cur.execute(\"SELECT CASE WHEN generation_id LIKE 'chatcmpl-fake-openrouter-%%' THEN 'openrouter-primary' ELSE COALESCE(response_json->>'upstream','missing') END AS upstream, state, actual_microusd IS NULL AS unknown, count(*)::int AS n FROM llm.ptr_provider_requests WHERE created_at >= %s::timestamptz GROUP BY upstream,state,actual_microusd IS NULL ORDER BY upstream,state,unknown\", (before,)); cols=[d.name for d in cur.description]; print(json.dumps([dict(zip(cols,row)) for row in cur.fetchall()], default=str)); conn.close()"
 )"
-fake_pod="$(pod_name "$gateway_namespace" "$fake_label")"
+fake_pod="$(pod_name "$app_namespace" "$fake_label")"
 fake_json="$(
-  timeout 30s kubectl --context "$context" -n "$gateway_namespace" exec "$fake_pod" -- python -c \
+  timeout 30s kubectl --context "$context" -n "$app_namespace" exec "$fake_pod" -- python -c \
     "import json,urllib.request; prefix='$prefix'; data=json.loads(urllib.request.urlopen('http://127.0.0.1:8000/counts',timeout=5).read()); ids=[x for x in data['request_ids'] if x.startswith(prefix)]; print(json.dumps({'prefix':prefix,'submitted_for_prefix':len(ids),'ids':ids,'duplicates':{k:v for k,v in data['duplicates'].items() if k.startswith(prefix)}}))"
 )"
 echo "ledger-window $ledger_json"

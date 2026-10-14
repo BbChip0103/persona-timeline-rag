@@ -62,6 +62,7 @@ jobs:
         run: |
           python3 infra/langfuse/test-deployment.py
           python3 infra/litellm/test-fixture.py
+          python3 infra/fake-openrouter/test-fake-openrouter.py
       - name: Root pytest suite
         run: |
           python3 -m venv "$RUNNER_TEMP/ptr-root-tests-venv"
@@ -120,16 +121,10 @@ jobs:
           set -euo pipefail
           diff -r supabase/migrations deploy/helm/ptr/files/supabase/migrations
           diff -r supabase/split deploy/helm/ptr/files/supabase/split
-      - name: LiteLLM chart files match source files
+      - name: Fake OpenRouter chart file matches source file
         run: |
           set -euo pipefail
-          expected="$RUNNER_TEMP/ptr-litellm-chart-files"
-          mkdir -p "$expected/persona_timeline_rag"
-          cp infra/litellm/config.k8s.yaml "$expected/config.k8s.yaml"
-          cp infra/litellm/ptr_budget_gate.py "$expected/ptr_budget_gate.py"
-          cp infra/litellm/fake-openrouter.py "$expected/fake-openrouter.py"
-          cp src/persona_timeline_rag/gateway_budget.py "$expected/persona_timeline_rag/gateway_budget.py"
-          diff -ru "$expected" deploy/helm/ptr/files/litellm
+          diff -u infra/fake-openrouter/fake-openrouter.py deploy/helm/ptr/files/fake-openrouter/fake-openrouter.py
       - name: Kind image prune selection
         run: bash deploy/kind/test-up-prune.sh
       - name: Kubernetes schema validation

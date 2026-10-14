@@ -1,10 +1,9 @@
 {{- if ne .Values.policy.enabled false }}
 {{- $app := .Values.namespaces.app -}}
 {{- $data := .Values.namespaces.data -}}
-{{- $gateway := .Values.namespaces.gateway -}}
 {{- $inference := .Values.namespaces.inference -}}
-{{- $apiServerCidrs := default (list) .Values.gateway.bootstrap.apiServerCIDRs -}}
-{{- $apiServerPorts := default (list 443) .Values.gateway.bootstrap.apiServerPorts -}}
+{{- $apiServerCidrs := default (list) .Values.policy.apiServerCIDRs -}}
+{{- $apiServerPorts := default (list 443) .Values.policy.apiServerPorts -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -187,14 +186,6 @@ spec:
           podSelector:
             matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: api}
       ports: [{protocol: TCP, port: 56441}]
-    {{- if .Values.gateway.enabled }}
-    - to:
-        - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: {{ $gateway }}}
-          podSelector:
-            matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: litellm}
-      ports: [{protocol: TCP, port: 4000}]
-    {{- end }}
     {{- if .Values.inference.enabled }}
     - to:
         - namespaceSelector:

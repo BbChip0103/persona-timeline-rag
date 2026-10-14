@@ -38,26 +38,4 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.hpa.cpuUtilization }}
-{{- if .Values.gateway.enabled }}
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: ptr-litellm
-  namespace: {{ .Values.namespaces.gateway }}
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: ptr-litellm
-  minReplicas: {{ .Values.autoscaling.hpa.litellm.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.hpa.litellm.maxReplicas }}
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: {{ .Values.autoscaling.hpa.cpuUtilization }}
-{{- end }}
 {{- end }}

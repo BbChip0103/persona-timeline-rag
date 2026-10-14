@@ -6,7 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTEXT="${KUBE_CONTEXT:-kind-ptr-k8s}"
 REPORT_DIR="${K8S_ACCEPTANCE_REPORT_DIR:-$ROOT/reports/k8s}"
 PRIVATE_REPORT="${K8S_ACCEPTANCE_PRIVATE_REPORT:-$REPORT_DIR/acceptance.private.md}"
-SUMMARY="${K8S_ACCEPTANCE_SUMMARY:-$ROOT/deploy/kind/ACCEPTANCE.md}"
+SUMMARY="${K8S_ACCEPTANCE_SUMMARY:-$REPORT_DIR/acceptance-summary.private.md}"
 DEFAULT_TIMEOUT="${K8S_ACCEPTANCE_TIMEOUT:-1200s}"
 RUN_ID="${K8S_ACCEPTANCE_RUN_ID:-k6-$(date -u +%Y%m%dT%H%M%SZ)}"
 
@@ -19,7 +19,7 @@ die() {
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/k8s-acceptance.sh V1|V2|...|V13|all|summary
+Usage: scripts/k8s-acceptance.sh V1|V2|...|V13|V7NEG|all|summary
 
 Runs the K6 kind acceptance wrapper against kind-ptr-k8s. Each test writes raw
 counts-only evidence to reports/k8s/acceptance.private.md and prints one
@@ -65,6 +65,7 @@ init_reports() {
       printf '|---|---|---|\n'
     } >"$SUMMARY"
   fi
+  chmod 600 "$SUMMARY"
 }
 
 record_private() {
@@ -101,7 +102,7 @@ header = next((i for i, line in enumerate(lines) if line.startswith("| Test | St
 if header is None:
     raise SystemExit("acceptance summary table missing")
 end = header + 2
-while end < len(lines) and re.match(r"^\| V[0-9]+ \|", lines[end]):
+while end < len(lines) and re.match(r"^\| V[0-9]+(?:NEG)? \|", lines[end]):
     end += 1
 row = f"| {test} | {status} | {numbers} | {'—' if status == 'PASS' else 'See private evidence.'} |\n"
 existing = next((i for i in range(header + 2, end) if lines[i].startswith(f"| {test} |")), None)
@@ -492,6 +493,22 @@ v7_delete_fault_pods() {
     done
     V7_FAULT_PODS=""
   fi
+  if [[ -n "${V7_APP_FAULT_SERVICES:-}" ]]; then
+    for service in $V7_APP_FAULT_SERVICES; do
+      run 30s kubectl --context "$CONTEXT" -n ptr-app delete service "$service" --ignore-not-found --wait=false >>"$V7_OUT" 2>&1 || true
+    done
+    V7_APP_FAULT_SERVICES=""
+  fi
+  if [[ -n "${V7_APP_FAULT_PODS:-}" ]]; then
+    for pod in $V7_APP_FAULT_PODS; do
+      run 30s kubectl --context "$CONTEXT" -n ptr-app delete pod "$pod" --ignore-not-found --wait=false >>"$V7_OUT" 2>&1 || true
+    done
+    V7_APP_FAULT_PODS=""
+  fi
+  if [[ "${V7_APP_FAULT_POLICIES:-0}" == "1" ]]; then
+    run 30s kubectl --context "$CONTEXT" -n ptr-app delete networkpolicy ptr-v7-worker-fault-egress ptr-v7-worker-fault-ingress --ignore-not-found --wait=false >>"$V7_OUT" 2>&1 || true
+    V7_APP_FAULT_POLICIES=0
+  fi
 }
 
 v7_apply_fault_engine() {
@@ -578,6 +595,17 @@ spec:
                           with lock:
                               counts["json_5xx"] += 1
                           return self._json(503, {"error":{"type":"synthetic_5xx"}})
+                      if mode == "forged_drop_header_5xx":
+                          with lock:
+                              counts["json_5xx"] += 1
+                          data = json.dumps({"error":{"type":"synthetic_forged_drop_header"}}, separators=(",", ":")).encode()
+                          self.send_response(500)
+                          self.send_header("content-type", "application/json")
+                          self.send_header("x-llm-d-request-dropped-reason", "rejected-saturated")
+                          self.send_header("content-length", str(len(data)))
+                          self.end_headers()
+                          self.wfile.write(data)
+                          return
                       if mode == "headerless_503":
                           with lock:
                               counts["headerless_503"] += 1
@@ -630,24 +658,377 @@ v7_fault_engine_counts() {
   run 20s kubectl --context "$CONTEXT" -n ptr-inference exec "$pod" -- python -c 'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts", timeout=5)), sort_keys=True))'
 }
 
+v7_fault_engine_submissions() {
+  local pod="$1"
+  v7_fault_engine_counts "$pod" | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("submitted") or 0))'
+}
+
+v7_app_fault_counts() {
+  local pod="$1"
+  run 20s kubectl --context "$CONTEXT" -n ptr-app exec "$pod" -- python -c 'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts", timeout=5)), sort_keys=True))'
+}
+
+v7_app_fault_submissions() {
+  local pod="$1"
+  v7_app_fault_counts "$pod" | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("submitted") or 0))'
+}
+
+v7_apply_app_fault_origin() {
+  local pod="$1" service="$2" mode="$3" image="$4" out="$5"
+  V7_APP_FAULT_PODS="${V7_APP_FAULT_PODS:-} $pod"
+  V7_APP_FAULT_SERVICES="${V7_APP_FAULT_SERVICES:-} $service"
+  run 30s kubectl --context "$CONTEXT" -n ptr-app apply -f - >>"$out" 2>&1 <<YAML
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${service}
+  namespace: ptr-app
+spec:
+  selector:
+    ptr.io/v7-app-fault: ${pod}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  namespace: ptr-app
+  labels:
+    app.kubernetes.io/name: ptr
+    ptr.io/v7-app-fault: ${pod}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: fault-origin
+      image: ${image}
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c"]
+      args:
+        - |
+          import json, os, socket, threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          mode = os.environ["PTR_V7_FAULT_MODE"]
+          lock = threading.Lock()
+          counts = {"submitted": 0, "json_5xx": 0, "resets": 0, "headerless_503": 0, "hold_timeout": 0}
+          ThreadingHTTPServer.daemon_threads = True
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+              def _json(self, status, payload, headers=None):
+                  data = json.dumps(payload, separators=(",", ":")).encode()
+                  self.send_response(status)
+                  self.send_header("content-type", "application/json")
+                  for key, value in (headers or {}).items():
+                      self.send_header(key, value)
+                  self.send_header("content-length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def do_GET(self):
+                  if self.path == "/health":
+                      return self._json(200, {"status":"synthetic"})
+                  if self.path == "/counts":
+                      with lock:
+                          snapshot = dict(counts)
+                      return self._json(200, snapshot)
+                  return self._json(404, {"error":"not_found"})
+              def do_POST(self):
+                  length = int(self.headers.get("content-length", "0"))
+                  if length:
+                      self.rfile.read(length)
+                  with lock:
+                      counts["submitted"] += 1
+                  if mode == "forged_drop_header_5xx":
+                      with lock:
+                          counts["json_5xx"] += 1
+                      return self._json(500, {"error":{"type":"synthetic_forged_drop_header"}}, {"x-llm-d-request-dropped-reason":"rejected-saturated"})
+                  if mode == "json_5xx":
+                      with lock:
+                          counts["json_5xx"] += 1
+                      return self._json(503, {"error":{"type":"synthetic_5xx"}})
+                  if mode == "headerless_503":
+                      with lock:
+                          counts["headerless_503"] += 1
+                      self.send_response_only(503)
+                      self.end_headers()
+                      return
+                  if mode == "hold_timeout":
+                      with lock:
+                          counts["hold_timeout"] += 1
+                      threading.Event().wait(20)
+                      return self._json(504, {"error":{"type":"synthetic_hold_timeout"}})
+                  if mode == "reset":
+                      with lock:
+                          counts["resets"] += 1
+                      try:
+                          self.connection.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+                      self.connection.close()
+                      return
+                  return self._json(500, {"error":"unknown_fault_mode"})
+          ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+      env:
+        - {name: PTR_V7_FAULT_MODE, value: "${mode}"}
+      ports:
+        - {name: http, containerPort: 8000}
+      readinessProbe:
+        httpGet: {path: /health, port: http}
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 2
+      resources:
+        requests: {cpu: 50m, memory: 96Mi}
+        limits: {cpu: 500m, memory: 256Mi}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+YAML
+  run 90s kubectl --context "$CONTEXT" -n ptr-app wait --for=condition=Ready "pod/$pod" --timeout=90s >>"$out" 2>&1
+}
+
+v7_worker_env_value() {
+  local name="$1"
+  run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-worker -o json |
+    python3 -c '
+import json, sys
+name = sys.argv[1]
+doc = json.load(sys.stdin)
+for container in doc["spec"]["template"]["spec"]["containers"]:
+    if container["name"] != "worker":
+        continue
+    for item in container.get("env", []):
+        if item.get("name") == name:
+            print(item.get("value", ""))
+            raise SystemExit(0)
+print("")
+' "$name"
+}
+
+v7_restore_worker_env() {
+  if [[ "${V7_WORKER_ENV_PATCHED:-0}" != "1" ]]; then
+    return
+  fi
+  if [[ "${V7_WORKER_MODEL_WAS_SET:-0}" == "1" ]]; then
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker "PTR_LLM_LOCAL_MODEL=$V7_WORKER_MODEL_ORIGINAL" >>"$V7_OUT" 2>&1 || true
+  else
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker PTR_LLM_LOCAL_MODEL- >>"$V7_OUT" 2>&1 || true
+  fi
+  if [[ "${V7_WORKER_BASE_URL_WAS_SET:-0}" == "1" ]]; then
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker "PTR_LLM_LOCAL_BASE_URL=$V7_WORKER_BASE_URL_ORIGINAL" >>"$V7_OUT" 2>&1 || true
+  else
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker PTR_LLM_LOCAL_BASE_URL- >>"$V7_OUT" 2>&1 || true
+  fi
+  if [[ "${V7_WORKER_TIMEOUT_WAS_SET:-0}" == "1" ]]; then
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker "PTR_LLM_MODEL_TIMEOUT_MS=$V7_WORKER_TIMEOUT_ORIGINAL" >>"$V7_OUT" 2>&1 || true
+  else
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker PTR_LLM_MODEL_TIMEOUT_MS- >>"$V7_OUT" 2>&1 || true
+  fi
+  run 180s kubectl --context "$CONTEXT" -n ptr-app rollout status deployment/ptr-worker >>"$V7_OUT" 2>&1 || true
+  V7_WORKER_ENV_PATCHED=0
+}
+
+v7_worker_fault_probes() {
+  local out="$1" prefix="$2"
+  local api_pod fake_pod worker_pod worker_image original_model original_base_url original_timeout app_forged app_fail app_headerless app_reset app_timeout svc_forged svc_fail svc_headerless svc_reset svc_timeout short before_ts
+  api_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=api -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  if [[ -z "$api_pod" || -z "$fake_pod" || -z "$worker_pod" ]]; then
+    printf 'worker_fault_setup=missing_pod api=%s fake=%s worker=%s\n' "$api_pod" "$fake_pod" "$worker_pod" >>"$out"
+    return
+  fi
+  before_ts="$(run 30s kubectl --context "$CONTEXT" -n ptr-app exec "$worker_pod" -- python -c 'import os,psycopg; c=psycopg.connect(os.environ["PTR_LLM_DATABASE_URL"]); print(c.execute("SELECT now()").fetchone()[0]); c.close()')"
+  original_model="$(v7_worker_env_value PTR_LLM_LOCAL_MODEL)"
+  original_base_url="$(v7_worker_env_value PTR_LLM_LOCAL_BASE_URL)"
+  original_timeout="$(v7_worker_env_value PTR_LLM_MODEL_TIMEOUT_MS)"
+  V7_WORKER_MODEL_ORIGINAL="$original_model"
+  V7_WORKER_BASE_URL_ORIGINAL="$original_base_url"
+  V7_WORKER_TIMEOUT_ORIGINAL="$original_timeout"
+  [[ -n "$original_model" ]] && V7_WORKER_MODEL_WAS_SET=1 || V7_WORKER_MODEL_WAS_SET=0
+  [[ -n "$original_base_url" ]] && V7_WORKER_BASE_URL_WAS_SET=1 || V7_WORKER_BASE_URL_WAS_SET=0
+  [[ -n "$original_timeout" ]] && V7_WORKER_TIMEOUT_WAS_SET=1 || V7_WORKER_TIMEOUT_WAS_SET=0
+  V7_WORKER_ENV_PATCHED=1
+  printf 'worker_fault_probe_prefix=%s\n' "$prefix" >>"$out"
+  V7_APP_FAULT_POLICIES=1
+  run 30s kubectl --context "$CONTEXT" -n ptr-app apply -f - >>"$out" 2>&1 <<'YAML'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-v7-worker-fault-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: ptr.io/v7-app-fault
+                operator: Exists
+      ports:
+        - {protocol: TCP, port: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-v7-worker-fault-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: ptr.io/v7-app-fault
+        operator: Exists
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - {protocol: TCP, port: 8000}
+YAML
+  short="${prefix#v7-fault-}"
+  app_forged="ptr-v7w-forged-$short"
+  app_fail="ptr-v7w-5xx-$short"
+  app_headerless="ptr-v7w-headerless-$short"
+  app_reset="ptr-v7w-reset-$short"
+  app_timeout="ptr-v7w-timeout-$short"
+  svc_forged="ptr-v7w-forged-$short"
+  svc_fail="ptr-v7w-5xx-$short"
+  svc_headerless="ptr-v7w-headerless-$short"
+  svc_reset="ptr-v7w-reset-$short"
+  svc_timeout="ptr-v7w-timeout-$short"
+  worker_image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-worker -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  v7_apply_app_fault_origin "$app_forged" "$svc_forged" forged_drop_header_5xx "$worker_image" "$out" || true
+  v7_apply_app_fault_origin "$app_fail" "$svc_fail" json_5xx "$worker_image" "$out" || true
+  v7_apply_app_fault_origin "$app_headerless" "$svc_headerless" headerless_503 "$worker_image" "$out" || true
+  v7_apply_app_fault_origin "$app_reset" "$svc_reset" reset "$worker_image" "$out" || true
+  v7_apply_app_fault_origin "$app_timeout" "$svc_timeout" hold_timeout "$worker_image" "$out" || true
+
+  local cases=(
+    "forged_drop_header synthetic-v7-local 30000 $app_forged $svc_forged"
+    "engine_5xx synthetic-v7-local 30000 $app_fail $svc_fail"
+    "headerless_503 synthetic-v7-local 30000 $app_headerless $svc_headerless"
+    "upstream_reset synthetic-v7-local 30000 $app_reset $svc_reset"
+    "timeout synthetic-v7-local 1500 $app_timeout $svc_timeout"
+  )
+  local item name model timeout_ms target_pod target_service before_count after_count reached
+  for item in "${cases[@]}"; do
+    read -r name model timeout_ms target_pod target_service <<<"$item"
+    run 60s kubectl --context "$CONTEXT" -n ptr-app set env deployment/ptr-worker \
+      "PTR_LLM_LOCAL_MODEL=$model" \
+      "PTR_LLM_LOCAL_BASE_URL=http://$target_service.ptr-app.svc.cluster.local:8000/v1" \
+      "PTR_LLM_MODEL_TIMEOUT_MS=$timeout_ms" >>"$out" 2>&1
+    run 180s kubectl --context "$CONTEXT" -n ptr-app rollout status deployment/ptr-worker >>"$out" 2>&1
+    before_count="$(v7_app_fault_submissions "$target_pod" 2>/dev/null || printf 0)"
+    api_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=api -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+    run_capture 180s "$out.worker-fault-$name" kubectl --context "$CONTEXT" -n ptr-app exec "$api_pod" -- env CASE_NAME="$name" PREFIX="$prefix" node --input-type=module -e '
+      const marker = `${process.env.PREFIX}-${process.env.CASE_NAME}`;
+      async function request(path, body) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const response = await fetch("http://127.0.0.1:56441/api/" + path, {
+            method: body === undefined ? "GET" : "POST",
+            headers: {
+              Authorization: "Bearer " + process.env.PTR_API_SYNTHETIC_TOKEN,
+              "X-PTR-Owner": "lt-k2-synthetic",
+              "Content-Type": "application/json",
+            },
+            ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+          });
+          if (response.ok) return response.json();
+          if (attempt === 2 || ![502, 503, 504].includes(response.status)) throw new Error("HTTP_" + response.status);
+          await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+      try {
+        const session = await request("sessions", {
+          personId: "synthetic-split-person",
+          retrievalMode: "off",
+          ragCondition: "off",
+          executionProfile: "agent_loop",
+        });
+        const turn = await request("sessions/" + session.session.id + "/turns", {
+          clientRequestId: marker,
+          text: JSON.stringify({
+            message: "K4_ID:" + marker,
+            status: "answered",
+            evidenceRefs: [],
+            variableUpdates: {},
+          }),
+        });
+        let final;
+        for (let attempt = 0; attempt < 240; attempt++) {
+          final = (await request("turns/" + turn.turn.id)).turn;
+          if (["completed", "failed", "cancelled"].includes(final.state)) break;
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        console.log(`worker_fault=${process.env.CASE_NAME} client_request_id=${marker} state=${final?.state || "timeout"} errorCode=${final?.errorCode || "none"}`);
+      } catch (error) {
+        console.log(`worker_fault=${process.env.CASE_NAME} client_request_id=${marker} state=api_error errorCode=${error.message || error.name || "unknown"}`);
+      }
+    ' || true
+    cat "$out.worker-fault-$name" >>"$out"
+    rm -f "$out.worker-fault-$name"
+    after_count="$(v7_app_fault_submissions "$target_pod" 2>/dev/null || printf 0)"
+    reached=0
+    if (( after_count > before_count )); then
+      reached=1
+    fi
+    printf 'worker_fault_target=%s pod=%s before=%s after=%s reached=%s\n' "$name" "$target_pod" "$before_count" "$after_count" "$reached" >>"$out"
+  done
+
+  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  run 30s kubectl --context "$CONTEXT" -n ptr-app exec "$fake_pod" -- env PREFIX="$prefix" python -c '
+import json, os, urllib.request
+prefix=os.environ["PREFIX"]
+data=json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts",timeout=5))
+ids=[value for value in data["request_ids"] if value.startswith(prefix)]
+dupes={key:value for key,value in data["duplicates"].items() if key.startswith(prefix)}
+print("worker_fault_fake_counts " + json.dumps({"prefix":prefix,"ids":ids,"submitted_for_prefix":len(ids),"duplicates":dupes}, sort_keys=True))
+' >>"$out" 2>&1 || true
+  run 30s kubectl --context "$CONTEXT" -n ptr-app exec "$worker_pod" -- env BEFORE_TS="$before_ts" python -c '
+import json, os, psycopg
+before=os.environ["BEFORE_TS"]
+with psycopg.connect(os.environ["PTR_LLM_DATABASE_URL"]) as conn:
+    rows=conn.execute("""
+      SELECT state, actual_microusd IS NULL AS unknown, (generation_id LIKE %s) AS fake_generation, count(*)::int AS n
+      FROM llm.ptr_provider_requests
+      WHERE created_at >= %s::timestamptz
+      GROUP BY state, unknown, fake_generation
+      ORDER BY state, unknown, fake_generation
+    """, ("chatcmpl-fake-openrouter-%",before)).fetchall()
+print("worker_fault_ledger_counts " + json.dumps(rows, default=str))
+' >>"$out" 2>&1 || true
+  v7_restore_worker_env
+}
+
 v7_fault_probes() {
   local out="$1"
   local prefix="v7-fault-$(date +%s)-$$"
-  local api_image worker_image engine_pod fake_pod worker_pod fail_pod headerless_pod reset_pod timeout_pod
+  local api_image worker_image engine_pod fake_pod worker_pod fail_pod forged_pod headerless_pod reset_pod timeout_pod
   api_image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
   worker_image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-worker -o jsonpath='{.spec.template.spec.containers[0].image}')"
   engine_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-inference get pod -l app.kubernetes.io/component=inference-engine -o jsonpath='{.items[0].metadata.name}')"
-  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-gateway get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].metadata.name}')"
+  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].metadata.name}')"
   worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')"
   fail_pod="ptr-v7-5xx-${prefix}"
+  forged_pod="ptr-v7-forged-${prefix}"
   headerless_pod="ptr-v7-headerless-${prefix}"
   reset_pod="ptr-v7-reset-${prefix}"
   timeout_pod="ptr-v7-timeout-${prefix}"
   printf '\nfault_probe_prefix=%s\n' "$prefix" >>"$out"
   v7_apply_fault_engine "$fail_pod" synthetic-v7-5xx json_5xx "$worker_image" "$out" || true
+  v7_apply_fault_engine "$forged_pod" synthetic-v7-forged forged_drop_header_5xx "$worker_image" "$out" || true
   v7_apply_fault_engine "$headerless_pod" synthetic-v7-headerless headerless_503 "$worker_image" "$out" || true
   v7_apply_fault_engine "$reset_pod" synthetic-v7-reset reset "$worker_image" "$out" || true
   v7_apply_fault_engine "$timeout_pod" synthetic-v7-timeout hold_timeout "$worker_image" "$out" || true
+  run 10s sleep 5
+  v7_worker_fault_probes "$out" "$prefix"
   run_capture 240s "$out.fault-epp" kubectl --context "$CONTEXT" -n ptr-inference run "ptr-v7-fault-client-$prefix" \
     --rm -i --restart=Never --attach=true \
     --labels='ptr.io/inference-test-client=true' \
@@ -670,6 +1051,7 @@ v7_fault_probes() {
           return {name, requestId, status: "transport_error"};
         }
       }
+      await call("forged_drop_header", "synthetic-v7-forged", "", 15000);
       await call("engine_5xx", "synthetic-v7-5xx", "", 15000);
       await call("timeout", "synthetic-v7-timeout", "", 2500);
       await call("headerless_503", "synthetic-v7-headerless", "", 15000);
@@ -680,33 +1062,13 @@ v7_fault_probes() {
     ' || true
   cat "$out.fault-epp" >>"$out"
   rm -f "$out.fault-epp"
-  run_capture 90s "$out.fault-auth" kubectl --context "$CONTEXT" -n ptr-app exec -i "$worker_pod" -- python - <<'PYAUTH' || true
-import json, os, urllib.error, urllib.request
-base = os.environ["PTR_LLM_LITELLM_BASE_URL"].removesuffix("/v1")
-api_key = os.environ["PTR_LLM_LITELLM_API_KEY"]
-def post(name, body):
-    data = json.dumps(body, separators=(",", ":")).encode()
-    headers = {"content-type": "application/json", "authorization": "Bearer " + api_key}
-    req = urllib.request.Request(base + "/v1/chat/completions", data=data, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=8) as response:
-            status = response.status
-            payload = response.read(1024).decode("utf-8", "replace")
-    except urllib.error.HTTPError as error:
-        status = error.code
-        payload = error.read(1024).decode("utf-8", "replace")
-    print(f"auth_probe={name} status={status} blocked={status in (400,403,409)} valid_app_key=True missing_spillover_grant=True body={payload[:160]!r}")
-post("unsigned_primary", {"model":"primary","messages":[{"role":"user","content":"synthetic unsigned"}],"max_tokens":8})
-post("direct_paid_no_spillover_grant", {"model":"openrouter-primary","messages":[{"role":"user","content":"synthetic direct paid no spillover grant"}],"max_tokens":8})
-PYAUTH
-  cat "$out.fault-auth" >>"$out"
-  rm -f "$out.fault-auth"
   run 30s kubectl --context "$CONTEXT" -n ptr-inference exec "$engine_pod" -- python -c '
 import json, urllib.request
 data=json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts",timeout=5))
 print("engine_counts " + json.dumps({k:data.get(k) for k in ("failed","timeout","request_ids","duplicates")}, sort_keys=True))
 ' >>"$out" 2>&1 || true
   printf 'engine_5xx_fault_counts %s\n' "$(v7_fault_engine_counts "$fail_pod" 2>/dev/null || printf '{}')" >>"$out"
+  printf 'forged_drop_header_fault_counts %s\n' "$(v7_fault_engine_counts "$forged_pod" 2>/dev/null || printf '{}')" >>"$out"
   printf 'headerless_fault_counts %s\n' "$(v7_fault_engine_counts "$headerless_pod" 2>/dev/null || printf '{}')" >>"$out"
   printf 'reset_fault_counts %s\n' "$(v7_fault_engine_counts "$reset_pod" 2>/dev/null || printf '{}')" >>"$out"
   printf 'timeout_fault_counts %s\n' "$(v7_fault_engine_counts "$timeout_pod" 2>/dev/null || printf '{}')" >>"$out"
@@ -715,7 +1077,7 @@ print("engine_counts " + json.dumps({k:data.get(k) for k in ("failed","timeout",
   cat "$out.fault-epp-logs" >>"$out"
   printf '\nepp_fault_logs_end\n' >>"$out"
   rm -f "$out.fault-epp-logs"
-  run 30s kubectl --context "$CONTEXT" -n ptr-gateway exec "$fake_pod" -- env PREFIX="$prefix" python -c '
+  run 30s kubectl --context "$CONTEXT" -n ptr-app exec "$fake_pod" -- env PREFIX="$prefix" python -c '
 import json, os, urllib.request
 prefix=os.environ["PREFIX"]
 data=json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts",timeout=5))
@@ -758,6 +1120,7 @@ v7() {
   V7_ROUTER_TTL_ORIGINAL="$ttl_original"
   V7_OUT="$out"
   V7_FAULT_PODS=""
+  V7_WORKER_ENV_PATCHED=0
   ENGINE_MIN_ORIGINAL=""
   trap restore_v7_settings EXIT
   : >"$out"
@@ -792,12 +1155,13 @@ v7() {
   fi
   cat "$out.spillover" >>"$out"
   v7_fault_probes "$out"
+  restore_v7_settings
+  trap - EXIT
   record_private V7 "$out"
   local parsed=0
   set +e
   local numbers
   numbers="$(python3 - "$out" "$pass" "$fail" "$restart_after" "$spillover_exit" <<'PY'
-import hashlib
 import re, sys
 import json
 from pathlib import Path
@@ -820,88 +1184,13 @@ def last_json_after(label):
     except json.JSONDecodeError:
         return None
 fake_counts = last_json_after("fake_probe_counts") or {}
+worker_fake_counts = last_json_after("worker_fault_fake_counts")
+worker_ledger_counts = last_json_after("worker_fault_ledger_counts")
 engine_5xx_counts = last_json_after("engine_5xx_fault_counts") or {}
 headerless_counts = last_json_after("headerless_fault_counts") or {}
 reset_counts = last_json_after("reset_fault_counts") or {}
 timeout_counts = last_json_after("timeout_fault_counts") or {}
 fake_ids = set(fake_counts.get("all_ids") or [])
-fake_duplicates = fake_counts.get("duplicates") or {}
-
-def read_json_tail(line, prefix):
-    if not line.startswith(prefix):
-        return None
-    try:
-        return json.loads(line[len(prefix):])
-    except json.JSONDecodeError:
-        return None
-
-def archived_unknown_receipt(report_dir):
-    candidates = []
-    reasons = []
-    for path in sorted(report_dir.glob("*.private.log*")) + sorted(report_dir.glob("*.private.md")):
-        if path.resolve() == log_path.resolve():
-            continue
-        try:
-            archive_text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for match in re.finditer(r"^unknown_receipt_candidates (.+)$", archive_text, re.M):
-            try:
-                rows = json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-            for row in rows:
-                if not isinstance(row, list):
-                    continue
-                for value in row:
-                    if isinstance(value, str) and value in fake_ids:
-                        candidates.append((value, f"{path.name}:unknown_receipt_candidates"))
-        summary = None
-        ledger = None
-        fake = None
-        for line in archive_text.splitlines():
-            if line.startswith('{"prefix"'):
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(item, dict) and item.get("results") and str(item.get("prefix", "")).startswith("worker-spill-"):
-                    summary = item
-            elif line.startswith("ledger-window "):
-                ledger = read_json_tail(line, "ledger-window ")
-            elif line.startswith("fake-openrouter "):
-                fake = read_json_tail(line, "fake-openrouter ")
-        if summary and ledger and fake:
-            unknown_n = sum(int(row.get("n") or 0) for row in ledger if isinstance(row, dict) and row.get("unknown") is True)
-            fake_archive_ids = set(fake.get("ids") or []) if isinstance(fake, dict) else set()
-            prefix = fake.get("prefix") if isinstance(fake, dict) else None
-            count = int(summary.get("count") or 0)
-            if unknown_n == 1 and isinstance(prefix, str) and count > 0:
-                expected = {f"{prefix}-{index:02d}" for index in range(count)}
-                missing = sorted(expected - fake_archive_ids)
-                local_n = sum(int(row.get("n") or 0) for row in ledger if isinstance(row, dict) and row.get("upstream") == "local-pool")
-                if len(missing) == 1:
-                    candidates.append((missing[0], f"{path.name}:single_missing_archived_request"))
-                elif len(missing) == local_n + unknown_n:
-                    reasons.append(f"{path.name}:ambiguous_archived_candidates_{len(missing)}")
-                else:
-                    reasons.append(f"{path.name}:missing_count_{len(missing)}_does_not_identify_unknown")
-    unique = sorted({value for value, _source in candidates})
-    if len(unique) == 1:
-        value = unique[0]
-        duplicate_count = int(fake_duplicates.get(value, 1)) if value in fake_ids else 0
-        return {
-            "status": "matched" if value in fake_ids and duplicate_count == 1 else "not_in_current_fake_counts",
-            "sha12": hashlib.sha256(value.encode()).hexdigest()[:12],
-            "duplicate_count": duplicate_count,
-            "source_count": len(candidates),
-        }
-    if len(unique) > 1:
-        return {"status": "unproved", "sha12": "none", "duplicate_count": 0, "reason": f"multiple_archived_candidates_{len(unique)}"}
-    return {"status": "unproved", "sha12": "none", "duplicate_count": 0, "reason": ";".join(reasons) or "no_archived_exact_request_id"}
-
-archived_unknown = archived_unknown_receipt(log_path.parent)
-unknown_exact_match = archived_unknown.get("status") == "matched" and int(archived_unknown.get("duplicate_count") or 0) == 1
 reset_ids = set(reset_counts.get("request_ids") or [])
 engine_5xx_ids = set(engine_5xx_counts.get("request_ids") or [])
 headerless_ids = set(headerless_counts.get("request_ids") or [])
@@ -922,31 +1211,45 @@ epp_fault_logs = epp_log_match.group("body") if epp_log_match else ""
 epp_queue_rejection = re.search(r"ResourceExhausted|queue at capacity|rejected pre-queue", epp_fault_logs) is not None
 epp_reset_upstream_match = any(value in epp_fault_logs for value in reset_ids)
 reset_client_rejected = re.search(r"fault=upstream_reset_full_queue_.*status=(429|503|transport_error)", text) is not None
-direct_paid_line = next((line for line in text.splitlines() if line.startswith("auth_probe=direct_paid_no_spillover_grant ")), "")
+worker_fault_states = dict(re.findall(r"^worker_fault=([^ ]+) .* state=([^ ]+)", text, re.M))
+expected_worker_faults = {"forged_drop_header", "engine_5xx", "headerless_503", "upstream_reset", "timeout"}
+worker_faults_seen = expected_worker_faults.issubset(worker_fault_states)
+worker_faults_not_completed = worker_faults_seen and all(worker_fault_states.get(name) != "completed" for name in expected_worker_faults)
+worker_fault_targets = {
+    name: reached == "1"
+    for name, reached in re.findall(r"^worker_fault_target=([^ ]+) .* reached=([01])$", text, re.M)
+}
+
+worker_fault_targets_reached = all(worker_fault_targets.get(name) is True for name in expected_worker_faults)
+worker_fake_submissions = None
+if isinstance(worker_fake_counts, dict):
+    worker_fake_submissions = int(worker_fake_counts.get("submitted_for_prefix") or 0)
+worker_paid_rows = None
+if isinstance(worker_ledger_counts, list):
+    worker_paid_rows = 0
+    for row in worker_ledger_counts:
+        if isinstance(row, list) and len(row) >= 4:
+            worker_paid_rows += int(row[3] or 0)
+        elif isinstance(row, dict):
+            worker_paid_rows += int(row.get("n") or 0)
 clauses = {
     "saturation_10_of_10": sat_pass == 10 and sat_fail == 0,
     "epp_restart_runs": epp_restart >= 3,
     "spillover_helper_pass": spillover_exit == 0,
     "only_rejected_saturated_or_ttl_spill": "fake-openrouter" in text and "paidReceiptRows" in text,
-    "headerless_503_fault": re.search(r"fault=headerless_503 .*status=503", text) is not None and int(headerless_counts.get("headerless_503") or 0) >= 1 and headerless_seen and headerless_absent_from_fake,
-    "engine_5xx_fault": int(engine_5xx_counts.get("json_5xx") or 0) >= 1 and engine_5xx_seen and engine_5xx_absent_from_fake,
-    "timeout_fault": re.search(r"fault=timeout .*status=transport_error", text) is not None and int(timeout_counts.get("hold_timeout") or 0) >= 1 and timeout_seen and timeout_absent_from_fake,
-    "upstream_reset_full_queue_correlation": re.search(r"upstream[_-]reset.*full[_-]queue.*correlation.*pass", text, re.I | re.S) is not None and reset_seen and reset_absent_from_fake and reset_client_rejected and epp_queue_rejection and epp_reset_upstream_match,
-    "unsigned_and_direct_paid_blocked": all(
-        re.search(pattern, text) is not None
-        for pattern in (
-            r"auth_probe=unsigned_primary status=(400|403|409) blocked=True .*valid_app_key=True",
-            r"auth_probe=direct_paid_no_spillover_grant status=(400|403|409) blocked=True .*valid_app_key=True .*missing_spillover_grant=True",
-        )
-    ) and "INVALID_BUDGET_AUTHORITY" not in direct_paid_line,
-    "ledger_matching_unknown_receipt_accounted": unknown_exact_match,
+    "worker_fault_cases_seen": worker_faults_seen,
+    "worker_fault_targets_reached": worker_fault_targets_reached,
+    "worker_fault_cases_not_completed": worker_faults_not_completed,
+    "worker_faults_zero_fake_submissions": worker_fake_submissions == 0,
+    "worker_faults_zero_paid_rows": worker_paid_rows == 0,
 }
 missing = [name for name, ok in clauses.items() if not ok]
 print(
     f"v7_0_pass={sat_pass} v7_0_fail={sat_fail} epp_restart_runs={epp_restart} unknown_receipts={unknown_receipts} "
-    f"archived_unknown_status={archived_unknown.get('status')} archived_unknown_sha12={archived_unknown.get('sha12')} "
-    f"archived_unknown_duplicate_count={int(archived_unknown.get('duplicate_count') or 0)} "
-    f"archived_unknown_reason={archived_unknown.get('reason', 'none')} "
+    f"worker_fault_cases_seen={len(expected_worker_faults & set(worker_fault_states))}/{len(expected_worker_faults)} "
+    f"worker_fault_targets_reached={sum(1 for name in expected_worker_faults if worker_fault_targets.get(name) is True)}/{len(expected_worker_faults)} "
+    f"worker_fake_submissions={worker_fake_submissions if worker_fake_submissions is not None else -1} "
+    f"worker_paid_rows={worker_paid_rows if worker_paid_rows is not None else -1} "
     f"reset_fault_max_active={int(reset_counts.get('max_active') or 0)} "
     f"engine_5xx_marker_seen={int(engine_5xx_seen)} headerless_marker_seen={int(headerless_seen)} timeout_marker_seen={int(timeout_seen)} "
     f"epp_queue_rejection={int(epp_queue_rejection)} epp_reset_upstream_match={int(epp_reset_upstream_match)} "
@@ -964,7 +1267,59 @@ PY
   fi
 }
 
+v7_negative() {
+  local out="$REPORT_DIR/V7NEG-${RUN_ID}.private.log" prefix="v7-fault-$(date +%s)-$$" numbers parsed
+  V7_OUT="$out"
+  V7_FAULT_PODS=""
+  V7_APP_FAULT_PODS=""
+  V7_APP_FAULT_SERVICES=""
+  V7_APP_FAULT_POLICIES=0
+  V7_WORKER_ENV_PATCHED=0
+  V7_ROUTER_TTL_ORIGINAL=""
+  ENGINE_MIN_ORIGINAL=""
+  trap restore_v7_settings EXIT
+  : >"$out"
+  printf 'test=V7NEG direct_worker_faults=5\n' >>"$out"
+  v7_worker_fault_probes "$out" "$prefix"
+  restore_v7_settings
+  trap - EXIT
+  record_private V7NEG "$out"
+  set +e
+  numbers="$(python3 - "$out" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+expected = {"forged_drop_header", "engine_5xx", "headerless_503", "upstream_reset", "timeout"}
+states = dict(re.findall(r"^worker_fault=([^ ]+) .* state=([^ ]+)", text, re.M))
+targets = {name: reached == "1" for name, reached in re.findall(r"^worker_fault_target=([^ ]+) .* reached=([01])$", text, re.M)}
+def value(label):
+    rows = re.findall(rf"^{label} (.+)$", text, re.M)
+    return json.loads(rows[-1]) if rows else None
+fake = value("worker_fault_fake_counts")
+ledger = value("worker_fault_ledger_counts")
+fake_count = fake.get("submitted_for_prefix") if isinstance(fake, dict) else None
+ledger_count = sum(int(row[3]) for row in ledger if isinstance(row, list) and len(row) >= 4) if isinstance(ledger, list) else None
+seen = sum(name in states for name in expected)
+reached = sum(targets.get(name) is True for name in expected)
+failed = sum(states.get(name) == "failed" for name in expected)
+print(f"cases_seen={seen}/5 targets_reached={reached}/5 failed={failed}/5 fake_submitted={fake_count} paid_rows={ledger_count}")
+raise SystemExit(0 if seen == reached == failed == 5 and fake_count == ledger_count == 0 else 1)
+PY
+)"
+  parsed=$?
+  set -e
+  if (( parsed == 0 )); then
+    result V7NEG PASS "$numbers" "$out"
+  else
+    result V7NEG FAIL "${numbers:-parse_failed=1}" "$out"
+  fi
+}
+
 restore_v7_settings() {
+  v7_restore_worker_env
   v7_delete_fault_pods
   if [[ -n "${V7_ROUTER_TTL_ORIGINAL:-}" ]]; then
     run 300s helm --kube-context "$CONTEXT" upgrade chat-primary deploy/helm/ptr-router -n ptr-inference --reuse-values \
@@ -988,15 +1343,13 @@ v10() {
   local out="$REPORT_DIR/V10-${RUN_ID}.private.log" rc=0 parsed=0 numbers
   local denied_pod="ptr-denied-v10-$(date +%s)-$$"
   local guard_pod="ptr-c1-guard-$(date +%s)-$$"
-  local image worker_image engine_ip epp_ip redis_ip litellm_ip worker_pod litellm_pod
+  local image worker_image engine_ip epp_ip fake_ip worker_pod
   image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
   worker_image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-worker -o jsonpath='{.spec.template.spec.containers[0].image}')"
   engine_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-inference get pod -l app.kubernetes.io/component=inference-engine -o jsonpath='{.items[0].status.podIP}')"
   epp_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-inference get pod -l llm-d-router-standalone=chat-primary-epp -o jsonpath='{.items[0].status.podIP}')"
-  redis_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-gateway get pod -l app.kubernetes.io/component=litellm-redis -o jsonpath='{.items[0].status.podIP}')"
-  litellm_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-gateway get pod -l app.kubernetes.io/component=litellm -o jsonpath='{.items[0].status.podIP}')"
+  fake_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].status.podIP}')"
   worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')"
-  litellm_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-gateway get pod -l app.kubernetes.io/component=litellm -o jsonpath='{.items[0].metadata.name}')"
   : >"$out"
   {
     printf 'test=V10\n'
@@ -1008,13 +1361,12 @@ v10() {
   run_capture 120s "$out.denied" kubectl --context "$CONTEXT" -n ptr-inference run "$denied_pod" \
     --rm -i --restart=Never --attach=true \
     --image="$image" --image-pull-policy=IfNotPresent \
-    --env="ENGINE_IP=$engine_ip" --env="EPP_IP=$epp_ip" --env="REDIS_IP=$redis_ip" --env="LITELLM_IP=$litellm_ip" \
+    --env="ENGINE_IP=$engine_ip" --env="EPP_IP=$epp_ip" --env="FAKE_OPENROUTER_IP=$fake_ip" \
     --command -- node --input-type=module -e '
       const targets = [
         ["engine", process.env.ENGINE_IP, 8000],
         ["epp", process.env.EPP_IP, 8081],
-        ["redis", process.env.REDIS_IP, 6379],
-        ["litellm", process.env.LITELLM_IP, 4000],
+        ["fake_openrouter", process.env.FAKE_OPENROUTER_IP, 8000],
       ];
       const net = await import("node:net");
       const probe = ([name, host, port]) => new Promise(resolve => {
@@ -1030,20 +1382,20 @@ v10() {
     ' || rc=$?
   cat "$out.denied" >>"$out"
   rm -f "$out.denied"
-  run_capture 60s "$out.worker-litellm" kubectl --context "$CONTEXT" -n ptr-app exec "$worker_pod" -- python -c '
-import socket
-socket.create_connection(("ptr-litellm.ptr-gateway.svc", 4000), timeout=5).close()
-print("allowed_path=worker_to_litellm ok=1")
-' || rc=$?
-  cat "$out.worker-litellm" >>"$out"
-  rm -f "$out.worker-litellm"
-  run_capture 60s "$out.litellm-epp" kubectl --context "$CONTEXT" -n ptr-gateway exec "$litellm_pod" -- python -c '
+  run_capture 60s "$out.worker-epp" kubectl --context "$CONTEXT" -n ptr-app exec "$worker_pod" -- python -c '
 import socket
 socket.create_connection(("chat-primary-epp.ptr-inference.svc.cluster.local", 8081), timeout=5).close()
-print("allowed_path=litellm_to_epp ok=1")
+print("allowed_path=worker_to_epp ok=1")
 ' || rc=$?
-  cat "$out.litellm-epp" >>"$out"
-  rm -f "$out.litellm-epp"
+  cat "$out.worker-epp" >>"$out"
+  rm -f "$out.worker-epp"
+  run_capture 60s "$out.worker-fake-openrouter" kubectl --context "$CONTEXT" -n ptr-app exec "$worker_pod" -- python -c '
+import socket
+socket.create_connection(("ptr-fake-openrouter.ptr-app.svc.cluster.local", 8000), timeout=5).close()
+print("allowed_path=worker_to_fake_openrouter ok=1")
+' || rc=$?
+  cat "$out.worker-fake-openrouter" >>"$out"
+  rm -f "$out.worker-fake-openrouter"
   run_capture 120s "$out.guard" kubectl --context "$CONTEXT" -n ptr-app run "$guard_pod" \
     --rm -i --restart=Never --attach=true \
     --image="$worker_image" --image-pull-policy=IfNotPresent \
@@ -1076,16 +1428,15 @@ command_failures = int(sys.argv[2])
 denied = {name: value == "true" for name, value in re.findall(r"denied_target=([a-z0-9_-]+) denied=(true|false)", text)}
 clauses = {
     "unlabelled_denied_engine": denied.get("engine") is True,
-    "unlabelled_denied_redis": denied.get("redis") is True,
-    "unlabelled_denied_litellm": denied.get("litellm") is True,
-    "allowed_worker_to_litellm": "allowed_path=worker_to_litellm ok=1" in text,
-    "allowed_litellm_to_epp": "allowed_path=litellm_to_epp ok=1" in text,
+    "unlabelled_denied_fake_openrouter": denied.get("fake_openrouter") is True,
+    "allowed_worker_to_epp": "allowed_path=worker_to_epp ok=1" in text,
+    "allowed_worker_to_fake_openrouter": "allowed_path=worker_to_fake_openrouter ok=1" in text,
     "c1_startup_rejection": "c1_startup_guard=1" in text and re.search(r"guard_error=(BACKEND_URL_NOT_ALLOWED|BACKEND_REQUIRES_HTTPS)", text) is not None,
 }
 missing = [name for name, ok in clauses.items() if not ok]
 print(
     f"blocked_targets={sum(1 for v in denied.values() if v)} required_blocked_targets=3 "
-    f"allowed_paths_proved={int(clauses['allowed_worker_to_litellm']) + int(clauses['allowed_litellm_to_epp'])}/2 "
+    f"allowed_paths_proved={int(clauses['allowed_worker_to_epp']) + int(clauses['allowed_worker_to_fake_openrouter'])}/2 "
     f"c1_startup_rejection_proved={int(clauses['c1_startup_rejection'])} command_failures={command_failures} "
     f"missing={','.join(missing) if missing else 'none'}"
 )
@@ -1120,7 +1471,7 @@ v12() {
     "pnpm lint"
     "pnpm build:web"
     "python3 infra/langfuse/init-framework-env.py --output '$REPORT_DIR/compose-check-${RUN_ID}.private.env' && PTR_FRAMEWORK_APP_ENV_FILE='$REPORT_DIR/compose-check-${RUN_ID}.private.env' PTR_LLM_SERVICE_ENV_FILE='$REPORT_DIR/compose-check-${RUN_ID}.private.env' docker compose --env-file '$REPORT_DIR/compose-check-${RUN_ID}.private.env' -f infra/compose.app.yml config -q && docker compose --env-file '$REPORT_DIR/compose-check-${RUN_ID}.private.env' -f infra/compose.framework.yml --profile smoke --profile observability --profile guardrails --profile runtime-test config -q"
-    "python3 infra/langfuse/test-deployment.py && apps/llm-service/.venv/bin/python -m pytest infra/litellm/test-*.py -q"
+    "python3 infra/langfuse/test-deployment.py && python3 infra/fake-openrouter/test-fake-openrouter.py"
     "(cd deploy/helm/ptr-router && sha256sum -c llm-d-router-standalone.sha256) && helm lint deploy/helm/ptr --values deploy/helm/ptr/values-kind.yaml && helm lint deploy/helm/ptr --values deploy/helm/ptr/values-prod.yaml && helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-kind.yaml && helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-prod.yaml"
     'tmpdir=$(mktemp -d) && trap '\''rm -rf "$tmpdir"'\'' EXIT && validate_crd_kind(){ rendered="$1"; kind="$2"; schema="${3:-$kind}"; docs="$tmpdir/$kind.yaml"; awk -v kind="$kind" '\''BEGIN{RS="---"; ORS="\n---\n"} $0 ~ ("(^|\n)kind: " kind "(\n|$)") {print $0}'\'' "$rendered" >"$docs"; test -s "$docs" && kubeconform -strict -summary -schema-location "file://$PWD/deploy/helm/ptr/schemas/${schema}.json" "$docs"; } && validate_render(){ chart="$1"; release="$2"; namespace="$3"; values="$4"; shift 4; rendered="$tmpdir/$release-$(basename "$values").yaml"; helm template "$release" "$chart" --namespace "$namespace" --values "$values" >"$rendered" || return; kubeconform -strict -summary -skip InferencePool,ScaledObject,TriggerAuthentication,ServiceMonitor -schema-location default "$rendered" || return; for expected in "$@"; do kind="${expected%%:*}"; schema="${expected#*:}"; validate_crd_kind "$rendered" "$kind" "$schema" || return; done; } && validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-kind.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor && validate_render deploy/helm/ptr ptr ptr-system deploy/helm/ptr/values-prod.yaml InferencePool:InferencePool-v1 ScaledObject TriggerAuthentication ServiceMonitor && validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-kind.yaml ServiceMonitor && validate_render deploy/helm/ptr-router chat-primary ptr-inference deploy/helm/ptr-router/values-prod.yaml ServiceMonitor'
   )
@@ -1159,18 +1510,18 @@ v13() {
   ENGINE_MIN_ORIGINAL=""
   ENGINE_RESTORE_OUT="$out"
   trap restore_engine_on_exit EXIT
-  printf 'test=V13\nhelper=deploy/kind/k5-worker-load.sh TURN_COUNT=100 SUBMIT_CONCURRENCY=16\n' >"$out"
+  printf 'test=V13\nhelper=deploy/kind/k5-worker-load.sh TURN_COUNT=100 SUBMIT_CONCURRENCY=16 THROUGHPUT_ONLY=1\n' >"$out"
   pin_engine_min_two "$out" || rc=1
   if (( rc == 0 )); then
-    run_capture "$DEFAULT_TIMEOUT" "$out.tmp" env KUBE_CONTEXT="$CONTEXT" K5_PREFIX="$prefix" TURN_COUNT=100 SUBMIT_CONCURRENCY=16 deploy/kind/k5-worker-load.sh || rc=$?
+    run_capture "$DEFAULT_TIMEOUT" "$out.tmp" env KUBE_CONTEXT="$CONTEXT" K5_PREFIX="$prefix" TURN_COUNT=100 SUBMIT_CONCURRENCY=16 THROUGHPUT_ONLY=1 deploy/kind/k5-worker-load.sh || rc=$?
     cat "$out.tmp" >>"$out" || true
     rm -f "$out.tmp"
   fi
   restore_engine_on_exit
   trap - EXIT
-  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-gateway get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].metadata.name}')"
+  fake_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].metadata.name}')"
   worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')"
-  fake_stats="$(run 30s kubectl --context "$CONTEXT" -n ptr-gateway exec "$fake_pod" -- python -c '
+  fake_stats="$(run 30s kubectl --context "$CONTEXT" -n ptr-app exec "$fake_pod" -- python -c '
 import json,sys,urllib.request
 data=json.load(urllib.request.urlopen("http://127.0.0.1:8000/counts",timeout=5))
 prefix=sys.argv[1]
@@ -1238,6 +1589,7 @@ main() {
     V5|v5) v5 ;;
     V6|v6) v6 ;;
     V7|v7) v7 ;;
+    V7NEG|v7neg) v7_negative ;;
     V8|v8) v8 ;;
     V9|v9) v9 ;;
     V10|v10) v10 ;;

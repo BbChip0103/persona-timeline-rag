@@ -13,22 +13,20 @@ app:
   # The 200-turn synthetic burst may wait behind the two simulated engines.
   api: {replicas: 2, maxQueueMs: 600000}
   worker: {replicas: 2, concurrency: 4}
-gateway:
+llm:
   billing:
     maxOutputTokens: 2048
     # 200 synthetic V5 admissions reserve at most 1.00 USD even if all receipts
     # become unknown; the ordinary 1 USD cumulative ledger rule stays intact.
     maxCallMicrousd: 5000
-  bootstrap:
-    apiServerCIDRs: ["10.96.0.1/32"]
-    apiServerPorts: [443, 6443]
-    # V5 submits 200 synthetic turns with high host-side concurrency; keep the
-    # app key above that burst so worker autoscaling, not LiteLLM RPM, is tested.
-    rpm: 1000
-  data:
-    enabled: true
+  openrouter:
+    baseUrlOverride: http://ptr-fake-openrouter.ptr-app.svc.cluster.local:8000
+    syntheticProviderFixture: true
   fakeOpenRouter:
     enabled: true
+policy:
+  apiServerCIDRs: ["10.96.0.1/32"]
+  apiServerPorts: [443, 6443]
 inference:
   engine:
     kind: sim
@@ -82,7 +80,6 @@ autoscaling:
   hpa:
     web: {minReplicas: 2, maxReplicas: 3}
     api: {minReplicas: 2, maxReplicas: 4}
-    litellm: {minReplicas: 2, maxReplicas: 3}
   worker:
     maxReplicaCount: 6
   engine:

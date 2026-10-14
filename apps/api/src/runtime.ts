@@ -102,6 +102,7 @@ function messagingSettings(env:NodeJS.ProcessEnv) {
   if(!/^[a-z0-9-]{1,40}$/.test(queueName)||!/^[a-z0-9-]{1,40}$/.test(namespace)) throw new CoreError('INVALID_INPUT');
   return {databaseUrl,pool,redisUrl:env.PTR_REDIS_URL??'',queueName,namespace};
 }
+const paidSpilloverPossible=(env:NodeJS.ProcessEnv)=>env.PTR_PAID_SPILLOVER==='1';
 /** Composition only. It never seeds, migrates, imports posts, or calls a live provider at startup. */
 export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFailure?:(failure:{turnId:string;code:string})=>void;onSafetyFallback?:(event:{scope:'turn'|'draft';reason:string})=>void;
   onTurnCompleted?:ChatServiceOptions['onTurnCompleted'];
@@ -125,6 +126,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const fakeText=new FakeTextProvider(),fakeEmbedding=new FakeEmbeddingProvider();
   const embed=(text:string,options:{signal:AbortSignal})=>fakeEmbedding.embed([text],options).then(vectors=>vectors[0]!);
   const providerName=env.PTR_CHAT_PROVIDER??'fake';
+  const billable=paidSpilloverPossible(env);
   if(!['fake','litellm'].includes(providerName))throw new CoreError('INVALID_INPUT','Legacy provider routes were removed');
   let model=providerName==='fake'?'synthetic/fake-text-v1':env.PTR_MODEL??'primary';
   let provider:TextProvider=fakeText;
@@ -134,7 +136,6 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   }
   if(providerName==='litellm') {
     if(!env.PTR_LITELLM_BASE_URL||!env.PTR_LITELLM_API_KEY)throw new CoreError('INVALID_INPUT');
-    const billable=env.PTR_LITELLM_BILLABLE==='1';
     if(!billable&&model!=='primary')throw new CoreError('INVALID_INPUT','Unapproved billable model alias');
     if(billable&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))throw new CoreError('INVALID_INPUT');
     const reservation=Number(env.PTR_LITELLM_RESERVATION_MICROUSD??100000);
@@ -204,7 +205,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const semanticSearch=providerName==='fake';
   // Only costly self-hosted turn calls get a minimal durable response checkpoint. Paid chat/Jev already
   // have independent request ledgers; drafts keep the unwrapped provider. Cheap graph stages restart.
-  const turnProvider=providerName==='litellm'&&env.PTR_LITELLM_BILLABLE!=='1'
+  const turnProvider=providerName==='litellm'&&!billable
     ?new CheckpointedTextProvider(provider,{checkpointer:new PostgresSaver(pool),
       identity:JSON.stringify({revision:'litellm-turn-receipt-v1',baseUrl:env.PTR_LITELLM_BASE_URL,
         model,maxOutputTokens:512,temperature:0,structuredOutput:'agent-json-schema-v1'})})
@@ -229,7 +230,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     retrieval:new PostgresRetrieval(sources,semanticSearch?{embed,modelRevision:fakeEmbedding.model}:undefined),
     ...(intentClassifier?{intentClassifier}:{}),...(inputSafety?{inputSafety,onSafetyFallback:hooks.onSafetyFallback??logSafetyFallback()}:{}),...(hooks.onTurnFailure?{onTurnFailure:hooks.onTurnFailure}:{}),
     ...(hooks.onTurnCompleted?{onTurnCompleted:hooks.onTurnCompleted}:{})});
-  return {chat,personas,provider,providerName,model,telemetry,...(guardrails?{guardrails}:{}),billable:env.PTR_LITELLM_BILLABLE==='1',leases:store,executionStore:store,delivery,events,eventSource,
+  return {chat,personas,provider,providerName,model,telemetry,...(guardrails?{guardrails}:{}),billable,leases:store,executionStore:store,delivery,events,eventSource,
     async oldestPendingAgeSeconds() {
       const result=await pool.query('SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0)::float8 AS age FROM turn_outbox');
       return Math.max(0,Number(result.rows[0]?.age??0));

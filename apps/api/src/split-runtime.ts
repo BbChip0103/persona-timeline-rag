@@ -25,6 +25,7 @@ export interface SplitApiRuntime {
   health():Promise<{database:boolean;redis:boolean}>;close():Promise<void>;
 }
 const integer=(env:NodeJS.ProcessEnv,key:string,fallback:number,min:number,max:number)=>{const n=Number(env[key]??fallback);if(!Number.isSafeInteger(n)||n<min||n>max)throw new CoreError('INVALID_INPUT');return n;};
+const paidSpilloverPossible=(env:NodeJS.ProcessEnv)=>env.PTR_PAID_SPILLOVER==='1';
 const clusterMode=(env:NodeJS.ProcessEnv)=>env.PTR_NETWORK_MODE==='cluster'&&!!env.KUBERNETES_SERVICE_HOST;
 const list=(raw:string|undefined)=>raw?.split(',').map(value=>value.trim()).filter(Boolean)??[];
 const effectiveHttpPort=(url:URL)=>url.port||(url.protocol==='https:'?'443':'80');
@@ -43,6 +44,7 @@ const assertSplitServiceUrl=(url:URL,env:NodeJS.ProcessEnv)=>{
 };
 /** Split production composition uses only app-schema storage and queue/control clients. No DDL/provider construction. */
 export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRuntime {
+  const billable=paidSpilloverPossible(env);
   const databaseUrl=env.PTR_APP_DATABASE_URL??env.DATABASE_URL??'';
   let db:URL;try{db=new URL(databaseUrl);}catch{throw new CoreError('INVALID_INPUT');}
   try{assertLocalDatabaseUrl(databaseUrl,env);}catch{throw new CoreError('INVALID_INPUT');}
@@ -73,7 +75,7 @@ export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRu
   const maintenance=new WorkerOutboxMaintenance({executions:store,delivery,events,state:dispatch=>currentQueue().getJobState(turnJobId(dispatch)),maxQueueMs,maxAttempts,graceMs:integer(env,'PTR_DISPATCH_GRACE_MS',2000,0,600000),intervalMs:integer(env,'PTR_DISPATCH_INTERVAL_MS',1000,50,60000)});
   // API/backend owns outbox reconciliation even when Python/control service is down.
   if(env.PTR_BACKEND_MAINTENANCE!=='0')maintenance.start();
-  return {kind:'split',chat,control,controlToken,executionStore:store,delivery,events,eventSource,providerName:env.PTR_CHAT_PROVIDER??'fake',model:env.PTR_MODEL??'synthetic/fake-text-v1',billable:env.PTR_LITELLM_BILLABLE==='1',draftLimiterClient:redis,listPersonas,
+  return {kind:'split',chat,control,controlToken,executionStore:store,delivery,events,eventSource,providerName:env.PTR_CHAT_PROVIDER??'fake',model:env.PTR_MODEL??'synthetic/fake-text-v1',billable,draftLimiterClient:redis,listPersonas,
     async draftRemote(session,brief,requestKey,deadlineAt,signal) {const payload=validateWire('DraftRequest',{contractVersion:1,session,brief,requestKey,deadlineAt});const result=await rpc('DraftResponse','/internal/llm/draft',payload,signal);const {contractVersion:_,...reply}=result;return reply as {content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}};},
     saveArtifact:artifact=>artifacts.save(artifact),
     loadArtifact:(ownerId,id)=>artifacts.get<CreativeArtifact>(ownerId,id),

@@ -147,5 +147,5 @@ cluster=$cluster_name
 backend_image=$backend_image
 worker_image=$worker_image
 helm_namespace=ptr-system
-helm_set_args=--set images.backend.repository=ptr-backend --set images.backend.tag=$backend_tag --set images.worker.repository=ptr-worker --set images.worker.tag=$worker_tag --set-string gateway.bootstrap.apiServerCIDRs[1]=$control_plane_ip/32 --set-string inference.apiServerCIDRs[1]=$control_plane_ip/32
+helm_set_args=--set images.backend.repository=ptr-backend --set images.backend.tag=$backend_tag --set images.worker.repository=ptr-worker --set images.worker.tag=$worker_tag --set-string inference.apiServerCIDRs[1]=$control_plane_ip/32
 EOF

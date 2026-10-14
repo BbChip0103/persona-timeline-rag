@@ -14,7 +14,22 @@ _lock = threading.Lock()
 _requests: dict[str, dict[str, object]] = {}
 _cost = float(os.environ.get("PTR_FAKE_OPENROUTER_COST", "0.000123"))
 _emit_cost_header = os.environ.get("PTR_FAKE_OPENROUTER_EMIT_COST_HEADER", "1") != "0"
+_key_limit = float(os.environ.get("PTR_FAKE_OPENROUTER_KEY_LIMIT", "1"))
+_key_limit_reset = os.environ.get("PTR_FAKE_OPENROUTER_KEY_LIMIT_RESET") or None
+_chat_model = os.environ.get("PTR_FAKE_OPENROUTER_CHAT_MODEL", "google/gemma-4-26b-a4b-it")
+_embedding_model = os.environ.get("PTR_FAKE_OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small")
 _marker = re.compile(r"\bK4_ID:([A-Za-z0-9_.:-]{1,96})\b")
+_pricing = {
+    "prompt": "0.00000007",
+    "completion": "0.00000034",
+    "request": "0",
+    "image": "0",
+    "web_search": "0",
+    "internal_reasoning": "0",
+    "input_cache_read": "0",
+    "input_cache_write": "0",
+}
+_embedding_pricing = {"prompt": "0.00000002", "completion": "0"}
 
 
 def _json(status: int, payload: object) -> bytes:
@@ -44,7 +59,7 @@ def _request_id(body: dict[str, object], headers: object) -> str:
 def _response_headers(request_id: str) -> dict[str, str]:
     headers = {"x-ptr-provider-request-id": request_id}
     if _emit_cost_header:
-        headers["x-litellm-response-cost"] = f"{_cost:.12f}"
+        headers["x-openrouter-response-cost"] = f"{_cost:.12f}"
     return headers
 
 
@@ -57,6 +72,42 @@ def _usage() -> dict[str, int | float]:
     if _emit_cost_header:
         usage["cost"] = _cost
     return usage
+
+
+def _deepinfra_endpoint() -> dict[str, object]:
+    return {
+        "name": "DeepInfra",
+        "provider_name": "DeepInfra",
+        "tag": "deepinfra/fake-kind",
+        "pricing": _pricing,
+        "supported_parameters": ["structured_outputs", "provider"],
+    }
+
+
+def _model_catalog() -> dict[str, object]:
+    return {
+        "data": [
+            {
+                "id": _chat_model,
+                "name": "Synthetic Gemma via DeepInfra",
+                "pricing": _pricing,
+                "supported_parameters": ["structured_outputs", "provider"],
+                "endpoints": [_deepinfra_endpoint()],
+            }
+        ]
+    }
+
+
+def _embedding_catalog() -> dict[str, object]:
+    return {
+        "data": [
+            {
+                "id": _embedding_model,
+                "name": "Synthetic embedding model",
+                "pricing": _embedding_pricing,
+            }
+        ]
+    }
 
 
 def _resolve_ref(schema: dict[str, object], root: dict[str, object]) -> dict[str, object]:
@@ -175,6 +226,27 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._reply(200, {"status": "ok"})
             return
+        if self.path == "/api/v1/models":
+            self._reply(200, _model_catalog())
+            return
+        if self.path == f"/api/v1/models/{_chat_model}/endpoints":
+            self._reply(200, {"data": {"id": _chat_model, "endpoints": [_deepinfra_endpoint()]}})
+            return
+        if self.path == "/api/v1/embeddings/models":
+            self._reply(200, _embedding_catalog())
+            return
+        if self.path == "/api/v1/endpoints/zdr":
+            self._reply(
+                200,
+                {"data": [{"model_id": _chat_model, "provider_name": "DeepInfra", "tag": "deepinfra/fake-kind"}]},
+            )
+            return
+        if self.path == "/api/v1/key":
+            self._reply(
+                200,
+                {"data": {"limit": _key_limit, "limit_remaining": _key_limit, "limit_reset": _key_limit_reset}},
+            )
+            return
         if self.path == "/counts":
             with _lock:
                 self._reply(
@@ -195,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path != "/v1/chat/completions":
+        if self.path != "/api/v1/chat/completions":
             self._reply(404, {"error": "not_found"})
             return
         length = int(self.headers.get("Content-Length", "0"))

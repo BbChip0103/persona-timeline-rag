@@ -1,5 +1,14 @@
-{{- if and .Values.gateway.enabled .Values.gateway.fakeOpenRouter.enabled }}
-{{- $ns := .Values.namespaces.gateway -}}
+{{- if .Values.llm.fakeOpenRouter.enabled }}
+{{- $ns := .Values.namespaces.app -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptr-fake-openrouter
+  namespace: {{ $ns }}
+data:
+  fake-openrouter.py: |-
+{{ .Files.Get "files/fake-openrouter/fake-openrouter.py" | indent 4 }}
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -37,6 +46,7 @@ spec:
       labels:
         app.kubernetes.io/name: ptr
         app.kubernetes.io/component: fake-openrouter
+        ptr.network/role: app
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -58,9 +68,9 @@ spec:
             - name: PORT
               value: "8000"
             - name: PTR_FAKE_OPENROUTER_COST
-              value: {{ .Values.gateway.fakeOpenRouter.cost | quote }}
+              value: {{ .Values.llm.fakeOpenRouter.cost | quote }}
             - name: PTR_FAKE_OPENROUTER_EMIT_COST_HEADER
-              value: {{ ternary "1" "0" .Values.gateway.fakeOpenRouter.emitCostHeader | quote }}
+              value: {{ ternary "1" "0" .Values.llm.fakeOpenRouter.emitCostHeader | quote }}
           readinessProbe:
             httpGet:
               path: /health
@@ -74,7 +84,7 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           resources:
-{{ toYaml .Values.gateway.fakeOpenRouter.resources | indent 12 }}
+{{ toYaml .Values.llm.fakeOpenRouter.resources | indent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -82,15 +92,15 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
           volumeMounts:
-            - name: litellm-files
+            - name: fake-openrouter
               mountPath: /opt/ptr
               readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: litellm-files
+        - name: fake-openrouter
           configMap:
-            name: ptr-litellm-files
+            name: ptr-fake-openrouter
             items:
               - key: fake-openrouter.py
                 path: fake-openrouter.py

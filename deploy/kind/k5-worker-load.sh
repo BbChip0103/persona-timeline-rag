@@ -17,6 +17,7 @@ submit_concurrency="${SUBMIT_CONCURRENCY:-80}"
 poll_ms="${POLL_MS:-1000}"
 timeout_seconds="${TIMEOUT_SECONDS:-900}"
 scale_down_wait_seconds="${SCALE_DOWN_WAIT_SECONDS:-900}"
+throughput_only="${THROUGHPUT_ONLY:-0}"
 prefix="${K5_PREFIX:-k5-load-$(date +%s)}"
 host_python="$(if command -v python3 >/dev/null 2>&1; then command -v python3; else command -v python; fi)"
 job_name="k5-worker-load-$(date +%s)"
@@ -81,6 +82,7 @@ const turnCount = Number(process.env.TURN_COUNT || '200');
 const submitConcurrency = Number(process.env.SUBMIT_CONCURRENCY || '80');
 const pollMs = Number(process.env.POLL_MS || '1000');
 const scaleDownWaitSeconds = Number(process.env.SCALE_DOWN_WAIT_SECONDS || '900');
+const throughputOnly = process.env.THROUGHPUT_ONLY === '1';
 const appNamespace = process.env.PTR_K8S_NAMESPACE || 'ptr-app';
 const workerDeployment = process.env.PTR_WORKER_DEPLOYMENT || 'ptr-worker';
 const owner = 'lt-k5-synthetic';
@@ -169,9 +171,18 @@ async function kubernetesJson(path) {
 }
 
 async function sampleWorkerReplicas() {
-  const deployment = await kubernetesJson(
-    `/apis/apps/v1/namespaces/${appNamespace}/deployments/${workerDeployment}`,
-  );
+  let deployment;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      deployment = await kubernetesJson(
+        `/apis/apps/v1/namespaces/${appNamespace}/deployments/${workerDeployment}`,
+      );
+      break;
+    } catch (error) {
+      if (attempt === 2 || !['K8S_TIMEOUT', 'ECONNRESET', 'ETIMEDOUT'].includes(error?.message)) throw error;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
   const sample = {
     desired: Number(deployment.spec?.replicas ?? 0),
     replicas: Number(deployment.status?.replicas ?? 0),
@@ -347,11 +358,13 @@ async function proof(client, turnIds) {
 async function main() {
   assertSafeConfig();
   event('start', { prefix, turnCount, submitConcurrency });
-  await sampleWorkerReplicas();
-  await sampleQueues();
+  if (!throughputOnly) {
+    await sampleWorkerReplicas();
+    await sampleQueues();
+  }
   const turnIds = await mapLimit(Array.from({ length: turnCount }, (_, index) => index), submitConcurrency, submitTurn);
   event('submitted', { submitted: turnIds.length });
-  await sampleWorkerReplicas();
+  if (!throughputOnly) await sampleWorkerReplicas();
 
   const client = new Client({ connectionString: process.env.PTR_APP_DATABASE_URL });
   await client.connect();
@@ -360,17 +373,21 @@ async function main() {
     let current = { counts: {}, terminal: 0 };
     while (Date.now() < deadline) {
       current = await states(client, turnIds);
-      await sampleWorkerReplicas();
-      await sampleQueues();
+      if (!throughputOnly) {
+        await sampleWorkerReplicas();
+        await sampleQueues();
+      }
       event('state_sample', { terminal: current.terminal, states: current.counts });
       if (current.terminal === turnIds.length) break;
       await new Promise(resolve => setTimeout(resolve, pollMs));
     }
-    const scaleDownDeadline = Date.now() + scaleDownWaitSeconds * 1000;
-    while (Date.now() < scaleDownDeadline) {
-      const sample = await sampleWorkerReplicas();
-      if (sample.desired <= 2) break;
-      await new Promise(resolve => setTimeout(resolve, 5000));
+    if (!throughputOnly) {
+      const scaleDownDeadline = Date.now() + scaleDownWaitSeconds * 1000;
+      while (Date.now() < scaleDownDeadline) {
+        const sample = await sampleWorkerReplicas();
+        if (sample.desired <= 2) break;
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
     }
     const final = await proof(client, turnIds);
     const passed = final.observed === turnIds.length
@@ -518,6 +535,7 @@ spec:
             - {name: SUBMIT_CONCURRENCY, value: "$submit_concurrency"}
             - {name: POLL_MS, value: "$poll_ms"}
             - {name: SCALE_DOWN_WAIT_SECONDS, value: "$scale_down_wait_seconds"}
+            - {name: THROUGHPUT_ONLY, value: "$throughput_only"}
             - {name: PTR_K8S_NAMESPACE, value: "$app_namespace"}
             - {name: PTR_WORKER_DEPLOYMENT, value: "$worker_deployment"}
             - {name: PTR_API_BASE_URL, value: "http://ptr-api.$app_namespace.svc.cluster.local:56441"}
@@ -558,13 +576,14 @@ if [[ -s "$node_err" ]]; then
   timeout 30s sed 's/^/stderr /' "$node_err" >&2
 fi
 
-timeout 30s "$host_python" - "$node_out" "$probe_status" <<'PY'
+timeout 30s "$host_python" - "$node_out" "$probe_status" "$throughput_only" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 node_path = Path(sys.argv[1])
 probe_status = int(sys.argv[2])
+throughput_only = sys.argv[3] == "1"
 
 events = [json.loads(line) for line in node_path.read_text().splitlines() if line.strip()]
 replicas = [event for event in events if event.get("event") == "replica_sample"]
@@ -622,6 +641,6 @@ summary = {
 print(json.dumps(summary))
 
 if (probe_status != 0 or not result or not result.get("passed")
-        or not scale_up_passed or not active_hold_passed or not scale_down_passed):
+        or not throughput_only and (not scale_up_passed or not active_hold_passed or not scale_down_passed)):
     raise SystemExit(1)
 PY

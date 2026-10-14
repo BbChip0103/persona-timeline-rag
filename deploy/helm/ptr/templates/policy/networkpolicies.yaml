@@ -1,10 +1,11 @@
 {{- $appNs := .Values.namespaces.app -}}
 {{- $dataNs := .Values.namespaces.data -}}
-{{- $gatewayNs := .Values.namespaces.gateway -}}
+{{- $inferenceNs := .Values.namespaces.inference -}}
 {{- $apiPort := 56441 -}}
 {{- $workerPort := 58442 -}}
 {{- $webPort := 56440 -}}
-{{- $litellmPort := 4000 -}}
+{{- $eppPort := 8081 -}}
+{{- $fakeOpenRouterPort := 8000 -}}
 {{- $postgresPort := int (default 5432 .Values.network.postgres.port) -}}
 {{- $redisPort := int (default 6379 .Values.network.redis.port) -}}
 {{- $gateway := default dict .Values.policy.gateway -}}
@@ -166,12 +167,11 @@ spec:
               app.kubernetes.io/component: api
       ports:
         - {protocol: TCP, port: {{ $apiPort }}}
-{{- if .Values.gateway.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: ptr-worker-to-litellm
+  name: ptr-worker-to-epp
   namespace: {{ $appNs }}
 spec:
   podSelector:
@@ -183,13 +183,74 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ $gatewayNs }}
+              kubernetes.io/metadata.name: {{ $inferenceNs }}
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: ptr
-              app.kubernetes.io/component: litellm
+              llm-d-router-standalone: {{ .Values.inference.routerService }}
       ports:
-        - {protocol: TCP, port: {{ $litellmPort }}}
+        - {protocol: TCP, port: {{ $eppPort }}}
+{{- if .Values.llm.fakeOpenRouter.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-fake-openrouter
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: fake-openrouter
+      ports:
+        - {protocol: TCP, port: {{ $fakeOpenRouterPort }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-fake-openrouter-ingress
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: fake-openrouter
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ptr
+              app.kubernetes.io/component: worker
+      ports:
+        - {protocol: TCP, port: {{ $fakeOpenRouterPort }}}
+{{- else }}
+{{- range .Values.llm.prod.externalHttpsCidrs }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ptr-worker-to-openrouter-{{ regexReplaceAll "[^a-z0-9-]" (lower .) "-" | trimSuffix "-" }}
+  namespace: {{ $appNs }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - {protocol: TCP, port: 443}
+{{- end }}
 {{- end }}
 {{- if .Values.data.enabled }}
 ---

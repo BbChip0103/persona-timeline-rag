@@ -29,26 +29,13 @@ maintenance:
     weeklyProductionReview:
       enabled: false
       syntheticSmoke: false
-gateway:
-  bootstrap:
-    # Documentation placeholder only: replace with the cluster API endpoint CIDR.
-    apiServerCIDRs: ["192.0.2.1/32"]
-    # Minimum floor: 40 max workers * 4 concurrent turns * 1.25 headroom = 200.
-    # This higher limit leaves room for multiple short turns per worker per minute.
-    rpm: 5000
-  data:
-    enabled: false
-  managedData:
-    postgres:
-      # Documentation placeholder only: TEST-NET-1, replace with managed LiteLLM Postgres CIDRs.
-      cidrs: ["192.0.2.0/24"]
-    redis:
-      # Documentation placeholder only: TEST-NET-2, replace with managed LiteLLM Redis CIDRs.
-      cidrs: ["198.51.100.0/24"]
+llm:
+  local:
+    model: Qwen/Qwen3-8B
   fakeOpenRouter:
     enabled: false
   openrouter:
-    baseUrl: https://openrouter.ai/api/v1
+    baseUrlOverride: ""
   prod:
     # Documentation placeholder only: TEST-NET-3, replace with approved egress ranges.
     # CIDR egress narrows destinations but is not host pinning; use an egress proxy
@@ -57,6 +44,9 @@ gateway:
 secrets:
   api: {existingSecret: ptr-api}
   worker: {existingSecret: ptr-worker}
+  workerOpenRouter:
+    existingSecret: ptr-worker-openrouter
+    apiKeyKey: OPENROUTER_API_KEY
   maintenance: {existingSecret: ptr-maintenance}
   personas: {existingSecret: ptr-personas}
 network:
@@ -78,6 +68,9 @@ policy:
     redis:
       # Documentation placeholder only: TEST-NET-2, replace with managed Redis CIDRs.
       cidrs: ["198.51.100.0/24"]
+  # Documentation placeholder only: replace with the cluster API endpoint CIDR.
+  apiServerCIDRs: ["192.0.2.1/32"]
+  apiServerPorts: [443]
 inference:
   engine:
     kind: vllm

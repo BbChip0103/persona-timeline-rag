@@ -78,6 +78,13 @@ def test_prod_queue_budget_is_literal_in_profile() -> None:
     assert "maxEngineReplicas" not in config
 
 
+def test_envoy_route_timeout_is_bounded_to_worker_deadline() -> None:
+    for profile in ("kind", "prod"):
+        rendered = render(profile)
+        assert "timeout: 30s" in rendered
+        assert "                                        timeout: 86400s" not in rendered
+
+
 def test_router_image_digests_are_pinned_through_upstream_value_fields() -> None:
     fake_digest = "sha256:" + "a" * 64
     deployment = document(

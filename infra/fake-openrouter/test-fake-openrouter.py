@@ -5,7 +5,9 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,7 +31,7 @@ class FakeOpenRouterTests(unittest.TestCase):
         self.assertEqual(
             fake._response_headers("synthetic-id"),
             {
-                "x-litellm-response-cost": "0.000123000000",
+                "x-openrouter-response-cost": "0.000123000000",
                 "x-ptr-provider-request-id": "synthetic-id",
             },
         )
@@ -132,6 +134,39 @@ class FakeOpenRouterTests(unittest.TestCase):
                 "variableUpdates": {},
             },
         )
+
+    def test_direct_openrouter_api_paths_are_served_under_api_v1(self):
+        fake = load_fake_openrouter()
+        server = fake.ThreadingHTTPServer(("127.0.0.1", 0), fake.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            for path in (
+                "/api/v1/models",
+                "/api/v1/models/google/gemma-4-26b-a4b-it/endpoints",
+                "/api/v1/embeddings/models",
+                "/api/v1/endpoints/zdr",
+                "/api/v1/key",
+            ):
+                with urllib.request.urlopen(base + path, timeout=2) as response:
+                    payload = json.load(response)
+                self.assertIn("data", payload)
+                if path == "/api/v1/models":
+                    self.assertIn("structured_outputs", payload["data"][0]["supported_parameters"])
+            body = json.dumps({"model": "google/gemma-4-26b-a4b-it", "messages": []}).encode()
+            request = urllib.request.Request(
+                base + "/api/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                payload = json.load(response)
+            self.assertTrue(payload["id"].startswith("chatcmpl-fake-openrouter-"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":

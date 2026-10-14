@@ -152,7 +152,7 @@ llm-d-router-standalone:
                                         - x-llm-d-request-dropped-reason
                                       route:
                                         cluster: original_destination_cluster
-                                        timeout: 86400s
+                                        timeout: 30s
                                         idle_timeout: 86400s
                                         upgrade_configs:
                                           - upgrade_type: websocket

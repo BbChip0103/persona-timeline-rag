@@ -1,7 +1,6 @@
 {{- if ne .Values.policy.enabled false }}
 {{- $app := .Values.namespaces.app -}}
 {{- $data := .Values.namespaces.data -}}
-{{- $gateway := .Values.namespaces.gateway -}}
 {{- $inference := .Values.namespaces.inference -}}
 {{- $postgresPort := int .Values.network.postgres.port -}}
 {{- $redisPort := int .Values.network.redis.port -}}
@@ -95,25 +94,6 @@ spec:
           podSelector:
             matchLabels: {app.kubernetes.io/name: keda-operator}
       ports: [{protocol: TCP, port: {{ $redisPort }}}]
-{{- end }}
-{{- if .Values.gateway.enabled }}
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: ptr-litellm-monitoring-ingress
-  namespace: {{ $gateway }}
-spec:
-  podSelector:
-    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: litellm}
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
-          podSelector:
-            matchLabels: {app.kubernetes.io/name: prometheus}
-      ports: [{protocol: TCP, port: 4000}]
 {{- end }}
 {{- if .Values.inference.enabled }}
 ---

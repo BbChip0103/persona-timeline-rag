@@ -794,6 +794,7 @@ async def test_control_total_timeout_even_if_server_drips_chunks():
 
 
 def test_installed_service_uses_explicit_shared_contract_directory(monkeypatch):
+    import json
     from pathlib import Path
 
     from ptr_llm.control import _wire_module, validate_wire
@@ -805,6 +806,13 @@ def test_installed_service_uses_explicit_shared_contract_directory(monkeypatch):
         assert validate_wire(
             "Dispatch", {"contractVersion": 1, "turnId": str(uuid4()), "dispatchSeq": 0}
         )
+        corpus = json.loads((directory / "corpus.json").read_text())
+        local_result = next(
+            case["value"]
+            for case in corpus
+            if case["name"] == "k8s_served_ids_are_valid_wire_results"
+        )
+        assert validate_wire("Result", local_result) == local_result
         monkeypatch.setenv("PTR_LLM_CONTRACTS_DIR", str(directory / "missing"))
         _wire_module.cache_clear()
         with pytest.raises(ControlRejected):

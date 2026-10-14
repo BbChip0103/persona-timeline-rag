@@ -163,7 +163,7 @@
         "claims": [],
         "evidence": [],
         "limitations": [],
-        "serving": {"calls": 2, "upstreams": ["local-pool", "openrouter-primary"], "secondaryCalls": 1}
+        "serving": {"calls": 2, "upstreams": ["local", "openrouter-primary"], "secondaryCalls": 1}
       }
     }
   },
