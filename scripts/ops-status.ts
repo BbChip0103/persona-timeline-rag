@@ -1,5 +1,5 @@
 /** Read-only framework status. API/worker counters come from standard collectors.
- * Optional LiteLLM/Langfuse readiness probes never call models or transfer credentials.
+ * Optional local-model/Langfuse readiness probes never call models or transfer credentials.
  */
 import { parseExposition, type ParsedExposition } from '@ptr/ops';
 import {bounded as nativeBounded} from '../packages/ops/src/bounded';
@@ -19,12 +19,17 @@ function base(raw:string):URL {
   if(!['http:','https:'].includes(parsed.protocol)||parsed.username||parsed.password||parsed.search||parsed.hash)throw new Error('invalid_status_target');
   return parsed;
 }
+function localModelBase(raw:string):URL {
+  const parsed=base(raw);
+  if(parsed.protocol!=='http:'||!['127.0.0.1','localhost'].includes(parsed.hostname))throw new Error('invalid_status_target');
+  return parsed;
+}
 function targets(env:NodeJS.ProcessEnv) {
   const metrics=ROLE_TARGETS.map(target=>({role:target.role,url:base(env[target.role==='api'?'PTR_OPS_API_METRICS_URL':'PTR_OPS_WORKER_METRICS_URL']??target.url).href}));
-  const readiness:{role:'litellm'|'langfuse';url:string}[]=[];
-  if(env.PTR_LITELLM_BASE_URL) {
-    const url=base(env.PTR_LITELLM_BASE_URL);url.pathname=`${url.pathname.replace(/\/v1\/?$/u,'').replace(/\/$/u,'')}/health/readiness`;
-    readiness.push({role:'litellm',url:url.href});
+  const readiness:{role:'local model'|'langfuse';url:string}[]=[];
+  if(env.PTR_LLM_LOCAL_BASE_URL) {
+    const url=localModelBase(env.PTR_LLM_LOCAL_BASE_URL);url.pathname=`${url.pathname.replace(/\/v1\/?$/u,'').replace(/\/$/u,'')}/health`;
+    readiness.push({role:'local model',url:url.href});
   }
   if(env.LANGFUSE_BASE_URL) {
     const url=base(env.LANGFUSE_BASE_URL);

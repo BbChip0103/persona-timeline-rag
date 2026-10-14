@@ -1,11 +1,13 @@
 # Split runtime and non-destructive cutover
 
-The default application runtime is now Nest → Python → LiteLLM/model serving.
-The gateway's [engine routing](gateway-routing.md) preserves cache-affinity,
-selectable cost scoring and background vLLM overload filtering through a pinned
-LiteLLM Proxy extension; these policies do not live in the Python chat worker.
+The default application runtime is now Nest → Python worker → direct local vLLM
+serving. The worker uses `PTR_LLM_PROVIDER=local` with the authenticated loopback
+`PTR_LLM_LOCAL_BASE_URL`, `PTR_LLM_LOCAL_MODEL`, `PTR_LLM_LOCAL_API_KEY` and
+`PTR_LLM_LOCAL_AUTH_REQUIRED=1`, with `PTR_LLM_SPILLOVER=off`; it must not carry
+OpenRouter keys in Compose mode.
 The historical TS worker is retired; the API rejects `PTR_LLM_SERVICE_MODE=legacy`.
-See `apps/llm-service/README.md` for native Python
+The former Nest → Python → LiteLLM proxy route is retained only as rollback
+context until L4 removes it. See `apps/llm-service/README.md` for native Python
 experiments, reviews, ingestion and persona commands.
 
 ## Ownership
@@ -14,7 +16,7 @@ experiments, reviews, ingestion and persona commands.
 |---|---|
 | Nest / `ptr_split_app` | `app.sessions/turns/messages/turn_outbox/turn_leases/turn_execution_grants`; auth, admission, queue reconciliation, immutable grant, generation fence, atomic final commit |
 | Python / `ptr_split_llm` | `llm.personas/persona_versions/source_*`, provider ledger, call-only Python checkpoints, result receipts; retrieval, prompts, LangGraph, inline Guardrails/Jev, Langfuse v4 and domain evaluation |
-| model serving | LiteLLM routing and existing GPU/provider; no access to app/LLM database credentials |
+| model serving | direct local vLLM endpoint and existing GPU/provider; no access to app/LLM database credentials |
 | migration / `ptr_split_owner` | new-target DDL and explicit native saver setup; never a running service credential |
 
 BullMQ renews queue locks. Nest validates the current Redis token **after** obtaining

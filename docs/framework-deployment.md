@@ -56,75 +56,21 @@ it, paste expanded Compose configuration or expose it in CI artifacts. Port sele
 is a best-effort local allocation; if another process wins a released port, startup
 fails without modifying that process. Create another **new** env/project for the retry.
 
-## Real LiteLLM with a synthetic upstream
+## Historical LiteLLM proxy verification
 
-```bash
-docker compose --env-file /tmp/ptr-framework-new.env \
-  -f infra/compose.framework.yml --profile smoke up -d --wait --wait-timeout 240
-python infra/litellm/smoke.py --env-file /tmp/ptr-framework-new.env
-python infra/langfuse/test-deployment.py
-python infra/litellm/test-fixture.py
-```
+The previous framework smoke used a real LiteLLM proxy, virtual-key bootstrap and
+synthetic OpenAI-compatible upstream. That path is historical for this repository's
+current operational Compose deployment. Current operations use the direct path in
+[operational deployment](operational-deployment.md): the Python worker calls the
+authenticated loopback vLLM endpoint directly, with `PTR_LLM_PROVIDER=local`,
+`PTR_LLM_LOCAL_BASE_URL`, `PTR_LLM_LOCAL_MODEL`, `PTR_LLM_LOCAL_API_KEY` and
+`PTR_LLM_LOCAL_AUTH_REQUIRED=1`, with `PTR_LLM_SPILLOVER=off`.
 
-`smoke` runs the real published LiteLLM proxy, its own Postgres and Redis, and a
-local synthetic OpenAI-compatible fixture. The shared engine applies a fixed 100ms
-delay, returns fixed16 prompt/12 completion token usage, and supports both SSE and
-JSON with identical content. `/counts` exposes delay and bounded call/concurrency
-metrics, not prompts/credentials. Only explicitly synthetic source-ID prefixes may
-receive grounded quote references. This is not a fake LiteLLM endpoint.
-The smoke proves API authentication, actual completion transport and usage,
-exactly one upstream submission for an ambiguous HTTP 500 and a timeout, persisted
-virtual-key spend, and refusal to call the upstream after a finite budget is exhausted.
-The fixture deliberately accepts no research data, has no provider key and never
-calls an external service. It cannot prove model quality or real GPU performance.
-
-Production applications must receive a constrained **virtual key**, not the master key:
-
-```bash
-python infra/litellm/bootstrap-app-key.py --env-file /tmp/ptr-framework-new.env \
-  --output /tmp/ptr-framework-app-key.env --budget-usd 1 --rpm 120 --tpm 32000 \
-  --model primary
-```
-
-This writes only `PTR_LITELLM_API_KEY` into a newly created 0600 file. The illustrative
-$1/day and rate limits are deployment ceilings, not a throughput SLO. Choose approved
-limits before any live run. Budget updates are asynchronous; simultaneous in-flight
-calls can exceed a spend ceiling. LiteLLM budgets **do not** establish exactly-once
-billing. The application must retain its submission/unknown-result ledger and refuse
-an automatic second billable submission when the first outcome is ambiguous.
-
-## Explicit live upstream configuration (not a smoke command)
-
-Deploy using `proxy` with `PTR_LITELLM_CONFIG=./litellm/config.live.yaml` only after the
-separate provider/data-transfer/cost approval. Model aliases are intentionally distinct:
-
-- `primary`: approved vLLM endpoint; `PTR_VLLM_MODEL` must include `openai/` and
-  `PTR_VLLM_BASE_URL` must include `/v1`. The engine receives
-  `chat_template_kwargs.enable_thinking=false`, preserving the existing Gemma contract.
-- `openrouter-primary`: `PTR_OPENROUTER_MODEL` includes `openrouter/`; key is provided
-  from the approved secret store. There is **no automatic self-hosted → paid fallback**.
-
-When two approved vLLM engines are deployed, explicitly select
-`./litellm/config.dual-vllm.live.yaml` and set the additional
-`PTR_VLLM_SECONDARY_{MODEL,BASE_URL,API_KEY}` fields. The two `primary` deployments
-have stable IDs `primary`/`secondary`. The config-loaded custom selector chooses
-among native healthy candidates using shared credit, cache affinity and selectable
-least-inflight/scored policies; see [engine routing](gateway-routing.md).
-`simple-shuffle` is the native initialization strategy, not the effective primary
-selection policy after callback attachment. `x-litellm-model-id` identifies the chosen deployment;
-selection across healthy engines is different from retrying a failed submission.
-The synthetic fixture's ID is `fake`. All configurations leave retries/fallbacks off.
-
-Router, SDK and provider retries are zero; fallback lists and maximum fallbacks are
-zero; weighted failover is disabled. Liveness/readiness checks do not query models.
-Never replace the healthcheck with `GET /health`: that route makes real model calls.
-No background model probes are configured. LiteLLM telemetry and verbose/error
-payload logging are disabled. The separate LiteLLM database persists key/spend data;
-its Redis is neither the app queue Redis nor the Langfuse Redis.
-
-Sources: [retry settings](https://docs.litellm.ai/docs/proxy/configs),
-[budget routing](https://docs.litellm.ai/docs/proxy/provider_budget_routing),
-[non-billable probes](https://docs.litellm.ai/docs/proxy/health).
+Do not run the old LiteLLM smoke, app-key bootstrap or proxy profile commands for
+the operational stack. The `infra/litellm` code remains only as rollback material
+until the L4 cleanup removes it. Retry, fallback, health-probe and cost limits for
+the active stack are enforced at the worker/provider boundary and verified by
+`pnpm ops:status` plus `scripts/operational-smoke.ts`.
 
 ## Guardrails and Langfuse v4
 

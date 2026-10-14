@@ -16,6 +16,7 @@ class ConfigurationError(ValueError):
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _POSTGRES_SSLMODES = {"require", "verify-ca", "verify-full"}
+_OPENROUTER_ENV_KEYS = ("OPENROUTER_API_KEY", "PTR_OPENROUTER_API_KEY")
 
 
 def _url(value: str, schemes: set[str], code: str) -> str:
@@ -31,6 +32,10 @@ def _url(value: str, schemes: set[str], code: str) -> str:
 
 def _cluster_network(env: Mapping[str, str]) -> bool:
     return env.get("PTR_NETWORK_MODE") == "cluster" and bool(env.get("KUBERNETES_SERVICE_HOST"))
+
+
+def _compose_openrouter_key_present(env: Mapping[str, str]) -> bool:
+    return any(name in env for name in _OPENROUTER_ENV_KEYS)
 
 
 def _svc_host(hostname: str | None) -> bool:
@@ -114,6 +119,8 @@ class Settings:
             "INVALID_REDIS_URL",
         )
         cluster_network = _cluster_network(env)
+        if not cluster_network and _compose_openrouter_key_present(env):
+            raise ConfigurationError("COMPOSE_OPENROUTER_KEYS_FORBIDDEN")
         if cluster_network:
             try:
                 redis_parsed = urlsplit(redis_url)

@@ -2,8 +2,9 @@ import { FrameworkConfigError, loadFrameworkConfig } from '../src/framework-conf
 const env=()=>({DATABASE_URL:'postgresql://ptr_framework_tester:synthetic-password@127.0.0.1:57432/ptr_framework_test',
   PTR_REDIS_URL:'redis://:synthetic-password@127.0.0.1:57479/0',PTR_CHAT_PROVIDER:'fake',PTR_GUARDRAILS_URL:'http://127.0.0.1:57464',PTR_GUARDRAILS_TOKEN:'synthetic_guard_token_abcdefghij',
   PTR_PERSONAS_FILE:'synthetic-personas.json',PTR_API_TOKEN:'synthetic-api-token-24-characters'});
-test('requires explicit fake or LiteLLM, isolated targets and positive concurrency',()=>{
+test('requires explicit fake, local or LiteLLM, isolated targets and positive concurrency',()=>{
   expect(loadFrameworkConfig('worker',env()).PTR_WORKER_CONCURRENCY).toBe(32);
+  expect(loadFrameworkConfig('worker',{...env(),PTR_CHAT_PROVIDER:'local'}).PTR_CHAT_PROVIDER).toBe('local');
   expect(()=>loadFrameworkConfig('api',{...env(),PTR_CHAT_PROVIDER:undefined})).toThrow(FrameworkConfigError);
   expect(()=>loadFrameworkConfig('worker',{...env(),PTR_WORKER_CONCURRENCY:'0'})).toThrow(FrameworkConfigError);
   expect(()=>loadFrameworkConfig('api',{...env(),DATABASE_URL:'postgresql://not-allowed:never-output@remote.invalid/production'})).toThrow(FrameworkConfigError);

@@ -170,8 +170,26 @@ async def test_runtime_rejects_noncluster_spillover_before_pool(monkeypatch, tmp
             _local_runtime_env(
                 tmp_path,
                 PTR_LLM_SPILLOVER="openrouter",
-                OPENROUTER_API_KEY="synthetic-paid-key",
             ),
+        )
+
+
+@pytest.mark.parametrize("key_name", ["OPENROUTER_API_KEY", "PTR_OPENROUTER_API_KEY"])
+async def test_runtime_rejects_compose_openrouter_key_names_before_pool(
+    monkeypatch, tmp_path, key_name
+):
+    from test_runtime_composition import _settings
+
+    from ptr_llm import runtime as module
+
+    def forbidden_pool(**_):
+        pytest.fail("compose key guard must fail before opening a pool")
+
+    monkeypatch.setattr(module, "AsyncConnectionPool", forbidden_pool)
+    with pytest.raises(ProviderError, match="COMPOSE_OPENROUTER_KEYS_FORBIDDEN"):
+        await module.build_runtime(
+            _settings(),
+            _local_runtime_env(tmp_path, **{key_name: ""}),
         )
 
 
@@ -208,8 +226,31 @@ async def test_runtime_never_accepts_paid_key_as_local_key(monkeypatch, tmp_path
             _settings(),
             _local_runtime_env(
                 tmp_path,
+                **_cluster_env(),
                 PTR_LLM_LOCAL_API_KEY="synthetic-same-key",
                 OPENROUTER_API_KEY="synthetic-same-key",
+            ),
+        )
+
+
+async def test_runtime_requires_local_api_key_when_operational_auth_flag_set(
+    monkeypatch, tmp_path
+):
+    from test_runtime_composition import _settings
+
+    from ptr_llm import runtime as module
+
+    def forbidden_pool(**_):
+        pytest.fail("local auth guard must fail before opening a pool")
+
+    monkeypatch.setattr(module, "AsyncConnectionPool", forbidden_pool)
+    with pytest.raises(ProviderError, match="LOCAL_API_KEY_REQUIRED"):
+        await module.build_runtime(
+            _settings(),
+            _local_runtime_env(
+                tmp_path,
+                PTR_LLM_LOCAL_AUTH_REQUIRED="1",
+                PTR_LLM_LOCAL_API_KEY="",
             ),
         )
 

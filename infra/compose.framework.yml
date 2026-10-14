@@ -1,5 +1,5 @@
 # Isolated, digest-pinned infrastructure; no research DB, existing env, host networking or fixed container names.
-# Always pass a NEW generated --env-file. Profiles: smoke (real proxy/local fake), proxy, guardrails, observability.
+# Always pass a NEW generated --env-file. Profiles: smoke (local fake engine), guardrails, observability.
 name: ${PTR_FRAMEWORK_PROJECT:?generate a NEW isolated environment file}
 
 x-service: &service
@@ -95,94 +95,6 @@ services:
       retries: 20
     networks: [runtime-test]
 
-  litellm:
-    <<: *service
-    profiles: [proxy, smoke]
-    image: ghcr.io/berriai/litellm:main-stable@sha256:3d88bd757134a00e8c00237b85a021ab1f6d54abb9c1df750f411dbe7256a500
-    command: [--config, /app/ptr-config.yaml, --host, 0.0.0.0, --port, "4000"]
-    environment:
-      DATABASE_URL: postgresql://ptr_litellm:${PTR_LITELLM_DB_PASSWORD:?required}@litellm-postgres:5432/ptr_litellm
-      PTR_LITELLM_MASTER_KEY: ${PTR_LITELLM_MASTER_KEY:?required}
-      LITELLM_MASTER_KEY: ${PTR_LITELLM_MASTER_KEY:?required}
-      LITELLM_SALT_KEY: ${PTR_LITELLM_SALT_KEY:?required}
-      PTR_LITELLM_REDIS_PASSWORD: ${PTR_LITELLM_REDIS_PASSWORD:?required}
-      LITELLM_TELEMETRY: "False"
-      DO_NOT_TRACK: "1"
-      DISABLE_ADMIN_UI: "true"
-      PTR_ROUTING_POLICY: ${PTR_ROUTING_POLICY:-least_inflight}
-      PTR_ROUTING_AFFINITY: ${PTR_ROUTING_AFFINITY:-on}
-      PTR_ROUTING_AFFINITY_MIN_TOKENS: ${PTR_ROUTING_AFFINITY_MIN_TOKENS:-256}
-      PTR_ROUTING_AFFINITY_SLACK: ${PTR_ROUTING_AFFINITY_SLACK:-0.5}
-      PTR_ROUTING_METRICS_INTERVAL_S: ${PTR_ROUTING_METRICS_INTERVAL_S:-1}
-      PTR_ROUTING_METRICS_TIMEOUT_S: ${PTR_ROUTING_METRICS_TIMEOUT_S:-0.5}
-      PTR_ROUTING_QUEUE_TIMEOUT_S: ${PTR_ROUTING_QUEUE_TIMEOUT_S:-10}
-      PTR_VLLM_MODEL: ${PTR_VLLM_MODEL:-}
-      PTR_VLLM_BASE_URL: ${PTR_VLLM_BASE_URL:-}
-      PTR_VLLM_API_KEY: ${PTR_VLLM_API_KEY:-}
-      PTR_VLLM_SECONDARY_MODEL: ${PTR_VLLM_SECONDARY_MODEL:-}
-      PTR_VLLM_SECONDARY_BASE_URL: ${PTR_VLLM_SECONDARY_BASE_URL:-}
-      PTR_VLLM_SECONDARY_API_KEY: ${PTR_VLLM_SECONDARY_API_KEY:-}
-      PTR_OPENROUTER_MODEL: ${PTR_OPENROUTER_MODEL:-}
-      PTR_OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-    volumes:
-      - ./litellm/ptr_routing.py:/app/ptr_routing.py:ro
-      - ./litellm/routing_state.py:/app/routing_state.py:ro
-      - ./litellm/routing_telemetry.py:/app/routing_telemetry.py:ro
-      - ../src/persona_timeline_rag/gateway_budget.py:/app/persona_timeline_rag/gateway_budget.py:ro
-      - type: bind
-        source: ${PTR_LITELLM_CONFIG:-./litellm/config.synthetic.yaml}
-        target: /app/ptr-config.yaml
-        read_only: true
-        bind:
-          create_host_path: false
-    ports:
-      - "127.0.0.1:${PTR_LITELLM_PORT:?required}:4000"
-    depends_on:
-      litellm-postgres:
-        condition: service_healthy
-      litellm-redis:
-        condition: service_healthy
-    healthcheck:
-      # Do not use /health: it calls configured models and can incur charges.
-      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/readiness',timeout=3)"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-      start_period: 60s
-    stop_grace_period: 35s
-    networks: [proxy]
-
-  litellm-postgres:
-    <<: *service
-    profiles: [proxy, smoke]
-    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
-    environment:
-      POSTGRES_USER: ptr_litellm
-      POSTGRES_DB: ptr_litellm
-      POSTGRES_PASSWORD: ${PTR_LITELLM_DB_PASSWORD:?required}
-    volumes: [litellm_postgres:/var/lib/postgresql/data]
-    healthcheck:
-      test: [CMD-SHELL, "pg_isready -U ptr_litellm -d ptr_litellm"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
-    networks: [proxy]
-
-  litellm-redis:
-    <<: *service
-    profiles: [proxy, smoke]
-    image: redis:7.4.5-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
-    environment:
-      REDIS_PASSWORD: ${PTR_LITELLM_REDIS_PASSWORD:?required}
-    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory-policy noeviction']
-    volumes: [litellm_redis:/data]
-    healthcheck:
-      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
-      interval: 3s
-      timeout: 3s
-      retries: 20
-    networks: [proxy]
-
   fake-engine:
     <<: *service
     profiles: [smoke]
@@ -199,7 +111,7 @@ services:
       interval: 3s
       timeout: 3s
       retries: 10
-    networks: [proxy]
+    networks: [synthetic-engine]
 
   guardrails:
     <<: *service
@@ -357,8 +269,6 @@ services:
 volumes:
   framework_test_postgres:
   framework_test_queue:
-  litellm_postgres:
-  litellm_redis:
   langfuse_postgres:
   langfuse_clickhouse:
   langfuse_clickhouse_logs:
@@ -369,7 +279,7 @@ networks:
   runtime-test:
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
-  proxy:
+  synthetic-engine:
   observability:
     internal: true
   validation:

@@ -193,6 +193,8 @@ async def test_factory_keeps_jev_safety_and_intent_when_summary_selection_is_gon
     runtime = await module.build_runtime(
         _settings(),
         {
+            "PTR_NETWORK_MODE": "cluster",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
             "PTR_LLM_RETRIEVAL_INDEX": "summary",
             "PTR_LLM_EVIDENCE_SELECTOR": "jev",
             "PTR_LLM_SAFETY_FILTER": "jev",

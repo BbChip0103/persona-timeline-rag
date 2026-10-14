@@ -27,25 +27,20 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     project = "ptr-fw-" + uuid.uuid4().hex[:12]
-    proxy, langfuse, blob, guardrails, engine = free_ports(5)
+    langfuse, blob, guardrails, engine = free_ports(4)
 
     def token():
         return secrets.token_hex(32)
 
     fields = {
         "PTR_FRAMEWORK_PROJECT": project,
-        "PTR_LITELLM_PORT": str(proxy),
         "PTR_LANGFUSE_PORT": str(langfuse),
         "PTR_LANGFUSE_BLOB_PORT": str(blob),
         "PTR_GUARDRAILS_PORT": str(guardrails),
         "PTR_FAKE_ENGINE_PORT": str(engine),
-        "PTR_LITELLM_MASTER_KEY": "sk-" + token(),
-        "PTR_LITELLM_SALT_KEY": "sk-" + token(),
-        "PTR_LITELLM_DB_PASSWORD": token(),
         "PTR_FRAMEWORK_BOOTSTRAP_PASSWORD": token(),
         "PTR_FRAMEWORK_TEST_DB_PASSWORD": token(),
         "PTR_FRAMEWORK_QUEUE_PASSWORD": token(),
-        "PTR_LITELLM_REDIS_PASSWORD": token(),
         "PTR_LANGFUSE_DB_PASSWORD": token(),
         "PTR_LANGFUSE_CLICKHOUSE_PASSWORD": token(),
         "PTR_LANGFUSE_REDIS_PASSWORD": token(),
@@ -62,16 +57,7 @@ def main():
         "LANGFUSE_SECRET_KEY": "sk-lf-" + token(),
         "LANGFUSE_BASE_URL": "http://127.0.0.1:" + str(langfuse),
         "PTR_GUARDRAILS_TOKEN": token(),
-        "PTR_LITELLM_CONFIG": "./litellm/config.synthetic.yaml",
         # No other project or provider configuration is copied into this file.
-        "PTR_VLLM_MODEL": "openai/approved-vllm-model",
-        "PTR_VLLM_BASE_URL": "http://127.0.0.1:1/v1",
-        "PTR_VLLM_API_KEY": "",
-        "PTR_VLLM_SECONDARY_MODEL": "",
-        "PTR_VLLM_SECONDARY_BASE_URL": "",
-        "PTR_VLLM_SECONDARY_API_KEY": "",
-        "PTR_OPENROUTER_MODEL": "openrouter/approved-model",
-        "OPENROUTER_API_KEY": "",
     }
     path = Path(args.output)
     # Exclusive creation is intentional: rerunning cannot rotate a database's secrets.

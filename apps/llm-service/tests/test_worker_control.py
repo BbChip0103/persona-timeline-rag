@@ -305,6 +305,17 @@ def test_worker_bind_host_accepts_explicit_pod_listener():
     assert Settings.from_env({**env, "PTR_LLM_HOST": "0.0.0.0"}).host == "0.0.0.0"
 
 
+@pytest.mark.parametrize("key_name", ["OPENROUTER_API_KEY", "PTR_OPENROUTER_API_KEY"])
+def test_compose_worker_rejects_openrouter_key_names_before_startup(key_name):
+    env = {
+        "PTR_LLM_DATABASE_URL": "postgresql://llm:synthetic@localhost/research",
+        "PTR_LLM_CONTROL_TOKEN": "synthetic-control-token-v1",
+        key_name: "",
+    }
+    with pytest.raises(ConfigurationError, match="COMPOSE_OPENROUTER_KEYS_FORBIDDEN"):
+        Settings.from_env(env)
+
+
 @pytest.mark.parametrize(
     ("changes", "error"),
     [

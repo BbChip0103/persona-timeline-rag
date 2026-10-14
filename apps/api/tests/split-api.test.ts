@@ -35,6 +35,12 @@ test('draft RPC keeps backend quota/artifact ownership and fictional marker',asy
  const session=await call('/api/sessions',{personId:persona.personId});const draft=await call(`/api/sessions/${session.body.session.id}/drafts`,{brief:'synthetic brief',clientRequestId:'synthetic-request'});
  expect(draft.status).toBe(201);expect(draft.body.artifact.content).toContain('[가상 포스트 초안 · AI 생성]');expect(draft.body.artifact.ownerId).toBeUndefined();expect(artifacts[0].ownerId).toBe('owner_synthetic_split');expect(runtime.draftRemote).toHaveBeenCalledWith(expect.objectContaining({id:session.body.session.id}),'synthetic brief','draft:owner_synthetic_split:synthetic-request',expect.any(Number),expect.any(AbortSignal));
 });
+test('local nonbillable drafts work without a client request ID',async()=>{
+ const session=await call('/api/sessions',{personId:persona.personId});
+ const draft=await call(`/api/sessions/${session.body.session.id}/drafts`,{brief:'synthetic local draft'});
+ expect(draft.status).toBe(201);
+ expect(runtime.draftRemote).toHaveBeenCalledWith(expect.any(Object),'synthetic local draft',expect.stringMatching(/^draft:owner_synthetic_split:[0-9a-f-]{36}$/u),expect.any(Number),expect.any(AbortSignal));
+});
 test('split larger internal admission does not widen public16KiB bodies',async()=>{expect((await call('/api/sessions',{personId:persona.personId,junk:'x'.repeat(20000)})).status).toBe(413);});
 test('public raw16KiB counts whitespace, while authenticated internal reply may exceed16KiB',async()=>{
  const catalogue=jest.spyOn(runtime,'listPersonas');

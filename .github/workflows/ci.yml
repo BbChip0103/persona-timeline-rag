@@ -46,9 +46,18 @@ jobs:
       - name: Compose file renders
         run: |
           env_file="$RUNNER_TEMP/ptr-framework-check.env"
+          role_env="$RUNNER_TEMP/ptr-compose-placeholder.env"
+          published="$RUNNER_TEMP/ptr-compose-placeholder.json"
           python3 infra/langfuse/init-framework-env.py --output "$env_file"
+          : > "$role_env"
+          printf '{}\n' > "$published"
           PTR_FRAMEWORK_APP_ENV_FILE="$env_file" PTR_LLM_SERVICE_ENV_FILE="$env_file" docker compose --env-file "$env_file" -f infra/compose.app.yml config -q
           docker compose --env-file "$env_file" -f infra/compose.framework.yml --profile smoke --profile observability --profile guardrails --profile runtime-test config -q
+          PTR_OPERATIONAL_PROJECT=ptr-ci-local PTR_OPERATIONAL_OWNER=synthetic-ci \
+            PTR_OPERATIONAL_BACKEND_IMAGE=synthetic-backend:local PTR_OPERATIONAL_WORKER_IMAGE=synthetic-worker:local \
+            PTR_FRAMEWORK_APP_ENV_FILE="$role_env" PTR_LLM_SERVICE_ENV_FILE="$role_env" \
+            PTR_OPERATIONAL_WEB_ENV_FILE="$role_env" PTR_OPERATIONAL_PUBLISHED_PERSONAS_FILE="$published" \
+            docker compose --env-file "$env_file" -f infra/compose.app.yml -f infra/split/compose.operational.yml config -q
       - name: Offline framework deployment and fixture regressions
         run: |
           python3 infra/langfuse/test-deployment.py
@@ -63,7 +72,7 @@ jobs:
         run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
       - name: Remove this check's private generated configuration
         if: always()
-        run: rm -f "$RUNNER_TEMP/ptr-framework-check.env"
+        run: rm -f "$RUNNER_TEMP/ptr-framework-check.env" "$RUNNER_TEMP/ptr-compose-placeholder.env" "$RUNNER_TEMP/ptr-compose-placeholder.json"
 
   backend-image:
     runs-on: ubuntu-24.04

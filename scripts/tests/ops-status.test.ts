@@ -69,22 +69,23 @@ test('usage validation makes no requests and prints no raw arguments',async()=>{
     const result=await status(healthy,healthy,{argv});expect(result.code).toBe(2);expect(result.requests).toEqual([]);expect(result.text).not.toContain('PRIVATE_SENTINEL');
   }
 });
-test('explicit LiteLLM and Langfuse check only free readiness, without transferring credentials or outputting payloads',async()=>{
-  const env={PTR_LITELLM_BASE_URL:'http://127.0.0.1:59000/v1',LANGFUSE_BASE_URL:'http://127.0.0.1:59001',
-    PTR_LITELLM_API_KEY:'PRIVATE_KEY_SENTINEL',LANGFUSE_SECRET_KEY:'PRIVATE_SECRET_SENTINEL'};
+test('explicit local model and Langfuse check only free readiness, without transferring credentials or outputting payloads',async()=>{
+  const env={PTR_LLM_LOCAL_BASE_URL:'http://127.0.0.1:59000/v1',LANGFUSE_BASE_URL:'http://127.0.0.1:59001',
+    PTR_LLM_LOCAL_API_KEY:'PRIVATE_KEY_SENTINEL',LANGFUSE_SECRET_KEY:'PRIVATE_SECRET_SENTINEL'};
   const {code,text,requests}=await status(healthy,healthy,{env});
   expect(code).toBe(0);expect(requests.slice(-2).map(request=>request.url)).toEqual([
-    'http://127.0.0.1:59000/health/readiness','http://127.0.0.1:59001/api/public/ready']);
-  expect(text).toMatch(/litellm readiness\s+ready/u);expect(text).toMatch(/langfuse readiness\s+ready/u);
+    'http://127.0.0.1:59000/health','http://127.0.0.1:59001/api/public/ready']);
+  expect(text).toMatch(/local model readiness\s+ready/u);expect(text).toMatch(/langfuse readiness\s+ready/u);
   expect(text).not.toMatch(/PRIVATE_|59000|59001/u);
   for(const request of requests)expect(Object.keys(request.init as object).sort()).toEqual(['redirect','signal']);
 });
 test('explicit unavailable dependency readiness is visible as an alert, without leaking response body',async()=>{
-  const {code,text}=await status(healthy,healthy,{env:{PTR_LITELLM_BASE_URL:'http://127.0.0.1:59000/v1'},readyStatus:503});
-  expect(code).toBe(1);expect(text).toMatch(/litellm readiness\s+unavailable\s+ALERT unavailable/u);expect(text).not.toContain('PRIVATE_READINESS_BODY_SENTINEL');
+  const {code,text}=await status(healthy,healthy,{env:{PTR_LLM_LOCAL_BASE_URL:'http://127.0.0.1:59000/v1'},readyStatus:503});
+  expect(code).toBe(1);expect(text).toMatch(/local model readiness\s+unavailable\s+ALERT unavailable/u);expect(text).not.toContain('PRIVATE_READINESS_BODY_SENTINEL');
 });
 test('explicit unsafe targets fail before any request; no credential-bearing URL prints',async()=>{
-  for(const env of [{PTR_LITELLM_BASE_URL:'https://u:PRIVATE_SENTINEL@host.invalid/v1'},
+  for(const env of [{PTR_LLM_LOCAL_BASE_URL:'https://u:PRIVATE_SENTINEL@host.invalid/v1'},
+    {PTR_LLM_LOCAL_BASE_URL:'https://openrouter.ai/api/v1'},
     {LANGFUSE_BASE_URL:'https://cloud.langfuse.com'},{PTR_OPS_API_METRICS_URL:'file:///PRIVATE_SENTINEL'}]) {
     const result=await status(healthy,healthy,{env});expect(result.code).toBe(2);expect(result.requests).toEqual([]);expect(result.text).toBe('usage invalid_status_target');
   }

@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from .billing import PostgresBudgetLedger, ProviderError
-from .config import Settings, _cluster_network
+from .config import Settings, _cluster_network, _compose_openrouter_key_present
 from .core.errors import CoreError
 from .core.persona import validate_persona
 from .core.runtime import LLMEngine
@@ -140,6 +140,10 @@ def _integer(env: Mapping[str, str], key: str, default: int, low: int, high: int
     if not low <= result <= high:
         raise ProviderError("INVALID_RUNTIME_CONFIG")
     return result
+
+
+def _truthy_flag(value: str | None) -> bool:
+    return value == "1"
 
 
 _generation_span: ContextVar[Any] = ContextVar("ptr_model_accounting_span", default=None)
@@ -363,15 +367,24 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
     pricing = None
     provider_choice = env.get("PTR_LLM_PROVIDER", "fake")
     spillover_mode = env.get("PTR_LLM_SPILLOVER", "off")
+    cluster_network = _cluster_network(env)
+    if not cluster_network and _compose_openrouter_key_present(env):
+        raise ProviderError("COMPOSE_OPENROUTER_KEYS_FORBIDDEN")
     if (
         provider_choice == "local"
         and env.get("PTR_LLM_LOCAL_API_KEY")
         and env.get("PTR_LLM_LOCAL_API_KEY") == env.get("OPENROUTER_API_KEY")
     ):
         raise ProviderError("PAID_KEY_ON_LOCAL_URL")
+    if (
+        provider_choice == "local"
+        and _truthy_flag(env.get("PTR_LLM_LOCAL_AUTH_REQUIRED"))
+        and not env.get("PTR_LLM_LOCAL_API_KEY", "").strip()
+    ):
+        raise ProviderError("LOCAL_API_KEY_REQUIRED")
     if spillover_mode not in ("off", "openrouter") or (
         spillover_mode == "openrouter"
-        and (provider_choice != "local" or not _cluster_network(env))
+        and (provider_choice != "local" or not cluster_network)
     ):
         raise ProviderError("INVALID_SPILLOVER_CONFIG")
     key_max_limit_usd = 1.0
@@ -495,7 +508,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 input_bytes=input_bytes,
                 base_url_override=env.get("PTR_LLM_OPENROUTER_BASE_URL"),
                 fixture_enabled=env.get("PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE") == "1",
-                cluster_mode=_cluster_network(env),
+                cluster_mode=cluster_network,
                 on_zdr_unavailable=lambda: telemetry.count("OPENROUTER_ZDR_UNAVAILABLE"),
             )
         if provider_name == "fake":
@@ -526,7 +539,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 max_output_tokens=tokens,
                 timeout_ms=timeout_ms,
                 input_bytes=input_bytes,
-                cluster_mode=_cluster_network(env),
+                cluster_mode=cluster_network,
                 paid_spillover=client if spillover_mode == "openrouter" else None,
                 on_spillover_check_failure=telemetry.count,
                 spillover_min_remaining_ms=_integer(

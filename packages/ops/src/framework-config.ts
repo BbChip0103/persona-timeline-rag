@@ -9,7 +9,7 @@ const token=z.string().min(24).max(512);
 const optional=<T extends z.ZodTypeAny>(value:T)=>z.preprocess(input=>input===''?undefined:input,value.optional());
 const integer=(fallback:number,min:number,max:number)=>z.coerce.number().int().min(min).max(max).default(fallback);
 const schema=z.object({
-  DATABASE_URL:z.string().min(1),PTR_REDIS_URL:z.string().min(1),PTR_CHAT_PROVIDER:z.enum(['fake','litellm']),
+  DATABASE_URL:z.string().min(1),PTR_REDIS_URL:z.string().min(1),PTR_CHAT_PROVIDER:z.enum(['fake','local','litellm']),
   PTR_PERSONAS_FILE:z.string().min(1),PTR_API_TOKEN:token,PTR_API_SYNTHETIC_TOKEN:optional(token),
   PTR_API_PORT:integer(56441,1024,65535),PTR_WORKER_CONCURRENCY:integer(32,1,1024),
   PTR_QUEUE_MAX_DEPTH:integer(256,1,100000),PTR_TURN_MAX_QUEUE_MS:integer(60000,1000,3600000),

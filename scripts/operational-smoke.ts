@@ -25,7 +25,7 @@ export function operationalConfig(env:NodeJS.ProcessEnv,execute=false,nonce?:str
   check(new URL(get('MODEL_METRICS_URL')).pathname==='/metrics','EXACT_NATIVE_METRICS_PATH');
   const manifest=resolve(get('DEPLOYMENT_MANIFEST'));check(manifest.startsWith('/tmp/ptr-operational-cutover-20261011/'),'PRIVATE_MANIFEST_PATH');
   return {execute,ownerNonce,callCap,maxOutputTokens,apiToken,manifest,output:OUTPUT,
-    backend:localUrl(get('BACKEND_URL')),worker:localUrl(get('WORKER_URL')),gateway:localUrl(get('GATEWAY_URL')),
+    backend:localUrl(get('BACKEND_URL')),worker:localUrl(get('WORKER_URL')),
     modelMetrics:localUrl(get('MODEL_METRICS_URL')),metricsToken:get('MODEL_METRICS_TOKEN'),
     appDatabase:db('APP_DATABASE_URL','ptr_split_app'),llmDatabase:db('LLM_DATABASE_URL','ptr_split_llm')};
 }
@@ -54,21 +54,50 @@ export function parseNativeMetrics(text:string){
 type Metrics=ReturnType<typeof parseNativeMetrics>;
 export class AdmissionBudget {submissions=0;constructor(readonly cap:number){check(Number.isInteger(cap)&&cap>=1&&cap<=3,'DISTINCT_TURN_CAP');}reserve(){check(this.submissions<this.cap,'LOCAL_SUBMISSION_CAP');this.submissions++;}}
 interface Service {name:string;id:string;image:string;ownerLabel:string}
-export function validateManifest(value:unknown,nonce:string){const body=record(value);check(body.ownerNonce===nonce,'DEPLOYMENT_OWNER_MISMATCH');const project=string(body.project);check(Array.isArray(body.services),'DEPLOYMENT_SERVICES_REQUIRED');const services:Service[]=body.services.map(value=>{const row=record(value);check(row.ownerLabel===nonce,'DEPLOYMENT_SERVICE_OWNER');return {name:string(row.name),id:string(row.id),image:string(row.image),ownerLabel:nonce};});check(['api','worker','model-gateway'].every(name=>services.filter(s=>s.name===name).length===1),'DEPLOYMENT_THREE_TIERS_REQUIRED');return {project,services};}
+export function validateManifest(value:unknown,nonce:string){const body=record(value);check(body.ownerNonce===nonce,'DEPLOYMENT_OWNER_MISMATCH');const project=string(body.project);check(Array.isArray(body.services),'DEPLOYMENT_SERVICES_REQUIRED');const services:Service[]=body.services.map(value=>{const row=record(value);check(row.ownerLabel===nonce,'DEPLOYMENT_SERVICE_OWNER');return {name:string(row.name),id:string(row.id),image:string(row.image),ownerLabel:nonce};});check(['api','worker'].every(name=>services.filter(s=>s.name===name).length===1),'DEPLOYMENT_TWO_TIERS_REQUIRED');return {project,services};}
 export function validateSignal(value:unknown,nonce:string,phase:string,requestNonce?:string){const body=record(value);check(body.ownerNonce===nonce&&body.phase===phase&&(!requestNonce||body.requestNonce===requestNonce),'PARENT_SIGNAL_MISMATCH');return true;}
 interface Proof {state:string;assistants:number;outbox:number;grants:number;acknowledged:number}
 export function completedProof(value:Proof){return value.state==='completed'&&value.assistants===1&&value.outbox===0&&value.grants===1&&value.acknowledged===1;}
 async function privateJson(path:string){const stat=await fs.lstat(path);check(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o077)===0,'PRIVATE_FILE_PERMISSIONS');return JSON.parse(await fs.readFile(path,'utf8')) as unknown;}
 async function writePrivate(path:string,body:unknown){await fs.mkdir(dirname(path),{recursive:true,mode:0o700});const dir=await fs.lstat(dirname(path));check(dir.isDirectory()&&!dir.isSymbolicLink()&&(dir.mode&0o077)===0,'PRIVATE_DIRECTORY_PERMISSIONS');const temp=`${path}.tmp-${process.pid}`;await fs.writeFile(temp,JSON.stringify(body,null,2)+'\n',{mode:0o600,flag:'wx'});await fs.rename(temp,path);}
-export function validateModelPolicy(value:unknown,callCap:number,maxOutputTokens:number){const raw=record(value);check(raw.qualificationCallCap===callCap&&raw.providerAdmissionHardCap===null&&raw.maxOutputTokens===maxOutputTokens&&raw.primaryOnly===true&&raw.automaticRetries===0&&raw.gatewayRetries===0&&raw.maxModelAttemptsPerTurn===3,'DEPLOYMENT_MODEL_POLICY_PROOF_REQUIRED');return true;}
+export function validateModelPolicy(value:unknown,callCap:number,maxOutputTokens:number){const raw=record(value);check(raw.qualificationCallCap===callCap&&raw.providerAdmissionHardCap===null&&raw.maxOutputTokens===maxOutputTokens&&raw.primaryOnly===true&&raw.automaticRetries===0&&raw.maxModelAttemptsPerTurn===3,'DEPLOYMENT_MODEL_POLICY_PROOF_REQUIRED');return true;}
+export function buildOperationalManifest(inspections:unknown[],project:string,nonce:string){
+  check(/^[a-z0-9][a-z0-9_-]*$/.test(project),'INVALID_COMPOSE_PROJECT');
+  const services:Service[]=[];
+  for(const value of inspections){
+    const inspected=record(value),settings=record(inspected.Config),labels=record(settings.Labels);
+    check(labels['com.docker.compose.project']===project&&labels['ptr.operational.owner']===nonce,'DEPLOYMENT_SERVICE_OWNER');
+    const name=string(labels['com.docker.compose.service']);
+    if(!['api','worker','web'].includes(name))continue;
+    const state=record(inspected.State);
+    check(state.Running===true,'DEPLOYMENT_SERVICE_NOT_RUNNING');
+    services.push({name,id:string(inspected.Id),image:string(inspected.Image),ownerLabel:nonce});
+  }
+  check(['api','worker','web'].every(name=>services.filter(service=>service.name===name).length===1),'DEPLOYMENT_THREE_TIERS_REQUIRED');
+  return {ownerNonce:nonce,project,services};
+}
+export async function regenerateOperationalManifest(config:Config,project:string,dependencies:{docker?:(args:string[])=>Promise<string>;persist?:(path:string,body:unknown)=>Promise<void>}={}){
+  const docker=dependencies.docker??(async(args:string[])=>(await runFile('docker',args,{timeout:10000,maxBuffer:1024*1024})).stdout);
+  const ids=(await docker(['ps','--filter',`label=com.docker.compose.project=${project}`,'--format','{{.ID}}'])).trim().split('\n').filter(Boolean);
+  check(ids.length>0&&ids.length<=20,'DEPLOYMENT_CONTAINER_COUNT');
+  const inspections=await Promise.all(ids.map(async id=>{const rows=JSON.parse(await docker(['inspect',id])) as unknown;check(Array.isArray(rows)&&rows.length===1,'INVALID_DOCKER_INSPECT');return rows[0];}));
+  const manifest={...buildOperationalManifest(inspections,project,config.ownerNonce),
+    qualificationCallCap:config.callCap,providerAdmissionHardCap:null,
+    maxOutputTokens:config.maxOutputTokens,primaryOnly:true,automaticRetries:0,
+    maxModelAttemptsPerTurn:3};
+  try{const stat=await fs.lstat(config.manifest);check(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o077)===0,'PRIVATE_FILE_PERMISSIONS');}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  await (dependencies.persist??writePrivate)(config.manifest,manifest);
+  return {project,services:manifest.services.map(service=>service.name),manifest:config.manifest};
+}
 async function ownership(config:Config){const raw=record(await privateJson(config.manifest));const manifest=validateManifest(raw,config.ownerNonce);if(config.execute){validateModelPolicy(raw,config.callCap,config.maxOutputTokens);}for(const service of manifest.services){const {stdout}=await runFile('docker',['inspect',service.id],{timeout:10000,maxBuffer:1024*1024});const inspected=record((JSON.parse(stdout) as unknown[])[0]),settings=record(inspected.Config),labels=record(settings.Labels);check(labels['ptr.operational.owner']===config.ownerNonce&&labels['com.docker.compose.project']===manifest.project&&labels['com.docker.compose.service']===service.name,'ACTUAL_DEPLOYMENT_OWNER_MISMATCH');check(settings.Image===service.image||inspected.Image===service.image,'ACTUAL_DEPLOYMENT_IMAGE_MISMATCH');}return {servicesVerified:manifest.services.length};}
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
-export interface SmokeDependencies {fetch?:typeof fetch;app?:Pool;llm?:Pool;verifyOwnership?:(config:Config)=>Promise<unknown>;persist?:(path:string,body:unknown)=>Promise<void>;delay?:(ms:number)=>Promise<void>;parentSignal?:(phase:string,requestNonce:string)=>Promise<unknown>;}
+export interface SmokeDependencies {fetch?:typeof fetch;app?:Pool;llm?:Pool;verifyOwnership?:(config:Config)=>Promise<unknown>;persist?:(path:string,body:unknown)=>Promise<void>;delay?:(ms:number)=>Promise<void>;parentSignal?:(phase:string,requestNonce:string)=>Promise<unknown>;singleTurn?:boolean;}
 export async function operationalSmoke(config:Config,dependencies:SmokeDependencies={}){
   const fetch=dependencies.fetch??globalThis.fetch,persist=dependencies.persist??writePrivate,sleep=dependencies.delay??delay;
   const app=dependencies.app??new Pool({connectionString:config.appDatabase,connectionTimeoutMillis:3000,statement_timeout:3000}),llm=dependencies.llm??new Pool({connectionString:config.llmDatabase,connectionTimeoutMillis:3000,statement_timeout:3000});
   const owner=`lt-ops-${createHmac('sha256',config.ownerNonce).update('actor').digest('hex').slice(0,20)}`,alien=`lt-ops-${createHmac('sha256',config.ownerNonce).update('alien').digest('hex').slice(0,20)}`;
-  const report:Record<string,unknown>={schema:1,mode:config.execute?'actual-operational':'preflight-no-generation',passed:false,rag:'off',executionProfile:'agent_loop',callCap:config.callCap,distinctTurnCap:3,maxModelAttemptsPerTurn:3,gatewayRetries:0,sdkAutomaticRetries:0,maxOutputTokens:config.maxOutputTokens,admissionCounts:null,errorCounterSupported:false,semantic:'not-run',stages:[]};
+  const report:Record<string,unknown>={schema:1,mode:config.execute?(dependencies.singleTurn?'single-turn-operational':'actual-operational'):'preflight-no-generation',passed:false,rag:'off',executionProfile:'agent_loop',callCap:config.callCap,distinctTurnCap:dependencies.singleTurn?1:3,maxModelAttemptsPerTurn:3,sdkAutomaticRetries:0,maxOutputTokens:config.maxOutputTokens,admissionCounts:null,errorCounterSupported:false,semantic:'not-run',stages:[]};
   const stages=report.stages as unknown[];const statuses:Record<string,number>={};let finalMetrics:Metrics|undefined;let initialMetrics:Metrics|undefined;
   const budget=new AdmissionBudget(Math.min(3,Math.floor(config.callCap/3)));
   const request=async(url:string,method='GET',body?:unknown,actor=owner,auth=true)=>{const response=await fetch(url,{method,redirect:'error',signal:AbortSignal.timeout(10000),headers:{...(auth?{Authorization:`Bearer ${config.apiToken}`,'X-PTR-Owner':actor}:{}),...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)})});statuses[String(response.status)]=(statuses[String(response.status)]??0)+1;return response;};
@@ -81,10 +110,10 @@ export async function operationalSmoke(config:Config,dependencies:SmokeDependenc
   try {
     await (dependencies.verifyOwnership??ownership)(config);
     for(const [pool,role] of [[app,'ptr_split_app'],[llm,'ptr_split_llm']] as const){const result=await pool.query<{db:string;role:string}>('SELECT current_database() AS db,current_user AS role');check(result.rows[0]?.db==='ptr_split_research'&&result.rows[0]?.role===role,'ACTUAL_DATABASE_IDENTITY');}
-    for(const [url,path] of [[config.backend,'/api/health'],[config.worker,'/health/ready'],[config.gateway,'/health/readiness']]){const response=await request(`${url}${path}`,'GET',undefined,owner,false);check(response.ok,'SERVICE_NOT_READY');await response.body?.cancel();}
+    for(const [url,path] of [[config.backend,'/api/health'],[config.worker,'/health/ready']]){const response=await request(`${url}${path}`,'GET',undefined,owner,false);check(response.ok,'SERVICE_NOT_READY');await response.body?.cancel();}
     const unauth=await request(`${config.backend}/api/personas`,'GET',undefined,owner,false);check(unauth.status===403,'UNAUTHENTICATED_CATALOGUE_NOT_DENIED');await unauth.body?.cancel();
     initialMetrics=await native();check(initialMetrics.running===0&&initialMetrics.waiting===0,'NATIVE_ENGINE_NOT_IDLE');
-    report.preflight={ownedThreeTiers:true,exactResearchRoles:true,readiness:true,unauthenticatedDenied:true};
+    report.preflight={ownedTwoTiers:true,exactResearchRoles:true,readiness:true,nativeModelMetrics:true,unauthenticatedDenied:true};
     if(!config.execute){report.passed=true;return report;}
     // Catalogue is read once into memory; neither IDs nor labels/revisions are saved or logged.
     const catalogue=await api('personas');check(Array.isArray(catalogue.personas),'CATALOGUE_INVALID');const candidate=catalogue.personas.map(record).find(row=>['synthetic','silver','human_reviewed'].includes(String(row.reviewStatus)));check(candidate,'PUBLISHED_PERSONA_REQUIRED');const personId=string(candidate.personId),query='짧게 인사만 해 주세요.',replyLanguage=utteranceLanguage(query,string(candidate.language));
@@ -96,6 +125,16 @@ export async function operationalSmoke(config:Config,dependencies:SmokeDependenc
     const denied=await request(`${config.backend}/api/turns/${encodeURIComponent(id)}`,'GET',undefined,alien);check(denied.status===404,'OWNER_ISOLATION_FAILED');await denied.body?.cancel();
     const deniedCancel=await request(`${config.backend}/api/turns/${encodeURIComponent(id)}/cancel`,'POST',{},alien);check(deniedCancel.status===404,'OWNER_CANCEL_ISOLATION_FAILED');await deniedCancel.body?.cancel();
     stages.push({stage:'completed',...await finish(id),ownerIsolation:true});
+    if(dependencies.singleTurn){
+      finalMetrics=await native();const successDelta=finalMetrics.successes-initialMetrics.successes;
+      check(successDelta>=1&&successDelta<=3,'NATIVE_SUCCESS_CAP_OR_COUNT');
+      check(finalMetrics.running===0&&finalMetrics.waiting===0,'NATIVE_ENGINE_NOT_DRAINED');
+      const paidAfter=await paid();report.providerRequestRows={before:paidBefore.total,after:paidAfter.total};
+      check(/^\d+$/.test(paidBefore.total)&&paidAfter.total===paidBefore.total,'RAG_OFF_AUXILIARY_SUBMISSION');
+      check(paidAfter.embeddings===paidBefore.embeddings&&paidAfter.committed===paidBefore.committed,'RAG_OFF_PAID_OR_EMBEDDING_CALL');
+      report.paid={providerRequestRowsDelta:0,embeddingRowsDelta:0,committedMicrousdDelta:0};report.passed=true;
+      return report;
+    }
     const beforeIdempotent=await native();check(await submit(sid,'ops_complete',false)===id,'IDEMPOTENCE_TURN_CHANGED');await sleep(1500);const afterIdempotent=await native();check(afterIdempotent.successes===beforeIdempotent.successes,'IDEMPOTENCE_EXTRA_GENERATION');check(completedProof(await proof(id)),'IDEMPOTENCE_EXACTLY_ONCE_FAILED');stages.push({stage:'idempotent',extraSuccessfulGenerations:0});
     // Session creation asks the worker-owned persona catalogue; stage all sessions before stopping that tier.
     const cancellationSession=await session(),recoverySession=await session();
@@ -113,7 +152,10 @@ export async function operationalSmoke(config:Config,dependencies:SmokeDependenc
     try{await persist(join(config.output,'summary.json'),report);}finally{await Promise.all([app.end(),llm.end()]);}
   }
 }
-async function main(){const args=process.argv.slice(2);for(let i=0;i<args.length;i++){check(['--env-file','--execute','--owner-nonce'].includes(args[i]!),'UNKNOWN_ARGUMENT');if(args[i]!=='--execute'){check(Boolean(args[i+1])&&!args[i+1]!.startsWith('--'),'ARGUMENT_VALUE_REQUIRED');i++;}}const envFile=args[args.indexOf('--env-file')+1];check(args.includes('--env-file')&&envFile,'EXPLICIT_PRIVATE_ENV_REQUIRED');const stat=await fs.lstat(envFile);check(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o077)===0,'PRIVATE_ENV_PERMISSIONS');const env:NodeJS.ProcessEnv={};for(const line of (await fs.readFile(envFile,'utf8')).split('\n')){const match=/^(PTR_OPERATIONAL_[A-Z_]+)=(.*)$/.exec(line);if(match){let value=match[2]!;if((value.startsWith('"')&&value.endsWith('"'))||(value.startsWith("'")&&value.endsWith("'")))value=value.slice(1,-1);env[match[1]!]=value;}}
+async function main(){const args=process.argv.slice(2);for(let i=0;i<args.length;i++){check(['--env-file','--execute','--owner-nonce','--regenerate-manifest','--project','--single-turn'].includes(args[i]!),'UNKNOWN_ARGUMENT');if(!['--execute','--regenerate-manifest','--single-turn'].includes(args[i]!)){check(Boolean(args[i+1])&&!args[i+1]!.startsWith('--'),'ARGUMENT_VALUE_REQUIRED');i++;}}const envFile=args[args.indexOf('--env-file')+1];check(args.includes('--env-file')&&envFile,'EXPLICIT_PRIVATE_ENV_REQUIRED');const stat=await fs.lstat(envFile);check(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o077)===0,'PRIVATE_ENV_PERMISSIONS');const env:NodeJS.ProcessEnv={};for(const line of (await fs.readFile(envFile,'utf8')).split('\n')){const match=/^(PTR_OPERATIONAL_[A-Z_]+)=(.*)$/.exec(line);if(match){let value=match[2]!;if((value.startsWith('"')&&value.endsWith('"'))||(value.startsWith("'")&&value.endsWith("'")))value=value.slice(1,-1);env[match[1]!]=value;}}
+  check(!args.includes('--regenerate-manifest')||(!args.includes('--execute')&&!args.includes('--single-turn')&&!args.includes('--owner-nonce')&&args.includes('--project')),'MANIFEST_ARGUMENT_CONFLICT');
+  check(!args.includes('--single-turn')||(args.includes('--execute')&&args.includes('--owner-nonce')),'SINGLE_TURN_ARGUMENT_CONFLICT');
   const config=operationalConfig(env,args.includes('--execute'),args.includes('--owner-nonce')?args[args.indexOf('--owner-nonce')+1]:undefined);
-  const report=await operationalSmoke(config);process.stdout.write(JSON.stringify({passed:report.passed,mode:report.mode,artifact:join(OUTPUT,'summary.json')})+'\n');}
+  if(args.includes('--regenerate-manifest')){const result=await regenerateOperationalManifest(config,args[args.indexOf('--project')+1]!);process.stdout.write(JSON.stringify(result)+'\n');return;}
+  const report=await operationalSmoke(config,{singleTurn:args.includes('--single-turn')});process.stdout.write(JSON.stringify({passed:report.passed,mode:report.mode,artifact:join(OUTPUT,'summary.json')})+'\n');}
 if(require.main===module)void main().catch(async error=>{const message=error instanceof Error?error.message:'';const code=/^[A-Z][A-Z0-9_]{1,80}$/.test(message)?message:'OPERATIONAL_SMOKE_FAILED';process.stderr.write(code+'\n');process.exitCode=1;});

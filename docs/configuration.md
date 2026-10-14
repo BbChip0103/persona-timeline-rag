@@ -23,8 +23,24 @@ the Kubernetes gateway. Cluster guard failures include
 `cluster_service_required`. A submitted call with an uncertain receipt is
 classified `PROVIDER_REQUEST_UNRESOLVED` and must not be retried.
 
+## Compose direct local model path
+
+The split Compose worker uses `PTR_LLM_PROVIDER=local` and connects directly to
+the authenticated vLLM SSH tunnel on loopback. Its private env file sets
+`PTR_LLM_LOCAL_BASE_URL` (the tunnel's `http://127.0.0.1:<port>/v1` URL),
+`PTR_LLM_LOCAL_MODEL` (the served model ID), `PTR_LLM_LOCAL_API_KEY` (the vLLM
+key) and `PTR_LLM_SPILLOVER=off`. The API/backend env sets
+`PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to the same ID. Keep the legacy
+`PTR_LITELLM_BILLABLE` API switch unset or `0` until its L3 replacement; local
+chat is not billable, so drafts require `clientRequestId` only for billable
+chat. Neither the worker nor backend/web env files contain an OpenRouter key.
+Compose has no central EPP admission signal, so local vLLM queues excess work
+instead of starting paid spillover.
+
 The production variable table below describes the earlier single-host profile;
-the split Kubernetes roles above use additional variables.
+the split Kubernetes roles above use additional variables. Its gateway and
+OpenRouter entries do not apply to the split Compose override described in
+[operational-deployment.md](operational-deployment.md).
 
 Production is one process per role (api, worker, dispatcher, web, and gateway when the chat provider is `gateway`) with
 **19 environment variables**. Every other knob is a constant; the scaling features measured in goal2 stay in the code

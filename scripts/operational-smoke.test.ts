@@ -1,8 +1,8 @@
 import { replyText } from '../packages/core/src/reply-texts';
-import { operationalConfig, parseNativeMetrics, privateMetadata, validateManifest, validateSignal, completedProof, AdmissionBudget, validateModelPolicy, validRagOffLimitations } from './operational-smoke';
+import { operationalConfig, parseNativeMetrics, privateMetadata, validateManifest, validateSignal, completedProof, AdmissionBudget, validateModelPolicy, validRagOffLimitations, buildOperationalManifest, regenerateOperationalManifest } from './operational-smoke';
 const env = {
   PTR_OPERATIONAL_OWNER_NONCE:'synthetic-owner-20261011', PTR_OPERATIONAL_BACKEND_URL:'http://127.0.0.1:56441',
-  PTR_OPERATIONAL_WORKER_URL:'http://127.0.0.1:58442', PTR_OPERATIONAL_GATEWAY_URL:'http://127.0.0.1:59990',
+  PTR_OPERATIONAL_WORKER_URL:'http://127.0.0.1:58442',
   PTR_OPERATIONAL_API_TOKEN:'synthetic-api-token-123456789', PTR_OPERATIONAL_MODEL_METRICS_URL:'http://127.0.0.1:59991/metrics',
   PTR_OPERATIONAL_MODEL_METRICS_TOKEN:'synthetic-metrics-token', PTR_OPERATIONAL_MODEL_CALL_CAP:'12',PTR_OPERATIONAL_MAX_OUTPUT_TOKENS:'512',
   PTR_OPERATIONAL_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_research',
@@ -29,12 +29,27 @@ it('metadata cannot contain corpus IDs/content or enumerable plain hashes',()=>{
   expect(JSON.stringify(value)).not.toMatch(/synthetic-secret-id|synthetic private reply/);
   expect(value).not.toEqual(privateMetadata('synthetic-secret-id','synthetic private reply','other-key'));
 });
-it('requires exact deployment/signal owner and all three service identities',()=>{
-  const manifest={ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,project:'synthetic-ops',services:['api','worker','model-gateway'].map(name=>({name,id:`synthetic-${name}`,image:'synthetic-image',ownerLabel:env.PTR_OPERATIONAL_OWNER_NONCE}))};
-  expect(validateManifest(manifest,env.PTR_OPERATIONAL_OWNER_NONCE).services).toHaveLength(3);
+it('requires exact deployment/signal owner and both service identities',()=>{
+  const manifest={ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,project:'synthetic-ops',services:['api','worker'].map(name=>({name,id:`synthetic-${name}`,image:'synthetic-image',ownerLabel:env.PTR_OPERATIONAL_OWNER_NONCE}))};
+  expect(validateManifest(manifest,env.PTR_OPERATIONAL_OWNER_NONCE).services).toHaveLength(2);
   expect(()=>validateManifest({...manifest,ownerNonce:'other'},env.PTR_OPERATIONAL_OWNER_NONCE)).toThrow();
   expect(()=>validateSignal({ownerNonce:'other',phase:'worker-paused'},env.PTR_OPERATIONAL_OWNER_NONCE,'worker-paused')).toThrow();
   expect(validateSignal({ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase:'worker-paused'},env.PTR_OPERATIONAL_OWNER_NONCE,'worker-paused')).toBe(true);
+});
+it('regenerates a gateway-less manifest from exact owned running service IDs',async()=>{
+  const nonce=env.PTR_OPERATIONAL_OWNER_NONCE,project='synthetic-ops',writes:unknown[]=[];
+  const inspected=(name:string)=>({Id:`synthetic-${name}`,Image:`sha256:${name}`,State:{Running:true},Config:{Labels:{'com.docker.compose.project':project,'com.docker.compose.service':name,'ptr.operational.owner':nonce}}});
+  const rows=['api','worker','web'].map(inspected);
+  const manifest=buildOperationalManifest(rows,project,nonce);
+  expect(validateManifest(manifest,nonce).services).toHaveLength(3);
+  expect(manifest.services.map(service=>service.name)).not.toContain('model-gateway');
+  expect(()=>buildOperationalManifest([...rows,inspected('worker')],project,nonce)).toThrow('DEPLOYMENT_THREE_TIERS_REQUIRED');
+  expect(()=>buildOperationalManifest([{...rows[0],Config:{Labels:{...rows[0]!.Config.Labels,'ptr.operational.owner':'other'}}},...rows.slice(1)],project,nonce)).toThrow('DEPLOYMENT_SERVICE_OWNER');
+  const docker=async(args:string[])=>args[0]==='ps'?rows.map(row=>row.Id).join('\n'):JSON.stringify([rows.find(row=>row.Id===args[1])]);
+  const result=await regenerateOperationalManifest(operationalConfig(env),project,{docker,persist:async(_path,body)=>{writes.push(body);}});
+  expect(result.services).toEqual(['api','worker','web']);
+  expect(writes).toEqual([{...manifest,qualificationCallCap:12,providerAdmissionHardCap:null,maxOutputTokens:512,primaryOnly:true,automaticRetries:0,maxModelAttemptsPerTurn:3}]);
+  expect(validateModelPolicy(writes[0],12,512)).toBe(true);
 });
 it('exactly-once means one assistant, drained outbox, one durable acknowledged receipt',()=>{
   expect(completedProof({state:'completed',assistants:1,outbox:0,grants:1,acknowledged:1})).toBe(true);
@@ -50,8 +65,8 @@ it('default preflight contacts readiness/denial/metrics only, never catalogue, m
   const urls:string[]=[],queries:string[]=[],artifacts:unknown[]=[];
   const pool=(role:string)=>({query:async(sql:string)=>{queries.push(sql);return {rows:[{db:'ptr_split_research',role}]};},end:async()=>undefined}) as unknown as Pool;
   const mockFetch:typeof fetch=async input=>{const url=String(input);urls.push(url);if(url.endsWith('/api/personas'))return new Response('{}',{status:403});if(url.endsWith('/metrics'))return new Response('vllm:request_success_total 0\nvllm:num_requests_running 0\nvllm:num_requests_waiting 0');return new Response('{}');};
-  const report=await operationalSmoke(operationalConfig(env),{fetch:mockFetch,app:pool('ptr_split_app'),llm:pool('ptr_split_llm'),verifyOwnership:async()=>({servicesVerified:3}),persist:async(_path,body)=>{artifacts.push(body);}});
-  expect(report.passed).toBe(true);expect(report.localDistinctTurnSubmissions).toBe(0);expect(urls).toHaveLength(5);expect(urls).not.toContain(expect.stringMatching(/chat\/completions|\/health$/));expect(queries.every(sql=>sql==='SELECT current_database() AS db,current_user AS role')).toBe(true);expect(artifacts).toHaveLength(1);
+  const report=await operationalSmoke(operationalConfig(env),{fetch:mockFetch,app:pool('ptr_split_app'),llm:pool('ptr_split_llm'),verifyOwnership:async()=>({servicesVerified:2}),persist:async(_path,body)=>{artifacts.push(body);}});
+  expect(report.passed).toBe(true);expect(report.localDistinctTurnSubmissions).toBe(0);expect(urls).toHaveLength(4);expect(urls).not.toContain(expect.stringMatching(/chat\/completions|\/health$/));expect(queries.every(sql=>sql==='SELECT current_database() AS db,current_user AS role')).toBe(true);expect(artifacts).toHaveLength(1);
 });
 it('preserves failed metadata and closes both connections without raw response/errors',async()=>{
   let closed=0;const artifacts:unknown[]=[];const pool={query:async()=>({rows:[{db:'wrong',role:'wrong'}]}),end:async()=>{closed++;}} as unknown as Pool;
@@ -61,7 +76,7 @@ it('preserves failed metadata and closes both connections without raw response/e
 it('rejects a stale parent marker even when deployment owner matches',()=>{
   expect(()=>validateSignal({ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase:'worker-paused',requestNonce:'old'},env.PTR_OPERATIONAL_OWNER_NONCE,'worker-paused','fresh')).toThrow('PARENT_SIGNAL_MISMATCH');
 });
-async function syntheticProtocol(providerRowsAfter=0){
+async function syntheticProtocol(providerRowsAfter=0,singleTurn=false){
   type Turn={id:string;state:string;client:string};const turns:Turn[]=[];let paused=false,successes=0,firstOwner='',sessions=0,sessionCountAtPause=0;const artifacts:unknown[]=[];
   const app={query:async(sql:string,args?:string[])=>{
     if(sql.startsWith('SELECT current_database'))return {rows:[{db:'ptr_split_research',role:'ptr_split_app'}]};
@@ -83,7 +98,7 @@ async function syntheticProtocol(providerRowsAfter=0){
     else if(url.pathname.includes('/api/turns/')){const id=url.pathname.split('/')[3],turn=turns.find(t=>t.id===id)!;if(actor!==firstOwner)status=404;else if(url.pathname.endsWith('/cancel')){turn.state='cancelled';body={cancelled:true};}else body={turn:{...turn,...(turn.state==='completed'?{reply:{status:'answered',content:'synthetic reply only',evidence:[],limitations:['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','ko'),replyText('limitation_posted_date','ko')]}}:{})}};}
     return new Response(JSON.stringify(body),{status});
   };
-  const report=await operationalSmoke(operationalConfig(env,true,env.PTR_OPERATIONAL_OWNER_NONCE),{app,llm,fetch:fake,verifyOwnership:async()=>undefined,persist:async(_path,body)=>{artifacts.push(body);},delay:async()=>undefined,parentSignal:async(phase,requestNonce)=>{if(phase==='worker-paused'){sessionCountAtPause=sessions;paused=true;}if(phase==='worker-resumed'){paused=false;for(const t of turns)if(t.state==='pending'){t.state='completed';successes++;}}return {ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase,requestNonce};}});
+  const report=await operationalSmoke(operationalConfig(env,true,env.PTR_OPERATIONAL_OWNER_NONCE),{app,llm,fetch:fake,verifyOwnership:async()=>undefined,persist:async(_path,body)=>{artifacts.push(body);},delay:async()=>undefined,singleTurn,parentSignal:async(phase,requestNonce)=>{if(phase==='worker-paused'){sessionCountAtPause=sessions;paused=true;}if(phase==='worker-resumed'){paused=false;for(const t of turns)if(t.state==='pending'){t.state='completed';successes++;}}return {ownerNonce:env.PTR_OPERATIONAL_OWNER_NONCE,phase,requestNonce};}});
   return {report,turns,artifacts,sessionCountAtPause,sessions};
 }
 it('runs the complete synthetic protocol with exactly-once ACK, owner denial, idempotence and staged recovery',async()=>{
@@ -91,6 +106,13 @@ it('runs the complete synthetic protocol with exactly-once ACK, owner denial, id
   expect(sessionCountAtPause).toBe(3);expect(sessions).toBe(3);
   expect(report).toMatchObject({passed:true,localDistinctTurnSubmissions:3,modelCallCreditsReserved:9,paid:{embeddingRowsDelta:0,committedMicrousdDelta:0},nativeCounters:{successDelta:2,admissions:null,errorDelta:null}});
   expect(turns).toHaveLength(3);expect((report.stages as unknown[])).toHaveLength(4);expect(JSON.stringify(artifacts)).not.toMatch(/synthetic-published-person|synthetic reply only|synthetic-turn-/);
+});
+it('runs one owned local smoke turn with zero paid cost and no recovery signals',async()=>{
+  const {report,turns,sessionCountAtPause,artifacts}=await syntheticProtocol(0,true);
+  expect(report).toMatchObject({passed:true,mode:'single-turn-operational',localDistinctTurnSubmissions:1,modelCallCreditsReserved:3,paid:{providerRequestRowsDelta:0,embeddingRowsDelta:0,committedMicrousdDelta:0}});
+  expect(turns).toHaveLength(1);expect(sessionCountAtPause).toBe(0);
+  expect(report.stages).toHaveLength(1);
+  expect(JSON.stringify(artifacts)).not.toMatch(/synthetic-published-person|synthetic reply only|synthetic-turn-/);
 });
 
 it('rejects every new auxiliary provider row even when zero-cost and non-embedding',async()=>{
@@ -103,11 +125,11 @@ it('rejects malformed/nonfinite used metrics, never silently drops a bad label s
   expect(()=>parseNativeMetrics(`${good}\nvllm:request_success_total{broken} 2`)).toThrow('INVALID_NATIVE_METRIC');
   expect(parseNativeMetrics(`${good}\n# ignored comment\nvllm:time_to_first_token_seconds_bucket{le="+Inf"} NaN`)).toMatchObject({successes:3});
 });
-it('forbids a fourth distinct turn and proves 3 bounded model attempts with no gateway or SDK retry',()=>{
+it('forbids a fourth distinct turn and proves 3 bounded model attempts with no SDK retry',()=>{
   expect(()=>new AdmissionBudget(4)).toThrow('DISTINCT_TURN_CAP');
-  const policy={qualificationCallCap:12,providerAdmissionHardCap:null,maxOutputTokens:512,primaryOnly:true,automaticRetries:0,maxModelAttemptsPerTurn:3,gatewayRetries:0};
+  const policy={qualificationCallCap:12,providerAdmissionHardCap:null,maxOutputTokens:512,primaryOnly:true,automaticRetries:0,maxModelAttemptsPerTurn:3};
   expect(validateModelPolicy(policy,12,512)).toBe(true);
-  for(const patch of [{maxModelAttemptsPerTurn:4},{gatewayRetries:1},{automaticRetries:1},{maxModelAttemptsPerTurn:undefined}])expect(()=>validateModelPolicy({...policy,...patch},12,512)).toThrow('DEPLOYMENT_MODEL_POLICY_PROOF_REQUIRED');
+  for(const patch of [{maxModelAttemptsPerTurn:4},{automaticRetries:1},{maxModelAttemptsPerTurn:undefined}])expect(()=>validateModelPolicy({...policy,...patch},12,512)).toThrow('DEPLOYMENT_MODEL_POLICY_PROOF_REQUIRED');
 });
 
 it('accepts only the native benign RAG-off disclosures (or explicitly synthetic empty fixture)',()=>{

@@ -65,15 +65,18 @@ function loopback(raw:string):string {
 }
 export function frameworkEnvironment(source:NodeJS.ProcessEnv,appKey:NodeJS.ProcessEnv,catalogue:string,queue:string):NodeJS.ProcessEnv {
   const password=source.PTR_FRAMEWORK_TEST_DB_PASSWORD,redisPassword=source.PTR_FRAMEWORK_QUEUE_PASSWORD;
-  demand(password&&redisPassword&&appKey.PTR_LITELLM_API_KEY,'GENERATED_SERVICE_CREDENTIALS_REQUIRED');
+  demand(password&&redisPassword,'GENERATED_SERVICE_CREDENTIALS_REQUIRED');
   const databaseUrl=`postgresql://ptr_framework_tester:${encodeURIComponent(password)}@127.0.0.1:57432/ptr_framework_test`;
   const redisUrl=`redis://:${encodeURIComponent(redisPassword)}@127.0.0.1:57479/0`;
   assertSyntheticTargets(databaseUrl,redisUrl);
-  demand(source.PTR_LITELLM_PORT&&source.PTR_GUARDRAILS_PORT,'GENERATED_SERVICE_PORTS_REQUIRED');
+  demand(source.PTR_FAKE_ENGINE_PORT&&source.PTR_GUARDRAILS_PORT,'GENERATED_SERVICE_PORTS_REQUIRED');
   demand(source.LANGFUSE_BASE_URL&&source.LANGFUSE_PUBLIC_KEY&&source.LANGFUSE_SECRET_KEY,'GENERATED_LANGFUSE_REQUIRED');
+  // The historical TS runtime keeps its provider label until L4, but its URL
+  // now targets the fake engine itself rather than a Compose proxy.
+  const localApiKey=appKey.PTR_LLM_LOCAL_API_KEY??'local-synthetic-no-auth';
   return {PATH:process.env.PATH,HOME:process.env.HOME,NODE_ENV:'production',PTR_LLM_SERVICE_MODE:'legacy',LANGSMITH_TRACING:'false',LANGCHAIN_TRACING_V2:'false',
     DATABASE_URL:databaseUrl,PTR_REDIS_URL:redisUrl,PTR_CHAT_PROVIDER:'litellm',PTR_MODEL:'primary',PTR_LITELLM_BILLABLE:'0',
-    PTR_LITELLM_BASE_URL:loopback(`http://127.0.0.1:${source.PTR_LITELLM_PORT}/v1`),PTR_LITELLM_API_KEY:appKey.PTR_LITELLM_API_KEY,
+    PTR_LITELLM_BASE_URL:loopback(`http://127.0.0.1:${source.PTR_FAKE_ENGINE_PORT}/v1`),PTR_LITELLM_API_KEY:localApiKey,
     PTR_GUARDRAILS_URL:loopback(`http://127.0.0.1:${source.PTR_GUARDRAILS_PORT}`),PTR_GUARDRAILS_TOKEN:source.PTR_GUARDRAILS_TOKEN,
     PTR_GUARDRAILS_TIMEOUT_MS:'1000',PTR_LANGFUSE_ENABLED:'1',PTR_LANGFUSE_LOCAL:'1',PTR_LANGFUSE_CAPTURE_CONTENT:'0',
     LANGFUSE_BASE_URL:loopback(source.LANGFUSE_BASE_URL),LANGFUSE_PUBLIC_KEY:source.LANGFUSE_PUBLIC_KEY,LANGFUSE_SECRET_KEY:source.LANGFUSE_SECRET_KEY,
@@ -213,7 +216,8 @@ export async function smoke(source:NodeJS.ProcessEnv,appKey:NodeJS.ProcessEnv,we
     const complete=await waitForTurn(fleet,turn.id);gates.turn=complete.state==='completed'&&!!complete.reply;
     gates.modelResult=!!complete.reply&&complete.reply.content.length>0&&!complete.reply.limitations.some(value=>value.startsWith('GUARDRAILS_'));
     const served=(await pool.query("SELECT reply->'serving' AS serving FROM turns WHERE id=$1",[turn.id])).rows[0].serving;
-    gates.actualTransport=served?.calls===1&&Array.isArray(served.upstreams)&&served.upstreams.some((value:string)=>['litellm','fake'].includes(value));
+    const directCount=await engineCounts(source);
+    gates.actualTransport=directCount.submitted-before.submitted===1&&served?.calls===1&&Array.isArray(served.upstreams)&&served.upstreams.some((value:string)=>['litellm','fake'].includes(value));
     gates.owner=(await apiRequest(fleet,`turns/${turn.id}`,undefined,'lt-other')).status===404;
     gates.dto=!JSON.stringify(complete).includes('"agent"')&&!JSON.stringify(complete).includes('"serving"');
     const again=await sendTurn(fleet,session,'smoke-hello');await sleep(250);const after=await engineCounts(source);
