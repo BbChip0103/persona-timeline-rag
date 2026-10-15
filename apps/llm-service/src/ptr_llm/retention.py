@@ -19,7 +19,9 @@ _THREAD_TURN_SQL = (
     f"(c.thread_id ~ '^model:{_UUID}:[0-9a-f]{{64}}$' "
     "AND split_part(c.thread_id,':',2)=t.id) OR "
     "(c.thread_id ~ '^python-call-v1:[0-9a-f]{64}:[0-9a-f]{64}$' "
-    "AND split_part(c.thread_id,':',2)=encode(sha256(convert_to(t.id,'UTF8')),'hex'))"
+    "AND split_part(c.thread_id,':',2) IN ("
+    "encode(sha256(convert_to(t.id,'UTF8')),'hex'),"
+    "encode(sha256(convert_to(t.id||':summary','UTF8')),'hex')))"
 )
 _SAVER_TABLES = tuple(
     f"llm.{prefix}{name}"
@@ -52,7 +54,11 @@ class RetentionOptions:
 def linked_thread_ids(threads: list[str], turn_ids: list[str]) -> list[str]:
     """Match exact, known native/legacy grammars; never deserialize checkpoint data."""
     turns = set(turn_ids)
-    scopes = {hashlib.sha256(turn.encode()).hexdigest() for turn in turns}
+    scopes = {
+        hashlib.sha256(request_key.encode()).hexdigest()
+        for turn in turns
+        for request_key in (turn, f"{turn}:summary")
+    }
     explicit = {f"{kind}:{turn}" for turn in turns for kind in ("turn", "character")}
     matched = []
     for thread in set(threads):
@@ -83,7 +89,8 @@ def maintenance_url(env: Any = None) -> str:
 async def retain_split_data(connection: Any, options: RetentionOptions | None = None) -> dict:
     """One bounded transaction binds purge eligibility to locked terminal app turns.
 
-    Billing tombstones, turn/message truth and active/resumable work survive. Missing
+    Deleted sessions bypass age retention and lose their application truth. Otherwise,
+    billing tombstones, turn/message truth and active/resumable work survive. Missing
     execution/turn scopes and opaque draft checkpoint hashes are retained, not guessed.
     Return only counts: no raw payloads, IDs, hashes, credentials or DSNs.
     """
@@ -107,6 +114,7 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
         await connection.execute("SET LOCAL statement_timeout='5s'")
         await connection.execute("SET LOCAL lock_timeout='1s'")
         mandatory = (
+            "app.sessions",
             "app.turns",
             "app.turn_outbox",
             "app.turn_execution_grants",
@@ -114,7 +122,7 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             "llm.ptr_provider_requests",
         )
         present = {}
-        for table in mandatory + _SAVER_TABLES:
+        for table in mandatory + ("app.user_memories",) + _SAVER_TABLES:
             row = await (
                 await connection.execute("SELECT to_regclass(%s) IS NOT NULL AS present", (table,))
             ).fetchone()
@@ -123,6 +131,23 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             raise ValueError("RETENTION_SCHEMA_NOT_READY")
         tables = [table for table in _SAVER_TABLES if present[table]]
         union = " UNION ".join(f"SELECT thread_id FROM {table}" for table in tables)
+        sessions = await (
+            await connection.execute(
+                "SELECT s.id FROM app.sessions s WHERE s.deleted_at IS NOT NULL "
+                "ORDER BY s.deleted_at,s.id LIMIT %s "
+                + ("FOR UPDATE OF s SKIP LOCKED" if options.apply else ""),
+                (options.limit,),
+            )
+        ).fetchall()
+        session_ids = [str(row["id"]) for row in sessions]
+        deleted_turns = await (
+            await connection.execute(
+                "SELECT t.id FROM app.turns t WHERE t.session_id=ANY(%s::text[]) "
+                "ORDER BY t.id " + ("FOR UPDATE OF t" if options.apply else ""),
+                (session_ids,),
+            )
+        ).fetchall()
+        deleted_ids = [str(row["id"]) for row in deleted_turns]
         turns = await (
             await connection.execute(
                 "SELECT t.id FROM app.turns t WHERE t.state IN ('completed','failed','cancelled') "
@@ -140,7 +165,7 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
                 (cutoff, cutoff, cutoff, options.limit),
             )
         ).fetchall()
-        ids = [str(row["id"]) for row in turns]
+        ids = sorted(set(deleted_ids + [str(row["id"]) for row in turns]))
         if options.apply:
             # Runtime result/ACK writes do not take app turn locks. A short bounded
             # maintenance table lock also prevents a new receipt racing grant
@@ -165,30 +190,35 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             await connection.execute(
                 "SELECT r.execution_id FROM llm.result_receipts r JOIN app.turn_execution_grants g "
                 "ON g.execution_id=r.execution_id WHERE g.turn_id=ANY(%s::text[]) "
-                "AND r.created_at<%s ORDER BY r.execution_id",
-                (ids, cutoff),
+                "AND (r.created_at<%s OR g.turn_id=ANY(%s::text[])) ORDER BY r.execution_id",
+                (ids, cutoff, deleted_ids),
             )
         ).fetchall()
         execution_ids = [str(row["execution_id"]) for row in receipts]
         grant_rows = await (
             await connection.execute(
                 "SELECT g.execution_id FROM app.turn_execution_grants g "
-                "WHERE g.turn_id=ANY(%s::text[]) AND NOT EXISTS(SELECT 1 FROM "
+                "WHERE g.turn_id=ANY(%s::text[]) AND (g.turn_id=ANY(%s::text[]) "
+                "OR NOT EXISTS(SELECT 1 FROM "
                 "llm.result_receipts r "
-                "WHERE r.execution_id=g.execution_id AND r.created_at>=%s) ORDER BY g.execution_id",
-                (ids, cutoff),
+                "WHERE r.execution_id=g.execution_id AND r.created_at>=%s)) "
+                "ORDER BY g.execution_id",
+                (ids, deleted_ids, cutoff),
             )
         ).fetchall()
         grant_ids = [str(row["execution_id"]) for row in grant_rows]
         raw = await (
             await connection.execute(
                 "SELECT r.key FROM llm.ptr_provider_requests r WHERE r.response_json IS NOT NULL "
-                "AND r.response_scrubbed_at IS NULL AND r.receipt_received_at<%s AND "
-                "((r.request_kind='draft' AND r.turn_id IS NULL) OR "
-                "(r.request_kind IN ('chat','decision') AND r.turn_id=ANY(%s::text[]))) "
-                "ORDER BY r.receipt_received_at,r.key LIMIT %s "
-                + ("FOR UPDATE OF r SKIP LOCKED" if options.apply else ""),
-                (cutoff, ids, options.limit),
+                "AND r.response_scrubbed_at IS NULL AND (r.turn_id=ANY(%s::text[]) OR r.key IN ("
+                "SELECT q.key FROM llm.ptr_provider_requests q WHERE q.response_json IS NOT NULL "
+                "AND q.response_scrubbed_at IS NULL AND q.receipt_received_at<%s AND "
+                "((q.request_kind='draft' AND q.turn_id IS NULL) OR "
+                "(q.request_kind IN ('chat','decision') AND q.turn_id=ANY(%s::text[]))) "
+                "ORDER BY q.receipt_received_at,q.key LIMIT %s)) "
+                "ORDER BY r.receipt_received_at,r.key "
+                + ("FOR UPDATE OF r" if options.apply else ""),
+                (deleted_ids, cutoff, ids, options.limit),
             )
         ).fetchall()
         keys = [str(row["key"]) for row in raw]
@@ -215,18 +245,40 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
         ).fetchone()
         planned = {
             "turns": len(ids),
+            "deletedSessions": len(session_ids),
             "checkpointThreads": len(threads),
             "resultReceipts": len(execution_ids),
             "grantSnapshots": len(grant_ids),
             "providerReceipts": len(keys),
+            "forgottenMemories": 0,
         }
+        if present.get("app.user_memories"):
+            forgotten = await (
+                await connection.execute(
+                    "SELECT count(*) AS count FROM app.user_memories "
+                    "WHERE forgotten AND forgotten_at<%s", (cutoff,)
+                )
+            ).fetchone()
+            planned["forgottenMemories"] = forgotten["count"]
         deleted = {
+            "sessions": 0,
+            "turns": 0,
             "checkpointRows": 0,
             "resultReceipts": 0,
             "grantSnapshots": 0,
             "providerReceipts": 0,
+            "forgottenMemories": 0,
         }
         if options.apply:
+            if present.get("app.user_memories"):
+                deleted["forgottenMemories"] = (
+                    await connection.execute(
+                        "DELETE FROM app.user_memories WHERE id IN ("
+                        "SELECT id FROM app.user_memories WHERE forgotten AND forgotten_at<%s "
+                        "ORDER BY forgotten_at,id FOR UPDATE SKIP LOCKED LIMIT %s)",
+                        (cutoff, options.limit),
+                    )
+                ).rowcount
             for table in tables:
                 cursor = await connection.execute(
                     f"DELETE FROM {table} WHERE thread_id=ANY(%s::text[])", (threads,)
@@ -251,6 +303,19 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
                     "WHERE key=ANY(%s::text[]) AND response_json IS NOT NULL "
                     "AND response_scrubbed_at IS NULL",
                     (now, keys),
+                )
+            ).rowcount
+            await connection.execute(
+                "DELETE FROM app.turn_outbox WHERE turn_id=ANY(%s::text[])", (deleted_ids,)
+            )
+            deleted["turns"] = (
+                await connection.execute(
+                    "DELETE FROM app.turns WHERE id=ANY(%s::text[])", (deleted_ids,)
+                )
+            ).rowcount
+            deleted["sessions"] = (
+                await connection.execute(
+                    "DELETE FROM app.sessions WHERE id=ANY(%s::text[])", (session_ids,)
                 )
             ).rowcount
         return {

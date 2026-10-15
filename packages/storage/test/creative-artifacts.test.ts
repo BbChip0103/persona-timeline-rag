@@ -16,10 +16,11 @@ test('save selects an owned session and load filters by owner',async()=>{
   const store=new PostgresCreativeArtifactStore({query} as unknown as Pool);
   await store.save(artifact);
   expect(query.mock.calls[0][0]).toMatch(/INSERT INTO app\.generated_artifacts[\s\S]*FROM app\.sessions/);
+  expect(query.mock.calls[0][0]).toContain('s.deleted_at IS NULL');
   expect(query.mock.calls[0][1]).toEqual([artifact.id,artifact.sessionId,artifact.ownerId,artifact]);
   await expect(store.get(artifact.ownerId,artifact.id)).resolves.toEqual(artifact);
   await expect(store.get('owner_synthetic_other',artifact.id)).resolves.toBeNull();
-  expect(query.mock.calls[1][0]).toMatch(/WHERE id=\$1 AND owner_id=\$2/);
+  expect(query.mock.calls[1][0]).toMatch(/JOIN app\.sessions s[\s\S]*s\.deleted_at IS NULL/);
   expect(query.mock.calls.slice(1).map(([,params])=>params)).toEqual([
     [artifact.id,artifact.ownerId],[artifact.id,'owner_synthetic_other'],
   ]);

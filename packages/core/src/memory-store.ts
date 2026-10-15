@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ChatMessage, ChatReply, ChatSession, ChatTurn, Persona, SendTurnInput, TurnState } from '@ptr/contracts';
+import type { ChatMessage, ChatReply, ChatSession, ChatTurn, Persona, SendTurnInput, TurnState, UserMemory, SessionSummary } from '@ptr/contracts';
 import { CoreError, type ConversationStore, type LeaseFence, type PersonaRepository, type QueuedTurn, type TurnDispatch, type TurnLeaseStore } from './ports';
 import { turnTextFingerprint } from './request-fingerprint';
 const terminal = (state:TurnState) => ['completed','failed','cancelled'].includes(state);
@@ -23,6 +23,28 @@ export class InMemoryConversationStore implements ConversationStore, TurnLeaseSt
   }
   async listOwnedSessions(owner:string):Promise<ChatSession[]> {
     return [...this.sessions.values()].filter(s => s.ownerId === owner).map(s => structuredClone(s));
+  }
+  async setUserMemoryConsent(id:string,owner:string,enabled:boolean):Promise<ChatSession> {
+    const session=this.sessions.get(id);
+    if(session?.ownerId!==owner) throw new CoreError('NOT_FOUND');
+    session.userMemoryConsent=enabled;
+    return structuredClone(session);
+  }
+  async getSessionSummary(id:string,owner:string):Promise<SessionSummary|undefined> {
+    if(!await this.getOwnedSession(id,owner)) throw new CoreError('NOT_FOUND');
+    return undefined;
+  }
+  async listUserMemories(_owner:string,_persona:string,_includeForgotten=false):Promise<UserMemory[]> { return []; }
+  async forgetUserMemory(_id:string,_owner:string):Promise<boolean> { return false; }
+  async deleteUserMemories(_owner:string,_persona:string):Promise<number> { return 0; }
+  async deleteOwnedSession(id:string,owner:string):Promise<boolean> {
+    const session=this.sessions.get(id);
+    if(session?.ownerId!==owner) return false;
+    const turns=[...this.turns.values()].filter(turn=>turn.sessionId===id);
+    if(turns.some(turn=>!terminal(turn.state))) throw new CoreError('TURN_ACTIVE');
+    for(const turn of turns) {this.turns.delete(turn.id);this.requestHashes.delete(turn.id);this.inputs.delete(turn.id);this.leases.delete(turn.id);this.outbox.delete(turn.id);this.dispatchSeq.delete(turn.id);}
+    this.messages.delete(id);this.sessions.delete(id);
+    return true;
   }
   async history(id:string,owner:string):Promise<ChatMessage[]> {
     if (!await this.getOwnedSession(id,owner)) throw new CoreError('NOT_FOUND');

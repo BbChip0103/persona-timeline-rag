@@ -75,7 +75,7 @@ export interface EvidenceCard { sourceId:string; personId:string; sourceUrl:stri
 export interface FactualClaim { text:string; evidenceRefs:EvidenceRef[] }
 export interface AgentExecution {
   revision:string; promptRevision:string; modelCalls:number; toolCalls:number;
-  variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful';speechLevel?:'casual'|'polite'};
+  variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful';speechLevel?:'casual'|'polite';lastYearRecallUsed?:boolean};
   decisionSummary?:string;
   steps:Array<{phase:'context'|'model'|'tool'|'validation';iteration:number;sourceIds?:string[];omittedSourceIds?:string[];query?:string}>;
   validator:'disabled'|'skipped_tool_followup'|'accepted'|'rejected'|'error';
@@ -130,7 +130,11 @@ export interface ChatSession {
   language:string; timezone:string; retrievalMode:RetrievalMode; ragCondition?:RagCondition; executionProfile?:ExecutionProfile; createdAt:string;
   /** Index into [greeting, ...alternateGreetings] ; absent means 0. */
   greetingIndex?:number;
+  userMemoryConsent?:boolean;
 }
+export type UserMemoryKind='name'|'like'|'dislike'|'recent_event'|'other';
+export interface UserMemory {id:string;ownerId:string;personaId:string;sessionOriginId:string;kind:UserMemoryKind;text:string;createdAt:string;forgotten:boolean}
+export interface SessionSummary {text:string;lastMessageId:string}
 export interface ChatMessage { id:string; sessionId:string; turnId:string|null; role:'user'|'assistant'; content:string; createdAt:string }
 export interface ChatTurn {
   id:string; sessionId:string; ownerId:string; clientRequestId:string; userText:string; sequence:number;

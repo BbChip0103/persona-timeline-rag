@@ -302,5 +302,321 @@
       "executionId": "00000000-0000-4000-8000-000000000002",
       "generation": 1
     }
+  },
+  {
+    "name": "c4_context_summary_consent",
+    "schema": "Context",
+    "valid": true,
+    "value": {
+      "turn": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "clientRequestId": "synthetic-request",
+        "userText": "나는 민트차를 좋아해",
+        "sequence": 1,
+        "state": "generating",
+        "createdAt": "2026-10-10T00:00:00Z"
+      },
+      "session": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "personId": "synthetic-person",
+        "personaId": "synthetic-persona",
+        "personaRevision": "synthetic-v1",
+        "language": "ko",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "userMemoryConsent": true
+      },
+      "input": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "clientRequestId": "synthetic-request",
+        "text": "나는 민트차를 좋아해"
+      },
+      "history": [],
+      "refusedTurnIds": [],
+      "userMemoryConsent": true,
+      "userMemories": [
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "kind": "like",
+          "text": "민트차를 좋아해",
+          "forgotten": false
+        }
+      ],
+      "summary": {
+        "text": "사용자는 차 이야기를 했다.",
+        "lastMessageId": "00000000-0000-4000-8000-000000000004"
+      }
+    }
+  },
+  {
+    "name": "c4_context_no_summary_after_gap",
+    "schema": "Context",
+    "valid": true,
+    "value": {
+      "turn": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "clientRequestId": "synthetic-request",
+        "userText": "나는 민트차를 좋아해",
+        "sequence": 1,
+        "state": "generating",
+        "createdAt": "2026-10-10T00:00:00Z"
+      },
+      "session": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "personId": "synthetic-person",
+        "personaId": "synthetic-persona",
+        "personaRevision": "synthetic-v1",
+        "language": "ko",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "userMemoryConsent": true
+      },
+      "input": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "clientRequestId": "synthetic-request",
+        "text": "나는 민트차를 좋아해"
+      },
+      "history": [],
+      "refusedTurnIds": [],
+      "userMemoryConsent": true,
+      "userMemories": [
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "kind": "like",
+          "text": "민트차를 좋아해",
+          "forgotten": false
+        }
+      ]
+    }
+  },
+  {
+    "name": "c4_context_consent_off",
+    "schema": "Context",
+    "valid": true,
+    "value": {
+      "turn": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "clientRequestId": "synthetic-request",
+        "userText": "나는 민트차를 좋아해",
+        "sequence": 1,
+        "state": "generating",
+        "createdAt": "2026-10-10T00:00:00Z"
+      },
+      "session": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "personId": "synthetic-person",
+        "personaId": "synthetic-persona",
+        "personaRevision": "synthetic-v1",
+        "language": "ko",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "userMemoryConsent": true
+      },
+      "input": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "clientRequestId": "synthetic-request",
+        "text": "나는 민트차를 좋아해"
+      },
+      "history": [],
+      "refusedTurnIds": [],
+      "userMemoryConsent": false,
+      "userMemories": []
+    }
+  },
+  {
+    "name": "c4_context_memory_overlong",
+    "schema": "Context",
+    "valid": false,
+    "value": {
+      "turn": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "clientRequestId": "synthetic-request",
+        "userText": "나는 민트차를 좋아해",
+        "sequence": 1,
+        "state": "generating",
+        "createdAt": "2026-10-10T00:00:00Z"
+      },
+      "session": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "personId": "synthetic-person",
+        "personaId": "synthetic-persona",
+        "personaRevision": "synthetic-v1",
+        "language": "ko",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "userMemoryConsent": true
+      },
+      "input": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "clientRequestId": "synthetic-request",
+        "text": "나는 민트차를 좋아해"
+      },
+      "history": [],
+      "refusedTurnIds": [],
+      "userMemoryConsent": true,
+      "userMemories": [
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "kind": "like",
+          "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "forgotten": false
+        }
+      ],
+      "summary": {
+        "text": "사용자는 차 이야기를 했다.",
+        "lastMessageId": "00000000-0000-4000-8000-000000000004"
+      }
+    }
+  },
+  {
+    "name": "c4_completed_updates",
+    "schema": "Result",
+    "valid": true,
+    "value": {
+      "kind": "completed",
+      "reply": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "turnId": "00000000-0000-4000-8000-000000000001",
+        "messageId": "00000000-0000-4000-8000-000000000002",
+        "personId": "synthetic-person",
+        "personaRevision": "synthetic-v1",
+        "responseKind": "small_talk",
+        "status": "answered",
+        "content": "synthetic reply",
+        "claims": [],
+        "evidence": [],
+        "limitations": [],
+        "serving": {
+          "calls": 2,
+          "upstreams": [
+            "local",
+            "openrouter-primary"
+          ],
+          "secondaryCalls": 1
+        }
+      },
+      "summaryUpdate": {
+        "text": "사용자는 차를 좋아한다.",
+        "lastMessageId": "00000000-0000-4000-8000-000000000004"
+      },
+      "userMemoryOps": [
+        {
+          "op": "add",
+          "kind": "like",
+          "text": "민트차를 좋아해"
+        }
+      ]
+    }
+  },
+  {
+    "name": "c4_completed_without_summary_update",
+    "schema": "Result",
+    "valid": true,
+    "value": {
+      "kind": "completed",
+      "reply": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "turnId": "00000000-0000-4000-8000-000000000001",
+        "messageId": "00000000-0000-4000-8000-000000000002",
+        "personId": "synthetic-person",
+        "personaRevision": "synthetic-v1",
+        "responseKind": "small_talk",
+        "status": "answered",
+        "content": "synthetic reply",
+        "claims": [],
+        "evidence": [],
+        "limitations": [],
+        "serving": {
+          "calls": 2,
+          "upstreams": [
+            "local",
+            "openrouter-primary"
+          ],
+          "secondaryCalls": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "c4_failed_must_not_update_memory",
+    "schema": "Result",
+    "valid": false,
+    "value": {
+      "kind": "failed",
+      "errorCode": "TURN_FAILED",
+      "userMemoryOps": [
+        {
+          "op": "add",
+          "kind": "like",
+          "text": "민트차를 좋아해"
+        }
+      ]
+    }
+  },
+  {
+    "name": "c4_prior_user_only_opener",
+    "schema": "Context",
+    "valid": true,
+    "value": {
+      "turn": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "clientRequestId": "synthetic-request",
+        "userText": "나는 민트차를 좋아해",
+        "sequence": 1,
+        "state": "generating",
+        "createdAt": "2026-10-10T00:00:00Z"
+      },
+      "session": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "ownerId": "owner_synthetic_wire",
+        "personId": "synthetic-person",
+        "personaId": "synthetic-persona",
+        "personaRevision": "synthetic-v1",
+        "language": "ko",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-10T00:00:00Z",
+        "userMemoryConsent": true
+      },
+      "input": {
+        "sessionId": "00000000-0000-4000-8000-000000000001",
+        "clientRequestId": "synthetic-request",
+        "text": "나는 민트차를 좋아해"
+      },
+      "history": [],
+      "refusedTurnIds": [],
+      "userMemoryConsent": true,
+      "userMemories": [
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "kind": "like",
+          "text": "민트차를 좋아해",
+          "forgotten": false
+        }
+      ],
+      "summary": {
+        "text": "사용자는 차 이야기를 했다.",
+        "lastMessageId": "00000000-0000-4000-8000-000000000004"
+      },
+      "previousSessionUserSaid": "I like green trees"
+    }
   }
 ]

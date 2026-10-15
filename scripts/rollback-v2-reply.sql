@@ -10,26 +10,48 @@ BEGIN
   END IF;
 END $$;
 
+-- Deleted sessions would become visible to old peers without C4 tombstone filtering.
+-- Run split retention until it has purged every deleted session before this script.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM app.sessions WHERE deleted_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'ROLLBACK_DELETED_SESSIONS_REMAIN';
+  END IF;
+END $$;
+
+UPDATE app.sessions
+SET document = document #- '{userMemoryConsent}'
+WHERE document ? 'userMemoryConsent';
+
+-- Root fields are defensive cleanup for malformed earlier C4 receipts persisted as replies.
+
 UPDATE app.turns
 SET reply = reply
+  #- '{summaryUpdate}'
+  #- '{userMemoryOps}'
   #- '{agent,variables,speechLevel}'
+  #- '{agent,variables,lastYearRecallUsed}'
   #- '{agent,variables,summary}'
   #- '{agent,variables,userMemories}'
   #- '{agent,variables,userMemoryConsent}'
   #- '{agent,variables,summaryUpdate}'
   #- '{agent,variables,userMemoryOps}'
-WHERE jsonb_typeof(reply #> '{agent,variables}') = 'object'
-  AND (reply #> '{agent,variables}') ?| ARRAY[
-    'speechLevel', 'summary', 'userMemories', 'userMemoryConsent',
+WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps']
+  OR (reply #> '{agent,variables}') ?| ARRAY[
+    'speechLevel', 'lastYearRecallUsed', 'summary', 'userMemories', 'userMemoryConsent',
     'summaryUpdate', 'userMemoryOps'
   ];
 
 DO $$
 BEGIN
+  IF EXISTS (SELECT 1 FROM app.sessions WHERE document ? 'userMemoryConsent') THEN
+    RAISE EXCEPTION 'ROLLBACK_V2_SESSION_KEYS_REMAIN';
+  END IF;
   IF EXISTS (
     SELECT 1 FROM app.turns
-    WHERE (reply #> '{agent,variables}') ?| ARRAY[
-      'speechLevel', 'summary', 'userMemories', 'userMemoryConsent',
+    WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps']
+      OR (reply #> '{agent,variables}') ?| ARRAY[
+      'speechLevel', 'lastYearRecallUsed', 'summary', 'userMemories', 'userMemoryConsent',
       'summaryUpdate', 'userMemoryOps'
     ]
   ) THEN

@@ -10,7 +10,9 @@ The Compose path here remains independent. The K6 fixes to the API `pg.Pool`
 idle-error listener, worker drain and K4 pass-through validation need an
 operational Compose redeploy before that deployment benefits from them; obtain
 user approval for that redeploy. Apply
-`supabase/split/0005_generated_artifacts.sql` before the service swap. Pause
+`supabase/split/0005_generated_artifacts.sql` before the service swap. The C4
+rollout also applies `supabase/split/0006_conversation_memory.sql` after the
+full drain and before replacing either peer. Pause
 new intake, drain the queue and active turns, then replace API and worker as one
 maintenance operation. Ship both images from the same source revision and wire
 contract version; do not run a v1 peer against v2. Check durable ACKs and
@@ -129,6 +131,19 @@ run is active, or start two manual runs together. Concurrent SQL apply runs are
 still row-safe: native split retention and the legacy checkpoint and receipt
 retention select candidates with `SKIP LOCKED`, then mutate those locked rows
 in the same transaction. These retention steps remain valid Kubernetes CronJobs.
+
+Before every redeploy, verify that Compose `ptr-maintenance-daily.timer` is
+active and the last `ptr-maintenance-daily.service` run succeeded (including
+its split-retention step); its private configuration and WorkingDirectory must
+point to the deployed checkout. For Kubernetes, verify the
+`ptr-maintenance-daily-split-retention` CronJob is not suspended and its latest
+Job completed successfully. An enabled schedule without a successful run does
+not prove deletion. Inspect status/counts only, without private dialogue content.
+Deleted sessions bypass ordinary retention age and are cleared on the next daily
+cleanup. Keep `LANGFUSE_CAPTURE_CONTENT=false`; session deletion does not erase
+Langfuse content if that setting was enabled. About once per 20 messages, the C4
+worker may spend up to 4 seconds on a local summary after preparing the reply;
+allow for that completion latency when draining the queue.
 
 The weekly human-review steps are host/systemd-only in production.
 `review-sample` writes private review sheets under the repo root, which is
@@ -348,7 +363,8 @@ PY
    Restore only the snapshot's config/code sources; data mounts stay untouched.
 
    The research DB, ledger, receipts and queue are not snapshotted or reset.
-   This redeploy applies only `split/0005`; it does not backfill, erase or replay
+   The C2-to-v2 redeploy applies `split/0005`; C4 additionally applies
+   `split/0006` after the drain. Neither migration backfills, erases or replays
    provider accounting.
    After the rollback window closes, an operator may manually delete old
    oversized snapshots from private storage. Keep the current snapshot until
@@ -538,6 +554,31 @@ PY
    JS
    ```
 
+   For a C4 rollout, apply the memory migration only after both zero-count
+   checks. Use the same private owner URL and verified loopback database as
+   step 4. Keep intake blocked while it runs and confirm the migration marker
+   before starting the new API and worker.
+
+   ```sh
+   (
+     set -euo pipefail
+     test -r "${OWNER_DB_ENV}"
+     test -r supabase/split/0006_conversation_memory.sql
+     PG_IMAGE='postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94'
+     timeout 45 docker run --rm --network host \
+       --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
+       --mount "type=bind,src=${PWD}/supabase/split/0006_conversation_memory.sql,dst=/migration.sql,readonly" \
+       --entrypoint sh "${PG_IMAGE}" -c \
+       'exec psql --no-psqlrc "$PTR_LLM_MAINTENANCE_DATABASE_URL" -v ON_ERROR_STOP=1 -f /migration.sql'
+     timeout 20 docker run --rm --network host \
+       --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
+       --entrypoint sh "${PG_IMAGE}" -c \
+       'exec psql --no-psqlrc "$PTR_LLM_MAINTENANCE_DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT current_database(), current_user, to_regclass('\''app.user_memories'\'') IS NOT NULL, EXISTS (SELECT 1 FROM public.ptr_schema_migrations WHERE name='\''split/0006_conversation_memory.sql'\'')"'
+   )
+   ```
+
+   The final line must be `ptr_split_research|ptr_split_owner|t|t`.
+
 6. Stop the drained old worker and replace API, worker and web in one maintenance
    operation. The worker stop uses the configured 90 second grace period. Take
    its exact container ID from the snapshot and recheck its project, service
@@ -633,12 +674,25 @@ PY
    The old gateway named volumes still exist because step 7 did not remove them.
    Ledger, receipts and queue are not reset. Keep intake paused, drain all v2
    work as in step 5, stop the new API, worker and web with the same verified
-   project/owner identity, then run the snapshot's `rollback-v2-reply.sql` with the
-   verified `ptr_split_owner` connection before starting the old C2 worker. It
-   removes v2-only agent-variable keys from stored previous replies using
+   project/owner identity. **Before the SQL rollback**, run the current C4
+   `ptr-llm retention --apply --confirm-database <verified split database>`
+   with the private `ptr_split_owner` maintenance connection. Repeat bounded
+   passes until `planned.deletedSessions` is zero, then verify
+   `SELECT count(*) FROM app.sessions WHERE deleted_at IS NOT NULL` returns zero.
+   This purges deleted-session receipts, checkpoints, turns and session rows
+   before the old peers, which do not understand C4 deletion, become visible.
+   The rollback SQL refuses to run while deleted sessions remain. Then run the
+   snapshot's `rollback-v2-reply.sql` with the verified `ptr_split_owner`
+   connection before starting the old C2 worker. It removes v2-only session
+   document and agent-variable keys from stored previous replies using
    idempotent jsonb `#-` operations. The script leaves C4 summary and memory
    tables alone; the old worker does not read them. Verify that no affected
-   reply remains before restoring old peers. Never apply it to an unrelated DB.
+   reply remains before restoring old peers. C4 `summaryUpdate` and
+   `userMemoryOps` are also removed from the reply root. Execution grant
+   context/result and LLM receipt JSON remain v2: this cleanup does not rewrite
+   them. A full drain is mandatory so the restored worker never resumes or
+   replays those v2 executions. Keep their hashes, execution IDs and billing
+   receipts intact. Never apply it to an unrelated DB.
 
    ```sh
    (

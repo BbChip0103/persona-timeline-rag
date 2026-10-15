@@ -47,20 +47,61 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
       }).execute();
     });
   }
+  async setUserMemoryConsent(sessionId:string,ownerId:string,enabled:boolean):Promise<ChatSession> {
+    const r=await this.pool.query(`UPDATE sessions SET document=jsonb_set(document,'{userMemoryConsent}',$3::jsonb) WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL RETURNING document`,[sessionId,ownerId,JSON.stringify(enabled)]);
+    if(!r.rowCount)throw new CoreError('NOT_FOUND');return r.rows[0].document;
+  }
+  async getSessionSummary(sessionId:string,ownerId:string):Promise<{text:string;lastMessageId:string}|undefined> {
+    const r=(await this.pool.query('SELECT summary,summary_last_message_id FROM sessions WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL',[sessionId,ownerId])).rows[0];
+    return r?.summary&&r.summary_last_message_id?{text:r.summary,lastMessageId:r.summary_last_message_id}:undefined;
+  }
+  async listUserMemories(ownerId:string,personaId:string,includeForgotten=false) {
+    const r=await this.pool.query('SELECT id,owner_id,persona_id,origin_session_id,kind,text,forgotten,created_at FROM user_memories WHERE owner_id=$1 AND persona_id=$2 AND ($3::boolean OR NOT forgotten) ORDER BY created_at,id',[ownerId,personaId,includeForgotten]);
+    return r.rows.map(row=>({id:String(row.id),ownerId:String(row.owner_id),personaId:String(row.persona_id),sessionOriginId:String(row.origin_session_id),kind:row.kind as 'name'|'like'|'dislike'|'recent_event'|'other',text:String(row.text),forgotten:Boolean(row.forgotten),createdAt:new Date(row.created_at).toISOString()}));
+  }
+  async forgetUserMemory(memoryId:string,ownerId:string):Promise<boolean> {
+    return transaction(this.pool,async client=>{
+      const memory=(await client.query('SELECT persona_id FROM user_memories WHERE id=$1 AND owner_id=$2',[memoryId,ownerId])).rows[0];
+      if(!memory)return false;
+      await client.query('UPDATE sessions SET summary=NULL,summary_last_message_id=NULL WHERE owner_id=$1 AND persona_id=$2 AND deleted_at IS NULL',[ownerId,memory.persona_id]);
+      return (await client.query('UPDATE user_memories SET forgotten=true WHERE id=$1 AND owner_id=$2 RETURNING id',[memoryId,ownerId])).rowCount===1;
+    });
+  }
+  async deleteUserMemories(ownerId:string,personaId:string):Promise<number> {
+    return transaction(this.pool,async client=>{
+      await client.query('UPDATE sessions SET summary=NULL,summary_last_message_id=NULL WHERE owner_id=$1 AND persona_id=$2 AND deleted_at IS NULL',[ownerId,personaId]);
+      return (await client.query('UPDATE user_memories SET forgotten=true WHERE owner_id=$1 AND persona_id=$2 AND NOT forgotten',[ownerId,personaId])).rowCount??0;
+    });
+  }
+  async deleteOwnedSession(sessionId:string,ownerId:string):Promise<boolean> {
+    return transaction(this.pool,async client=>{
+      const owned=await client.query('SELECT id FROM sessions WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL FOR UPDATE',[sessionId,ownerId]);
+      if(!owned.rowCount)return false;
+      const running=await client.query('SELECT id FROM turns WHERE session_id=$1 AND state=ANY($2::text[]) FOR UPDATE',[sessionId,active]);
+      if(running.rowCount)throw new CoreError('TURN_ACTIVE');
+      await client.query('UPDATE sessions SET summary=NULL,summary_last_message_id=NULL WHERE id=$1',[sessionId]);
+      await client.query('DELETE FROM messages WHERE session_id=$1',[sessionId]);
+      await client.query('DELETE FROM user_memories WHERE origin_session_id=$1',[sessionId]);
+      await client.query("UPDATE turn_execution_grants SET context='{}'::jsonb,result=CASE WHEN result_hash IS NULL THEN NULL ELSE '{}'::jsonb END WHERE turn_id IN (SELECT id FROM turns WHERE session_id=$1)",[sessionId]);
+      await client.query("UPDATE turns SET deleted_at=now(),reply=NULL,user_text='',request_input=NULL WHERE session_id=$1",[sessionId]);
+      await client.query('UPDATE sessions SET deleted_at=now(),summary=NULL,summary_last_message_id=NULL WHERE id=$1',[sessionId]);
+      return true;
+    });
+  }
   async getOwnedSession(sessionId: string, ownerId: string): Promise<ChatSession | undefined> {
     const row = await this.database.selectFrom('sessions').select('document')
-      .where('id', '=', sessionId).where('owner_id', '=', ownerId).executeTakeFirst();
+      .where('id', '=', sessionId).where('owner_id', '=', ownerId).where('deleted_at', 'is', null).executeTakeFirst();
     return row?.document;
   }
   async listOwnedSessions(ownerId: string): Promise<ChatSession[]> {
     const rows = await this.database.selectFrom('sessions').select('document')
-      .where('owner_id', '=', ownerId).orderBy('created_at', 'desc').orderBy('id').execute();
+      .where('owner_id', '=', ownerId).where('deleted_at', 'is', null).orderBy('created_at', 'desc').orderBy('id').execute();
     return rows.map(row => row.document);
   }
   async history(sessionId: string, ownerId: string): Promise<ChatMessage[]> {
     const rows = await this.database.selectFrom('messages as m')
       .innerJoin('sessions as s', 's.id', 'm.session_id').leftJoin('turns as t', 't.id', 'm.turn_id')
-      .selectAll('m').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId)
+      .selectAll('m').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId).where('s.deleted_at', 'is', null)
       .where(expression => expression.or([expression('m.turn_id', 'is', null), expression('t.state', '=', 'completed')]))
       .orderBy('m.ordinal').execute();
     return rows.map(row => ({ id: row.id, sessionId: row.session_id, turnId: row.turn_id,
@@ -68,7 +109,7 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
   }
   async refusedTurnIds(sessionId: string, ownerId: string): Promise<string[]> {
     const rows = await this.database.selectFrom('turns as t').innerJoin('sessions as s', 's.id', 't.session_id')
-      .select('t.id').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId).where('t.state', '=', 'completed')
+      .select('t.id').where('s.id', '=', sessionId).where('s.owner_id', '=', ownerId).where('s.deleted_at', 'is', null).where('t.state', '=', 'completed')
       .where(sql<string>`${sql.ref('t.reply')}->'inputSafety'->>'action'`, '=', 'refuse').execute();
     return rows.map(row => String(row.id));
   }
@@ -76,7 +117,7 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
     const fingerprint=requestHash??turnTextFingerprint(text);
     if(!/^[a-f0-9]{64}$/.test(fingerprint)) throw new CoreError('INVALID_INPUT');
     return transaction(this.pool, async client => {
-      const session = await client.query('SELECT id FROM sessions WHERE id=$1 AND owner_id=$2 FOR UPDATE', [sessionId, ownerId]);
+      const session = await client.query('SELECT id,document FROM sessions WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL FOR UPDATE', [sessionId, ownerId]);
       if (!session.rowCount) throw new CoreError('NOT_FOUND');
       const existing = await client.query('SELECT * FROM turns WHERE session_id=$1 AND client_request_id=$2', [sessionId, clientRequestId]);
       if (existing.rowCount) {
@@ -85,9 +126,9 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
       }
       const active = await client.query('SELECT id FROM turns WHERE session_id=$1 AND NOT(state=ANY($2::text[]))', [sessionId, terminal]);
       if (active.rowCount) throw new CoreError('TURN_ACTIVE');
-      const result = await client.query(`INSERT INTO turns(id,session_id,owner_id,client_request_id,user_text,request_hash,sequence,state,request_input)
-        SELECT $1,$2,$3,$4,$5,$6,COALESCE(MAX(sequence),0)+1,'pending',$7 FROM turns WHERE session_id=$2 RETURNING *`,
-      [randomUUID(), sessionId, ownerId, clientRequestId, text, fingerprint, input ?? null]);
+      const result = await client.query(`INSERT INTO turns(id,session_id,owner_id,client_request_id,user_text,request_hash,sequence,state,request_input,user_memory_consent_at_input)
+        SELECT $1,$2,$3,$4,$5,$6,COALESCE(MAX(sequence),0)+1,'pending',$7,$8 FROM turns WHERE session_id=$2 RETURNING *`,
+      [randomUUID(), sessionId, ownerId, clientRequestId, text, fingerprint, input ?? null, session.rows[0].document?.userMemoryConsent===true]);
       const reserved = turn(result.rows[0]);
       if (!input) return { turn: reserved, created: true };
       // Same transaction as the reservation: a committed turn always has a dispatch to deliver.
@@ -137,7 +178,7 @@ export class PostgresConversationStore implements ConversationStore, TurnLeaseSt
   }
   async getTurn(turnId: string, ownerId: string): Promise<ChatTurn | undefined> {
     const row = await this.database.selectFrom('turns as t').innerJoin('sessions as s', 's.id', 't.session_id')
-      .selectAll('t').where('t.id', '=', turnId).where('s.owner_id', '=', ownerId).executeTakeFirst();
+      .selectAll('t').where('t.id', '=', turnId).where('s.owner_id', '=', ownerId).where('s.deleted_at', 'is', null).executeTakeFirst();
     return row ? turn(row) : undefined;
   }
   async cancelTurn(turnId: string, ownerId: string): Promise<boolean> {

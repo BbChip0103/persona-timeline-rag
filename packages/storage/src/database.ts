@@ -5,6 +5,9 @@ import type { ChatMessage, ChatReply, ChatSession, SendTurnInput, TurnState } fr
 type Timestamp = ColumnType<Date, string | Date, string | Date>;
 
 interface SessionsTable {
+  deleted_at: Generated<Date | null>;
+  summary: Generated<string | null>;
+  summary_last_message_id: Generated<string | null>;
   id: string;
   owner_id: string;
   person_id: string;

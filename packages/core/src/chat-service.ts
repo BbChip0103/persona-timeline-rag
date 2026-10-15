@@ -100,7 +100,14 @@ function fencedStore(store:ConversationStore,fence:LeaseFence,events?:TurnEvents
   };
   return {
     create:(session,greeting)=>store.create(session,greeting),getOwnedSession:(id,owner)=>store.getOwnedSession(id,owner),
-    listOwnedSessions:owner=>store.listOwnedSessions(owner),history:(id,owner)=>store.history(id,owner),refusedTurnIds:(id,owner)=>store.refusedTurnIds(id,owner),
+    listOwnedSessions:owner=>store.listOwnedSessions(owner),
+    setUserMemoryConsent:(id,owner,enabled)=>store.setUserMemoryConsent(id,owner,enabled),
+    getSessionSummary:(id,owner)=>store.getSessionSummary(id,owner),
+    listUserMemories:(owner,persona,includeForgotten)=>store.listUserMemories(owner,persona,includeForgotten),
+    forgetUserMemory:(id,owner)=>store.forgetUserMemory(id,owner),
+    deleteUserMemories:(owner,persona)=>store.deleteUserMemories(owner,persona),
+    deleteOwnedSession:(id,owner)=>store.deleteOwnedSession(id,owner),
+    history:(id,owner)=>store.history(id,owner),refusedTurnIds:(id,owner)=>store.refusedTurnIds(id,owner),
     reserveTurn:(...args)=>store.reserveTurn(...args),getTurn:(id,owner)=>store.getTurn(id,owner),cancelTurn:(id,owner)=>store.cancelTurn(id,owner),
     transitionTurn:async(id,expected,next,errorCode)=>announce(await store.transitionTurn(id,expected,next,errorCode,fence),id,next,errorCode),
     completeTurn:async(id,reply)=>announce(await store.completeTurn(id,reply,fence),id,'completed'),

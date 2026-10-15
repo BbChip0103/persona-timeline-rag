@@ -60,13 +60,31 @@ AGENT_RESPONSE_JSON_SCHEMA = {
 }
 
 
-def agent_response_schema(sources):
+USER_MEMORY_SCHEMA = {
+    "type": "array",
+    "maxItems": 3,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["op", "kind", "text"],
+        "properties": {
+            "op": {"const": "add"},
+            "kind": {"enum": ["name", "like", "dislike", "recent_event", "other"]},
+            "text": {"type": "string", "minLength": 4, "maxLength": 120},
+        },
+    },
+}
+
+
+def agent_response_schema(sources, *, memory_consent=False):
     """Finite complete references from the trusted, budgeted context, never message prefixes.
 
     Native decoding selects a full reference instead of recombining identifiers and
     quote text. Historical parsing and the final exact provenance validator stay intact.
     """
     schema: dict[str, Any] = copy.deepcopy(AGENT_RESPONSE_JSON_SCHEMA)
+    if memory_consent:
+        schema["properties"]["variableUpdates"]["properties"]["userMemory"] = USER_MEMORY_SCHEMA
     choices = []
     seen = set()
     for source in sources:
@@ -104,7 +122,12 @@ def agent_response_schema(sources):
 
 def variables(value=None):
     value = {} if value is None else value
-    if not isinstance(value, dict) or set(value) - {"conversationTopic", "tone", "speechLevel"}:
+    if not isinstance(value, dict) or set(value) - {
+        "conversationTopic",
+        "tone",
+        "speechLevel",
+        "lastYearRecallUsed",
+    }:
         raise CoreError("INVALID_INPUT")
     topic = value.get("conversationTopic", "")
     tone = value.get("tone", "neutral")
@@ -118,6 +141,10 @@ def variables(value=None):
     result = {"conversationTopic": topic, "tone": tone}
     if "speechLevel" in value:
         result["speechLevel"] = value["speechLevel"]
+    if "lastYearRecallUsed" in value:
+        if type(value["lastYearRecallUsed"]) is not bool:
+            raise CoreError("INVALID_INPUT")
+        result["lastYearRecallUsed"] = value["lastYearRecallUsed"]
     return result
 
 
@@ -131,7 +158,7 @@ def _credential(value):
     return False
 
 
-def parse_agent_response(raw):
+def parse_agent_response(raw, *, memory_consent=False):
     try:
         if not isinstance(raw, str) or len(raw.encode("utf8")) > 65536 or contains_credential(raw):
             raise ValueError()
@@ -143,9 +170,15 @@ def parse_agent_response(raw):
         if isinstance(updates, dict):
             updates.pop("replyLanguage", None)
             updates.pop("speechLevel", None)
+            updates.pop("lastYearRecallUsed", None)
         from jsonschema import Draft202012Validator
 
-        Draft202012Validator(AGENT_RESPONSE_JSON_SCHEMA).validate(value)
+        schema: dict[str, Any] = copy.deepcopy(AGENT_RESPONSE_JSON_SCHEMA)
+        if memory_consent:
+            schema["properties"]["variableUpdates"]["properties"]["userMemory"] = USER_MEMORY_SCHEMA
+        elif isinstance(updates, dict):
+            updates.pop("userMemory", None)
+        Draft202012Validator(schema).validate(value)
         for ref in value["evidenceRefs"]:
             if (
                 utf16_length(ref["sourceId"]) > 200

@@ -1,5 +1,6 @@
 /** User-facing copy for API and turn errors. Never interpolate an upstream code or message. */
 const copy:Record<string,{ko:string;en:string}>={
+  INTAKE_PAUSED:{ko:'잠시 점검 중이에요. 조금 뒤에 다시 이야기해요!',en:'We’re taking a short maintenance break. Please try again in a moment!'},
   QUEUE_FULL:{ko:'지금 대화가 몰려서 조금 뒤에 다시 보내 줘!',en:'Lots of people are chatting right now. Please send that again in a bit!'},
   QUEUE_TIMEOUT:{ko:'답장을 시작하는 데 시간이 좀 걸렸어. 조금 뒤에 다시 보내 줘!',en:'It took too long to start a reply. Please send that again in a bit!'},
   WORKER_LOST:{ko:'답장을 쓰다가 잠깐 문제가 생겼어. 다시 보내 줄래?',en:'Something interrupted the reply. Could you send that again?'},

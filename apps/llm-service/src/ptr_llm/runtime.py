@@ -239,6 +239,11 @@ class ObservedProvider:
         if close is not None:
             await close()
 
+    async def generate_local_only(self, messages: Any, **options: Any) -> str:
+        if not callable(getattr(self.provider, "generate_local_only", None)):
+            raise ProviderError("LOCAL_ONLY_UNAVAILABLE")
+        return await self.generate(messages, **dict(options, local_only=True))
+
     async def generate(self, messages: Any, **options: Any) -> str:
         prompt = applied_prompt(self.prompts)
         with self.telemetry.observation(

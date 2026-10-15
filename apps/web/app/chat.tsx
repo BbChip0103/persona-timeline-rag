@@ -14,7 +14,7 @@ import { browserTimezone } from '../lib/browser-timezone';
 type Mode='off'|'lexical'|'semantic';
 type RagCondition='off'|'caption'|'caption_image';
 type Persona={id:string;personId:string;label:string;tagline?:string;starters?:string[];language:string;revision:string;reviewStatus?:string;aiDisclosure:string};
-type Session={id:string;personId:string;personaRevision:string;language?:string;retrievalMode:Mode;ragCondition?:RagCondition;createdAt:string};
+type Session={id:string;personId:string;personaRevision:string;language?:string;userMemoryConsent?:boolean;retrievalMode:Mode;ragCondition?:RagCondition;createdAt:string};
 type Message={id:string;turnId:string|null;role:'user'|'assistant';content:string};
 type Turn={id:string;sessionId:string;userText:string;state:string;errorCode?:string};
 type Attempt={clientRequestId:string;text:string;timeline?:{query?:string;start?:string;end?:string;dateBasis:'posted'|'event';limit:number}};
@@ -40,6 +40,8 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   const [sessionId,setSessionId]=useState<string>();const [activeId,setActiveId]=useState<string>();
   const sessionQuery=useQuery({queryKey:['session',sessionId],enabled:ownerActive&&Boolean(sessionId),queryFn:({signal})=>api<{session:Session;history:Message[]}>(`sessions/${sessionId}`,undefined,signal)});
   const session=ownerActive?sessionQuery.data?.session:undefined;const history=ownerActive?(sessionQuery.data?.history??[]):[];
+  const memoryQuery=useQuery({queryKey:['memories',sessionId],enabled:ownerActive&&Boolean(sessionId),queryFn:({signal})=>api<{memories:{id:string;kind:string;text:string}[]}>(`sessions/${sessionId}/memories`,undefined,signal)});
+  const [memoryBusy,setMemoryBusy]=useState(false);
   const activeQuery=useQuery({queryKey:['turn',activeId],enabled:false,queryFn:({signal})=>api<{turn:Turn}>(`turns/${activeId}`,undefined,signal)});
   const active=ownerActive?activeQuery.data?.turn:undefined;
   const setActive=(turn:Turn|undefined)=>{if(turn){client.setQueryData(['turn',turn.id],{turn});setActiveId(turn.id);}else setActiveId(undefined);};
@@ -53,7 +55,7 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   const sessionMutation=useMutation({mutationFn:(body:unknown)=>api<{session:Session}>('sessions',body)});
   const cancelMutation=useMutation({mutationFn:(id:string)=>api(`turns/${id}/cancel`,{})});
   const draftMutation=useMutation({mutationFn:(value:DraftAttempt)=>api<{artifact?:{content:string};notice?:{content:string};image:{code:string}}>(`sessions/${value.sessionId}/drafts`,{brief:value.brief,clientRequestId:value.clientRequestId})});
-  const busy=!ownerActive||selectBusy||sessionQuery.isFetching||submitMutation.isPending||sessionMutation.isPending;
+  const busy=memoryBusy||!ownerActive||selectBusy||sessionQuery.isFetching||submitMutation.isPending||sessionMutation.isPending;
   const draftBusy=draftMutation.isPending;const draft=ownerActive?(draftMutation.data?.artifact?.content??draftMutation.data?.notice?.content??''):'';
   function invalidateOwner() {
     ownerEpoch.current++;viewEpoch.current++;sessionRef.current=undefined;streamController.current?.abort();setOwnerActive(false);setSessionId(undefined);setActiveId(undefined);setAttempt(undefined);setFailedAttempt(undefined);setError('');setNotice('');setText('');setBrief('');setQuery('');setStart('');setEnd('');setPersonId('');setReturning(false);setReentryPreview(undefined);setDisclosureFor(undefined);
@@ -61,12 +63,35 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   }
   const currentView=(owner:number,view:number,id?:string)=>mounted.current&&ownerActive&&ownerEpoch.current===owner&&viewEpoch.current===view&&(id===undefined||sessionRef.current===id);
 
+  async function updateMemory(action:'consent'|'one'|'all'|'session',enabled?:boolean,memoryId?:string) {
+    if(!session||memoryBusy)return;
+    const id=session.id;const owner=ownerEpoch.current;const view=viewEpoch.current;
+    if(action==='session'&&!window.confirm(english(session.language??selected?.language)?'Delete this chat and its memories?':'대화와 이 대화에서 저장한 기억을 삭제할까요?'))return;
+    setMemoryBusy(true);setError('');
+    try {
+      if(action==='consent') {
+        await api(`sessions/${id}/memory-consent`,{enabled});
+        if(currentView(owner,view,id))client.setQueryData<{session:Session;history:Message[]}>(['session',id],previous=>previous?{...previous,session:{...previous.session,userMemoryConsent:enabled}}:previous);
+      } else {
+        const path=action==='session'?`sessions/${id}`:`sessions/${id}/memories${action==='one'?`/${memoryId}`:''}`;
+        await requestApi(path,undefined,undefined,onUnauthorized,'DELETE');
+      }
+      if(!currentView(owner,view,id))return;
+      if(action==='session') {
+        streamController.current?.abort();viewEpoch.current++;sessionRef.current=undefined;setSessionId(undefined);setActive(undefined);setAttempt(undefined);setFailedAttempt(undefined);setText('');setNotice('');setReturning(false);setReentryPreview(undefined);setBrief('');draftMutation.reset();draftAttempt.current=undefined;
+        localStorage.removeItem('ptr-session-id');localStorage.removeItem(`ptr-active-turn-${id}`);
+        client.removeQueries({queryKey:['session',id],exact:true});client.removeQueries({queryKey:['memories',id],exact:true});
+        client.setQueryData<{sessions:Session[]}>(['sessions'],previous=>({sessions:(previous?.sessions??[]).filter(item=>item.id!==id)}));
+      } else await client.invalidateQueries({queryKey:['memories',id],exact:true});
+    }catch(e){if(currentView(owner,view,id))setError((e as Error).message);}
+    finally{if(mounted.current&&ownerEpoch.current===owner)setMemoryBusy(false);}
+  }
   async function refreshHistory(id:string) {
     const owner=ownerEpoch.current;const view=viewEpoch.current;if(!currentView(owner,view,id))return;
     await client.invalidateQueries({queryKey:['session',id],exact:true,refetchType:'none'});
     if(!currentView(owner,view,id))return;
     const value=await client.fetchQuery({queryKey:['session',id],queryFn:({signal})=>api<{session:Session;history:Message[]}>(`sessions/${id}`,undefined,signal)});
-    if(currentView(owner,view,id))languageRef.current=value.session.language;
+    if(currentView(owner,view,id)){languageRef.current=value.session.language;void client.invalidateQueries({queryKey:['memories',id],exact:true});}
     return value;
   }
   async function selectSession(id:string,reentry=true) {
@@ -124,7 +149,8 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   // Disabled observers may retain their last result after cache.clear(); never render another owner epoch's data.
   const visibleError=ownerActive?(error||(people.error as Error|undefined)?.message||(stored.error as Error|undefined)?.message||(sessionQuery.error as Error|undefined)?.message||''):'';
   const selected=personas.find(persona=>persona.personId===(session?.personId??personId));
-  const disclosureKey=selected?`ptr-ai-disclosed:${ownerScope}:${selected.id}`:undefined;
+  const disclosureKey=selected&&(!sessionId||session?.personId===personId)
+    ?`ptr-ai-disclosed:${ownerScope}:${selected.id}`:undefined;
   const showFirstDisclosure=Boolean(disclosureKey&&disclosureFor===disclosureKey);
   useEffect(()=>{setDisclosureFor(disclosureKey&&localStorage.getItem(disclosureKey)!=='1'?disclosureKey:undefined);},[disclosureKey]);
   useEffect(()=>{if(showFirstDisclosure&&disclosureKey)localStorage.setItem(disclosureKey,'1');},[showFirstDisclosure,disclosureKey]);
@@ -137,7 +163,7 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
       {operatorMode&&<section className="operator-controls" aria-label="운영자 설정">{people.data?.operatorNotice&&<p role="status" data-testid="operator-notice">{people.data.operatorNotice}</p>}<label htmlFor="rag-condition">새 세션의 RAG 조건</label><select id="rag-condition" value={condition} onChange={event=>setCondition(event.target.value as RagCondition)} disabled={busy||draftBusy||Boolean(active)}>{Object.entries(conditionLabel).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select>
       {condition!=='off'&&<><label htmlFor="mode">검색 알고리즘</label><select id="mode" value={mode} onChange={event=>setMode(event.target.value as Mode)} disabled={busy||draftBusy||Boolean(active)}><option value="lexical">Lexical</option><option value="semantic">Semantic</option></select></>}</section>}
       <button disabled={!personId||busy||draftBusy||Boolean(active)} onClick={async()=>{const owner=ownerEpoch.current;const view=viewEpoch.current;setError('');try{const value=await sessionMutation.mutateAsync({personId,ragCondition:operatorMode?condition:'caption',retrievalMode:operatorMode?(condition==='off'?'off':mode):'lexical',timezone:browserTimezone()});if(!currentView(owner,view))return;client.setQueryData<{sessions:Session[]}>(['sessions'],previous=>({sessions:[value.session,...(previous?.sessions??[])]}));await selectSession(value.session.id,false);}catch(e){if(currentView(owner,view))setError((e as Error).message);}}}>새 대화 시작</button>
-      <h3>저장된 대화</h3><nav aria-label="저장된 대화">{sessions.length===0&&<p className="muted">아직 저장된 대화가 없어요.</p>}{sessions.map(value=><button className={`session-button ${session?.id===value.id?'selected':''}`} key={value.id} disabled={busy||draftBusy||Boolean(active)} onClick={()=>{setPersonId(value.personId);setMode(value.retrievalMode==='off'?'lexical':value.retrievalMode);setCondition(value.ragCondition??'caption');void selectSession(value.id);}}><strong>{personas.find(persona=>persona.personId===value.personId)?.label??'캐릭터'}</strong><small>{operatorMode&&`${sessionLabel(value)} · `}{new Date(value.createdAt).toLocaleDateString('ko-KR')}</small></button>)}</nav></aside>
+      <h3>저장된 대화</h3><nav aria-label="저장된 대화">{sessions.length===0&&<p className="muted">아직 저장된 대화가 없어요.</p>}{sessions.map(value=><button className={`session-button ${session?.id===value.id?'selected':''}`} key={value.id} disabled={busy||draftBusy||Boolean(active)} onClick={()=>{setPersonId(value.personId);setMode(value.retrievalMode==='off'?'lexical':value.retrievalMode);setCondition(value.ragCondition??'caption');void selectSession(value.id);}}><strong>{personas.find(persona=>persona.personId===value.personId)?.label??'캐릭터'}</strong><small>{operatorMode&&`${sessionLabel(value)} · `}{new Date(value.createdAt).toLocaleDateString('ko-KR')}</small></button>)}</nav>{session&&<section className="memory-panel" aria-label={english(selected?.language)?'Your memories':'내 기억'}><h3>{english(selected?.language)?'Your memories':'내 기억'}</h3><p>{english(selected?.language)?`May ${selected?.label??'this character'} remember what you share?`:`${selected?.label??'캐릭터'}${nameParticle(selected?.label??'캐릭터')} 대화 내용을 기억해도 될까요?`}</p><label><input type="checkbox" aria-label={english(selected?.language)?'Allow chat memories':'대화 기억 허용'} checked={session.userMemoryConsent===true} disabled={busy||Boolean(active)} onChange={event=>void updateMemory('consent',event.target.checked)}/>{english(selected?.language)?'Allow chat memories':'대화 기억 허용'}</label>{memoryQuery.isError&&<p role="alert">{friendlyError((memoryQuery.error as Error).message,session.language??selected?.language)}</p>}<ul>{(memoryQuery.data?.memories??[]).map(memory=><li key={memory.id}><p>{memory.text}</p><button className="quiet" disabled={busy||Boolean(active)} aria-label={english(selected?.language)?'Forget this memory':'이 기억 지우기'} onClick={()=>void updateMemory('one',undefined,memory.id)}>{english(selected?.language)?'Forget':'지우기'}</button></li>)}</ul><button className="quiet" disabled={busy||Boolean(active)||!memoryQuery.data?.memories.length} onClick={()=>void updateMemory('all')}>{english(selected?.language)?'Forget all memories':'기억 전부 지우기'}</button><p className="muted">{english(selected?.language)?'The original messages remain. Delete the chat to remove them.':'대화 원문은 남아요. 완전히 지우려면 대화를 삭제하세요.'}</p><button className="quiet" disabled={busy||draftBusy||Boolean(active)} onClick={()=>void updateMemory('session')}>{english(selected?.language)?'Delete chat':'대화 삭제'}</button></section>}</aside>
     <main className="main-panel"><section className="chat-heading"><div><h2>{selected?.label??'캐릭터를 골라 줘'}</h2>{operatorMode&&<p className="muted">{selected?.reviewStatus??''} · {session?`고정 revision ${session.personaRevision}`:'새 대화를 시작하면 인사말이 표시됩니다.'}</p>}</div>{operatorMode&&session&&<span className="mode-tag" data-testid="session-mode">{sessionLabel(session)}</span>}</section>
       {showFirstDisclosure&&selected&&<p className="persistent-disclosure" data-testid="first-disclosure">{english(selected.language)?`${selected.label} is an AI character, not the real ${selected.label}.`:`${selected.label} 스타일로 만든 AI 캐릭터예요. 실제 ${selected.label}${nameParticle(selected.label)} 아니에요.`}</p>}
       {returning&&session&&reentryPreview&&<div className="reentry"><p data-testid="last-preview">{english(selected?.language)?'Last chat: ':'지난 대화: '}{reentryPreview.slice(0,100)}</p><p data-testid="reentry-cue">{voiceText('reentry',session.language??selected?.language??'ko',reentryLevel,lastAssistant,session.id)}</p></div>}

@@ -299,6 +299,10 @@ class DirectLocalTextProvider:
             }
         )
 
+    async def generate_local_only(self, messages, **kwargs):
+        """Summary calls cannot enter paid spillover, even when capacity is exhausted."""
+        return await self.generate(messages, local_only=True, **kwargs)
+
     async def generate(
         self,
         messages: list[dict[str, str]],
@@ -311,6 +315,7 @@ class DirectLocalTextProvider:
         on_usage: Any = None,
         response_schema: dict[str, Any] | None = None,
         on_metrics: Any = None,
+        local_only: bool = False,
     ) -> str:
         import httpx
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -448,8 +453,7 @@ class DirectLocalTextProvider:
                 candidate = response.headers.get("x-llm-d-request-dropped-reason")
                 drop_reason = (
                     candidate
-                    if response.status_code == 429
-                    and candidate in _ALLOWED_CAPACITY_DROP_REASONS
+                    if response.status_code == 429 and candidate in _ALLOWED_CAPACITY_DROP_REASONS
                     else None
                 )
 
@@ -517,8 +521,11 @@ class DirectLocalTextProvider:
                         timeout_code=timeout_code,
                     )
                     if not lease_acquired:
+                        if local_only:
+                            raise ProviderError("LOCAL_CAPACITY_UNAVAILABLE")
                         can_spill = (
-                            self.spillover_enabled
+                            not local_only
+                            and self.spillover_enabled
                             and self.paid_spillover is not None
                             and not spill_attempted
                             and (time.monotonic() - slot_wait_start) * 1000
@@ -559,6 +566,7 @@ class DirectLocalTextProvider:
                     capacity = local_status == 429 and drop_reason in _ALLOWED_CAPACITY_DROP_REASONS
                     if (
                         capacity
+                        and not local_only
                         and self.spillover_enabled
                         and self.paid_spillover is not None
                         and attempts == 1
@@ -571,7 +579,11 @@ class DirectLocalTextProvider:
                                 self.spillover_enabled = False
                                 set_available(False)
                             retry_local_after_refusal = True
-                    if capacity and (self.cluster_mode or retry_local_after_refusal):
+                    if (
+                        capacity
+                        and not local_only
+                        and (self.cluster_mode or retry_local_after_refusal)
+                    ):
                         delay = min(random.uniform(0.25, 1), remaining_ms / 1000)
                         if delay <= 0:
                             raise ProviderError(timeout_code)

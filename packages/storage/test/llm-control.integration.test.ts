@@ -76,7 +76,7 @@ suite('split app durable Start/Complete handshake synthetic PG',()=>{
     expect((await control.start({...f.request,executionId:randomUUID()})).status).toBe('lost');
     expect((await control.complete(complete)).status).toBe('lost');
   });
-  test('101 prior history messages fail CONTEXT_LIMIT without silently truncating or granting a model call',async()=>{
+  test('101 prior history messages continue with a recent window of 40 messages',async()=>{
     const f=await fixture();
     for(let i=0;i<50;i++) {
       const id=randomUUID();
@@ -84,10 +84,25 @@ suite('split app durable Start/Complete handshake synthetic PG',()=>{
       await pool.query("INSERT INTO messages(id,session_id,turn_id,role,content,created_at) VALUES($1,$2,$3,'user','synthetic prior user',now()),($4,$2,$3,'assistant','synthetic prior assistant',now())",[randomUUID(),f.session.id,id,randomUUID()]);
     }
     expect((await store.history(f.session.id,f.session.ownerId))).toHaveLength(101);
-    expect(await control.start(f.request)).toEqual({contractVersion:2,status:'lost'});
-    expect(await store.getTurn(f.request.turnId,f.session.ownerId)).toMatchObject({state:'failed',errorCode:'CONTEXT_LIMIT'});
-    expect((await pool.query('SELECT * FROM turn_execution_grants WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);
-    expect((await pool.query('SELECT * FROM turn_outbox WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);
+    const started=await control.start(f.request);
+    expect(started.status).toBe('granted');
+    if(started.status==='granted')expect(started.grant.context.history).toHaveLength(40);
+    expect(await store.getTurn(f.request.turnId,f.session.ownerId)).toMatchObject({state:'pending'});
+  });
+  test('owned deletion clears visible conversation and grant payloads while retaining identity',async()=>{
+    const f=await claimed();
+    expect(await store.deleteOwnedSession(f.session.id,'synthetic-other-owner')).toBe(false);
+    await expect(store.deleteOwnedSession(f.session.id,f.session.ownerId)).rejects.toMatchObject({code:'TURN_ACTIVE'});
+    await control.complete({...f.binding,result:{kind:'completed',reply:f.reply}});
+    const before=(await pool.query('SELECT execution_id,context_hash,result_hash FROM turn_execution_grants WHERE turn_id=$1',[f.request.turnId])).rows[0];
+    expect(await store.deleteOwnedSession(f.session.id,f.session.ownerId)).toBe(true);
+    expect(await store.getOwnedSession(f.session.id,f.session.ownerId)).toBeUndefined();
+    expect(await store.getTurn(f.request.turnId,f.session.ownerId)).toBeUndefined();
+    expect(await store.history(f.session.id,f.session.ownerId)).toEqual([]);
+    const deleted=(await pool.query('SELECT reply,user_text,deleted_at FROM turns WHERE id=$1',[f.request.turnId])).rows[0];
+    expect(deleted).toMatchObject({reply:null,user_text:''});expect(deleted.deleted_at).not.toBeNull();
+    const after=(await pool.query('SELECT execution_id,context_hash,result_hash,context,result FROM turn_execution_grants WHERE turn_id=$1',[f.request.turnId])).rows[0];
+    expect(after).toMatchObject({...before,context:{},result:{}});
   });
   test('cancellation, deadline and immutable persona bindings fence publication',async()=>{
     const cancelled=await claimed();await store.cancelTurn(cancelled.request.turnId,cancelled.session.ownerId);

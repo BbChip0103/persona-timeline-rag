@@ -17,12 +17,30 @@ export class SplitChatService {
     const greetings=[persona.greeting,...persona.alternateGreetings??[]];
     if(value.greetingIndex!==undefined&&value.greetingIndex>=greetings.length)throw new CoreError('INVALID_INPUT');
     const id=randomUUID(),index=value.greetingIndex??greetingIndexFor(id,greetings.length);
-    const session:ChatSession={id,ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition?{ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString(),...(value.greetingIndex!==undefined||greetings.length>1?{greetingIndex:index}:{})};
+    const session:ChatSession={id,ownerId,userMemoryConsent:false,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition?{ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString(),...(value.greetingIndex!==undefined||greetings.length>1?{greetingIndex:index}:{})};
     await this.store.create(session,{id:randomUUID(),sessionId:id,turnId:null,role:'assistant',content:greetings[index]!,createdAt:session.createdAt});return session;
   }
   async getSession(ownerId:string,id:string):Promise<ChatSession> {const session=await this.store.getOwnedSession(id,ownerId);if(!session)throw new CoreError('NOT_FOUND');return session;}
   listSessions(ownerId:string) {return this.store.listOwnedSessions(ownerId);}
   async history(ownerId:string,id:string):Promise<ChatMessage[]> {await this.getSession(ownerId,id);return this.store.history(id,ownerId);}
+  async setUserMemoryConsent(ownerId:string,id:string,enabled:boolean):Promise<ChatSession> {
+    await this.getSession(ownerId,id);return this.store.setUserMemoryConsent(id,ownerId,enabled);
+  }
+  async listUserMemories(ownerId:string,id:string) {
+    const session=await this.getSession(ownerId,id);
+    return (await this.store.listUserMemories(ownerId,session.personaId)).filter(memory=>!memory.forgotten).map(({id,kind,text})=>({id,kind,text}));
+  }
+  async forgetUserMemory(ownerId:string,id:string,memoryId:string):Promise<boolean> {
+    const memories=await this.listUserMemories(ownerId,id);
+    if(!memories.some(memory=>memory.id===memoryId))return false;
+    return this.store.forgetUserMemory(memoryId,ownerId);
+  }
+  async deleteUserMemories(ownerId:string,id:string):Promise<number> {
+    const session=await this.getSession(ownerId,id);return this.store.deleteUserMemories(ownerId,session.personaId);
+  }
+  async deleteSession(ownerId:string,id:string):Promise<boolean> {
+    await this.getSession(ownerId,id);return this.store.deleteOwnedSession(id,ownerId);
+  }
   async getTurn(ownerId:string,id:string):Promise<ChatTurn> {const turn=await this.store.getTurn(id,ownerId);if(!turn)throw new CoreError('NOT_FOUND');return turn;}
   async cancelTurn(ownerId:string,id:string):Promise<boolean> {await this.getTurn(ownerId,id);const applied=await this.store.cancelTurn(id,ownerId);if(applied)void this.events.publish({turnId:id,state:'cancelled'}).catch(()=>undefined);return applied;}
   async submitTurn(ownerId:string,input:SendTurnInput) {

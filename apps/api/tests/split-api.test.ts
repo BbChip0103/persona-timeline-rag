@@ -51,7 +51,7 @@ test('session default succeeds with semantic search disabled as by PTR_LLM_SEMAN
  runtime.chat=new SplitChatService(store,async()=>[persona],{backlog:async()=>0,publish:async()=>undefined},{publish:async()=>undefined},256,false);
  const created=await call('/api/sessions',{personId:persona.personId});
  expect(created.status).toBe(201);
- expect(created.body.session).toMatchObject({ragCondition:'caption',retrievalMode:'lexical'});
+ expect(created.body.session).toMatchObject({ragCondition:'caption',retrievalMode:'lexical',userMemoryConsent:false});
 });
 test('draft RPC keeps backend quota/artifact ownership and fictional marker',async()=>{
  const session=await call('/api/sessions',{personId:persona.personId});const draft=await call(`/api/sessions/${session.body.session.id}/drafts`,{brief:'synthetic brief',clientRequestId:'synthetic-request'});

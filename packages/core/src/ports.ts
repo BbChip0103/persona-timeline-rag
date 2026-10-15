@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Persona, ProviderMessage, SendTurnInput, SourcePost, TimelineQuery, TurnState } from '@ptr/contracts';
+import type { ChatMessage, ChatReply, ChatSession, ChatTurn, EvidenceCard, Persona, ProviderMessage, SendTurnInput, SourcePost, TimelineQuery, TurnState, UserMemory, SessionSummary } from '@ptr/contracts';
 /**
  * `requestKey`: a stable per-turn key (the turn id) a gateway may use to scope billing idempotency; providers may ignore it.
  * `deadlineAt`: when the turn times out (epoch ms), so a provider does not start retries the turn cannot wait for.
@@ -24,6 +24,12 @@ export interface ConversationStore {
   create(session:ChatSession,greeting:ChatMessage):Promise<void>;
   getOwnedSession(sessionId:string,ownerId:string):Promise<ChatSession|undefined>;
   listOwnedSessions(ownerId:string):Promise<ChatSession[]>;
+  setUserMemoryConsent(sessionId:string,ownerId:string,enabled:boolean):Promise<ChatSession>;
+  getSessionSummary(sessionId:string,ownerId:string):Promise<SessionSummary|undefined>;
+  listUserMemories(ownerId:string,personaId:string,includeForgotten?:boolean):Promise<UserMemory[]>;
+  forgetUserMemory(memoryId:string,ownerId:string):Promise<boolean>;
+  deleteUserMemories(ownerId:string,personaId:string):Promise<number>;
+  deleteOwnedSession(sessionId:string,ownerId:string):Promise<boolean>;
   history(sessionId:string,ownerId:string):Promise<ChatMessage[]>;
   /** Completed turns of the session whose stored reply records an input-safety refusal (reply.inputSafety.action). */
   refusedTurnIds(sessionId:string,ownerId:string):Promise<string[]>;

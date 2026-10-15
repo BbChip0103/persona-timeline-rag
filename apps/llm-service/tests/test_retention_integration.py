@@ -40,7 +40,7 @@ def docker(*args):
 async def isolated_pg():
     name = "ptr-retention-test-" + uuid4().hex[:12]
     label = "ptr.retention.owner=" + name
-    docker(
+    container_id = docker(
         "run",
         "--pull",
         "never",
@@ -60,6 +60,7 @@ async def isolated_pg():
         "POSTGRES_DB=ptr_split_test",
         "pgvector/pgvector:0.8.1-pg15",
     )
+    print(f"C4_RETENTION_CONTAINER_STARTED={container_id}")
     try:
         inspected = json.loads(docker("inspect", name))[0]
         assert inspected["Config"]["Labels"]["ptr.retention.owner"] == name
@@ -82,12 +83,15 @@ async def isolated_pg():
         inspected = json.loads(docker("inspect", name))[0]
         assert inspected["Config"]["Labels"]["ptr.retention.owner"] == name
         docker("rm", "-f", name)
+        print(f"C4_RETENTION_CONTAINER_REMOVED={container_id}")
 
 
 async def seed(connection):
     await connection.execute("CREATE SCHEMA app; CREATE SCHEMA llm")
     await connection.execute("""
-        CREATE TABLE app.turns(id text PRIMARY KEY,state text,finished_at timestamptz);
+        CREATE TABLE app.sessions(id text PRIMARY KEY,deleted_at timestamptz);
+        CREATE TABLE app.turns(id text PRIMARY KEY,state text,finished_at timestamptz,
+            session_id text REFERENCES app.sessions(id),deleted_at timestamptz);
         CREATE TABLE app.turn_outbox(turn_id text);
         CREATE TABLE app.turn_execution_grants(execution_id text PRIMARY KEY,turn_id text,
             context jsonb,result jsonb);
@@ -110,7 +114,9 @@ async def seed(connection):
     ]
     turns = [f"00000000-0000-4000-8000-{i:012d}" for i in range(1, 7)]
     for turn, (state, finished) in zip(turns, states, strict=True):
-        await connection.execute("INSERT INTO app.turns VALUES(%s,%s,%s)", (turn, state, finished))
+        await connection.execute(
+            "INSERT INTO app.turns(id,state,finished_at) VALUES(%s,%s,%s)", (turn, state, finished)
+        )
         await connection.execute(
             "INSERT INTO app.turn_execution_grants VALUES(%s,%s,%s,%s)",
             (turn, turn, '{"syntheticContext":true}', '{"syntheticResult":true}'),
@@ -161,6 +167,7 @@ async def snapshot(connection):
     return {
         table: (await (await connection.execute(f"SELECT * FROM {table} ORDER BY 1")).fetchall())
         for table in (
+            "app.sessions",
             "app.turns",
             "app.turn_execution_grants",
             "llm.result_receipts",
@@ -175,11 +182,20 @@ async def test_real_transaction_dry_run_purge_progress_and_tombstones(isolated_p
         isolated_pg, autocommit=True, row_factory=dict_row
     ) as connection:
         turns = await seed(connection)
+        old_summary_thread = (
+            "python-call-v1:"
+            + hashlib.sha256(f"{turns[0]}:summary".encode()).hexdigest()
+            + ":" + "a" * 64
+        )
+        await connection.execute(
+            "INSERT INTO llm.checkpoints VALUES(%s,%s)",
+            (old_summary_thread, "synthetic-summary-with-history"),
+        )
         before = await snapshot(connection)
         dry = await retain_split_data(connection, RetentionOptions(now=NOW))
         assert before == await snapshot(connection)
         assert dry["planned"]["turns"] == 3
-        assert dry["planned"]["checkpointThreads"] == 6
+        assert dry["planned"]["checkpointThreads"] == 7
         assert dry["deferred"]["orphanResultReceipts"] == 1
         assert dry["deferred"]["legacy_unscoped"] == 1
         assert dry["deferred"]["missing_turn"] == 1
@@ -189,10 +205,13 @@ async def test_real_transaction_dry_run_purge_progress_and_tombstones(isolated_p
             RetentionOptions(now=NOW, apply=True, confirm_database="ptr_split_test", limit=1),
         )
         assert applied["deleted"] == {
-            "checkpointRows": 6,
+            "sessions": 0,
+            "turns": 0,
+            "checkpointRows": 7,
             "resultReceipts": 1,
             "grantSnapshots": 1,
             "providerReceipts": 1,
+            "forgottenMemories": 0,
         }
         # Draft selection shares the bounded receipt limit; next batch completes
         # remaining artifacts rather than repeatedly selecting the already-cleaned turn.
@@ -203,6 +222,11 @@ async def test_real_transaction_dry_run_purge_progress_and_tombstones(isolated_p
         assert second["planned"]["turns"] == 2
         assert second["deleted"]["providerReceipts"] == 3
         final = await snapshot(connection)
+        assert not await (
+            await connection.execute(
+                "SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (old_summary_thread,)
+            )
+        ).fetchall()
         assert final["app.turns"] == before["app.turns"]
         for table in TABLES:
             assert len(final[f"llm.{table}"]) == 4  # active/recent/outbox/opaque orphan
@@ -266,7 +290,11 @@ async def test_real_mutation_failure_rolls_back_all_prior_purge(isolated_pg):
     async with await psycopg.AsyncConnection.connect(
         isolated_pg, autocommit=True, row_factory=dict_row
     ) as connection:
-        await seed(connection)
+        turns = await seed(connection)
+        await connection.execute("INSERT INTO app.sessions VALUES('deleted',%s)", (NOW,))
+        await connection.execute(
+            "UPDATE app.turns SET session_id='deleted' WHERE id=%s", (turns[2],)
+        )
         before = await snapshot(connection)
         await connection.execute(
             "CREATE FUNCTION llm.reject_scrub() RETURNS trigger LANGUAGE "
@@ -309,3 +337,72 @@ async def test_worker_receipt_timeout_cancels_real_query_and_connection_recovers
             )
         assert time.monotonic() - started < 1
         assert (await (await connection.execute("SELECT 1 AS ready")).fetchone())["ready"] == 1
+
+
+async def test_deleted_session_purges_recent_artifacts_on_next_run(isolated_pg):
+    async with await psycopg.AsyncConnection.connect(
+        isolated_pg, autocommit=True, row_factory=dict_row
+    ) as connection:
+        turns = await seed(connection)
+        target = turns[2]
+        summary_thread = (
+            "python-call-v1:"
+            + hashlib.sha256(f"{target}:summary".encode()).hexdigest()
+            + ":" + "a" * 64
+        )
+        await connection.execute(
+            "INSERT INTO llm.checkpoints VALUES(%s,%s)",
+            (summary_thread, "synthetic-summary-with-history"),
+        )
+        await connection.execute("INSERT INTO app.sessions VALUES('deleted',%s)", (NOW,))
+        await connection.execute(
+            "UPDATE app.turns SET session_id='deleted',deleted_at=%s WHERE id=%s", (NOW, target)
+        )
+        # A deleted session also overrides active/outbox protection; the API
+        # deletion fence owns stopping work before this maintenance transaction.
+        await connection.execute("UPDATE app.turns SET state='running' WHERE id=%s", (target,))
+        await connection.execute("INSERT INTO app.turn_outbox VALUES(%s)", (target,))
+        before = await snapshot(connection)
+        dry = await retain_split_data(connection, RetentionOptions(now=NOW))
+        assert before == await snapshot(connection)
+        assert dry["planned"]["deletedSessions"] == 1
+        result = await retain_split_data(
+            connection, RetentionOptions(now=NOW, apply=True, confirm_database="ptr_split_test")
+        )
+        assert result["deleted"]["sessions"] == 1
+        assert result["deleted"]["turns"] == 1
+        assert not await (
+            await connection.execute(
+                "SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (summary_thread,)
+            )
+        ).fetchall()
+        for table, column in [
+            ("app.turns", "id"),
+            ("app.turn_execution_grants", "turn_id"),
+            ("llm.result_receipts", "execution_id"),
+        ]:
+            assert not await (
+                await connection.execute(f"SELECT 1 FROM {table} WHERE {column}=%s", (target,))
+            ).fetchall()
+        assert not await (await connection.execute("SELECT 1 FROM app.sessions")).fetchall()
+        ledger = await (
+            await connection.execute(
+                "SELECT response_json,state,reserved_microusd "
+                "FROM llm.ptr_provider_requests WHERE key=%s",
+                (target,),
+            )
+        ).fetchone()
+        assert ledger == {"response_json": None, "state": "unknown", "reserved_microusd": 100}
+        for table in TABLES:
+            assert not await (
+                await connection.execute(
+                    f"SELECT 1 FROM llm.{table} WHERE thread_id=%s OR thread_id=%s",
+                    (
+                        f"turn:{target}",
+                        "python-call-v1:"
+                        + hashlib.sha256(target.encode()).hexdigest()
+                        + ":"
+                        + "a" * 64,
+                    ),
+                )
+            ).fetchall()

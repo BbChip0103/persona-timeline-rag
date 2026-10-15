@@ -29,6 +29,14 @@ from .evidence import (
     validate_source_bound_reply,
 )
 from .guardrails import validate_input, validate_output
+from .memory import (
+    RECALL,
+    last_year_query,
+    memory_ops,
+    recall_allowed,
+    seasonal_recall_eligible,
+    summarize,
+)
 from .persona import dumps, match_lore, render_lore_message, serialized_bytes, validate_persona
 from .policy import REVISION, SENTENCES, VOICES, has_user_self_marker
 from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
@@ -72,12 +80,7 @@ def should_ask_back(intent, rag_condition, text, evidence):
         if not has_user_self_marker(asked):
             question = True
             break
-    return (
-        intent == "timeline"
-        and rag_condition not in (None, "off")
-        and question
-        and not evidence
-    )
+    return intent == "timeline" and rag_condition not in (None, "off") and question and not evidence
 
 
 def _ask_back_streak(history):
@@ -97,7 +100,7 @@ def _ask_back_streak(history):
 def requested_speech_level(text):
     """Only a direct user request may change the session's Korean register."""
     if regex.search(
-        r"\?|(?:지\s*마|don't|do\s+not|never)\b|\b(?:he|she|they)\s+told\s+me\b",
+        r"\?|(?:지\s*마|don't|do\s+not|never)\b|\b(?:he|she|they)\s+(?:told\s+me\b|said\s*:)",
         text,
         regex.I,
     ):
@@ -109,10 +112,12 @@ def requested_speech_level(text):
         return "polite"
     if regex.search(r"(?:말\s*편하게|반말)(?:로)?\s*" + ending, text):
         return "casual"
+    if regex.search(r"말\s*놓자[.!~]*$", text):
+        return "casual"
     english_request = (
         r"\b(?:(?:speak|talk)\s+(?:{adverbs})|"
         r"(?:use|speak(?:\s+in)?)\s+(?:{adjectives})"
-        r"(?:\s+(?:speech|language|tone))?)[.!~]*$"
+        r"(?:\s+(?:speech|language|tone))?)(?:\s+with\s+me)?[.!~]*$"
     )
     if regex.search(
         english_request.format(adverbs="politely|formally", adjectives="polite|formal|honorific"),
@@ -271,7 +276,11 @@ class LLMEngine:
     async def handle(self, grant, *, before_costly, cancelled):
         try:
             reply = await self.execute(grant, before_costly=before_costly, cancelled=cancelled)
-            return {"kind": "completed", "reply": reply}
+            result = {"kind": "completed", "reply": reply}
+            for key in ("summaryUpdate", "userMemoryOps"):
+                if key in reply:
+                    result[key] = reply.pop(key)
+            return result
         except (ControlUnavailable, ControlRejected, ExecutionStopped):
             raise
         except Exception as error:
@@ -313,8 +322,6 @@ class LLMEngine:
             if session["retrievalMode"] == "semantic" and not self.semantic_search:
                 raise CoreError("TURN_FAILED", "RETRIEVAL_UNAVAILABLE")
             history = context["history"]
-            if len(history) > 100:
-                raise CoreError("CONTEXT_LIMIT")
             document = await self.personas.get(session["personaId"], session["personaRevision"])
             if document is None:
                 raise CoreError("PERSONA_UNAVAILABLE")
@@ -807,6 +814,21 @@ class LLMEngine:
                 else:
                     sources = searched
                     trace = dict(trace, action="search", query=q.get("query", ""))
+            previous_vars = (snap.get("ownedPrevious") or {}).get("agent", {}).get("variables", {})
+            if (
+                turn.get("createdAt")
+                and not previous_vars.get("lastYearRecallUsed")
+                and seasonal_recall_eligible(text, q)
+            ):
+                recall_query = last_year_query(
+                    turn["createdAt"], session["timezone"], session["personId"], text
+                )
+                recall_sources = await search(recall_query)
+                frame["recallCandidateIds"] = [source["id"] for source in recall_sources[:2]]
+                seen = {source["id"] for source in sources}
+                # Keep the same evidence budget while reserving room for server-scoped recall.
+                extra = [source for source in recall_sources[:2] if source["id"] not in seen]
+                sources = sources[: EVIDENCE_POST_LIMIT - len(extra)] + extra
             if session.get("ragCondition") != "caption_image":
                 sources = [{k: v for k, v in s.items() if k != "imageAnnotations"} for s in sources]
             return dict(frame, sources=copy.deepcopy(sources), memoryTrace=trace)
@@ -865,6 +887,7 @@ class LLMEngine:
                         **({"speechLevel": snap["level"]} if snap["speechLevel"] else {}),
                     },
                     level=snap["level"],
+                    memory_context=context,
                     cancelled=cancelled,
                     max_tool_rounds=self.max_tool_rounds,
                     search=tool_search
@@ -1161,7 +1184,14 @@ class LLMEngine:
             if agent and agent_run:
                 if output["status"] == "answered" and not frame.get("deflect"):
                     agent["variables"] = variables(
-                        dict(agent["variables"], **agent_run["response"]["variableUpdates"])
+                        dict(
+                            agent["variables"],
+                            **{
+                                k: v
+                                for k, v in agent_run["response"]["variableUpdates"].items()
+                                if k != "userMemory"
+                            },
+                        )
                     )
                 if snap["speechLevel"]:
                     agent["variables"] = variables(
@@ -1191,6 +1221,35 @@ class LLMEngine:
                     "steps": [],
                     "validator": "disabled",
                 }
+            recall_used = bool(
+                (snap.get("ownedPrevious") or {})
+                .get("agent", {})
+                .get("variables", {})
+                .get("lastYearRecallUsed")
+            )
+            if not recall_allowed(
+                output["content"],
+                output["evidence"],
+                set(frame.get("recallCandidateIds", [])),
+                recall_used,
+            ):
+                output.update(
+                    content=voice_text(
+                        "memory_ask_back",
+                        snap["replyLanguage"],
+                        snap["level"],
+                        snap["previousAssistantText"],
+                        turn["id"],
+                    ),
+                    evidence=[],
+                    claims=[],
+                    grounding="unverified_model",
+                    status="insufficient_evidence",
+                )
+            elif RECALL.search(output["content"]):
+                recall_used = True
+            if agent and recall_used:
+                agent["variables"]["lastYearRecallUsed"] = True
             remembered = remember_source_context(frame["memorySources"], output["evidence"])
             reply = dict(
                 output,
@@ -1218,6 +1277,15 @@ class LLMEngine:
             ]:
                 if item is not None:
                     reply[key] = item
+            if agent_run and not frame.get("deflect"):
+                ops = memory_ops(
+                    agent_run["response"].get("variableUpdates", {}).get("userMemory"),
+                    text,
+                    context.get("userMemoryConsent", False),
+                    context.get("userMemories", []),
+                )
+                if ops:
+                    reply["userMemoryOps"] = ops
             if remembered:
                 reply["sourceContext"] = {
                     "revision": RETRIEVAL_CONTEXT_REVISION,
@@ -1266,7 +1334,11 @@ class LLMEngine:
                 context={"stages": stages},
             )
         check()
-        return result["frame"]["reply"]
+        reply = result["frame"]["reply"]
+        update = await summarize(self.provider, context, turn["id"], deadline, cancelled, guarded)
+        if update:
+            reply["summaryUpdate"] = update
+        return reply
 
     async def catalogue(self):
         from .persona import catalogue

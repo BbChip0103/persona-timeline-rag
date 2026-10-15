@@ -13,6 +13,7 @@ async function fixtures(page:Page,options:{operatorMode?:boolean;operatorNotice?
     if(path==='personas')value={operatorMode:options.operatorMode??false,operatorNotice:options.operatorNotice,personas:['a','b','c','d'].map((id,index)=>({id:'synthetic-persona-'+id,personId:'synthetic-person-'+id,label:options.englishPersonas?`Synthetic Character ${index+1}`:`합성 캐릭터 ${index+1}`,...(options.withoutCardCopy?{}:{tagline:'오늘은 어떤 이야기를 해 볼까?',starters:['오늘 어땠어?','좋아하는 걸 이야기해 줘']}),language:options.englishPersonas?'en':'ko',revision:'synthetic-v1',reviewStatus:'synthetic',aiDisclosure:options.englishPersonas?`AI character · not the real Synthetic Character ${index+1}`:`AI 캐릭터 · 실제 합성 캐릭터 ${index+1} 아님`}))};
     else if(path==='sessions'&&!body)value={sessions};
     else if(path==='sessions'&&body){sessionBodies.push(body);const session={id:'synthetic-session-'+(++counter),personId:String(body.personId),personaRevision:'synthetic-v1',retrievalMode:String(body.retrievalMode??'lexical'),ragCondition:String(body.ragCondition??'caption'),createdAt:'2026-01-01T00:00:00Z'};sessions.unshift(session);histories.set(session.id,[{id:'synthetic-greeting-'+counter,turnId:null,role:'assistant',content:`${options.oldGreeting?'AI 연구용 시뮬레이션입니다. ':''}안녕, 편하게 이야기해 줘.`}]);value={session};}
+    else if(/^sessions\/[^/]+\/memories$/.test(path))value={memories:[]};
     else if(/^sessions\/[^/]+$/.test(path)){const id=path.split('/')[1]!;value={session:sessions.find(session=>session.id===id),history:histories.get(id)??[]};}
     else if(/^sessions\/[^/]+\/turns$/.test(path)&&body){sentBodies.push(body);const id=String(body.clientRequestId);let turn=requestIds.get(id);
       if(!turn){turn={id:'synthetic-turn-'+(++counter),sessionId:path.split('/')[1]!,clientRequestId:id,userText:String(body.text),state:options.initialState??'generating'};turns.set(turn.id,turn);requestIds.set(id,turn);histories.get(turn.sessionId)!.push({id:'synthetic-user-'+counter,turnId:turn.id,role:'user',content:turn.userText});}
@@ -164,6 +165,8 @@ test('real BFF boundary: HttpOnly signed cookie, origin restriction and fixed ro
   await fixtures(page);await login(page);
   const cookie=(await page.context().cookies()).find(value=>value.name==='ptr_owner')!;expect(cookie.httpOnly).toBe(true);expect(cookie.sameSite).toBe('Strict');expect(cookie.value).not.toContain(password);
   await page.unroute('**/api/proxy/**');
+  expect((await page.request.delete('/api/proxy/sessions/synthetic-session/memories',{headers:{Origin:'https://untrusted.example'}})).status()).toBe(403);
+  expect((await page.request.delete('/api/proxy/arbitrary/upstream',{headers:{Origin:'http://127.0.0.1:56448'}})).status()).toBe(404);
   const status=await page.evaluate(async()=>{const response=await fetch('/api/proxy/arbitrary/upstream');return response.status;});expect(status).toBe(404);
   expect(await page.evaluate(()=>document.cookie)).not.toContain('ptr_owner');
   await page.context().addCookies([{...cookie,value:cookie.value+'tampered'}]);
@@ -290,4 +293,22 @@ for(const operatorMode of [false,true])test(`SYNTHETIC ONLY: mismatch notice is 
   await fixtures(page,{operatorMode,operatorNotice:'운영자 API 옵션이 꺼져 있어요. 설정을 확인해 주세요.'});await login(page);
   await expect(page.getByTestId('operator-notice')).toHaveCount(operatorMode?1:0);
   if(operatorMode){await newSession(page);await expect(page.getByTestId('operator-notice')).toHaveCount(1);}
+});
+
+test('SYNTHETIC ONLY: memory requires opt-in and confirms chat deletion',async({page})=>{
+  await fixtures(page);let enabled=false;let memories=[{id:'memory-one',kind:'like',text:'합성 취미는 그림 그리기'}];let deleted=false;const writes:string[]=[];
+  await page.route('**/api/proxy/sessions/*/memories**',async route=>{const path=new URL(route.request().url()).pathname;if(route.request().method()==='GET')await route.fulfill({json:{memories}});else {writes.push(path);memories=path.endsWith('/memories')?[]:memories.filter(item=>!path.endsWith('/'+item.id));await route.fulfill({json:{deleted:true}});}});
+  await page.route('**/api/proxy/sessions/*/memory-consent',async route=>{enabled=route.request().postDataJSON().enabled;writes.push('consent');await route.fulfill({json:{session:{userMemoryConsent:enabled}}});});
+  await page.route(/\/api\/proxy\/sessions\/synthetic-session-\d+$/,async route=>{if(route.request().method()!=='DELETE'){await route.fallback();return;}deleted=true;await route.fulfill({json:{deleted:true}});});
+  await login(page);await newSession(page);
+  await expect(page.getByRole('checkbox',{name:'대화 기억 허용'})).not.toBeChecked();expect(writes).toEqual([]);
+  await expect(page.getByText('합성 캐릭터 1이 대화 내용을 기억해도 될까요?')).toBeVisible();
+  await page.getByRole('checkbox',{name:'대화 기억 허용'}).click();await expect.poll(()=>enabled).toBe(true);await expect(page.getByRole('checkbox',{name:'대화 기억 허용'})).toBeChecked();
+  await expect(page.getByText('합성 취미는 그림 그리기')).toBeVisible();
+  await page.getByRole('button',{name:'이 기억 지우기'}).click();await expect(page.getByText('합성 취미는 그림 그리기')).toHaveCount(0);
+  memories=[{id:'memory-two',kind:'like',text:'합성 취미는 산책하기'}];await page.reload();await expect(page.getByText('합성 취미는 산책하기')).toBeVisible();
+  await page.getByRole('button',{name:'기억 전부 지우기'}).click();await expect(page.getByText('합성 취미는 산책하기')).toHaveCount(0);
+  page.once('dialog',dialog=>dialog.dismiss());await page.getByRole('button',{name:'대화 삭제',exact:true}).click();expect(deleted).toBe(false);
+  page.once('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'대화 삭제',exact:true}).click();await expect.poll(()=>deleted).toBe(true);
+  await expect(page.getByText('안녕, 편하게 이야기해 줘.')).toHaveCount(0);
 });

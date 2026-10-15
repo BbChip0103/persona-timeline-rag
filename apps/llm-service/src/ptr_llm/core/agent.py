@@ -12,6 +12,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
 from .errors import CoreError
+from .memory import memory_messages
 from .persona import dumps
 from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
 from .protocol import agent_response_schema, parse_agent_response, variables
@@ -20,7 +21,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v16-natural-recall"
+AGENT_PROMPT_REVISION = "character-agent-context-v17-consent-memory"
 
 
 class AgentState(TypedDict, total=False):
@@ -118,6 +119,7 @@ async def run_character_agent(
     timezone_name="UTC",
     reply_language=None,
     level=None,
+    memory_context=None,
 ):
     persona = copy.deepcopy(persona)
     history = copy.deepcopy(history)
@@ -198,6 +200,7 @@ async def run_character_agent(
                 ),
             }
         ]
+        after.extend(memory_messages(memory_context or {}))
         if lore:
             after.append(lore)
         after.append(
@@ -211,7 +214,7 @@ async def run_character_agent(
         )
         ctx = build_experiment_context(
             persona,
-            history,
+            history[-max(1, 52 - len(after) - len(run["transcript"])) :],
             text,
             run["sources"],
             policy=safety + POLICY["recollectionVoice"] + POLICY["protocol"],
@@ -251,12 +254,17 @@ async def run_character_agent(
             deadline_at=deadline_at,
             priority=1 if run["iteration"] else 0,
             on_served=served,
-            response_schema=agent_response_schema(run["context"]["sources"]),
+            response_schema=agent_response_schema(
+                run["context"]["sources"],
+                memory_consent=bool((memory_context or {}).get("userMemoryConsent")),
+            ),
         )
         check()
         limitation = None
         try:
-            response = parse_agent_response(raw)
+            response = parse_agent_response(
+                raw, memory_consent=bool((memory_context or {}).get("userMemoryConsent"))
+            )
         except CoreError:
             response = service_retry()
             limitation = "AGENT_REPLY_INVALID"

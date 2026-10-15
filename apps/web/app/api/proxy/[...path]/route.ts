@@ -5,12 +5,12 @@ import { apiUrl } from '../../../../lib/config';
 export const runtime='nodejs';
 const id='[a-zA-Z0-9_-]{1,200}';
 const events=new RegExp(`^turns/${id}/events$`);
-const routes={GET:new RegExp(`^(personas|sessions|sessions/${id}|turns/${id}|turns/${id}/events)$`),POST:new RegExp(`^(sessions|sessions/${id}/(turns|drafts)|turns/${id}/cancel)$`)};
+const routes={GET:new RegExp(`^(personas|sessions|sessions/${id}|turns/${id}|turns/${id}/events|sessions/${id}/memories)$`),DELETE:new RegExp(`^sessions/${id}(/memories(/${id})?)?$`),POST:new RegExp(`^(sessions|sessions/${id}/(turns|drafts|memory-consent)|turns/${id}/cancel)$`)};
 async function proxy(request:Request,context:{params:Promise<{path:string[]}>}) {
-  if(!localHost(request)||(request.method==='POST'&&!sameOrigin(request))) return NextResponse.json({error:{code:'FORBIDDEN_ORIGIN'}},{status:403});
+  if(!localHost(request)||(request.method!=='GET'&&!sameOrigin(request))) return NextResponse.json({error:{code:'FORBIDDEN_ORIGIN'}},{status:403});
   const owner=await signedOwner(); if(!owner) return NextResponse.json({error:{code:'UNAUTHORIZED'}},{status:403});
   const path=(await context.params).path.join('/');
-  if(!(request.method==='GET'?routes.GET:routes.POST).test(path)||new URL(request.url).search) return NextResponse.json({error:{code:'NOT_FOUND'}},{status:404});
+  if(!(request.method==='GET'?routes.GET:request.method==='DELETE'?routes.DELETE:routes.POST).test(path)||new URL(request.url).search) return NextResponse.json({error:{code:'NOT_FOUND'}},{status:404});
   try {
     // Fixed loopback target : PTR_API_URL is no longer read; instrumentation.ts refuses a different value.
     const origin=apiUrl();
@@ -35,3 +35,5 @@ async function proxy(request:Request,context:{params:Promise<{path:string[]}>}) 
 }
 export const GET=proxy;
 export const POST=proxy;
+
+export const DELETE=proxy;

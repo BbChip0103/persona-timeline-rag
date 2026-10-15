@@ -18,15 +18,15 @@ it('Redis outage rolls back rather than granting during an unverifiable lock',as
   expect(client.query).toHaveBeenLastCalledWith('ROLLBACK');
 });
 it('canonical result receipt hash ignores transport JSON object ordering but not result changes',()=>{expect(canonicalHash({a:1,b:{c:2,d:3}})).toBe(canonicalHash({b:{d:3,c:2},a:1}));expect(canonicalHash({a:1})).not.toBe(canonicalHash({a:2}));});
-it('bounded LIMIT101 probes overflow and commits CONTEXT_LIMIT rather than silently slicing last100',async()=>{
+it('long histories use a bounded recent window and no longer fail due to message count',async()=>{
   const client={query:jest.fn(async(sql:string)=>{
-    if(sql.includes('FOR UPDATE'))return {rows:[{id:request.turnId,dispatch_seq:0,state:'pending',request_input:{text:'synthetic'},attempts:0,lease_owner:null,session_id:'synthetic-session'}]};
+    if(sql.includes('FOR UPDATE'))return {rows:[{id:request.turnId,dispatch_seq:0,state:'pending',request_input:{text:'synthetic'},attempts:0,lease_owner:null,session_id:'synthetic-session',created_at:new Date()}]};
     if(sql.includes('FROM turn_outbox'))return {rows:[{expired:false}]};
-    if(sql.includes('SELECT m.*')){expect(sql).toContain('LIMIT 101');return {rows:Array.from({length:101},(_,i)=>({id:`synthetic-${i}`,session_id:'synthetic-session',turn_id:null,role:'assistant',content:'synthetic message',created_at:new Date()}))};}
+    if(sql.includes('SELECT m.*')){expect(sql).toContain('LIMIT 41');return {rows:Array.from({length:101},(_,i)=>({id:`synthetic-${i}`,session_id:'synthetic-session',turn_id:null,role:'assistant',content:'synthetic message',created_at:new Date()}))};}
     return {rows:[]};
   }),release:jest.fn()};
   const control=new PostgresLlmControl({connect:async()=>client} as unknown as Pool,async()=>true);
   expect(await control.start(request)).toEqual({contractVersion:2,status:'lost'});
-  expect(client.query).toHaveBeenCalledWith(expect.stringContaining("state='failed'"),[request.turnId,'CONTEXT_LIMIT']);
+  expect(client.query).not.toHaveBeenCalledWith(expect.stringContaining("state='failed'"),[request.turnId,'CONTEXT_LIMIT']);
   expect(client.query.mock.calls.some(([sql])=>sql.includes('INSERT INTO turn_execution_grants'))).toBe(false);
 });

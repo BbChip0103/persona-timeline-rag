@@ -32,7 +32,7 @@
 |---|---|---|---|
 | Jev 의도 분류 | `PTR_INTENT_CLASSIFIER=jev` + `GOAL1_LIVE_ENABLED=true` + `GOAL1_ALLOW_EXTERNAL_DATA=true` + `OPENROUTER_API_KEY` | 규칙으로 의도가 정해지지 않은 턴에서만(검색 없는 대조 세션 제외): 이번 사용자 발화 앞 500자, 같은 세션의 직전 사용자 발화 최대 2개(각 300자, 자격 정보 패턴·민감 발화 제외), 고정 질문문 | OpenRouter Decisions API, 모델 `typesafe/jev-1.13`(TypeSafe) |
 | Jev 입력 안전 검사 | `PTR_SAFETY_FILTER=jev` + 위 live 조건 | 모든 턴(규칙이 이미 거절한 턴은 자해 질문만): 이번 사용자 발화 전체(첫 500자 창 + 4100자 창들), 직전 사용자 발화 최대 2개, 고정 질문문. 창작 초안 요청이면 초안 지시문(최대 2000자) | 같음 |
-| Compose / Kubernetes paid spillover (기본 off) | `PTR_LLM_PROVIDER=local` + `PTR_LLM_SPILLOVER=openrouter` + `PTR_LLM_LIVE_ENABLED=1` + `PTR_LLM_ALLOW_EXTERNAL_DATA=1` + 원장 DB + worker-only OpenRouter key. Compose는 `PTR_LLM_LOCAL_SLOTS` 설정과 Redis 공유 슬롯 2초 대기 초과, Kubernetes는 EPP `rejected-saturated` 또는 `rejected-ttl-expired` 첫 시도 drop reason일 때만. DeepInfra ZDR 확인 필수 | 그 턴의 프롬프트 전체: 정책 문구, 페르소나 카드(실존 인물 페르소나의 배경 포함), 근거 게시물 최대 3건의 원본 캡션(이미지 조건이면 AI 이미지 설명 포함), 최근 대화, 사용자 발화. 엔진 5xx, bare 503, timeout, reset은 spillover grant가 아닙니다 | OpenRouter → DeepInfra 고정, 모델은 `PTR_LLM_OPENROUTER_MODEL` |
+| Compose / Kubernetes paid spillover (기본 off) | `PTR_LLM_PROVIDER=local` + `PTR_LLM_SPILLOVER=openrouter` + `PTR_LLM_LIVE_ENABLED=1` + `PTR_LLM_ALLOW_EXTERNAL_DATA=1` + 원장 DB + worker-only OpenRouter key. Compose는 `PTR_LLM_LOCAL_SLOTS` 설정과 Redis 공유 슬롯 2초 대기 초과, Kubernetes는 EPP `rejected-saturated` 또는 `rejected-ttl-expired` 첫 시도 drop reason일 때만. DeepInfra ZDR 확인 필수 | 그 턴의 프롬프트 전체: 정책 문구, 페르소나 카드(실존 인물 페르소나의 배경 포함), 근거 게시물 최대 3건의 원본 캡션(이미지 조건이면 AI 이미지 설명 포함), 최근 대화, 사용자 발화, 이전 대화 요약과 동의한 사용자 기억(`USER_MEMORY`), 동의한 이전 세션에서 사용자가 직접 한 안전한 발화(첫 응답에서만). 요약 생성은 spillover 중 미루지만 채팅 프롬프트에 이미 포함된 요약·기억은 외부 전송 대상입니다. 엔진 5xx, bare 503, timeout, reset은 spillover grant가 아닙니다 | OpenRouter → DeepInfra 고정, 모델은 `PTR_LLM_OPENROUTER_MODEL` |
 | 자체 엔진(RunPod) | `PTR_LLM_PROVIDER=local` 또는 Kubernetes EPP/InferencePool local route | 모든 채팅 턴의 프롬프트 전체(실존 인물 데이터 포함) | RunPod에서 빌린 GPU 호스트(제3자 하드웨어)의 vLLM/SGLang. Compose는 127.0.0.1 SSH 터널로만 접속하고, Kubernetes는 EPP/InferencePool을 통해 접속합니다 |
 
 - OpenRouter 요청(Jev·spillover)은 `data_collection: deny`, `zdr: true`, `allow_fallbacks: false`와 가격 상한을 붙여 보냅니다. 이것은 요청 조건이며, OpenRouter와 그 뒤 제공자가 실제로 지키는지는 이 코드가 검증하지 못합니다.
@@ -60,6 +60,16 @@
 다운로드 무결성과 분석 정확성은 별개입니다. 크기·CRC·소유자·매핑·계정별 누락을 확인한 뒤에도 이미지 내용과 날짜는 별도 검수해야 합니다. partial 다운로드나 이미지 누락을 완료로 보고하지 않습니다.
 
 필요한 부분집합만 보존하고 연구가 끝나거나 승인이 변경되면 보존 필요성을 재검토합니다. 로컬 파일 암호화·접근 제어·백업·삭제 기한은 운영자가 별도로 정해야 하며 현재 scaffold가 자동 제공하지 않습니다.
+
+### 대화 요약과 사용자 기억 (C4)
+
+대화 원문·최근 메시지, 세션 요약, 사용자 기억, 삭제한 기억의 제외 표시, 실행 권한의 context/result, LLM receipt·LangGraph 체크포인트는 모두 비공개 대화 데이터입니다. 요약과 사용자 기억은 사용자가 말한 내용과 대화 흐름이며, 실존 인물의 활동 근거가 아닙니다. 요약은 최근 창보다 오래된 대화를 로컬 모델로 압축하며 외부 spillover 중에는 생성을 미룹니다. 약 20개 메시지마다 요약을 시도하는 턴은 로컬 요약 호출 때문에 완료가 최대 약 4초 늦어질 수 있습니다.
+
+사용자 기억은 기본 꺼짐이고 명시적으로 동의한 뒤에만 추출·저장합니다. 그 턴에서 직접 쓴 문장에서 나온 이름·선호·비선호·최근 일·기타만 받으며, 항목당 120자, owner·페르소나당 **활성 기억** 30개로 제한합니다. 건강·정치·종교·성적 지향·정확한 위치·연락처·금융·미성년 여부는 거부합니다. owner 범위의 화면/API에서 기억을 보고 하나씩 또는 전부 삭제할 수 있습니다. 기억을 지우면 해당 owner·페르소나의 요약도 비우고, 남은 기록으로 다시 만듭니다. 삭제한 기억의 원문은 재추출 방지와 요약 제외를 위해 보존하며, 기본 90일의 보존 기간이 지나면 활성화된 일일 정리에서 삭제합니다. 그 뒤에는 제외 표시가 사라져 같은 내용을 사용자가 다시 말하면 다시 추출될 수 있습니다. 부분 문자열 제외와 요약 원문 가리기에 원문이 필요하므로 해시만으로는 현재 계약을 지킬 수 없습니다. 최근 대화 원문에는 삭제한 기억이 남으므로 완전히 지우려면 대화를 삭제하세요.
+
+대화를 삭제하면 화면과 API에서는 즉시 사라지고, 남은 사본은 다음 일일 정리에서 지워진다(정리 타이머가 켜져 있을 때). 삭제 요청은 메시지·요약·해당 세션에서 나온 기억을 지우고, 세션·turn에 삭제 표시를 하며 turn 입력과 reply, 실행 권한 context/result를 비웁니다. 진행 중인 턴이 있으면 삭제를 거부합니다. 해시와 execution ID는 다음 정리를 위해 남깁니다. 다음 일일 정리는 일반 보존 기간을 기다리지 않고 LLM receipt·체크포인트를 정리한 뒤 turn·세션을 지웁니다. Compose는 `ptr-maintenance-daily.timer`, Kubernetes는 `ptr-maintenance-daily-split-retention`이 활성이고 마지막 실행이 성공해야 합니다([운영 점검](operational-deployment.md)).
+
+Langfuse는 운영 기본값 `LANGFUSE_CAPTURE_CONTENT=false`로 내용 수집이 꺼져 있습니다. 내용을 수집하도록 켰다면 대화 삭제로 Langfuse 사본까지 지워지지 않습니다. 별도 Langfuse 보존·삭제 절차가 필요합니다.
 
 ### 사람 검수 시트
 

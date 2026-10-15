@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { Body, Catch, Controller, Get, HttpCode, HttpException, Inject, Module, Param, Post, Req, Res, UseGuards, type ArgumentsHost, type CanActivate, type ExecutionContext, type ExceptionFilter, type INestApplication, type OnApplicationShutdown } from '@nestjs/common';
+import { Body, Catch, Controller, Delete, Get, HttpCode, HttpException, Inject, Module, Param, Post, Req, Res, UseGuards, type ArgumentsHost, type CanActivate, type ExecutionContext, type ExceptionFilter, type INestApplication, type OnApplicationShutdown } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import {json,type Request,type Response,type NextFunction} from 'express';
@@ -28,6 +28,7 @@ const OPERATOR_OPTIONS=Symbol('OPERATOR_OPTIONS');
 export const DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE=10;
 const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
 const sendBodySchema=SendTurnSchema.omit({sessionId:true});
+const memoryConsentSchema=z.object({enabled:z.boolean()}).strict();
 const cancelBodySchema=z.preprocess(value=>!value||typeof value==='object'&&Object.keys(value).length===0?{}:value,z.object({}).strict());
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
 const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason:'이 포스트 초안 요청은 이미지를 제출하지 않습니다. 무료 이미지 생성은 자격을 검증하는 별도 private runner에서 실행하며 완료 결과와 작업 상태를 별도로 기록합니다.'};
@@ -118,6 +119,22 @@ class ApiController {
   }
   @Get('sessions/:id') async session(@Req() request:Request,@Param('id') id:string) {
     const caller=owner(request);return {session:safeSession(await this.runtime.chat.getSession(caller,id)),history:await this.runtime.chat.history(caller,id)};
+  }
+  @Post('sessions/:id/memory-consent') @UseGuards(RequestOwnerGuard)
+  async memoryConsent(@Req() request:Request,@Param('id') id:string,@Body(new ZodSchemaPipe(memoryConsentSchema)) body:z.output<typeof memoryConsentSchema>) {
+    return {session:safeSession(await this.runtime.chat.setUserMemoryConsent(owner(request),id,body.enabled))};
+  }
+  @Get('sessions/:id/memories') async memories(@Req() request:Request,@Param('id') id:string) {
+    return {memories:await this.runtime.chat.listUserMemories(owner(request),id)};
+  }
+  @Delete('sessions/:id/memories/:memoryId') async forgetMemory(@Req() request:Request,@Param('id') id:string,@Param('memoryId') memoryId:string) {
+    return {deleted:await this.runtime.chat.forgetUserMemory(owner(request),id,memoryId)};
+  }
+  @Delete('sessions/:id/memories') async forgetAllMemories(@Req() request:Request,@Param('id') id:string) {
+    return {deleted:await this.runtime.chat.deleteUserMemories(owner(request),id)};
+  }
+  @Delete('sessions/:id') async deleteSession(@Req() request:Request,@Param('id') id:string) {
+    return {deleted:await this.runtime.chat.deleteSession(owner(request),id)};
   }
   @Post('sessions/:id/turns') @UseGuards(RequestOwnerGuard) async send(@Req() request:Request,@Param('id',new ZodSchemaPipe(SendTurnSchema.shape.sessionId)) id:string,@Body(new ZodSchemaPipe(sendBodySchema)) body:z.output<typeof sendBodySchema>) {
     const caller=owner(request);

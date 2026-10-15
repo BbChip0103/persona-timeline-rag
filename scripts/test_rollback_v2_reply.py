@@ -40,7 +40,8 @@ def _psql(container: str, statements: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.startswith("PROOF:")]
 
 
-def test_rollback_sql_restores_c2_previous_reply_schema():
+@pytest.mark.parametrize("nested_variables", [True, False])
+def test_rollback_sql_restores_c2_previous_reply_schema(nested_variables):
     container = os.getenv("PTR_ROLLBACK_TEST_CONTAINER")
     if not container:
         pytest.skip(
@@ -49,6 +50,7 @@ def test_rollback_sql_restores_c2_previous_reply_schema():
 
     v1 = json.loads(V1_SCHEMA.read_text(encoding="utf-8"))
     validator = Draft202012Validator({**v1, "$ref": "#/$defs/Reply"})
+    session_validator = Draft202012Validator({**v1, "$ref": "#/$defs/Session"})
     uid = "00000000-0000-4000-8000-000000000066"
     turn_id = "00000000-0000-4000-8000-000000000067"
     reply = {
@@ -60,6 +62,8 @@ def test_rollback_sql_restores_c2_previous_reply_schema():
         "responseKind": "small_talk",
         "status": "answered",
         "content": "Synthetic reply.",
+        "summaryUpdate": {"text": "Synthetic summary", "lastMessageId": "synthetic-message"},
+        "userMemoryOps": [{"op": "add", "kind": "like", "text": "Synthetic tea"}],
         "claims": [],
         "evidence": [],
         "limitations": [],
@@ -72,6 +76,7 @@ def test_rollback_sql_restores_c2_previous_reply_schema():
                 "conversationTopic": "synthetic-topic",
                 "tone": "neutral",
                 "speechLevel": "casual",
+                "lastYearRecallUsed": True,
                 "summary": "synthetic-summary",
                 "userMemories": [],
                 "userMemoryConsent": False,
@@ -82,6 +87,10 @@ def test_rollback_sql_restores_c2_previous_reply_schema():
             "validator": "disabled",
         },
     }
+    if not nested_variables:
+        reply["agent"]["variables"] = {
+            "conversationTopic": "synthetic-topic", "tone": "neutral"
+        }
     assert not validator.is_valid(reply)
     session = {
         "id": uid,
@@ -89,7 +98,14 @@ def test_rollback_sql_restores_c2_previous_reply_schema():
         "personId": "synthetic-person",
         "personaId": "synthetic-persona",
         "personaRevision": "synthetic-revision",
+        "language": "en",
+        "timezone": "UTC",
+        "retrievalMode": "off",
+        "createdAt": "2026-10-15T00:00:00Z",
+        "userMemoryConsent": True,
     }
+    deleted_id = "00000000-0000-4000-8000-000000000069"
+    deleted_session = {**session, "id": deleted_id}
     prelude = f"""
 BEGIN;
 SET LOCAL statement_timeout = '10s';
@@ -98,6 +114,11 @@ VALUES (
   '{uid}','synthetic-owner','synthetic-person','synthetic-persona',
   'synthetic-revision','{json.dumps(session)}'::jsonb,now()
 );
+INSERT INTO app.sessions(
+  id,owner_id,person_id,persona_id,persona_revision,document,created_at,deleted_at
+)
+VALUES ('{deleted_id}','synthetic-owner','synthetic-person','synthetic-persona',
+  'synthetic-revision','{json.dumps(deleted_session)}'::jsonb,now(),now());
 INSERT INTO app.turns(id,session_id,owner_id,client_request_id,user_text,sequence,state,reply)
 VALUES (
   '{turn_id}','{uid}','synthetic-owner','synthetic-rollback',
@@ -105,20 +126,30 @@ VALUES (
 );
 """
     # The SQL updates only transaction-local synthetic data for this proof.
+    with pytest.raises(subprocess.CalledProcessError) as blocked:
+        _psql(container, prelude + SQL.read_text(encoding="utf-8") + "\nROLLBACK;\n")
+    assert "ROLLBACK_DELETED_SESSIONS_REMAIN" in blocked.value.stderr
     queries = f"""
 SELECT 'PROOF:' || reply::text FROM app.turns WHERE id='{turn_id}';
+-- This synthetic purge represents the required split-retention pass before rollback.
+DELETE FROM app.sessions WHERE id='{deleted_id}' AND deleted_at IS NOT NULL;
 {SQL.read_text(encoding="utf-8")}
 SELECT 'PROOF:' || reply::text FROM app.turns WHERE id='{turn_id}';
 {SQL.read_text(encoding="utf-8")}
 SELECT 'PROOF:' || reply::text FROM app.turns WHERE id='{turn_id}';
+SELECT 'PROOF:SESSION:' || document::text FROM app.sessions;
 ROLLBACK;
 """
     rows = _psql(container, prelude + queries)
-    assert len(rows) == 3
-    before, cleaned, repeated = [json.loads(row.removeprefix("PROOF:")) for row in rows]
+    assert len(rows) == 4
+    before, cleaned, repeated = [json.loads(row.removeprefix("PROOF:")) for row in rows[:3]]
     assert before == reply
     assert cleaned == repeated
     validator.validate(cleaned)
+    session_documents = [json.loads(row.removeprefix("PROOF:SESSION:")) for row in rows[3:]]
+    assert len(session_documents) == 1
+    assert all(session_validator.is_valid(document) for document in session_documents)
+    assert all("userMemoryConsent" not in document for document in session_documents)
     assert cleaned["agent"]["variables"] == {
         "conversationTopic": "synthetic-topic",
         "tone": "neutral",

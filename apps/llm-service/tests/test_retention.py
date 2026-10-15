@@ -42,17 +42,20 @@ def test_thread_matching_never_guesses_or_uses_substring():
 
     turn = "00000000-0000-4000-8000-000000000001"
     scope = hashlib.sha256(turn.encode()).hexdigest()
+    summary_scope = hashlib.sha256(f"{turn}:summary".encode()).hexdigest()
     fp = "a" * 64
     valid = [
         f"turn:{turn}",
         f"character:{turn}",
         f"model:{turn}:{fp}",
         f"python-call-v1:{scope}:{fp}",
+        f"python-call-v1:{summary_scope}:{fp}",
     ]
     invalid = [
         f"turn:{turn}:other",
         f"python-call-v1:{scope}:oops",
         f"python-call-v1:{'b' * 64}:{fp}",
+        f"python-call-v1:{hashlib.sha256(f'{turn}:summary:other'.encode()).hexdigest()}:{fp}",
         f"model:{turn}:bad",
         "unlinked",
     ]
@@ -97,7 +100,7 @@ class FakeConnection:
             rows = [{"role": self.role, "db": self.db}]
         elif "to_regclass" in sql:
             rows = [{"present": True}]
-        elif sql.startswith("SELECT t.id"):
+        elif sql.startswith("SELECT t.id") and "session_id" not in sql:
             rows = [{"id": "00000000-0000-4000-8000-000000000001"}]
         elif sql.startswith("SELECT DISTINCT c.thread_id"):
             turn = "00000000-0000-4000-8000-000000000001"
@@ -172,6 +175,12 @@ async def test_apply_preserves_paid_tombstones_and_protects_result_insert_race()
     assert "response_json=NULL" in update and "response_scrubbed_at" in update
     assert "reserved_microusd=" not in update and "state=" not in update
     assert not any(sql.startswith("DELETE FROM llm.ptr_provider_requests") for sql in statements)
+    assert result["deleted"]["forgottenMemories"] == 1
+    assert any(
+        sql.startswith("DELETE FROM app.user_memories WHERE id IN (")
+        and "FOR UPDATE SKIP LOCKED LIMIT %s" in sql
+        for sql in statements
+    )
 
 
 def test_maintenance_never_uses_runtime_or_ambient_database_url():

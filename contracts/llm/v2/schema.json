@@ -81,6 +81,9 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 4
+        },
+        "userMemoryConsent": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -347,6 +350,9 @@
                 "casual",
                 "polite"
               ]
+            },
+            "lastYearRecallUsed": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -1186,6 +1192,28 @@
             "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
           },
           "maxItems": 100
+        },
+        "summary": {
+          "$ref": "#/$defs/Summary"
+        },
+        "summaryGap": {
+          "type": "boolean"
+        },
+        "userMemories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserMemory"
+          },
+          "maxItems": 30
+        },
+        "userMemoryConsent": {
+          "type": "boolean"
+        },
+        "previousSessionUserSaid": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 120,
+          "x-maxUtf8Bytes": 480
         }
       },
       "required": [
@@ -1512,6 +1540,16 @@
             },
             "reply": {
               "$ref": "#/$defs/Reply"
+            },
+            "summaryUpdate": {
+              "$ref": "#/$defs/Summary"
+            },
+            "userMemoryOps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/UserMemoryOp"
+              },
+              "maxItems": 3
             }
           },
           "required": [
@@ -1890,6 +1928,97 @@
     },
     "ProgressResponse": {
       "$ref": "#/$defs/CompleteResponse"
+    },
+    "Summary": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "x-maxUtf8Bytes": 8000
+        },
+        "lastMessageId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        }
+      },
+      "required": [
+        "text",
+        "lastMessageId"
+      ],
+      "additionalProperties": false
+    },
+    "UserMemory": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "kind": {
+          "enum": [
+            "name",
+            "like",
+            "dislike",
+            "recent_event",
+            "other"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 120,
+          "x-maxUtf8Bytes": 480
+        },
+        "forgotten": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "text",
+        "forgotten"
+      ],
+      "additionalProperties": false
+    },
+    "UserMemoryOp": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "const": "add"
+        },
+        "kind": {
+          "enum": [
+            "name",
+            "like",
+            "dislike",
+            "recent_event",
+            "other"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 120,
+          "x-maxUtf8Bytes": 480
+        }
+      },
+      "required": [
+        "op",
+        "kind",
+        "text"
+      ],
+      "additionalProperties": false
     }
   }
 }
