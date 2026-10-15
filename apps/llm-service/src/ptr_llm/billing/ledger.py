@@ -18,6 +18,10 @@ class ProviderError(Exception):
         super().__init__(code)
 
 
+class SpilloverNotSubmitted(ProviderError):
+    """A chat attempt that has not crossed the paid ledger submit boundary."""
+
+
 def provider_request_scope(request_key: str | None, kind: str) -> dict[str, str] | None:
     if not request_key:
         return None
@@ -83,6 +87,13 @@ class MemoryBudgetLedger:
         self.baseline_committed_microusd = baseline_committed_microusd
         self.requests: dict[str, BudgetRequest] = {}
         self._lock = asyncio.Lock()
+
+    async def remaining_microusd(self) -> int:
+        async with self._lock:
+            maximum = min(self.cap_microusd, self.baseline_committed_microusd + EXTRA_CAP_MICROUSD)
+            if len(self.requests) >= self.call_cap:
+                return 0
+            return max(0, maximum - sum(committed(request) for request in self.requests.values()))
 
     async def reserve(
         self,
@@ -167,6 +178,36 @@ class PostgresBudgetLedger:
 
         assert_llm_pool(pool, database_url)
         self.pool = pool
+
+    async def remaining_microusd(self) -> int:
+        """Read the same effective cap and committed sum as reserve, without writing."""
+        from psycopg.rows import dict_row
+
+        async with self.pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT b.cap_microusd,b.call_cap,m.baseline_committed_microusd,"
+                "m.extra_cap_microusd FROM llm.ptr_provider_budget b CROSS JOIN "
+                "llm.ptr_provider_migration_budget m WHERE b.id='global' "
+                "AND m.id='python-split-45'"
+            )
+            budget = await cur.fetchone()
+            if budget is None or not 0 <= budget["extra_cap_microusd"] <= EXTRA_CAP_MICROUSD:
+                raise ProviderError("BUDGET_NOT_INITIALIZED")
+            await cur.execute(
+                "SELECT COALESCE(SUM(CASE WHEN state='settled' THEN "
+                "COALESCE(actual_microusd,reserved_microusd) ELSE "
+                "GREATEST(reserved_microusd,COALESCE(actual_microusd,0)) END),0) "
+                "AS committed,COUNT(*) AS calls FROM llm.ptr_provider_requests"
+            )
+            aggregate = await cur.fetchone()
+            if aggregate["calls"] >= budget["call_cap"]:
+                return 0
+            maximum = min(
+                budget["cap_microusd"],
+                MAX_TOTAL_MICROUSD,
+                budget["baseline_committed_microusd"] + budget["extra_cap_microusd"],
+            )
+            return max(0, maximum - aggregate["committed"])
 
     async def reserve(
         self,

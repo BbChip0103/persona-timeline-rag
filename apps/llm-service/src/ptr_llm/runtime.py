@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import os
 import time
@@ -50,6 +51,8 @@ from .repositories import (
 )
 from .telemetry import FrameworkTelemetry as Telemetry
 from .telemetry import TelemetryConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _load_publication(
@@ -366,7 +369,16 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         raise ProviderError("LITELLM_PROVIDER_REMOVED")
     spillover_mode = env.get("PTR_LLM_SPILLOVER", "off")
     cluster_network = _cluster_network(env)
-    if not cluster_network and _compose_openrouter_key_present(env):
+    slots_raw = env.get("PTR_LLM_LOCAL_SLOTS")
+    local_slots = _integer(env, "PTR_LLM_LOCAL_SLOTS", 1, 1, 256) if slots_raw is not None else None
+    spillover_wait_ms = _integer(env, "PTR_LLM_SPILLOVER_WAIT_MS", 2000, 100, 10000)
+    if cluster_network and local_slots is not None:
+        raise ProviderError("INVALID_SPILLOVER_CONFIG")
+    if (
+        not cluster_network
+        and _compose_openrouter_key_present(env)
+        and not (spillover_mode == "openrouter" and local_slots is not None)
+    ):
         raise ProviderError("COMPOSE_OPENROUTER_KEYS_FORBIDDEN")
     if (
         provider_choice == "local"
@@ -382,19 +394,26 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
         raise ProviderError("LOCAL_API_KEY_REQUIRED")
     if spillover_mode not in ("off", "openrouter") or (
         spillover_mode == "openrouter"
-        and (provider_choice != "local" or not cluster_network)
+        and (provider_choice != "local" or not (cluster_network or local_slots is not None))
     ):
         raise ProviderError("INVALID_SPILLOVER_CONFIG")
     key_max_limit_usd = 1.0
     if spillover_mode == "openrouter":
+        if (
+            env.get("PTR_LLM_OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it")
+            != "google/gemma-4-26b-a4b-it"
+        ):
+            raise ProviderError("INVALID_SPILLOVER_CONFIG")
         if not env.get("OPENROUTER_API_KEY", "").strip():
             raise ProviderError("OPENROUTER_KEY_REQUIRED")
         try:
             key_max_limit_usd = float(env.get("PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD", "1"))
         except ValueError:
             raise ProviderError("INVALID_RUNTIME_CONFIG") from None
-        if not math.isfinite(key_max_limit_usd) or key_max_limit_usd <= 0:
+        if not math.isfinite(key_max_limit_usd) or not 0 < key_max_limit_usd <= 1:
             raise ProviderError("INVALID_RUNTIME_CONFIG")
+        if local_slots is not None and settings.concurrency <= local_slots:
+            logger.warning("OPENROUTER_SPILLOVER_CONCURRENCY_NOT_ABOVE_SLOTS")
     if settings.database_url.split("://", 1)[1].split(":", 1)[0] != "ptr_split_llm":
         raise ProviderError("RUNTIME_REQUIRES_LLM_ROLE")
     pool: AsyncConnectionPool[AsyncConnection[dict[str, Any]]] = AsyncConnectionPool(
@@ -431,6 +450,11 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 or identity["cap"] != 1_000_000
             ):
                 raise ProviderError("RUNTIME_SCHEMA_NOT_READY")
+            if (
+                env.get("PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE") == "1"
+                and identity["db"] != "ptr_split_test"
+            ):
+                raise ProviderError("SYNTHETIC_FIXTURE_REQUIRES_TEST_DB")
         prompts = await load_prompt_snapshot(prompt_config, telemetry.client)
         personas = PostgresPersonaRepository(pool, settings.database_url)
         publication = _load_publication(env, settings.database_url)
@@ -476,6 +500,7 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                 base_url_override=env.get("PTR_LLM_OPENROUTER_BASE_URL"),
                 fixture_enabled=env.get("PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE") == "1",
                 cluster_mode=cluster_network,
+                fixture_database=identity["db"],
                 on_zdr_unavailable=lambda: telemetry.count("OPENROUTER_ZDR_UNAVAILABLE"),
             )
         if provider_name == "fake":
@@ -483,21 +508,45 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
             provider = FakeTextProvider()
         elif provider_name == "local":
             model = env.get("PTR_LLM_LOCAL_MODEL", "")
-            provider = DirectLocalTextProvider(
-                base_url=env.get("PTR_LLM_LOCAL_BASE_URL", ""),
-                model=model,
-                api_key=env.get("PTR_LLM_LOCAL_API_KEY", ""),
-                max_output_tokens=tokens,
-                timeout_ms=timeout_ms,
-                input_bytes=input_bytes,
-                cluster_mode=cluster_network,
-                paid_spillover=client if spillover_mode == "openrouter" else None,
-                on_spillover_check_failure=telemetry.count,
-                spillover_min_remaining_ms=_integer(
-                    env, "PTR_LLM_SPILLOVER_MIN_REMAINING_MS", 10000, 0, 300000
-                ),
-                on_metrics=_observe_provider_metrics,
-            )
+            slot_redis = None
+            slots = None
+            if local_slots is not None:
+                from redis.asyncio import Redis
+
+                from .providers.local_slots import LocalSlots
+
+                slot_redis = Redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_timeout=settings.backend_timeout,
+                    socket_connect_timeout=settings.backend_timeout,
+                )
+                slots = LocalSlots(
+                    slot_redis, f"{settings.queue_prefix}:llm:local-slots", local_slots
+                )
+            try:
+                provider = DirectLocalTextProvider(
+                    base_url=env.get("PTR_LLM_LOCAL_BASE_URL", ""),
+                    model=model,
+                    api_key=env.get("PTR_LLM_LOCAL_API_KEY", ""),
+                    max_output_tokens=tokens,
+                    timeout_ms=timeout_ms,
+                    input_bytes=input_bytes,
+                    cluster_mode=cluster_network,
+                    paid_spillover=client if spillover_mode == "openrouter" else None,
+                    on_spillover_check_failure=telemetry.count,
+                    spillover_min_remaining_ms=_integer(
+                        env, "PTR_LLM_SPILLOVER_MIN_REMAINING_MS", 10000, 0, 300000
+                    ),
+                    on_metrics=_observe_provider_metrics,
+                    local_slots=slots,
+                    slot_redis=slot_redis,
+                    spillover_wait_ms=spillover_wait_ms,
+                )
+            except BaseException:
+                if slot_redis is not None:
+                    await slot_redis.aclose()
+                raise
             if spillover_mode == "openrouter":
                 await provider.start_spillover_checks(key_max_limit_usd)
         elif provider_name == "openrouter" and client is not None:

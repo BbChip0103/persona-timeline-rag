@@ -3,6 +3,7 @@ from .ledger import (
     MemoryBudgetLedger,
     PostgresBudgetLedger,
     ProviderError,
+    SpilloverNotSubmitted,
     provider_request_scope,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "MemoryBudgetLedger",
     "PostgresBudgetLedger",
     "ProviderError",
+    "SpilloverNotSubmitted",
     "provider_request_scope",
 ]

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from langchain_openai import OpenAIEmbeddings
 from pydantic import SecretStr
 
-from ptr_llm.billing import ProviderError, provider_request_scope
+from ptr_llm.billing import ProviderError, SpilloverNotSubmitted, provider_request_scope
 from ptr_llm.config import _svc_host
 
 from .common import (
@@ -123,6 +123,7 @@ class OpenRouterClient:
         base_url_override: str | None = None,
         fixture_enabled: bool = False,
         cluster_mode: bool = False,
+        fixture_database: str | None = None,
         on_zdr_unavailable: Callable[[], None] | None = None,
     ):
         import httpx
@@ -145,9 +146,14 @@ class OpenRouterClient:
                 raise ProviderError("OPENROUTER_URL_NOT_ALLOWED") from None
             if not (
                 fixture_enabled
-                and cluster_mode
                 and parsed.scheme in ("http", "https")
-                and _svc_host(parsed.hostname)
+                and (
+                    cluster_mode
+                    and _svc_host(parsed.hostname)
+                    or not cluster_mode
+                    and fixture_database == "ptr_split_test"
+                    and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+                )
                 and not parsed.username
                 and not parsed.password
                 and parsed.path in ("", "/")
@@ -182,6 +188,23 @@ class OpenRouterClient:
             "openrouter_operation", default=None
         )
         self._chat: Any = None
+        self._chat_submission: ContextVar[list[bool] | None] = ContextVar(
+            "openrouter_chat_submitted", default=None
+        )
+
+    async def reverify_spillover(self) -> None:
+        """Refresh pricing and ZDR without exposing partially verified state."""
+        await self._owned(lambda: self._verify_pricing(force=True))
+
+    def max_chat_reservation_microusd(self) -> int:
+        policy = TEXT_MODELS[self.model]
+        return math.ceil(
+            (self.input_bytes + 64 * 64 + 2048) * 2 * policy["prompt"]
+            + self.max_output_tokens * policy["completion"]
+        )
+
+    async def spillover_budget_available(self) -> bool:
+        return await self.ledger.remaining_microusd() >= self.max_chat_reservation_microusd()
 
     async def _owned(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         if self._closed:
@@ -358,9 +381,13 @@ class OpenRouterClient:
             raise ProviderError("OPENROUTER_KEY_LIMIT")
         return True
 
-    async def _verify_pricing(self, signal: asyncio.Event | None = None) -> None:
-        if self._text_verified:
+    async def _verify_pricing(
+        self, signal: asyncio.Event | None = None, *, force: bool = False
+    ) -> None:
+        if self._text_verified and not force:
             return
+        structured_outputs = False
+        zdr_available = self._chat_zdr_available
         catalog = await self._fetch("/api/v1/models", signal=signal)
         embeddings = await self._fetch("/api/v1/embeddings/models", signal=signal)
         policy = TEXT_MODELS[self.model]
@@ -383,7 +410,7 @@ class OpenRouterClient:
             if metadata.get("reasoning", {}).get("mandatory") is True:
                 raise ProviderError("MANDATORY_REASONING_NOT_ALLOWED")
             if model == self.model:
-                self.structured_outputs = "structured_outputs" in metadata.get(
+                structured_outputs = "structured_outputs" in metadata.get(
                     "supported_parameters", []
                 )
             for key, value in metadata["pricing"].items():
@@ -446,7 +473,7 @@ class OpenRouterClient:
                 deepinfra_tags.add(tag)
                 if "supported_parameters" in deepinfra:
                     supported = deepinfra["supported_parameters"]
-                    self.structured_outputs = self.structured_outputs and (
+                    structured_outputs = structured_outputs and (
                         isinstance(supported, list) and "structured_outputs" in supported
                     )
                 if not {"prompt", "completion"} <= pricing.keys():
@@ -498,8 +525,11 @@ class OpenRouterClient:
                 )
                 if self.on_zdr_unavailable is not None:
                     self.on_zdr_unavailable()
-            self._chat_zdr_available = zdr_available
-        self._text_verified = True
+        self.structured_outputs, self._chat_zdr_available, self._text_verified = (
+            structured_outputs,
+            zdr_available,
+            True,
+        )
 
     async def _verify_decision_pricing(self, model: str, signal: asyncio.Event | None) -> None:
         if model in self._decisions_verified:
@@ -595,6 +625,11 @@ class OpenRouterClient:
         if deadline_at is not None and time.time() * 1000 >= deadline_at:
             await self.ledger.finish(key, 0, None, None)
             raise ProviderError("PROVIDER_DEADLINE")
+        if endpoint == "chat/completions":
+            marker = self._chat_submission.get()
+            if marker is not None:
+                # A failed submit write may have committed; never retry it locally.
+                marker[0] = True
         await self.ledger.submitted(key)
         try:
             if deadline_at is not None and time.time() * 1000 >= deadline_at:
@@ -631,15 +666,39 @@ class OpenRouterClient:
         *,
         signal: asyncio.Event | None = None,
         deadline_at: float | None = None,
+        require_zdr: bool = False,
         **options: Any,
     ) -> str:
-        return await self._owned(
-            lambda: self._deadline(
-                self._generate(messages, signal=signal, deadline_at=deadline_at, **options),
-                signal,
-                deadline_at,
-            )
-        )
+        submitted = [False]
+
+        async def chat() -> str:
+            token = self._chat_submission.set(submitted)
+            try:
+                return await self._deadline(
+                    self._generate(
+                        messages,
+                        signal=signal,
+                        deadline_at=deadline_at,
+                        require_zdr=require_zdr,
+                        **options,
+                    ),
+                    signal,
+                    deadline_at,
+                )
+            finally:
+                self._chat_submission.reset(token)
+
+        try:
+            return await self._owned(chat)
+        except ProviderError as error:
+            # A pre-submit deadline has already expired; local waiting cannot help.
+            if require_zdr and not submitted[0] and error.code != "PROVIDER_DEADLINE":
+                raise SpilloverNotSubmitted(error.code) from None
+            raise
+        except Exception:
+            if require_zdr and not submitted[0]:
+                raise SpilloverNotSubmitted("PROVIDER_TRANSPORT") from None
+            raise
 
     async def decide(
         self,
@@ -696,6 +755,7 @@ class OpenRouterClient:
         max_output_tokens: int | None = None,
         deadline_at: float | None = None,
         response_schema: dict[str, Any] | None = None,
+        require_zdr: bool = False,
         **_: Any,
     ) -> str:
         check_cancel(signal)
@@ -705,6 +765,8 @@ class OpenRouterClient:
         if deadline_at is not None and deadline_at <= time.time() * 1000:
             raise ProviderError("PROVIDER_DEADLINE")
         await self.verify_pricing(signal)
+        if require_zdr and not self._chat_zdr_available:
+            raise ProviderError("ZDR_UNAVAILABLE")
         agent = any(m["role"] == "system" and "AGENT_JSON_REPLY" in m["content"] for m in messages)
         if response_schema is not None:
             from jsonschema import Draft202012Validator

@@ -10,7 +10,7 @@ from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .config import Settings
 from .control import ControlRejected, validate_wire
@@ -50,6 +50,14 @@ def create_app(
         return JSONResponse(
             {"status": "ready" if okay else "unavailable"}, status_code=200 if okay else 503
         )
+
+    if runner is not None:
+
+        @app.get("/metrics")
+        async def metrics() -> Response:
+            from .spillover_metrics import render
+
+            return Response(render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/internal/llm/personas", dependencies=[Depends(authenticate)])
     async def personas() -> dict[str, Any]:

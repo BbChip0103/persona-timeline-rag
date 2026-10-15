@@ -7,14 +7,17 @@ import copy
 import json
 import logging
 import math
+import random
 import time
 from contextvars import ContextVar
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
-from ptr_llm.billing import ProviderError
+from ptr_llm.billing import ProviderError, SpilloverNotSubmitted
 from ptr_llm.config import _svc_host
+from ptr_llm.spillover_metrics import set_available
 
 from .common import (
     bounded,
@@ -26,6 +29,7 @@ from .common import (
     js_json,
 )
 from .control_tokens import neutralize_json_strings, neutralize_messages
+from .local_slots import LocalSlots
 from .transport import LimitedTransport
 
 _ALLOWED_CAPACITY_DROP_REASONS = frozenset(("rejected-saturated", "rejected-ttl-expired"))
@@ -55,6 +59,9 @@ class DirectLocalTextProvider:
         input_bytes: int = 65536,
         transport: Any = None,
         on_metrics: Any = None,
+        local_slots: LocalSlots | None = None,
+        slot_redis: Any = None,
+        spillover_wait_ms: int = 2000,
     ):
         import httpx
 
@@ -92,7 +99,11 @@ class DirectLocalTextProvider:
             input_bytes,
         )
         self.transport = transport
+        self.cluster_mode = cluster_mode
         self.on_metrics = on_metrics
+        self.local_slots = local_slots
+        self.slot_redis = slot_redis
+        self.spillover_wait_ms = spillover_wait_ms
         self.paid_spillover = paid_spillover
         self.on_spillover_check_failure = on_spillover_check_failure
         self.spillover_min_remaining_ms = spillover_min_remaining_ms
@@ -185,8 +196,12 @@ class DirectLocalTextProvider:
             for task in active:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
-            if self._client is not None:
-                await self._client.aclose()
+            try:
+                if self._client is not None:
+                    await self._client.aclose()
+            finally:
+                if self.slot_redis is not None:
+                    await self.slot_redis.aclose()
 
     async def start_spillover_checks(
         self, max_limit_usd: float, *, interval_seconds: float = 60
@@ -207,6 +222,7 @@ class DirectLocalTextProvider:
                     logger.warning("OPENROUTER_SPILLOVER_DISABLED")
             self.spillover_enabled = available
             self._spillover_check_failed = not available
+            set_available(available)
 
         try:
             available = await self.paid_spillover.verify_key_limit(max_limit_usd)
@@ -216,6 +232,11 @@ class DirectLocalTextProvider:
         if available:
             try:
                 await self.paid_spillover.verify_pricing()
+                if not getattr(self.paid_spillover, "_chat_zdr_available", True):
+                    available = False
+                budget_check = getattr(self.paid_spillover, "spillover_budget_available", None)
+                if available and budget_check is not None:
+                    available = await budget_check()
             except ProviderError:
                 available = False
         update_status(available)
@@ -226,9 +247,23 @@ class DirectLocalTextProvider:
                 try:
                     ready = await self.paid_spillover.verify_key_limit(max_limit_usd)
                     if ready:
-                        await self.paid_spillover.verify_pricing()
+                        reverify = getattr(self.paid_spillover, "reverify_spillover", None)
+                        if reverify is not None:
+                            await reverify()
+                        else:
+                            await self.paid_spillover.verify_pricing()
+                        ready = getattr(self.paid_spillover, "_chat_zdr_available", True)
+                        budget_check = getattr(
+                            self.paid_spillover, "spillover_budget_available", None
+                        )
+                        if ready and budget_check is not None:
+                            ready = await budget_check()
                     update_status(ready)
-                except ProviderError:
+                except Exception as error:
+                    logger.warning(
+                        "OPENROUTER_SPILLOVER_RECHECK_FAILED error_class=%s",
+                        type(error).__name__,
+                    )
                     update_status(False)
 
         self._spillover_check_task = asyncio.create_task(recheck())
@@ -347,6 +382,10 @@ class DirectLocalTextProvider:
         transport_error_code: str | None = None
         drop_reason: str | None = None
         local_status: int | None = None
+        lease_id = uuid4().hex if self.local_slots is not None else None
+        lease_acquired = False
+        spill_attempted = False
+        retry_local_after_refusal = False
 
         def report(ok: bool, error: str | None = None) -> None:
             if metrics_callback:
@@ -439,43 +478,110 @@ class DirectLocalTextProvider:
                 )(content=m["content"])
                 for m in safe
             ]
-            try:
-                raw = await bounded(
-                    private_ainvoke(runnable, input_messages),
-                    timeout=(effective_deadline - time.time() * 1000) / 1000,
+
+            async def paid_result() -> str:
+                nonlocal cost
+                paid_usage: dict[str, int | None] = {}
+
+                def receive_paid_cost(value: int | None) -> None:
+                    nonlocal cost
+                    cost = value
+
+                text = await self.paid_spillover.generate(
+                    messages,
+                    require_zdr=True,
                     signal=signal,
-                    timeout_code=timeout_code,
+                    request_key=request_key,
+                    deadline_at=effective_deadline,
+                    response_schema=response_schema,
+                    on_cost=receive_paid_cost,
+                    on_usage=paid_usage.update,
                 )
-            except Exception:
+                return success({"text": text, "usage": paid_usage, "upstream": "openrouter"})
+
+            slot_wait_start = time.monotonic()
+            raw: Any = None
+            while True:
+                check_cancel(signal)
                 remaining_ms = effective_deadline - time.time() * 1000
-                if (
-                    self.spillover_enabled
-                    and self.paid_spillover is not None
-                    and local_status == 429
-                    and drop_reason in _ALLOWED_CAPACITY_DROP_REASONS
-                    and attempts == 1
-                    and remaining_ms >= self.spillover_min_remaining_ms
-                ):
-                    paid_usage: dict[str, int | None] = {}
-
-                    def receive_paid_cost(value: int | None) -> None:
-                        nonlocal cost
-                        cost = value
-
-                    def paid_used(value: dict[str, int | None]) -> None:
-                        paid_usage.update(value)
-
-                    text = await self.paid_spillover.generate(
-                        messages,
+                if remaining_ms <= 0:
+                    raise ProviderError(timeout_code)
+                if self.local_slots is not None and not lease_acquired:
+                    assert lease_id is not None
+                    lease_acquired = await bounded(
+                        self.local_slots.acquire(lease_id, remaining_ms / 1000 + 2),
+                        timeout=remaining_ms / 1000,
                         signal=signal,
-                        request_key=request_key,
-                        deadline_at=effective_deadline,
-                        response_schema=response_schema,
-                        on_cost=receive_paid_cost,
-                        on_usage=paid_used,
+                        timeout_code=timeout_code,
                     )
-                    return success({"text": text, "usage": paid_usage, "upstream": "openrouter"})
-                raise
+                    if not lease_acquired:
+                        can_spill = (
+                            self.spillover_enabled
+                            and self.paid_spillover is not None
+                            and not spill_attempted
+                            and (time.monotonic() - slot_wait_start) * 1000
+                            >= self.spillover_wait_ms
+                            and remaining_ms >= self.spillover_min_remaining_ms
+                        )
+                        if can_spill:
+                            spill_attempted = True
+                            try:
+                                return await paid_result()
+                            except SpilloverNotSubmitted as error:
+                                if error.code in ("BUDGET_EXCEEDED", "BUDGET_NOT_INITIALIZED"):
+                                    self.spillover_enabled = False
+                                    set_available(False)
+                                # The request was never sent; continue waiting for the slot.
+                        if signal is None:
+                            await asyncio.sleep(min(0.05, remaining_ms / 1000))
+                        else:
+                            try:
+                                await asyncio.wait_for(
+                                    signal.wait(), timeout=min(0.05, remaining_ms / 1000)
+                                )
+                            except TimeoutError:
+                                pass
+                        continue
+                local_status = None
+                drop_reason = None
+                try:
+                    raw = await bounded(
+                        private_ainvoke(runnable, input_messages),
+                        timeout=(effective_deadline - time.time() * 1000) / 1000,
+                        signal=signal,
+                        timeout_code=timeout_code,
+                    )
+                    break
+                except Exception:
+                    remaining_ms = effective_deadline - time.time() * 1000
+                    capacity = local_status == 429 and drop_reason in _ALLOWED_CAPACITY_DROP_REASONS
+                    if (
+                        capacity
+                        and self.spillover_enabled
+                        and self.paid_spillover is not None
+                        and attempts == 1
+                        and remaining_ms >= self.spillover_min_remaining_ms
+                    ):
+                        try:
+                            return await paid_result()
+                        except SpilloverNotSubmitted as error:
+                            if error.code in ("BUDGET_EXCEEDED", "BUDGET_NOT_INITIALIZED"):
+                                self.spillover_enabled = False
+                                set_available(False)
+                            retry_local_after_refusal = True
+                    if capacity and (self.cluster_mode or retry_local_after_refusal):
+                        delay = min(random.uniform(0.25, 1), remaining_ms / 1000)
+                        if delay <= 0:
+                            raise ProviderError(timeout_code)
+                        if signal is None:
+                            await asyncio.sleep(delay)
+                        else:
+                            try:
+                                await asyncio.wait_for(signal.wait(), timeout=delay)
+                            except TimeoutError:
+                                pass
+                        continue
+                    raise
             if agent:
                 if not isinstance(raw, dict) or raw.get("parsed") is None:
                     raise ProviderError("INVALID_PROVIDER_RESPONSE")
@@ -528,5 +634,13 @@ class DirectLocalTextProvider:
             report(False, code)
             raise ProviderError(code) from None
         finally:
-            self._hook_context.reset(token)
-            self._active.discard(task)
+            try:
+                if lease_id is not None:
+                    assert self.local_slots is not None
+                    try:
+                        await asyncio.shield(self.local_slots.release(lease_id))
+                    except Exception:
+                        logger.warning("LOCAL_SLOT_UNAVAILABLE")
+            finally:
+                self._hook_context.reset(token)
+                self._active.discard(task)

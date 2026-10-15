@@ -119,7 +119,14 @@ class Settings:
             "INVALID_REDIS_URL",
         )
         cluster_network = _cluster_network(env)
-        if not cluster_network and _compose_openrouter_key_present(env):
+        if (
+            not cluster_network
+            and _compose_openrouter_key_present(env)
+            and not (
+                env.get("PTR_LLM_SPILLOVER") == "openrouter"
+                and env.get("PTR_LLM_LOCAL_SLOTS") is not None
+            )
+        ):
             raise ConfigurationError("COMPOSE_OPENROUTER_KEYS_FORBIDDEN")
         if cluster_network:
             try:
