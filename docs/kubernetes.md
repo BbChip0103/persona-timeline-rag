@@ -25,7 +25,7 @@ limits the permitted paths.
 removes the LLM gateway from the active Kubernetes architecture. The worker
 calls local vLLM through the EPP/InferencePool path, and the EPP owns
 routing/admission for local serving. Paid spillover is a worker-only direct
-OpenRouter call, guarded by the durable provider ledger and the provider key's
+OpenRouter call, guarded by the durable provider ledger and, by default, the provider key's
 credit limit. The paid key exists only in the worker Secret; rollback restores
 the old gateway from the private operational snapshot, not from this repository.
 
@@ -133,9 +133,12 @@ configuration. Before use:
   password from this Secret).
   `ptr-worker` supplies `PTR_LLM_DATABASE_URL`, `PTR_LLM_REDIS_URL`,
   `PTR_LLM_CONTROL_TOKEN`. When `llm.spillover=openrouter`,
-  `ptr-worker-openrouter` supplies a dedicated `OPENROUTER_API_KEY` with a
+  `ptr-worker-openrouter` supplies an approved `OPENROUTER_API_KEY` with a
   provider-side credit limit no greater than
-  `PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD`; omit that Secret/env path when
+  `PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD` by default. Explicit
+  `llm.openrouter.keyLimitCheck=skip` accepts an authenticated key without
+  that per-key cap and relies on the shared ledger and account-level limits;
+  omit that Secret/env path when
   spillover is off. `ptr-personas` supplies
   `PTR_LLM_PUBLISHED_PERSONAS_JSON`. `ptr-maintenance` supplies
   `PTR_LLM_MAINTENANCE_DATABASE_URL` and approved maintenance controls/Redis
@@ -153,8 +156,9 @@ configuration. Before use:
 - Authorize OpenRouter egress through an egress proxy or hostname-aware policy
   if host pinning is required. A CIDR NetworkPolicy is not host pinning. Keep
   the fake OpenRouter disabled and require explicit paid-call authorization.
-- Verify the worker-only OpenRouter key credit limit and the separate shared
-  USD ledger cap before enabling paid spillover. Provider API unavailability
+- Verify the worker-only OpenRouter key credit limit (or account-level limit
+  when `keyLimitCheck=skip`) and the separate shared USD ledger cap before
+  enabling paid spillover. Provider API unavailability
   disables spillover until the next key check; local serving remains available.
 - Install KEDA, Prometheus Operator/Prometheus, and metrics-server; install the
   GIE v1 `InferencePool` CRD before rendering the app chart. Provide matching
@@ -263,7 +267,7 @@ Keep telemetry redacted.
 Spillover is allowed only for EPP `rejected-saturated` or
 `rejected-ttl-expired` drop reasons. A bare 503, engine 5xx, timeout or reset is
 not a spillover grant. A paid result with unclear cost becomes `unknown` in the
-durable ledger; never resubmit it. The provider key limit is separate from the
+durable ledger; never resubmit it. The default provider key limit is separate from the
 shared USD budget. Production worker egress uses an OpenRouter CIDR list on 443;
 CIDR policy does not pin a hostname. Kind permits only its fake OpenRouter
 Service for spillover.

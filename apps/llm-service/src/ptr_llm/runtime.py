@@ -375,6 +375,9 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
     if provider_choice == "litellm":
         raise ProviderError("LITELLM_PROVIDER_REMOVED")
     spillover_mode = env.get("PTR_LLM_SPILLOVER", "off")
+    key_limit_check = env.get("PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK", "required")
+    if key_limit_check not in {"required", "skip"}:
+        raise ProviderError("INVALID_RUNTIME_CONFIG")
     cluster_network = _cluster_network(env)
     slots_raw = env.get("PTR_LLM_LOCAL_SLOTS")
     local_slots = _integer(env, "PTR_LLM_LOCAL_SLOTS", 1, 1, 256) if slots_raw is not None else None
@@ -555,7 +558,9 @@ async def build_runtime(settings: Settings, env: Mapping[str, str] | None = None
                     await slot_redis.aclose()
                 raise
             if spillover_mode == "openrouter":
-                await provider.start_spillover_checks(key_max_limit_usd)
+                await provider.start_spillover_checks(
+                    key_max_limit_usd, key_limit_check=key_limit_check
+                )
         elif provider_name == "openrouter" and client is not None:
             model, provider = client.model, client
         else:

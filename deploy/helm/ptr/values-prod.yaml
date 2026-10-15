@@ -40,6 +40,7 @@ llm:
   openrouter:
     baseUrlOverride: ""
     keyMaxLimitUsd: "1"
+    keyLimitCheck: required
   prod:
     # Documentation placeholder only: TEST-NET-3, replace with approved egress ranges.
     # CIDR egress narrows destinations but is not host pinning; use an egress proxy

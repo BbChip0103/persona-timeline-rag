@@ -230,6 +230,7 @@ llm:
     baseUrlOverride: ""
     syntheticProviderFixture: false
     keyMaxLimitUsd: "1"
+    keyLimitCheck: required
   billing:
     liveEnabled: "1"
     allowExternalData: "1"

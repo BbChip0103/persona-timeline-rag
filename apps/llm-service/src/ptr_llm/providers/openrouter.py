@@ -350,8 +350,12 @@ class OpenRouterClient:
     async def verify_pricing(self, signal: asyncio.Event | None = None) -> None:
         await self._owned(lambda: self._verify_pricing(signal))
 
-    async def verify_key_limit(self, max_limit_usd: float) -> bool:
-        """Return false on provider outages; reject a real uncapped paid key."""
+    async def verify_key_limit(
+        self, max_limit_usd: float, *, key_limit_check: str = "required"
+    ) -> bool:
+        """Authenticate the key; optionally require a bounded lifetime credit limit."""
+        if key_limit_check not in {"required", "skip"}:
+            raise ProviderError("INVALID_OPENROUTER_KEY_LIMIT_CHECK")
         if (
             type(max_limit_usd) not in (int, float)
             or not math.isfinite(max_limit_usd)
@@ -363,8 +367,16 @@ class OpenRouterClient:
         except ProviderError as error:
             if error.code == "PROVIDER_CLOSED":
                 raise
+            if key_limit_check == "skip" and error.code in {
+                "PROVIDER_HTTP_401", "PROVIDER_HTTP_403"
+            }:
+                raise
             return False
         data = result.get("data")
+        if key_limit_check == "skip":
+            if not isinstance(data, dict):
+                raise ProviderError("INVALID_PROVIDER_RESPONSE")
+            return True
         raw_limit = data.get("limit") if isinstance(data, dict) else None
         raw_reset = data.get("limit_reset") if isinstance(data, dict) else None
         if (

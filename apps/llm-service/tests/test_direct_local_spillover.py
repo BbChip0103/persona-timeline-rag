@@ -300,6 +300,54 @@ async def test_runtime_cluster_openrouter_outage_disables_spillover(monkeypatch,
         await built.close()
 
 
+async def test_runtime_wires_skip_policy_into_spillover_checks(monkeypatch, tmp_path):
+    from test_runtime_composition import FakePool, _settings
+
+    from ptr_llm import runtime as module
+
+    class FakeOpenRouter:
+        def __init__(self, **_kwargs):
+            self._chat_zdr_available = True
+            self.checked = False
+
+        async def verify_key_limit(self, limit, *, key_limit_check="required"):
+            assert limit == 1
+            assert key_limit_check == "skip"
+            self.checked = True
+            return True
+
+        async def verify_pricing(self):
+            pass
+
+        async def spillover_budget_available(self):
+            return True
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(module, "AsyncConnectionPool", FakePool)
+    monkeypatch.setattr(module, "OpenRouterClient", FakeOpenRouter)
+    built = await module.build_runtime(
+        _settings(),
+        _local_runtime_env(
+            tmp_path,
+            **_cluster_env(
+                PTR_LLM_SPILLOVER="openrouter",
+                PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK="skip",
+                PTR_LLM_LIVE_ENABLED="1",
+                PTR_LLM_ALLOW_EXTERNAL_DATA="1",
+                OPENROUTER_API_KEY="synthetic-paid-key",
+            ),
+        ),
+    )
+    try:
+        local = built.provider.provider.provider
+        assert local.paid_spillover.checked is True
+        assert local.spillover_enabled is True
+    finally:
+        await built.close()
+
+
 async def test_local_spillover_rechecks_after_key_endpoint_recovers():
     recovered = asyncio.Event()
 
@@ -1209,16 +1257,141 @@ async def test_openrouter_key_limit_rejects_missing_or_excessive_limit(payload):
         await client.aclose()
 
 
+@pytest.mark.parametrize("key_limit_check", ["required", "skip"])
 @pytest.mark.asyncio
-async def test_openrouter_key_limit_outage_disables_spillover_without_blocking_local_startup():
+async def test_openrouter_key_limit_outage_disables_spillover_without_blocking_local_startup(
+    key_limit_check,
+):
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("synthetic outage", request=request)
 
     client = _openrouter_client(handler)
     try:
-        assert await client.verify_key_limit(max_limit_usd=10) is False
+        assert await client.verify_key_limit(
+            max_limit_usd=10, key_limit_check=key_limit_check
+        ) is False
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_skip_accepts_uncapped_authenticated_key():
+    seen = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("authorization")))
+        return httpx.Response(200, json={"data": {"limit": None}})
+
+    client = _openrouter_client(handler)
+    try:
+        assert await client.verify_key_limit(1, key_limit_check="skip") is True
+        assert seen == [("/api/v1/key", "Bearer synthetic-paid-key")]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_skip_refuses_authentication_failure():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "synthetic refusal"})
+
+    client = _openrouter_client(handler)
+    try:
+        with pytest.raises(ProviderError, match="PROVIDER_HTTP_401"):
+            await client.verify_key_limit(1, key_limit_check="skip")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_skip_starts_spillover_only_after_key_price_zdr_and_budget_checks():
+    paths = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v1/key":
+            return httpx.Response(200, json={"data": {"limit": None, "limit_reset": None}})
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json=_openrouter_models_response())
+        if request.url.path == "/api/v1/embeddings/models":
+            return httpx.Response(200, json=_embedding_models_response())
+        raise AssertionError("no paid submission")
+
+    paid = _openrouter_client(handler)
+    local = _local_provider_cls()(
+        base_url="http://127.0.0.1:8111/v1", model="local/synthetic", paid_spillover=paid
+    )
+    try:
+        await local.start_spillover_checks(1, key_limit_check="skip")
+        assert local.spillover_enabled is True
+        assert paid._text_verified is True
+        assert paid._chat_zdr_available is True
+        assert paths == [
+            "/api/v1/key", "/api/v1/models", "/api/v1/embeddings/models",
+        ]
+    finally:
+        await local.aclose()
+        await paid.aclose()
+
+
+@pytest.mark.asyncio
+async def test_skip_auth_failure_refuses_spillover_startup():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/key"
+        return httpx.Response(403, json={"error": "synthetic refusal"})
+
+    paid = _openrouter_client(handler)
+    local = _local_provider_cls()(
+        base_url="http://127.0.0.1:8111/v1", model="local/synthetic", paid_spillover=paid
+    )
+    try:
+        with pytest.raises(ProviderError, match="PROVIDER_HTTP_403"):
+            await local.start_spillover_checks(1, key_limit_check="skip")
+        assert local.spillover_enabled is False
+    finally:
+        await local.aclose()
+        await paid.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_skip_warning_is_deduplicated_until_state_change(caplog, monkeypatch):
+    from ptr_llm.providers import local as local_module
+
+    monkeypatch.setattr(local_module, "_key_limit_skip_warning_state", None)
+
+    class Paid:
+        def __init__(self):
+            self.available = True
+            self._chat_zdr_available = True
+            self.checks = 0
+
+        async def verify_key_limit(self, _limit, *, key_limit_check="required"):
+            assert key_limit_check == "skip"
+            self.checks += 1
+            return self.available
+
+        async def verify_pricing(self):
+            pass
+
+    paid = Paid()
+    provider = _local_provider_cls()(
+        base_url="http://127.0.0.1:8111/v1", model="local/synthetic", paid_spillover=paid
+    )
+    with caplog.at_level(logging.WARNING):
+        try:
+            await provider.start_spillover_checks(1, key_limit_check="skip", interval_seconds=0.01)
+            async with asyncio.timeout(1):
+                while paid.checks < 3:
+                    await asyncio.sleep(0.01)
+            assert caplog.text.count("OPENROUTER_KEY_LIMIT_CHECK_SKIPPED") == 1
+            paid.available = False
+            next_check = paid.checks + 1
+            async with asyncio.timeout(1):
+                while paid.checks < next_check:
+                    await asyncio.sleep(0.01)
+            assert caplog.text.count("OPENROUTER_KEY_LIMIT_CHECK_SKIPPED") == 2
+        finally:
+            await provider.aclose()
 
 
 @pytest.mark.asyncio

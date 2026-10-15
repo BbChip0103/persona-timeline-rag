@@ -133,8 +133,10 @@ Upstream interfaces verified against installed SDK and official docs:
 
 Full owner-role provisioning/copy/rollback and nonsecret env templates: [split runbook](../../docs/python-llm-split.md).
 Billable direct OpenRouter use requires explicit live/data approval, trusted
-price ceilings and a configured provider key credit limit; missing or nonfinite
-limits fail startup. Compose keeps `PTR_LLM_SPILLOVER=off` and carries no
+price ceilings and, by default, a configured provider key credit limit; missing or nonfinite
+provider-side key limits fail startup in `required` mode. Explicit
+`PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=skip` still authenticates the key and relies
+on the US$1 ledger cap and account-level limits. Compose keeps `PTR_LLM_SPILLOVER=off` and carries no
 OpenRouter key.
 
 Native split owner operations are `ptr-llm checkpoint-setup` and `ptr-llm retention`.

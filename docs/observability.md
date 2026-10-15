@@ -20,7 +20,7 @@ cost is uncertain: retain the receipt and do not resubmit.
 
  (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
 removes the gateway from the current serving path. The durable provider ledger
-and provider key credit limit enforce paid budget, the EPP owns local routing and
+and, by default, the provider key credit limit enforce paid budget, the EPP owns local routing and
 admission, and the paid OpenRouter key is present only in the Kubernetes worker.
 Rollback restores the old gateway from the private operational snapshot, not
 from files kept in this repository.

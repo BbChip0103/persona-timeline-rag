@@ -140,6 +140,11 @@ spec:
               value: {{ .Values.llm.openrouter.model | quote }}
             - name: PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD
               value: {{ .Values.llm.openrouter.keyMaxLimitUsd | quote }}
+            {{- if not (has .Values.llm.openrouter.keyLimitCheck (list "required" "skip")) }}
+            {{- fail "llm.openrouter.keyLimitCheck must be required or skip" }}
+            {{- end }}
+            - name: PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK
+              value: {{ .Values.llm.openrouter.keyLimitCheck | quote }}
             {{- if .Values.llm.openrouter.syntheticProviderFixture }}
             - name: PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE
               value: "1"

@@ -36,8 +36,8 @@
 | 자체 엔진(RunPod) | `PTR_LLM_PROVIDER=local` 또는 Kubernetes EPP/InferencePool local route | 모든 채팅 턴의 프롬프트 전체(실존 인물 데이터 포함) | RunPod에서 빌린 GPU 호스트(제3자 하드웨어)의 vLLM/SGLang. Compose는 127.0.0.1 SSH 터널로만 접속하고, Kubernetes는 EPP/InferencePool을 통해 접속합니다 |
 
 - OpenRouter 요청(Jev·spillover)은 `data_collection: deny`, `zdr: true`, `allow_fallbacks: false`와 가격 상한을 붙여 보냅니다. 이것은 요청 조건이며, OpenRouter와 그 뒤 제공자가 실제로 지키는지는 이 코드가 검증하지 못합니다.
-- Paid spillover는 DeepInfra ZDR endpoint 확인에 실패하면 꺼집니다. 60초마다 키·가격·ZDR을 다시 확인하며 ZDR 조건을 제거해서 보내지 않습니다. 프롬프트/완성 가격 상한은 백만 token당 US$0.1/US$0.5, 누적 원장 상한은 US$1이며 전용 worker key의 lifetime credit limit도 US$1 이하여야 합니다. 검증은 가짜 OpenRouter만 사용하며 실제 유료 제출은 GPU가 실제 포화일 때만 허용합니다. 제출 전 거절은 로컬 대기로 돌아가고, 제출 후 실패/unknown은 재제출하지 않습니다.
-- Paid spillover는 턴 id를 원장 멱등 키로 씁니다. 같은 턴의 재시도는 끝난 응답을 재사용하거나, 결과가 미확정이면 다시 보내지 않습니다(이중 과금 없음). 예산은 durable ledger와 worker-only provider key credit limit으로 제한합니다.
+- Paid spillover는 DeepInfra ZDR endpoint 확인에 실패하면 꺼집니다. 60초마다 키·가격·ZDR을 다시 확인하며 ZDR 조건을 제거해서 보내지 않습니다. 프롬프트/완성 가격 상한은 백만 token당 US$0.1/US$0.5, 누적 원장 상한은 US$1입니다. 기본 `PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=required`는 전용 worker key의 lifetime credit limit도 US$1 이하로 요구합니다. 명시적 `skip`은 키 인증은 유지하지만 이 per-key 제한을 생략하므로 원장 상한과 계정 단위 제한에 의존하며 지출 위험이 커집니다. 검증은 가짜 OpenRouter만 사용하며 실제 유료 제출은 GPU가 실제 포화일 때만 허용합니다. 제출 전 거절은 로컬 대기로 돌아가고, 제출 후 실패/unknown은 재제출하지 않습니다.
+- Paid spillover는 턴 id를 원장 멱등 키로 씁니다. 같은 턴의 재시도는 끝난 응답을 재사용하거나, 결과가 미확정이면 다시 보내지 않습니다(이중 과금 없음). 예산은 durable ledger로 제한하고, 기본 모드에서는 worker-only provider key credit limit도 적용합니다.
 - Jev 호출이 실패하거나 시간을 넘기면 규칙만으로 처리합니다(fail-open). 페르소나 카드·캡션·모델 응답은 Jev로 보내지 않습니다.
 - RunPod 호스트는 이 저장소 밖의 제3자 장비입니다. 프롬프트는 그 호스트의 엔진 프로세스가 처리하며, 호스트의 디스크·로그 보존과 접근 통제는 이 코드가 관리하지 않습니다. 접속 정보와 호스트 정보는 저장소에 두지 않습니다.
 - 이 표 밖의 직접 OpenRouter 연구 실행(채팅과 질의 임베딩)도 같은 live 조건과 원장으로 OpenRouter에 보냅니다. External image는 위 창작물 계약을 따릅니다.

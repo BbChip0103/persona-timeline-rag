@@ -113,6 +113,8 @@ class Settings:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         env = os.environ if env is None else env
+        if env.get("PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK", "required") not in {"required", "skip"}:
+            raise ConfigurationError("INVALID_OPENROUTER_KEY_LIMIT_CHECK")
         redis_url = _url(
             env.get("PTR_LLM_REDIS_URL", "redis://127.0.0.1:6379/0"),
             {"redis", "rediss"},

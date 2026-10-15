@@ -34,6 +34,7 @@ from .transport import LimitedTransport
 
 _ALLOWED_CAPACITY_DROP_REASONS = frozenset(("rejected-saturated", "rejected-ttl-expired"))
 logger = logging.getLogger(__name__)
+_key_limit_skip_warning_state: bool | None = None
 
 
 class _NoCookies(DefaultCookiePolicy):
@@ -204,13 +205,30 @@ class DirectLocalTextProvider:
                     await self.slot_redis.aclose()
 
     async def start_spillover_checks(
-        self, max_limit_usd: float, *, interval_seconds: float = 60
+        self,
+        max_limit_usd: float,
+        *,
+        key_limit_check: str = "required",
+        interval_seconds: float = 60,
     ) -> None:
         """Fail on key misconfiguration; suspend paid calls during provider outages."""
         if self.paid_spillover is None:
             return
+        if key_limit_check not in {"required", "skip"}:
+            raise ProviderError("INVALID_OPENROUTER_KEY_LIMIT_CHECK")
+
+        async def verify_key() -> bool:
+            if key_limit_check == "skip":
+                return await self.paid_spillover.verify_key_limit(
+                    max_limit_usd, key_limit_check="skip"
+                )
+            return await self.paid_spillover.verify_key_limit(max_limit_usd)
 
         def update_status(available: bool) -> None:
+            global _key_limit_skip_warning_state
+            if key_limit_check == "skip" and _key_limit_skip_warning_state != available:
+                logger.warning("OPENROUTER_KEY_LIMIT_CHECK_SKIPPED")
+                _key_limit_skip_warning_state = available
             if available:
                 if not self.spillover_enabled:
                     logger.warning("OPENROUTER_SPILLOVER_ENABLED")
@@ -225,7 +243,7 @@ class DirectLocalTextProvider:
             set_available(available)
 
         try:
-            available = await self.paid_spillover.verify_key_limit(max_limit_usd)
+            available = await verify_key()
         except ProviderError:
             update_status(False)
             raise
@@ -245,7 +263,7 @@ class DirectLocalTextProvider:
             while True:
                 await asyncio.sleep(interval_seconds)
                 try:
-                    ready = await self.paid_spillover.verify_key_limit(max_limit_usd)
+                    ready = await verify_key()
                     if ready:
                         reverify = getattr(self.paid_spillover, "reverify_spillover", None)
                         if reverify is not None:

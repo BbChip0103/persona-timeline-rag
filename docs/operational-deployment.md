@@ -38,7 +38,7 @@ must match the operating vLLM `max-num-seqs`; inspect the owned GPU deployment
 record without changing RunPod/vLLM. If the value cannot be established, start
 with 8 and review the metrics. Set worker concurrency to ceil(slots × 1.25),
 for example 10 for 8 slots; concurrency at or below slots cannot create overflow
-and produces a startup warning. Only the worker receives the dedicated
+and produces a startup warning. Only the worker receives the approved
 OpenRouter key. Set the backend's `PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to
 the same served model ID, and `PTR_PAID_SPILLOVER=1` when enabling spillover so
 paid-capable drafts require `clientRequestId` (`0` when spillover is off).
@@ -53,8 +53,14 @@ other local failures do not. Before submission, unavailable spillover (including
 budget, price, key or DeepInfra ZDR checks) returns to local slot waiting until
 the turn deadline. After submission, failure or unknown results retain their
 existing accounting and are never resubmitted locally or externally. The
-cumulative ledger cap is US$1, with a separate dedicated key lifetime credit
-limit no greater than US$1; check current cumulative usage before enabling.
+cumulative ledger cap is US$1. By default,
+`PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=required` also requires a dedicated key
+with a lifetime credit limit no greater than US$1. An explicit `skip` accepts
+an authenticated key without that per-key limit, while still checking the key,
+pricing and ZDR every 60 seconds. This increases exposure if the ledger cap or
+account-level limit fails; verify the account-level limit and current cumulative
+usage before enabling. Startup and state changes log
+`OPENROUTER_KEY_LIMIT_CHECK_SKIPPED` without repeating it on every recheck.
 DeepInfra is pinned, with prompt/completion price caps of US$0.1/US$0.5 per
 million tokens. DeepInfra must appear in the ZDR endpoint list; absence disables
 spillover. Key, price and ZDR availability are rechecked every 60 seconds.
@@ -87,7 +93,7 @@ network availability or multi-engine performance.
 
  (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
 removes the gateway from the active operational path. The durable provider
-ledger and the provider key's credit limit enforce paid budget, the EPP owns
+ledger and, by default, the provider key's credit limit enforce paid budget, the EPP owns
 local routing/admission in Kubernetes, and the paid key lives only in the
 worker. Compose uses Redis shared slots for admission; Kubernetes uses EPP. Rollback restores the old gateway from
 the private snapshot rather than from this checkout.
@@ -109,11 +115,12 @@ reservation exposure of a 200-turn V5 run to US$1.00 even if all receipts are
 `unknown`; it does not change the production setting or ledger rules. Do not
 use this procedure for the research or production database.
 
-When paid spillover is enabled, the constrained worker-only OpenRouter key must
+When paid spillover is enabled, the worker-only OpenRouter key must
 not be the first bottleneck during worker scale-out. Its provider-side rate and
 credit limits must cover `autoscaling.worker.maxReplicaCount *
 app.worker.concurrency`, plus operational headroom, while staying within the
-approved maximum credit limit. The worker active-list scaler threshold derives
+approved maximum credit limit when the per-key check is required. With `skip`,
+verify equivalent account-level limits separately. The worker active-list scaler threshold derives
 from `app.worker.concurrency`, so the active trigger tracks that same capacity
 instead of a separate stale value.
 The kind EPP queue TTL is two seconds. The V5 synthetic run slows the simulator
@@ -469,8 +476,10 @@ PY
    after these edits. The helper must reject a missing/duplicate key, slots
    outside 1–256, waits outside 100–10000 ms, a paid key while spillover is off,
    and `PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE=1` in operational configuration.
-   Startup separately verifies the dedicated key lifetime limit ≤ US$1, prices
-   and DeepInfra ZDR. Tests use synthetic fixtures only; never enable that flag
+   Startup separately verifies the dedicated key lifetime limit ≤ US$1 by
+   default, and always verifies key authentication, prices and DeepInfra ZDR.
+   Set `PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=skip` only for the approved
+   account-level-limit exception; `check compose` prints a warning. Tests use synthetic fixtures only; never enable that flag
    against `ptr_split_research`.
 
    Check that the `NEW_OP_ENV` path entries point to these new private files.

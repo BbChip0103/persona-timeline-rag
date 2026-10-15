@@ -32,6 +32,7 @@ SETTINGS = Settings(
         ({"PTR_LLM_LOCAL_SLOTS": "bad"}, "INVALID_RUNTIME_CONFIG"),
         ({"PTR_LLM_SPILLOVER_WAIT_MS": "99"}, "INVALID_RUNTIME_CONFIG"),
         ({"PTR_LLM_SPILLOVER_WAIT_MS": "10001"}, "INVALID_RUNTIME_CONFIG"),
+        ({"PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK": "invalid"}, "INVALID_RUNTIME_CONFIG"),
         (
             {"PTR_LLM_SPILLOVER": "openrouter", "OPENROUTER_API_KEY": "synthetic"},
             "COMPOSE_OPENROUTER_KEYS_FORBIDDEN",
@@ -86,6 +87,17 @@ async def test_compose_keys_allowed_only_with_spill_and_slots():
     assert Settings.from_env(env).database_url == URL
     with pytest.raises(ConfigurationError, match="COMPOSE_OPENROUTER_KEYS_FORBIDDEN"):
         Settings.from_env({**env, "PTR_LLM_SPILLOVER": "off"})
+
+
+def test_settings_rejects_invalid_key_limit_check():
+    with pytest.raises(ConfigurationError, match="INVALID_OPENROUTER_KEY_LIMIT_CHECK"):
+        Settings.from_env(
+            {
+                "PTR_LLM_DATABASE_URL": URL,
+                "PTR_LLM_CONTROL_TOKEN": "synthetic-control-key-that-is-long-enough",
+                "PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK": "invalid",
+            }
+        )
 
 
 async def test_memory_ledger_remaining_is_read_only_and_tracks_reservations():

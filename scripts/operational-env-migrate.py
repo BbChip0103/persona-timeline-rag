@@ -24,6 +24,7 @@ LOCAL_KEYS = {
     "PTR_LLM_SPILLOVER_WAIT_MS": "2000",
     "PTR_LLM_CONCURRENCY": "10",
     "PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD": "1",
+    "PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK": "required",
     "PTR_LLM_EMBEDDING_PROVIDER": "off",
     "PTR_LLM_INTENT_CLASSIFIER": "off",
     "PTR_LLM_SAFETY_FILTER": "off",
@@ -38,7 +39,7 @@ COMPOSE_KEYS = {
     "PTR_OPERATIONAL_WEB_ENV_FILE": "",
 }
 REQUIRED = {
-    "worker": set(LOCAL_KEYS),
+    "worker": set(LOCAL_KEYS) - {"PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK"},
     "backend": set(BACKEND_KEYS),
     "compose": set(COMPOSE_KEYS)
     | {
@@ -152,6 +153,9 @@ def _values(kind: str, path: Path) -> dict[str, str]:
 
 def _check_spillover(values: dict[str, str]) -> None:
     enabled = values.get("PTR_LLM_SPILLOVER") == "openrouter"
+    key_limit_check = values.get("PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK", "required")
+    if key_limit_check not in {"required", "skip"}:
+        raise ValueError("invalid PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK")
     if values.get("PTR_LLM_SPILLOVER", "off") not in {"off", "openrouter"}:
         raise ValueError("invalid PTR_LLM_SPILLOVER")
     if enabled:
@@ -185,6 +189,8 @@ def _check_spillover(values: dict[str, str]) -> None:
         raise ValueError("invalid slot, concurrency or wait setting")
     if enabled and concurrency <= slots:
         print("warning: PTR_LLM_CONCURRENCY <= PTR_LLM_LOCAL_SLOTS")
+    if enabled and key_limit_check == "skip":
+        print("warning: per-key limit check skipped; budget relies on the ledger cap and account-level limits")
     if not enabled:
         for key in ("PTR_LLM_LIVE_ENABLED", "PTR_LLM_ALLOW_EXTERNAL_DATA"):
             if values.get(key) == "1":

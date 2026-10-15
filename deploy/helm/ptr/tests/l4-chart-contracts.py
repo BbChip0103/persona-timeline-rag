@@ -71,8 +71,21 @@ def assert_worker_timeout_and_key_limit() -> None:
     worker_env = container_env(docs, "ptr-worker", "worker")
     assert worker_env["PTR_LLM_MODEL_TIMEOUT_MS"]["value"] == "25000"
     assert worker_env["PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD"]["value"] == "1"
+    assert worker_env["PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK"]["value"] == "required"
     values = yaml.safe_load(PROD_VALUES.read_text(encoding="utf-8"))
     assert values["llm"]["openrouter"]["keyMaxLimitUsd"] == "1"
+    defaults = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+    assert defaults["llm"]["openrouter"]["keyLimitCheck"] == "required"
+    skipped = render("--values", str(PROD_VALUES), "--set", "llm.openrouter.keyLimitCheck=skip")
+    assert container_env(skipped, "ptr-worker", "worker")[
+        "PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK"
+    ]["value"] == "skip"
+    try:
+        render("--values", str(PROD_VALUES), "--set", "llm.openrouter.keyLimitCheck=invalid")
+    except AssertionError as error:
+        assert "keyLimitCheck must be required or skip" in str(error)
+    else:
+        raise AssertionError("invalid chart key limit mode rendered")
 
 
 def assert_egress_shapes() -> None:

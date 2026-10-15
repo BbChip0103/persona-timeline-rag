@@ -100,6 +100,18 @@ class OperationalEnvMigrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("concurrency", result.stdout.lower())
             self.assertNotIn("synthetic-private", result.stdout + result.stderr)
+            skip_line = "PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=skip\n"
+            worker.write_text(worker.read_text() + skip_line)
+            result = run("check", "compose", compose)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "per-key limit check skipped; budget relies on the ledger cap and account-level limits",
+                result.stdout,
+            )
+            self.assertNotIn("synthetic-private", result.stdout + result.stderr)
+            worker.write_text(worker.read_text().replace(skip_line, skip_line.replace("skip", "bad")))
+            self.assertNotEqual(run("check", "compose", compose).returncode, 0)
+            worker.write_text(worker.read_text().replace("PTR_LLM_OPENROUTER_KEY_LIMIT_CHECK=bad\n", ""))
             backend.write_text("PTR_PAID_SPILLOVER=0\n")
             self.assertNotEqual(run("check", "compose", compose).returncode, 0)
             backend.write_text("PTR_PAID_SPILLOVER=true\n")
