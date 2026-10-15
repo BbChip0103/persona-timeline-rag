@@ -12,4 +12,4 @@ def test_worker_load_uses_smoke_reply_shape() -> None:
         assert "evidenceRefs: []" in source
         assert "variableUpdates: {}" in source
     assert "final.completed > turnIds.length / 2" in load
-    assert "engine ScaledObject must be pinned to two replicas for V5" in load
+    assert "engine ScaledObject must match the expected pinned replicas" in load

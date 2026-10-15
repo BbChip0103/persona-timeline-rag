@@ -123,10 +123,10 @@ jobs:
       - name: Helm lint
         run: |
           (cd deploy/helm/ptr-router && sha256sum -c llm-d-router-standalone.sha256)
-          helm lint deploy/helm/ptr --values deploy/helm/ptr/values-kind.yaml
-          helm lint deploy/helm/ptr --values deploy/helm/ptr/values-prod.yaml
-          helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-kind.yaml
-          helm lint deploy/helm/ptr-router --values deploy/helm/ptr-router/values-prod.yaml
+          helm lint --strict deploy/helm/ptr --values deploy/helm/ptr/values-kind.yaml
+          helm lint --strict deploy/helm/ptr --values deploy/helm/ptr/values-prod.yaml
+          helm lint --strict deploy/helm/ptr-router --values deploy/helm/ptr-router/values-kind.yaml
+          helm lint --strict deploy/helm/ptr-router --values deploy/helm/ptr-router/values-prod.yaml
       - name: Prod render excludes synthetic OpenRouter fixture settings
         run: bash deploy/helm/ptr/tests/prod-render-no-kind-fixtures.sh
       - name: Synthetic bootstrap SQL matches the source migrations
@@ -164,6 +164,9 @@ jobs:
             local rendered
             rendered="$RUNNER_TEMP/${release}-${namespace}-$(basename "$values").yaml"
             helm template "$release" "$chart" --namespace "$namespace" --values "$values" > "$rendered"
+            if [[ "$chart" == deploy/helm/ptr ]]; then
+              test "$(grep -c '^kind: ServiceMonitor$' "$rendered")" -eq 3
+            fi
             kubeconform -strict -summary -skip InferencePool,ScaledObject,TriggerAuthentication,ClusterTriggerAuthentication,ServiceMonitor -schema-location default "$rendered"
             for expected in "$@"; do
               local kind="${expected%%:*}"

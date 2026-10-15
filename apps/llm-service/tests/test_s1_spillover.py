@@ -120,6 +120,16 @@ async def test_post_submit_failure_does_not_retry_local():
 
 
 async def test_cluster_retries_epp_without_resubmitting_paid(monkeypatch):
+    from ptr_llm.spillover_metrics import render
+
+    def retry_count() -> float:
+        line = next(
+            line for line in render().decode().splitlines()
+            if line.startswith("ptr_llm_local_capacity_retries_total ")
+        )
+        return float(line.split()[-1])
+
+    retries_before = retry_count()
     monkeypatch.setattr("ptr_llm.providers.local.random.uniform", lambda _a, _b: 0.25)
     local_calls = []
     paid_calls = []
@@ -156,6 +166,7 @@ async def test_cluster_retries_epp_without_resubmitting_paid(monkeypatch):
         assert len(local_calls) == 4
         assert len(paid_calls) == 1
         assert metrics[-1]["attempts"] == 4
+        assert retry_count() - retries_before == 3
     finally:
         await provider.aclose()
 

@@ -175,9 +175,11 @@ HPA targets 70% CPU for web and API. The worker's composed KEDA metric targets
 one replica per unit of
 `min(max(wait/8, active/C), ceil(readyEngines * S * H / C))`, where `S` is
 engine `maxNumSeqs`, `C` is worker concurrency, and `H` is
-`desiredEngines > readyEngines ? scaleUpHeadroom : steadyHeadroom`.
+`(desiredEngines > readyEngines || spilloverAvailable > 0) ? spillHeadroom : steadyHeadroom`.
 The two chart knobs default to `autoscaling.worker.steadyHeadroom=1.0` and
-`scaleUpHeadroom=1.25`. `wait` and `active` are BullMQ list lengths;
+`spillHeadroom=1.25`. The former `scaleUpHeadroom` value is folded into
+`spillHeadroom`, so engine scale-up retains the same worker cap. `wait` and
+`active` are BullMQ list lengths;
 `readyEngines` comes from `kube_deployment_status_replicas_ready`, and the
 scale-up comparison uses `kube_deployment_spec_replicas` for the same engine
 Deployment. Prometheus `up` can see a simulator before its readiness probe
@@ -189,11 +191,11 @@ production monitoring must use the same namespace-scoped RBAC and scrape the
 same metrics. Grafana and
 Alertmanager stay disabled in kind.
 
-At a stable engine count, worker capacity matches the ready GPU capacity, so a
-sustained backlog alone does not create paid spillover. During engine startup,
-the temporary 1.25 headroom can admit more work than the ready engines can
-serve; EPP saturation may then grant paid spillover. The paid ledger and the
-approved 1 USD kind cap still bound usage. In kind (`S=2`, `C=2`), the steady
+At a stable engine count, worker capacity matches the ready GPU capacity when
+spillover is unavailable. While spillover is available or engines scale up,
+the 1.25 headroom can admit more work than the ready engines can serve; EPP
+saturation may then grant paid spillover. The ledger and the approved 1 USD
+kind cap still bound usage. In kind (`S=2`, `C=2`), the steady
 caps are 1 and 2 workers for one and two engines, respectively. Kind sets the
 worker minimum to 1 so the one-engine steady count matches capacity. The
 scale-up caps from one and two ready engines are 2 and 3 workers, respectively.
@@ -206,8 +208,10 @@ a 120 s HPA scale-down stabilization window. KEDA's 10 s polling interval
 refreshes status; HPA queries the metric independently at this minimum.
 If the ready-engine series disappears, the `engines` trigger's
 `ignoreNullValues: "false"` makes the missing result an error instead of feeding
-zero into the worker formula. The `scaling_up`
-trigger retains `or vector(0)`. If any scaler fails 3 consecutive metric reads,
+zero into the worker formula. The `scaling_up` and `spill` triggers retain
+`or vector(0)`. The spill trigger reads
+`max(ptr_llm_spillover_available) or vector(0)` from worker `/metrics`;
+zero means the ledger cannot reserve another call. If any scaler fails 3 consecutive metric reads,
 KEDA `currentReplicasIfLower` emits the current
 worker count when it is below `fallback.replicas=4`, otherwise 4, until metrics
 recover.
@@ -247,8 +251,10 @@ Daily split and framework retention are CronJobs. Kind runs weekly review jobs
 as synthetic smoke only; production runs them on the host. `Forbid` stops
 scheduled overlap only: operators must serialize manual Jobs themselves.
 
-ServiceMonitors scrape API `/metrics/prom`, EPP `/metrics`
-and vLLM `/metrics`. The worker has no metrics HTTP endpoint in this deployment.
+ServiceMonitors scrape API `/metrics/prom`, worker `/metrics`, EPP `/metrics`
+and vLLM `/metrics`. In cluster mode the worker binds `0.0.0.0:58442` so
+Prometheus can scrape it through the worker Service; Compose retains its
+loopback default.
 Alert on nonterminal turn age/outbox growth, API readiness, queue wait and KEDA
 fallback, missing engine scrape data, EPP drops versus saturation/timeouts,
 engine readiness/restarts, spillover rate, and paid budget/unknown receipts.

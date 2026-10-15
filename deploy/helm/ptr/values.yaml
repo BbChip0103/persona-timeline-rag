@@ -61,10 +61,11 @@ autoscaling:
     minReplicaCount: 2
     maxReplicaCount: 40
     # The worker cap is ceil(ready_engines * engine.maxNumSeqs * headroom / concurrency).
-    # steadyHeadroom keeps workers matched to ready GPU capacity. scaleUpHeadroom
-    # applies only while the engine Deployment's desired replicas exceed ready replicas.
+    # steadyHeadroom matches ready GPU capacity. spillHeadroom applies while the
+    # engine Deployment scales up or a worker reports spillover available.
+    # This folds the former scaleUpHeadroom setting into the same headroom value.
     steadyHeadroom: "1.0"
-    scaleUpHeadroom: "1.25"
+    spillHeadroom: "1.25"
     # KEDA currentReplicasIfLower keeps the current worker count when it is
     # below fallback.replicas, and otherwise emits fallback.replicas. This
     # prevents a metrics outage from overcommitting a small run while capping a
@@ -124,6 +125,8 @@ monitoring:
     interval: 15s
     api:
       path: /metrics/prom
+    worker:
+      path: /metrics
     engine:
       path: /metrics
 

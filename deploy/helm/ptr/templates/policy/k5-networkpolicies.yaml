@@ -26,6 +26,23 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: ptr-worker-monitoring-ingress
+  namespace: {{ $app }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: worker}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ptr-monitoring}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: prometheus}
+      ports: [{protocol: TCP, port: 58442}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: ptr-maintenance-to-data
   namespace: {{ $app }}
 spec:

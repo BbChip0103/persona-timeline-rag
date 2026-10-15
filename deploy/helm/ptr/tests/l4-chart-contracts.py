@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[4]
 CHART = ROOT / "deploy" / "helm" / "ptr"
 PROD_VALUES = CHART / "values-prod.yaml"
+KIND_VALUES = CHART / "values-kind.yaml"
 
 
 def render(*args: str) -> list[dict]:
@@ -101,10 +103,64 @@ def assert_egress_shapes() -> None:
     assert policies(prod_off, "ptr-worker-to-openrouter-") == []
 
 
+def assert_worker_spill_capacity_and_metrics() -> None:
+    for enabled in ("true", "false"):
+        removed = subprocess.run(
+            ["timeout", "60s", "helm", "template", "ptr", str(CHART),
+             "--values", str(KIND_VALUES),
+             "--set", "autoscaling.worker.scaleUpHeadroom=1.5",
+             "--set", f"autoscaling.worker.enabled={enabled}"],
+            text=True, capture_output=True, check=False,
+        )
+        assert removed.returncode != 0
+        assert "autoscaling.worker.scaleUpHeadroom was removed" in removed.stderr
+    for values_path in (KIND_VALUES, PROD_VALUES):
+        docs = render("--values", str(values_path))
+        values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+        assert values["autoscaling"]["worker"]["spillHeadroom"] == "1.25"
+        worker = named(docs, "ScaledObject", "ptr-worker")
+        formula = worker["spec"]["advanced"]["scalingModifiers"]["formula"]
+        assert "(scaling_up > 0 || spill > 0 ? 1.25 : 1.0)" in formula
+        spill = next(trigger for trigger in worker["spec"]["triggers"] if trigger.get("name") == "spill")
+        assert spill["type"] == "prometheus"
+        app_namespace = named(docs, "ScaledObject", "ptr-worker")["metadata"]["namespace"]
+        assert spill["metadata"]["query"] == f'max(ptr_llm_spillover_available{{namespace="{app_namespace}"}}) or vector(0)'
+        assert spill["metadata"]["threshold"] == "1"
+
+        engine_kind = yaml.safe_load(values_path.read_text(encoding="utf-8"))["inference"]["engine"]["kind"]
+        engine = named(docs, "ScaledObject", f"ptr-{engine_kind}")
+        engine_formula = engine["spec"]["advanced"]["scalingModifiers"]["formula"]
+        overrides = yaml.safe_load(values_path.read_text(encoding="utf-8"))
+        steady_headroom = overrides.get("autoscaling", {}).get("worker", {}).get(
+            "steadyHeadroom", values["autoscaling"]["worker"]["steadyHeadroom"]
+        )
+        match = re.search(r"\(wait \+ active\) / \(\d+ \* ([0-9.]+)\)", engine_formula)
+        assert match is not None and match.group(1) == str(steady_headroom)
+        assert "spill" not in engine_formula
+
+        service = named(docs, "Service", "ptr-worker")
+        assert service["metadata"]["labels"]["ptr.io/monitoring"] == "true"
+        assert service["spec"]["ports"] == [{"name": "http", "port": 58442, "targetPort": "http"}]
+        monitor = named(docs, "ServiceMonitor", "ptr-worker")
+        assert monitor["spec"]["selector"]["matchLabels"]["app.kubernetes.io/component"] == "worker"
+        assert monitor["spec"]["selector"]["matchLabels"]["ptr.io/monitoring"] == "true"
+        assert monitor["spec"]["endpoints"] == [{"port": "http", "path": "/metrics", "interval": "15s"}]
+        policy = named(docs, "NetworkPolicy", "ptr-worker-monitoring-ingress")
+        assert policy["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "worker"
+        assert policy["spec"]["ingress"] == [
+            {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ptr-monitoring"}},
+                       "podSelector": {"matchLabels": {"app.kubernetes.io/name": "prometheus"}}}],
+             "ports": [{"protocol": "TCP", "port": 58442}]}
+        ]
+        assert container_env(docs, "ptr-worker", "worker")["PTR_LLM_HOST"]["value"] == "0.0.0.0"
+
+
 def main() -> int:
     assert_spillover_env()
     assert_worker_timeout_and_key_limit()
     assert_egress_shapes()
+    assert_worker_spill_capacity_and_metrics()
+    print("chart contract tests: 4 passed")
     return 0
 
 

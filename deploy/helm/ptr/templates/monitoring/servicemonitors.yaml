@@ -16,6 +16,24 @@ spec:
     - port: http
       path: {{ .Values.monitoring.serviceMonitors.api.path | quote }}
       interval: {{ .Values.monitoring.serviceMonitors.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ptr-worker
+  namespace: {{ .Values.namespaces.app }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Values.namespaces.app | quote }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ptr
+      app.kubernetes.io/component: worker
+      ptr.io/monitoring: "true"
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.serviceMonitors.worker.path | quote }}
+      interval: {{ .Values.monitoring.serviceMonitors.interval }}
 {{- if .Values.inference.enabled }}
 ---
 apiVersion: monitoring.coreos.com/v1

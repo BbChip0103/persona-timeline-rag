@@ -207,8 +207,12 @@ class InferenceChartContractTest(unittest.TestCase):
         )
         api_hpa = document(result.stdout, "HorizontalPodAutoscaler", "ptr-api")
         engine_monitor = document(result.stdout, "ServiceMonitor", "ptr-engine")
+        worker_monitor = document(result.stdout, "ServiceMonitor", "ptr-worker")
+        worker_service = document(result.stdout, "Service", "ptr-worker")
         api_service = document(result.stdout, "Service", "ptr-api")
         engine_service = document(result.stdout, "Service", "ptr-engine-metrics")
+        self.assertIn("path: \"/metrics\"", worker_monitor)
+        self.assertIn('ptr.io/monitoring: "true"', worker_service)
 
         for field in (
             "minReplicaCount: 1",
@@ -424,6 +428,7 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for name, port in (
             ("ptr-api-monitoring-ingress", 56441),
+            ("ptr-worker-monitoring-ingress", 58442),
             ("ptr-inference-monitoring-ingress", 8000),
             ("ptr-epp-monitoring-ingress", 9090),
             ("ptr-keda-redis-ingress", 6379),
@@ -437,6 +442,7 @@ class InferenceChartContractTest(unittest.TestCase):
             self.assertIn(f"port: {port}", policy)
         for name in (
             "ptr-api-monitoring-ingress",
+            "ptr-worker-monitoring-ingress",
             "ptr-inference-monitoring-ingress",
             "ptr-epp-monitoring-ingress",
         ):
@@ -518,6 +524,7 @@ class InferenceChartContractTest(unittest.TestCase):
 
         for name, port in (
             ("ptr-api-monitoring-ingress", 56441),
+            ("ptr-worker-monitoring-ingress", 58442),
             ("ptr-inference-monitoring-ingress", 8000),
             ("ptr-epp-monitoring-ingress", 9090),
         ):
@@ -543,6 +550,7 @@ class InferenceChartContractTest(unittest.TestCase):
 
         for allowed in (
             "app.kubernetes.io/component: api",
+            "app.kubernetes.io/component: worker",
             "app.kubernetes.io/component: inference-engine",
             "llm-d-router-standalone: chat-primary-epp",
         ):
@@ -567,6 +575,7 @@ class InferenceChartContractTest(unittest.TestCase):
 
         expected = {
             "ptr-api-monitoring-ingress": 56441,
+            "ptr-worker-monitoring-ingress": 58442,
             "ptr-inference-monitoring-ingress": 8000,
             "ptr-epp-monitoring-ingress": 9090,
             "ptr-kube-state-metrics-ingress": 8080,
@@ -740,11 +749,11 @@ class InferenceChartContractTest(unittest.TestCase):
                     "formula": (
                         f"min(max(wait / 8, active / {concurrency}), "
                         f"ceil(engines * {max_num_seqs} * "
-                        f"(scaling_up > 0 ? 1.25 : 1.0) / {concurrency}))"
+                        f"(scaling_up > 0 || spill > 0 ? 1.25 : 1.0) / {concurrency}))"
                     ),
                     "target": "1", "metricType": "AverageValue",
                 })
-                wait, active, engines, scaling_up = worker["triggers"]
+                wait, active, engines, scaling_up, spill = worker["triggers"]
                 self.assertEqual(
                     [(trigger["name"], trigger["type"]) for trigger in worker["triggers"]],
                     [
@@ -752,6 +761,7 @@ class InferenceChartContractTest(unittest.TestCase):
                         ("active", "redis"),
                         ("engines", "prometheus"),
                         ("scaling_up", "prometheus"),
+                        ("spill", "prometheus"),
                     ],
                 )
                 self.assertEqual(wait["metadata"]["listName"], "ptr:turns:wait")
@@ -760,20 +770,25 @@ class InferenceChartContractTest(unittest.TestCase):
                 self.assertEqual(active["metadata"]["listLength"], str(concurrency))
                 self.assertEqual(engines["metadata"]["threshold"], "1")
                 self.assertEqual(scaling_up["metadata"]["threshold"], "1")
+                self.assertEqual(spill["metadata"]["threshold"], "1")
+                self.assertEqual(
+                    spill["metadata"]["query"],
+                    'max(ptr_llm_spillover_available{namespace="ptr-app"}) or vector(0)',
+                )
 
         changed = helm_template(
             "kind", "--set", "app.worker.concurrency=5",
             "--set", "inference.engine.maxNumSeqs=6",
             "--set", "autoscaling.worker.redis.waitListLength=16",
             "--set", "autoscaling.worker.steadyHeadroom=1.1",
-            "--set", "autoscaling.worker.scaleUpHeadroom=1.5",
+            "--set", "autoscaling.worker.spillHeadroom=1.5",
         )
         self.assertEqual(changed.returncode, 0, changed.stderr)
         worker = parsed_document(changed.stdout, "ScaledObject", "ptr-worker")["spec"]
         self.assertEqual(
             worker["advanced"]["scalingModifiers"]["formula"],
             "min(max(wait / 16, active / 5), "
-            "ceil(engines * 6 * (scaling_up > 0 ? 1.5 : 1.1) / 5))",
+            "ceil(engines * 6 * (scaling_up > 0 || spill > 0 ? 1.5 : 1.1) / 5))",
         )
 
     def test_kind_v5_queue_wait_and_engine_scale_match_synthetic_capacity(self) -> None:

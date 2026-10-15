@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from ptr_llm.billing import ProviderError, SpilloverNotSubmitted
 from ptr_llm.config import _svc_host
-from ptr_llm.spillover_metrics import set_available
+from ptr_llm.spillover_metrics import record_capacity_retry, set_available
 
 from .common import (
     bounded,
@@ -575,6 +575,7 @@ class DirectLocalTextProvider:
                         delay = min(random.uniform(0.25, 1), remaining_ms / 1000)
                         if delay <= 0:
                             raise ProviderError(timeout_code)
+                        record_capacity_retry()
                         if signal is None:
                             await asyncio.sleep(delay)
                         else:

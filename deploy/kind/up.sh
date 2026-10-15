@@ -90,6 +90,11 @@ pull_pinned_chart() {
 keda_chart="$(pull_pinned_chart keda keda 2.21.0 a7da56bf41a33dad9d2fc82a6fdecee552fff947d80bf1e1dbcf4db0f9e26dee)"
 metrics_server_chart="$(pull_pinned_chart metrics-server metrics-server 3.14.0 c2ca1185c01e6e7f53dd1b7d131f0c9b3fa50e003ed068b784563a1b5a3422a1)"
 prometheus_chart="$(pull_pinned_chart prometheus-community kube-prometheus-stack 92.3.1 5c976ae9562ec3b28b571f38e109e5d3f2ea3355573da416cd06be52dce6bd6a)"
+# Namespace-scoped kube-state-metrics RBAC in the monitoring chart needs this
+# target namespace on the first install, before the InferencePool CRD is added.
+"${kubectl_cmd[@]}" create namespace ptr-inference --dry-run=client -o yaml |
+  "${kubectl_cmd[@]}" label --local -f - ptr.io/namespace=inference -o yaml |
+  "${kubectl_cmd[@]}" apply -f - >/dev/null
 "$helm_bin" --kube-context "kind-$cluster_name" upgrade --install ptr-keda "$keda_chart" \
   --version 2.21.0 --namespace ptr-keda --create-namespace --values "$script_dir/keda-values.yaml" \
   --wait --timeout 5m >/dev/null
@@ -110,9 +115,6 @@ printf '%s  %s\n' "$gie_sha256" "$gie_manifest" | sha256sum -c - >/dev/null
 "${kubectl_cmd[@]}" wait --for=condition=Established --timeout=60s crd/inferencepools.inference.networking.k8s.io >/dev/null
 "${kubectl_cmd[@]}" get crd inferencepools.inference.networking.k8s.io -o json |
   jq -e '.spec.versions[] | select(.name == "v1" and .served == true)' >/dev/null
-"${kubectl_cmd[@]}" create namespace ptr-inference --dry-run=client -o yaml |
-  "${kubectl_cmd[@]}" label --local -f - ptr.io/namespace=inference -o yaml |
-  "${kubectl_cmd[@]}" apply -f - >/dev/null
 
 stamp="$(date -u +%Y%m%d%H%M%S%N)-$(openssl rand -hex 4)"
 git_rev="$(git -C "$repo_root" rev-parse --short=12 HEAD 2>/dev/null || printf 'nogit')"

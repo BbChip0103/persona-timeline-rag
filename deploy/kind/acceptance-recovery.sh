@@ -34,6 +34,17 @@ fi
 mkdir -p "$evidence_dir"
 chmod 700 "$evidence_dir"
 
+kind_helm_upgrade() {
+  local control_plane_ip
+  control_plane_ip="$(timeout 10s docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ptr-k8s-control-plane)"
+  [[ "$control_plane_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
+    --reuse-values -f "$kind_values" \
+    --set-string "inference.apiServerCIDRs[1]=$control_plane_ip/32" \
+    --set-string "policy.apiServerCIDRs[1]=$control_plane_ip/32" \
+    "$@" --wait
+}
+
 usage() {
   cat <<USAGE
 Usage: $0 V1|V2|V3|V4|V9|V11|all
@@ -130,31 +141,30 @@ cleanup_job() {
 
 restore_redis_replicas() {
   if [[ -n "${original_redis_replicas:-}" ]]; then
-    timeout 60s kubectl --context "$context" -n "$data_ns" scale statefulset/ptr-redis --replicas="$original_redis_replicas" >/dev/null 2>&1 || true
-    timeout 180s kubectl --context "$context" -n "$data_ns" rollout status statefulset/ptr-redis >/dev/null 2>&1 || true
+    timeout 60s kubectl --context "$context" -n "$data_ns" scale statefulset/ptr-redis --replicas="$original_redis_replicas" >/dev/null || { echo "restore failed: Redis replicas" >&2; return 1; }
+    timeout 180s kubectl --context "$context" -n "$data_ns" rollout status statefulset/ptr-redis >/dev/null || { echo "restore failed: Redis rollout" >&2; return 1; }
     original_redis_replicas=""
   fi
 }
 
 restore_node() {
   if [[ -n "${drained_node:-}" ]]; then
-    timeout 60s kubectl --context "$context" uncordon "$drained_node" >/dev/null 2>&1 || true
+    timeout 60s kubectl --context "$context" uncordon "$drained_node" >/dev/null || { echo "restore failed: node uncordon" >&2; return 1; }
     drained_node=""
   fi
 }
 
 restore_engine_replicas() {
   if [[ -n "${original_engine_replicas:-}" ]]; then
-    timeout 120s kubectl --context "$context" -n "$inference_ns" scale deployment/ptr-sim --replicas="$original_engine_replicas" >/dev/null 2>&1 || true
-    timeout 180s kubectl --context "$context" -n "$inference_ns" rollout status deployment/ptr-sim >/dev/null 2>&1 || true
+    timeout 120s kubectl --context "$context" -n "$inference_ns" scale deployment/ptr-sim --replicas="$original_engine_replicas" >/dev/null || { echo "restore failed: engine replicas" >&2; return 1; }
+    timeout 180s kubectl --context "$context" -n "$inference_ns" rollout status deployment/ptr-sim >/dev/null || { echo "restore failed: engine rollout" >&2; return 1; }
     original_engine_replicas=""
   fi
 }
 
 restore_engine_min() {
   if [[ -n "${original_engine_min:-}" ]]; then
-    timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
-      --reuse-values -f "$kind_values" --set autoscaling.engine.minReplicaCount="$original_engine_min" --wait >/dev/null 2>&1 || true
+    kind_helm_upgrade --set autoscaling.engine.minReplicaCount="$original_engine_min" >/dev/null || { echo "restore failed: engine minimum" >&2; return 1; }
     original_engine_min=""
   fi
 }
@@ -163,11 +173,9 @@ restore_engine_min() {
 
 restore_engine_values_file() {
   if [[ -n "${restore_engine_values:-}" ]]; then
-    timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
-      --reuse-values -f "$kind_values" \
+    kind_helm_upgrade \
       --set inference.engine.timeToFirstToken="${original_engine_time_to_first_token:-8s}" \
-      --set inference.engine.interTokenLatency="${original_engine_inter_token_latency:-0s}" \
-      --wait >/dev/null 2>&1 || true
+      --set inference.engine.interTokenLatency="${original_engine_inter_token_latency:-0s}" >/dev/null || { echo "restore failed: engine latency values" >&2; return 1; }
     restore_engine_values=""
     original_engine_time_to_first_token=""
     original_engine_inter_token_latency=""
@@ -187,9 +195,9 @@ pause_worker_autoscaling() {
 restore_worker_autoscaling() {
   if [[ -n "${worker_autoscaling_restore_needed:-}" ]]; then
     if [[ -n "${original_worker_scaledobject_paused:-}" ]]; then
-      timeout 60s kubectl --context "$context" -n "$app_ns" annotate scaledobject ptr-worker autoscaling.keda.sh/paused="$original_worker_scaledobject_paused" --overwrite >/dev/null 2>&1 || true
+      timeout 60s kubectl --context "$context" -n "$app_ns" annotate scaledobject ptr-worker autoscaling.keda.sh/paused="$original_worker_scaledobject_paused" --overwrite >/dev/null || { echo "restore failed: worker autoscaling annotation" >&2; return 1; }
     else
-      timeout 60s kubectl --context "$context" -n "$app_ns" annotate scaledobject ptr-worker autoscaling.keda.sh/paused- >/dev/null 2>&1 || true
+      timeout 60s kubectl --context "$context" -n "$app_ns" annotate scaledobject ptr-worker autoscaling.keda.sh/paused- >/dev/null || { echo "restore failed: worker autoscaling annotation" >&2; return 1; }
     fi
     original_worker_scaledobject_paused=""
     worker_autoscaling_restore_needed=""
@@ -198,33 +206,40 @@ restore_worker_autoscaling() {
 
 restore_worker_replicas() {
   if [[ -n "${original_worker_replicas:-}" ]]; then
-    timeout 120s kubectl --context "$context" -n "$app_ns" scale deployment/ptr-worker --replicas="$original_worker_replicas" >/dev/null 2>&1 || true
-    timeout 180s kubectl --context "$context" -n "$app_ns" rollout status deployment/ptr-worker >/dev/null 2>&1 || true
+    timeout 120s kubectl --context "$context" -n "$app_ns" scale deployment/ptr-worker --replicas="$original_worker_replicas" >/dev/null || { echo "restore failed: worker replicas" >&2; return 1; }
+    timeout 180s kubectl --context "$context" -n "$app_ns" rollout status deployment/ptr-worker >/dev/null || { echo "restore failed: worker rollout" >&2; return 1; }
     original_worker_replicas=""
   fi
 }
 
 restore_api_replicas() {
   if [[ -n "${original_api_replicas:-}" ]]; then
-    timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
-      --reuse-values -f "$kind_values" --wait >/dev/null 2>&1 || true
+    kind_helm_upgrade >/dev/null || { echo "restore failed: API replicas" >&2; return 1; }
     original_api_replicas=""
   fi
 }
 
 cleanup_all() {
+  local status=0
   cleanup_client
   cleanup_job
-  restore_redis_replicas
-  restore_node
-  restore_worker_autoscaling
-  restore_worker_replicas
-  restore_engine_values_file
-  restore_api_replicas
-  restore_engine_min
-  restore_engine_replicas
+  restore_redis_replicas || status=1
+  restore_node || status=1
+  restore_worker_autoscaling || status=1
+  restore_worker_replicas || status=1
+  restore_engine_values_file || status=1
+  restore_api_replicas || status=1
+  restore_engine_min || status=1
+  restore_engine_replicas || status=1
+  return "$status"
 }
-trap cleanup_all EXIT
+finish() {
+  local status=$?
+  trap - EXIT
+  cleanup_all || status=1
+  exit "$status"
+}
+trap finish EXIT
 
 create_api_client() {
   cleanup_client
@@ -1203,6 +1218,21 @@ try {
 NODE
 }
 
+worker_admitted_count_js() {
+  cat <<'NODE'
+import pg from 'pg';
+const {Client} = pg;
+const client = new Client({connectionString: process.env.PTR_APP_DATABASE_URL});
+await client.connect();
+try {
+  const rows = await client.query('SELECT count(*)::int AS n FROM app.turns WHERE client_request_id LIKE $1', [`${process.env.REQUEST_PREFIX}-%`]);
+  console.log(JSON.stringify({event: 'worker_admitted_count', count: rows.rows[0].n}));
+} finally {
+  await client.end();
+}
+NODE
+}
+
 worker_inflight_state_js() {
   cat <<'NODE'
 import pg from 'pg';
@@ -1418,35 +1448,29 @@ terminating_pod_request_proof() {
   local namespace="$1" pod="$2" delete_at="$3" prefix="$4" file="$5" log_file="$6"
   [[ -e "$log_file" ]] || private_log "$log_file"
   timeout 10s python3 - "$delete_at" "$prefix" "$pod" "$log_file" >>"$file" <<'PY'
-import datetime as dt,json,re,sys
+import datetime as dt,json,sys
 delete_raw,prefix,pod,path=sys.argv[1:5]
 def parse(value):
     return dt.datetime.fromisoformat(value.replace("Z","+00:00"))
 deleted=parse(delete_raw)
-marker_re=re.compile(rf"\b{re.escape(prefix)}[a-z]?-[0-9]{{4}}\b")
-field_re=re.compile(r"(?i)(?:x-request-id|request[-_ ]?id|req[_-]?id)[^A-Za-z0-9_.:-]{0,20}([A-Za-z0-9_.:-]{1,128})")
 first_seen={}
-lines={}
 snapshot_ok=False
 with open(path, errors="replace") as handle:
     for line in handle:
         if line.startswith('# log_snapshot_status=ok'):
             snapshot_ok=True
+        # The simulator also logs X-Request-Id headers for readiness probes.
+        # Only a POST request line can show new inference traffic.
+        if 'method="POST"' not in line:
+            continue
         try:
             stamp=parse(line.split(None,1)[0])
         except Exception:
             continue
-        ids=[]
-        ids.extend(match.group(0) for match in marker_re.finditer(line))
-        field=field_re.search(line)
-        if field:
-            ids.append(field.group(1))
-        for request_id in ids:
-            if request_id not in first_seen or stamp < first_seen[request_id]:
-                first_seen[request_id]=stamp
-                lines[request_id]=line[:300].rstrip()
+        request_id=f"post-{len(first_seen)+1}"
+        first_seen[request_id]=stamp
 new_ids={request_id: stamp for request_id, stamp in first_seen.items() if stamp >= deleted}
-print(json.dumps({"event":"terminating_pod_request_proof","pod":pod,"deleteAt":delete_raw,"prefix":prefix,"logSnapshotOk":snapshot_ok,"distinctRequestIds":len(first_seen),"newDistinctRequestIdsAfterDelete":len(new_ids),"sample":[{"requestId": key, "firstSeenAt": value.isoformat(), "line": lines.get(key)} for key,value in list(new_ids.items())[:3]]}))
+print(json.dumps({"event":"terminating_pod_request_proof","pod":pod,"deleteAt":delete_raw,"prefix":prefix,"logSnapshotOk":snapshot_ok,"distinctRequestIds":len(first_seen),"newDistinctRequestIdsAfterDelete":len(new_ids),"sample":[{"requestId": key, "firstSeenAt": value.isoformat()} for key,value in list(new_ids.items())[:3]]}))
 raise SystemExit(0 if snapshot_ok and not new_ids else 1)
 PY
 }
@@ -1578,7 +1602,7 @@ run_v1() {
 
 
 run_v2() {
-  local prefix="${V2_PREFIX:-v2${short_run_id}}" file engine worker node summary engine_rc worker_rc drain_rc term_rc pdb_rc drain_term_rc delete_at log_file drain_log drain_pods pod worker_sample_ids worker_execution_ids worker_ack_rc missing_clause
+  local prefix="${V2_PREFIX:-v2${short_run_id}}" file engine worker node summary engine_rc worker_rc drain_rc term_rc pdb_rc drain_term_rc delete_at log_file drain_log drain_pods pod worker_sample_ids worker_execution_ids worker_ack_rc missing_clause admitted
   file="$evidence_dir/V2-${prefix}.private.log"
   private_log "$file"
   if [[ "${V2_WORKER_ONLY:-0}" == "1" ]]; then
@@ -1588,7 +1612,17 @@ run_v2() {
       return 1
     fi
     apply_probe_job V2W "${prefix}w" 16 4 360 turns
-    timeout 5s sleep 2
+    admitted=0
+    for _ in {1..120}; do
+      admitted="$(api_node REQUEST_PREFIX="${prefix}w" < <(worker_admitted_count_js) | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)"
+      [[ "$admitted" == "16" ]] && break
+      timeout 2s sleep 1
+    done
+    printf 'worker_admitted_before_delete=%s\n' "$admitted" >>"$file"
+    if [[ "$admitted" != "16" ]]; then
+      result V2 FAIL mode=worker_only missing_clause=all_turns_admitted_before_delete cause=worker_probe_admission_failed "evidence=$file"
+      return 1
+    fi
     api_node REQUEST_PREFIX="${prefix}w" < <(worker_inflight_sample_js) >>"$file" 2>&1 || true
     worker_sample_ids="$(sampled_turn_ids "$file")"
     kubectl_t -n "$app_ns" delete pod "$worker" --wait=false >/dev/null
@@ -1615,8 +1649,7 @@ run_v2() {
     return 1
   fi
   original_engine_min="$(kubectl_t -n "$inference_ns" get scaledobject ptr-sim -o jsonpath='{.spec.minReplicaCount}')"
-  timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
-    --reuse-values -f "$kind_values" --set autoscaling.engine.minReplicaCount=2 --wait >/dev/null
+  kind_helm_upgrade --set autoscaling.engine.minReplicaCount=2 >/dev/null
   kubectl_t -n "$inference_ns" rollout status deployment/ptr-sim --timeout=180s >/dev/null
   pdb_rc=1
   pdb_proof "$file" && pdb_rc=0
@@ -1648,7 +1681,17 @@ run_v2() {
     return 1
   fi
   apply_probe_job V2W "${prefix}w" 16 4 360 turns
-  timeout 5s sleep 2
+  admitted=0
+  for _ in {1..120}; do
+    admitted="$(api_node REQUEST_PREFIX="${prefix}w" < <(worker_admitted_count_js) | python3 -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null || echo 0)"
+    [[ "$admitted" == "16" ]] && break
+    timeout 2s sleep 1
+  done
+  printf 'worker_admitted_before_delete=%s\n' "$admitted" >>"$file"
+  if [[ "$admitted" != "16" ]]; then
+    result V2 FAIL mode=full missing_clause=all_turns_admitted_before_delete cause=worker_probe_admission_failed "evidence=$file"
+    return 1
+  fi
   api_node REQUEST_PREFIX="${prefix}w" < <(worker_inflight_sample_js) >>"$file" 2>&1 || true
   worker_sample_ids="$(sampled_turn_ids "$file")"
   kubectl_t -n "$app_ns" delete pod "$worker" --wait=false >/dev/null
@@ -1756,11 +1799,9 @@ run_v3() {
   original_engine_time_to_first_token="$(timeout 30s helm --kube-context "$context" get values "$release" -n ptr-system --all -o json | timeout 10s python3 -c 'import json,sys; print(json.load(sys.stdin).get("inference",{}).get("engine",{}).get("timeToFirstToken") or "8s")')"
   original_engine_inter_token_latency="$(timeout 30s helm --kube-context "$context" get values "$release" -n ptr-system --all -o json | timeout 10s python3 -c 'import json,sys; print(json.load(sys.stdin).get("inference",{}).get("engine",{}).get("interTokenLatency") or "0s")')"
   restore_engine_values=1
-  timeout 240s helm --kube-context "$context" upgrade "$release" "$chart" -n ptr-system \
-    --reuse-values -f "$kind_values" \
+  kind_helm_upgrade \
     --set inference.engine.timeToFirstToken=20s \
-    --set inference.engine.interTokenLatency="$original_engine_inter_token_latency" \
-    --wait >/dev/null
+    --set inference.engine.interTokenLatency="$original_engine_inter_token_latency" >/dev/null
   kubectl_t -n "$inference_ns" rollout status deployment/ptr-sim --timeout=180s >/dev/null
   mid_file="$(probe_file V3MID "${prefix}mid")"
   EXPECT_TERMINAL_ANY=1 SECOND_SSE_MS=180000 apply_probe_job V3MID "${prefix}mid" 1 1 360 sse

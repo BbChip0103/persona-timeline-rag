@@ -192,6 +192,12 @@ spec:
           podSelector:
             matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: api}
       ports: [{protocol: TCP, port: 56441}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $app }}}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: ptr, app.kubernetes.io/component: worker}
+      ports: [{protocol: TCP, port: 58442}]
     {{- if .Values.inference.enabled }}
     - to:
         - namespaceSelector:

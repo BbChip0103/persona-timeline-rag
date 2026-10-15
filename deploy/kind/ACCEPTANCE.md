@@ -148,3 +148,61 @@ were in fallback and held workers and engines at 1/1; fallback cleared at
 15:26:47. A synthetic RAG-off smoke turn completed with durable ACK and no
 outbox residue on the final profile. One saturation check passed: 32 requests,
 2 successes, 22 `rejected-saturated`, and 8 `rejected-ttl-expired` drops.
+
+## Stage S3: worker spill headroom, 2026-10-15
+
+Fresh `ptr-k8s` on kind used only the simulator, synthetic database and fake
+OpenRouter. No paid or external model calls were made. The first `up.sh` attempt
+exposed a clean-install order error: kube-state-metrics tried to create RBAC in
+`ptr-inference` before the namespace existed. After moving namespace creation
+before the add-on install, the documented install sequence, readiness check and
+durable-ACK smoke passed. The 32-request saturation check returned 2 successes,
+22 `rejected-saturated` and 8 `rejected-ttl-expired` responses. Prometheus
+scraped the worker gauge at 1 before K1 and at 0 after synthetic budget
+exhaustion. Raw outputs are ignored, mode-0600 files in `reports/k8s/`.
+
+| Case | Measured result |
+|---|---|
+| K1: one engine, budget available | `reports/k8s/design64-s3-k1-20261015T092406882344286Z.json`: `casePassed=true`; gauge 1→1; 194 worker samples showed desired/Ready 1/1→2/2 within 60 s, then 1/1, with no sample above cap 2. **100/100 completed**; failed/cancelled/outbox/duplicate rows 0. Fake submissions +58 equalled settled ledger +58, duplicate fake IDs 0. EPP capacity rejections 0→0, 0.0/s. |
+| K2: one engine, budget exhausted | `reports/k8s/design64-s3-k2-20261015T092933947418849Z.json`: `casePassed=true`; gauge 0→0; 245 worker samples stayed at desired/Ready 1/1 and cap 1. **60/60 completed**; failed/cancelled/outbox/duplicate rows 0. Fake submissions +0 equalled settled ledger +0, duplicate fake IDs 0. EPP capacity rejections 0→0, 0.0/s. |
+| K3: exhausted budget, forced local capacity retry | `reports/k8s/design64-s3-k3-20261015T093520277767988Z.json`: `casePassed=true`; gauge 0→0; 85 worker samples stayed at desired/Ready 2/2. **40/40 completed**; failed/cancelled/outbox/duplicate rows 0. Fake submissions and settled ledger each +0, duplicate fake IDs 0. EPP capacity rejections 0→108 (1.248/s across the full harness interval); worker retries +127 (1.467/s across that interval). The active window from first observed rejection to last completion was 78.699 s: per-pod retries 65 and 62, or **0.826/s and 0.788/s**, each ≤ worker concurrency 2 × 4/s = 8/s. Cluster-wide active-window retry rate was 1.614/s for reference. The EPP queue cap 1 and simulator first-token delay 4 s were temporary; the harness restored their defaults and the synthetic budget cap. |
+| K4: L5 F2 scale-up | After restoring the synthetic cap, one engine scaled to two; workers reached 3 under the new available-spill cap. The passing 100-turn run had **100/100 completed**, 0 failed/cancelled/outbox/duplicate rows; fake submissions 110→152 (+42), duplicate IDs 0. A preceding 80-concurrent submission attempt hit one API HTTP 500 after creating 96 turns; all 96 subsequently completed. The passing run used submission concurrency 40. |
+| K4: V2 drain | At both gauge 0 and gauge 1, fresh full V2 runs passed. In each run, engine deletion, worker deletion and node drain each completed **16/16** turns with 0 failed, outbox residue or duplicates. PDB respected; terminating engine Pods received 0 new POST requests, and four sampled worker turns had durable ACKs. All four kind nodes were Ready after uncordon. |
+| K4: V10 NetworkPolicy | Four unlabelled targets blocked, including worker port 58442; allowed worker paths connected 2/2; C1 startup guard proved; 0 command failures. |
+
+The first two V2 runs had complete turn proofs but failed the termination check:
+the harness counted `X-Request-Id` headers from the simulator's readiness GET
+as inference requests. The corrected check accepts six historical GET-only log
+snapshots and rejects a synthetic POST after deletion; fresh full V2 runs
+passed at both budget states. The exact K1–K3 summaries are linked above;
+their private traces and the F2 trace are in `design64-s3-*.private.log`.
+The gauge-1 V2 and final V10 logs are
+`V2-k6-20261015T074609Z.private.log` and
+`V10-k6-20261015T075005Z.private.log` under `reports/k8s/`.
+
+The K3 active-window start is the first EPP rejection seen by host polling;
+the retry numerator starts at the preceding per-pod counter sample. The end
+counter sample follows the job's all-completed event, before its scale-down
+wait. This sampling makes the numerator conservative at both boundaries.
+The passing run used submit concurrency 16. All K3 overrides were kind-only
+and restored by the harness.
+
+A later V2 retest exposed a separate harness race: deleting a worker two
+seconds after starting the probe left 12 of 16 session creations to fail with
+API HTTP 502, before those turns were admitted. The harness now waits for all
+16 turn reservations before deleting the worker; the final passing run proved
+four sampled in-flight turns were acknowledged. This keeps the deletion test
+about in-flight recovery rather than session creation during a worker outage.
+
+The V2 cleanup also exposed a Helm value overlay bug: reapplying
+`values-kind.yaml` discarded the runtime control-plane CIDR entries, and KEDA's
+webhook and metrics API could not reach the Kubernetes API. The harness now
+preserves those entries on every Helm upgrade. After restoring them, both KEDA
+Deployments became Ready, all 32 nonterminal Pods were Ready, worker and engine
+returned to 1/1, both ScaledObjects were Ready without fallback, the worker
+gauge was 1, and a final durable-ACK synthetic smoke passed. The ledger cap was
+restored to 1,000,000 microUSD; all four kind nodes remained Ready. The final
+V2 run also verified the control-plane CIDRs persisted through both its setup
+and cleanup upgrades.
+
+Note on K3: the design describes K3 as "the gauge is still 1 when the budget runs out". This run instead started with spill already unavailable (budget exhausted, gauge 0). In cluster mode, a capacity 429 takes the same local-retry branch whether or not a spill was attempted first (`providers/local.py`). The one extra step in the stale-gauge window is the refusal before submission. The S1 unit tests cover it: `test_first_epp_capacity_refusal_retries_local_without_second_spill` and `test_chat_pre_submit_budget_refusal_has_special_type_and_no_submission`.

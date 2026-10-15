@@ -1347,13 +1347,15 @@ v10() {
   local out="$REPORT_DIR/V10-${RUN_ID}.private.log" rc=0 parsed=0 numbers
   local denied_pod="ptr-denied-v10-$(date +%s)-$$"
   local guard_pod="ptr-c1-guard-$(date +%s)-$$"
-  local image worker_image engine_ip epp_ip fake_ip worker_pod
+  local image worker_image engine_ip epp_ip fake_ip worker_ip worker_pod
   image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-api -o jsonpath='{.spec.template.spec.containers[0].image}')"
   worker_image="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get deployment ptr-worker -o jsonpath='{.spec.template.spec.containers[0].image}')"
   engine_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-inference get pod -l app.kubernetes.io/component=inference-engine -o jsonpath='{.items[0].status.podIP}')"
   epp_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-inference get pod -l llm-d-router-standalone=chat-primary-epp -o jsonpath='{.items[0].status.podIP}')"
   fake_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=fake-openrouter -o jsonpath='{.items[0].status.podIP}')"
-  worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')"
+  worker_pod="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod -l 'app.kubernetes.io/component=worker,!ptr.io/probe' -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | awk '{print $1}')"
+  worker_ip="$(run 20s kubectl --context "$CONTEXT" -n ptr-app get pod "$worker_pod" -o jsonpath='{.status.podIP}')"
+  [[ -n "$worker_ip" ]] || die "V10 worker pod has no IP"
   : >"$out"
   {
     printf 'test=V10\n'
@@ -1365,12 +1367,13 @@ v10() {
   run_capture 120s "$out.denied" kubectl --context "$CONTEXT" -n ptr-inference run "$denied_pod" \
     --rm -i --restart=Never --attach=true \
     --image="$image" --image-pull-policy=IfNotPresent \
-    --env="ENGINE_IP=$engine_ip" --env="EPP_IP=$epp_ip" --env="FAKE_OPENROUTER_IP=$fake_ip" \
+    --env="ENGINE_IP=$engine_ip" --env="EPP_IP=$epp_ip" --env="FAKE_OPENROUTER_IP=$fake_ip" --env="WORKER_IP=$worker_ip" \
     --command -- node --input-type=module -e '
       const targets = [
         ["engine", process.env.ENGINE_IP, 8000],
         ["epp", process.env.EPP_IP, 8081],
         ["fake_openrouter", process.env.FAKE_OPENROUTER_IP, 8000],
+        ["worker_metrics", process.env.WORKER_IP, 58442],
       ];
       const net = await import("node:net");
       const probe = ([name, host, port]) => new Promise(resolve => {
@@ -1433,13 +1436,14 @@ denied = {name: value == "true" for name, value in re.findall(r"denied_target=([
 clauses = {
     "unlabelled_denied_engine": denied.get("engine") is True,
     "unlabelled_denied_fake_openrouter": denied.get("fake_openrouter") is True,
+    "unlabelled_denied_worker_metrics": denied.get("worker_metrics") is True,
     "allowed_worker_to_epp": "allowed_path=worker_to_epp ok=1" in text,
     "allowed_worker_to_fake_openrouter": "allowed_path=worker_to_fake_openrouter ok=1" in text,
     "c1_startup_rejection": "c1_startup_guard=1" in text and re.search(r"guard_error=(BACKEND_URL_NOT_ALLOWED|BACKEND_REQUIRES_HTTPS)", text) is not None,
 }
 missing = [name for name, ok in clauses.items() if not ok]
 print(
-    f"blocked_targets={sum(1 for v in denied.values() if v)} required_blocked_targets=3 "
+    f"blocked_targets={sum(1 for v in denied.values() if v)} required_blocked_targets=4 "
     f"allowed_paths_proved={int(clauses['allowed_worker_to_epp']) + int(clauses['allowed_worker_to_fake_openrouter'])}/2 "
     f"c1_startup_rejection_proved={int(clauses['c1_startup_rejection'])} command_failures={command_failures} "
     f"missing={','.join(missing) if missing else 'none'}"

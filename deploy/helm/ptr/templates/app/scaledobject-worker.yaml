@@ -1,3 +1,6 @@
+{{- if hasKey .Values.autoscaling.worker "scaleUpHeadroom" }}
+{{- fail "autoscaling.worker.scaleUpHeadroom was removed; use autoscaling.worker.spillHeadroom" }}
+{{- end }}
 {{- if .Values.autoscaling.worker.enabled }}
 {{- $redisTLS := eq .Values.network.redis.scheme "rediss" -}}
 {{- $caTLS := and $redisTLS .Values.autoscaling.worker.redis.caKey -}}
@@ -48,7 +51,7 @@ spec:
         scaleDown:
           stabilizationWindowSeconds: {{ .Values.autoscaling.worker.scaleDownStabilizationSeconds }}
     scalingModifiers:
-      formula: {{ printf "min(max(wait / %v, active / %v), ceil(engines * %v * (scaling_up > 0 ? %v : %v) / %v))" .Values.autoscaling.worker.redis.waitListLength .Values.app.worker.concurrency .Values.inference.engine.maxNumSeqs .Values.autoscaling.worker.scaleUpHeadroom .Values.autoscaling.worker.steadyHeadroom .Values.app.worker.concurrency | quote }}
+      formula: {{ printf "min(max(wait / %v, active / %v), ceil(engines * %v * (scaling_up > 0 || spill > 0 ? %v : %v) / %v))" .Values.autoscaling.worker.redis.waitListLength .Values.app.worker.concurrency .Values.inference.engine.maxNumSeqs .Values.autoscaling.worker.spillHeadroom .Values.autoscaling.worker.steadyHeadroom .Values.app.worker.concurrency | quote }}
       target: "1"
       metricType: AverageValue
   fallback:
@@ -91,5 +94,12 @@ spec:
         serverAddress: {{ $prometheusAddress | quote }}
         metricName: ptr_engine_scaling_up
         query: {{ printf "(max(kube_deployment_spec_replicas{namespace=%q,deployment=%q}) > bool max(kube_deployment_status_replicas_ready{namespace=%q,deployment=%q})) or vector(0)" .Values.namespaces.inference $engineDeployment .Values.namespaces.inference $engineDeployment | quote }}
+        threshold: "1"
+    - type: prometheus
+      name: spill
+      metadata:
+        serverAddress: {{ $prometheusAddress | quote }}
+        metricName: ptr_llm_spillover_available
+        query: {{ printf "max(ptr_llm_spillover_available{namespace=%q}) or vector(0)" .Values.namespaces.app | quote }}
         threshold: "1"
 {{- end }}
