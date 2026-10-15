@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { LoreEntry, Persona } from '@ptr/contracts';
-import { CoreError, InMemoryConversationStore, InMemoryPersonaRepository, LORE_BYTE_LIMIT, aiDisclosurePrefix, createLocalChat, greetingIndexFor, greetingsOf, loreBytes, matchLore, renderLoreMessage } from '../src';
+import { CoreError, InMemoryConversationStore, InMemoryPersonaRepository, LORE_BYTE_LIMIT, createLocalChat, greetingIndexFor, greetingsOf, loreBytes, matchLore, renderLoreMessage } from '../src';
 import { cardPersona, v1Persona } from './persona-fixtures';
 
 /**  (lore matching) and §3.5 (greetings, per-language disclosure). Synthetic personas only. */
@@ -52,36 +52,32 @@ describe('matchLore',()=>{
 });
 
 describe('greetings and AI disclosure (§3.5)',()=>{
-  test('greeting list, deterministic index from sha256(session id), per-language prefix',()=>{
+  test('greeting list and deterministic index from sha256(session id)',()=>{
     expect(greetingsOf(v1Persona)).toEqual([v1Persona.greeting]);
     expect(greetingsOf(cardPersona)).toEqual([cardPersona.greeting,...cardPersona.alternateGreetings!]);
     expect(greetingIndexFor('session-1',3)).toBe(createHash('sha256').update('session-1').digest().readUInt32BE(0)%3);
     expect(greetingIndexFor('anything',1)).toBe(0);
-    expect(aiDisclosurePrefix('ko')).toBe('AI 연구용 시뮬레이션입니다. ');expect(aiDisclosurePrefix('ko-KR')).toBe('AI 연구용 시뮬레이션입니다. ');
-    expect(aiDisclosurePrefix('en')).toBe('AI research simulation. ');expect(aiDisclosurePrefix('ja')).toBe('AI research simulation. ');
-    expect(aiDisclosurePrefix('ko_KR')).toBe('AI 연구용 시뮬레이션입니다. ');expect(aiDisclosurePrefix('KO')).toBe('AI 연구용 시뮬레이션입니다. ');
-    expect(aiDisclosurePrefix('kor')).toBe('AI research simulation. ');expect(aiDisclosurePrefix('kok')).toBe('AI research simulation. ');
   });
-  const en:Persona={...v1Persona,id:'persona:synthetic-en',personId:'synthetic-en',language:'en',greeting:'Hi, research AI here.'};
+  const en:Persona={...v1Persona,id:'persona:synthetic-en',personId:'synthetic-en',language:'en',greeting:'Hi there.'};
   const chat=()=>{const store=new InMemoryConversationStore();
     return {store,chat:createLocalChat({store,personas:new InMemoryPersonaRepository([v1Persona,cardPersona,en]),provider:{generate:async()=>'ok'}})};};
   const create=(c:ReturnType<typeof chat>['chat'],persona:Persona,extra:Record<string,unknown>={})=>c.createSession('owner',{personId:persona.personId,personaId:persona.id,personaRevision:persona.revision,...extra});
-  test('a v1 Korean persona keeps its greeting bytes and session shape; English sessions get the English prefix',async()=>{
+  test('a v1 Korean persona keeps its greeting bytes and session shape; English greeting also stands alone',async()=>{
     const h=chat();
     const ko=await create(h.chat,v1Persona);expect(ko.greetingIndex).toBeUndefined();
-    expect((await h.store.history(ko.id,'owner'))[0]!.content).toBe(`AI 연구용 시뮬레이션입니다. ${v1Persona.greeting}`);
+    expect((await h.store.history(ko.id,'owner'))[0]!.content).toBe(v1Persona.greeting);
     const english=await create(h.chat,en);
-    expect((await h.store.history(english.id,'owner'))[0]!.content).toBe(`AI research simulation. ${en.greeting}`);
+    expect((await h.store.history(english.id,'owner'))[0]!.content).toBe(en.greeting);
   });
   test('alternate greetings: explicit index (evaluation pins 0) or the session-id hash, stored on the session',async()=>{
     const h=chat();const list=greetingsOf(cardPersona);
     const pinned=await create(h.chat,cardPersona,{greetingIndex:0});expect(pinned.greetingIndex).toBe(0);
-    expect((await h.store.history(pinned.id,'owner'))[0]!.content).toBe(`AI 연구용 시뮬레이션입니다. ${list[0]}`);
+    expect((await h.store.history(pinned.id,'owner'))[0]!.content).toBe(list[0]);
     const second=await create(h.chat,cardPersona,{greetingIndex:2});
-    expect((await h.store.history(second.id,'owner'))[0]!.content).toBe(`AI 연구용 시뮬레이션입니다. ${list[2]}`);
+    expect((await h.store.history(second.id,'owner'))[0]!.content).toBe(list[2]);
     const hashed=await create(h.chat,cardPersona);
     expect(hashed.greetingIndex).toBe(greetingIndexFor(hashed.id,list.length));
-    expect((await h.store.history(hashed.id,'owner'))[0]!.content).toBe(`AI 연구용 시뮬레이션입니다. ${list[hashed.greetingIndex!]}`);
+    expect((await h.store.history(hashed.id,'owner'))[0]!.content).toBe(list[hashed.greetingIndex!]);
     await expect(create(h.chat,cardPersona,{greetingIndex:3})).rejects.toEqual(new CoreError('INVALID_INPUT'));
     await expect(create(h.chat,v1Persona,{greetingIndex:1})).rejects.toEqual(new CoreError('INVALID_INPUT'));
     expect((await create(h.chat,v1Persona,{greetingIndex:0})).greetingIndex).toBe(0);

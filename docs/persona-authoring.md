@@ -13,6 +13,8 @@ trimmed, nonempty and at most n code points.
 
 | field | shape | rendered? |
 |---|---|---|
+| `tagline` | `text(60)` | public character card only; never sent to the model |
+| `starters` | `text(60)[]`, at most 4 | public character card chips only; never sent to the model |
 | `alternateGreetings` | `text(300)[]`, at most 4 | one greeting per session (see below) |
 | `personality` | `{summary?: text(300), traits: text(40)[] ≤8, values: text(60)[] ≤6, speechHabits: text(80)[] ≤8}` | in the persona definition |
 | `background` | `{text: text(500), sourceRefs: id[1..20]}` | text only, as `background: {text, label: "part of PERSONA_BLOCKS; NOT citable"}` |
@@ -86,11 +88,13 @@ report holds `{path, rule, severity}` and never field text.
   - A real-person persona with no same-person test captions is an error (`leak_check_unavailable`): the check cannot
     run.
 - **Real-person personas** (`reviewStatus ≠ synthetic`):
-  - Private-life categories are errors in greetings, personality, background, examples and lore. The categories are
+  - Private-life categories are errors in card copy, greetings, personality, background, examples and lore. The categories are
     family, romance, address, health, real-time location and minors, in Korean and English.
   - The patterns are deliberately broad ("가족 여행" and "병원" match). There is no exception list: reword the text.
-  - `containsUngroundedBiography` in greetings, personality and examples is an error. For synthetic personas it is a
+  - `containsUngroundedBiography` in card copy, greetings, personality and examples is an error. For synthetic personas it is a
     warning.
+- **Public card copy** (`tagline`, `starters`): `card_copy` rejects research, evidence, retrieval, system and model
+  terminology. English terms use Unicode word boundaries, so a term joined to Korean text is treated as one word.
 - **Warnings (publish allowed):** dates and places.
 
 These are narrow regex gates. For real people, the user's confirmation of the publish summary stays the main control.
@@ -305,9 +309,9 @@ policy · persona definition · [examples] · history (greeting first) · [state
   - The greeting comes from `[greeting, ...alternateGreetings]`: `CreateSessionSchema.greetingIndex` when given
     (evaluations pin 0), otherwise `sha256(session id)[0..4] mod n`.
   - The index is stored on the session when it was given or there is a choice.
-  - The server always prefixes the disclosure: `AI 연구용 시뮬레이션입니다. ` for `ko`, `ko-…` and `ko_…` sessions,
-    `AI research simulation. ` otherwise. New English sessions' greeting bytes change under v5. Stored greetings do
-    not.
+  - New greetings have no research prefix. The chat shows AI disclosure on first entry for each owner and persona,
+    with a persistent character marker. For older stored greetings, the UI removes the exact prefix
+    `AI 연구용 시뮬레이션입니다. ` or `AI research simulation. ` only when rendering; stored messages stay unchanged.
 - **Unchanged:** the legacy `buildPrompt` paths (timeline v4, small talk v2) and the fictional-draft path render none
   of the new fields, and their bytes are unchanged.
 - **Context limits:**

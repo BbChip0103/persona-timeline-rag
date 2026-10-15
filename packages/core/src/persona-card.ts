@@ -63,5 +63,3 @@ export function matchLore(persona:Persona,input:{current:string;previous:readonl
 export const greetingsOf=(persona:Persona)=>[persona.greeting,...(persona.alternateGreetings??[])];
 /** Default greeting for a session: the first four bytes of sha256(session id), modulo the list length. */
 export const greetingIndexFor=(sessionId:string,count:number)=>createHash('sha256').update(sessionId).digest().readUInt32BE(0)%count;
-/** Server-side AI disclosure before the greeting (v5): Korean for `ko*` sessions, English otherwise. */
-export const aiDisclosurePrefix=(language:string)=>/^ko(?:$|[-_])/i.test(language)?'AI 연구용 시뮬레이션입니다. ':'AI research simulation. ';

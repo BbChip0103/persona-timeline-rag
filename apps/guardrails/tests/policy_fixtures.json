@@ -474,5 +474,12 @@
   {"input": {"utterance": "나 엄마랑 싸웠어", "reply": "아프지 마! 건강 챙겨~", "realPerson": true, "language": "ko"}, "expected": null},
   {"input": {"utterance": "나 엄마랑 싸웠어", "reply": "몸 아프지 않게 조심해!", "realPerson": true, "language": "ko"}, "expected": null},
   {"input": {"utterance": "그림 좋네?", "reply": "나도 아프지 마", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
-  {"input": {"utterance": "나 결혼해", "reply": "남친도 결혼하자고 고 축하해", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "축하해", "edited": true}}
+  {"input": {"utterance": "나 결혼해", "reply": "남친도 결혼하자고 고 축하해", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "축하해", "edited": true}},
+  {"input": {"utterance": "안녕", "reply": "- **오늘은** 바람 좋다.\n2. *산책* 갈래?", "realPerson": false, "language": "ko"}, "expected": {"reason": "formatting", "content": "오늘은 바람 좋다. 산책 갈래?", "edited": true}},
+  {"input": {"utterance": "hi", "reply": "- ", "realPerson": false, "language": "en"}, "expected": {"reason": "formatting", "content": "Oops, I lost my train of thought. Could you say that again?"}},
+  {"input": {"utterance": "어디 나왔어?", "reply": "그건 딱히 말해 줄 수 있는 정보가 없거든\n너는 어디 나왔어?", "realPerson": true, "language": "ko"}, "expected": {"reason": "meta_talk", "content": "너는 어디 나왔어?", "edited": true}},
+  {"input": {"utterance": "어디 나왔어?", "reply": "- 그건 딱히 말해 줄 수 있는 정보가 없거든\n- 너는 어디 나왔어?", "realPerson": true, "language": "ko"}, "expected": {"reason": "meta_talk", "content": "너는 어디 나왔어?", "edited": true}},
+  {"input": {"utterance": "그림 좋네?", "reply": "- 엄마랑 여행했어.\n- 색 조합도 마음에 들어!", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "색 조합도 마음에 들어!", "edited": true}},
+  {"input": {"utterance": "hi", "reply": "^_^", "realPerson": false, "language": "en"}, "expected": null},
+  {"input": {"utterance": "hi", "reply": "٣. hello", "realPerson": false, "language": "en"}, "expected": null}
 ]

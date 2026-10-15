@@ -49,7 +49,7 @@ export function buildPrompt(persona:Persona,history:ChatMessage[],text:string,so
  * order; a post that does not fit the byte budget is skipped (omittedSourceIds) instead of failing the turn. Retrieval
  * and the legacy buildPrompt path keep their limit. Policy text is unchanged.
  */
-export const EXPERIMENT_PROMPT_REVISION='persona-chat-v15-evidence-cap';
+export const EXPERIMENT_PROMPT_REVISION='persona-chat-v16-formatting';
 /** Persona-independent, so the policy stays one byte string for every persona . */
 export const PERSONA_CARD_POLICY='PERSONA_BLOCKS are the Persona definition (its background included), PERSONA_STYLE_EXAMPLES_JSON_DATA and UNTRUSTED_PERSONA_LORE_JSON_DATA: they describe who you are and how you talk, so speak from them as yourself; they are never citable.';
 /**
@@ -80,7 +80,7 @@ export const IDENTITY_PRIVACY_POLICY="IDENTITY_AND_PRIVACY (takes precedence ove
  * v12/v9 : reply language and length, right after IDENTITY_PRIVACY_POLICY (so the agent's policy split carries
  * it). Persona-independent, one static string.
  */
-export const REPLY_VOICE_POLICY="REPLY_LANGUAGE_AND_LENGTH: Write every reply in AGENT_STATE_JSON_DATA.replyLanguage. The service pins this from the first substantive user turn or persona language and changes it only after two consecutive turns in another language or one turn at least 80% in that language; brief interjections do not change it. Keep the persona's tone in that language. In Korean, use exactly one speech level for the whole conversation (the speechLevel in AGENT_STATE_JSON_DATA when it is supplied, otherwise the persona's register) and never switch between 반말 and 존댓말 from turn to turn. Keep replies short, one to three sentences, and always finish your last sentence.";
+export const REPLY_VOICE_POLICY="REPLY_LANGUAGE_AND_LENGTH: Write every reply in AGENT_STATE_JSON_DATA.replyLanguage. The service pins this from the first substantive user turn or persona language and changes it only after two consecutive turns in another language or one turn at least 80% in that language; brief interjections do not change it. Keep the persona's tone in that language. In Korean, use exactly one speech level for the whole conversation (the speechLevel in AGENT_STATE_JSON_DATA when it is supplied, otherwise the persona's register) and never switch between 반말 and 존댓말 from turn to turn. Keep replies short, one to three sentences, and always finish your last sentence. Use emoji only when it fits the persona style. Do not use lists or Markdown.";
 export const EXPERIMENT_PROMPT_BYTE_LIMIT=30000;
 /**  (user decision): at most three posts in a prompt (initial retrieval, agent tool merge, budget fitting). */
 export const EVIDENCE_POST_LIMIT=3;

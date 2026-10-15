@@ -11,7 +11,7 @@ import { DEFAULT_SAFETY_THRESHOLDS, RULE_PATH_CATEGORIES, SAFETY_CATEGORIES, SAF
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
-import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
+import { greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
 import { REPLY_GUARD_REVISION, guardReply, hasUserSelfMarker, splitSentences } from './reply-guard';
 import type { GuardrailsClient } from './guardrails';
 import { replyText, speechLevel, utteranceLanguage, voiceText, isVoiceText, type VoiceTextKey } from './reply-texts';
@@ -131,7 +131,7 @@ export class ChatService {
     const greetingIndex=value.greetingIndex??greetingIndexFor(id,greetings.length);
     const session:ChatSession={id,ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition ? {ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString(),
       ...(value.greetingIndex!==undefined||greetings.length>1?{greetingIndex}:{})};
-    await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:`${aiDisclosurePrefix(persona.language)}${greetings[greetingIndex]}`,createdAt:session.createdAt});
+    await this.options.store.create(session,{id:randomUUID(),sessionId:session.id,turnId:null,role:'assistant',content:greetings[greetingIndex]!,createdAt:session.createdAt});
     return session;
   }
   async getSession(ownerId:string,sessionId:string):Promise<ChatSession> {

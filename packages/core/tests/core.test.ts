@@ -53,7 +53,7 @@ describe('session and turn lifecycle',()=>{
   test('greeting once, owner isolation, separate person sessions and revision pinned',async()=>{
     const h=harness();const session=await h.create();
     expect((await h.service.history('owner_synthetic_a',session.id))).toHaveLength(1);
-    expect((await h.service.history('owner_synthetic_a',session.id))[0].content).toContain('AI');
+    expect((await h.service.history('owner_synthetic_a',session.id))[0].content).toBe(persona.greeting);
     await expect(h.service.history('owner_synthetic_b',session.id)).rejects.toMatchObject({code:'NOT_FOUND'});
     await expect(h.service.createSession('owner_synthetic_a',{personId:'person_synthetic_b',personaId:persona.id,personaRevision:'v1'})).rejects.toMatchObject({code:'FORBIDDEN'});
     await expect(h.service.createSession('owner_synthetic_a',{personId:persona.personId,personaId:persona.id,personaRevision:'v2'})).rejects.toMatchObject({code:'PERSONA_UNAVAILABLE'});

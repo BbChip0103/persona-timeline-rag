@@ -48,7 +48,14 @@ import { voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
  * receives a neutral empathy prompt; other emptied replies receive the private decline.
  */
 export const REPLY_GUARD_REVISION='reply-guard-v8';
-export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk';
+export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'|'formatting';
+/** Remove model-authored Markdown decoration, leaving its words for the safety checks below. */
+function withoutMarkdown(reply:string):string {
+  const noLists=reply.replace(/^[ \t]{0,3}(?:[-*•][ \t]+|[0-9]+[.)][ \t]+)/gmu,'');
+  const noEmphasis=noLists.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<![\w^])_([^_\n]+)_(?![\w^])/gu,(_match,boldStar:string,boldUnderscore:string,italicStar:string,italicUnderscore:string)=>boldStar??boldUnderscore??italicStar??italicUnderscore);
+  return noEmphasis===reply?reply:noEmphasis.replace(/[ \t]*\n[ \t]*/gu,(_match,offset:number)=>
+    /[.!?。！？~…]$/u.test(noEmphasis.slice(0,offset).trimEnd())?' ':'. ').trim();
+}
 // Only "not in my data" constructions (review HIGH: bare data words, perfume notes, notes apps, "on my feed" and questions back
 // to the user are ordinary chat); a sentence ending in a question mark is never meta talk.
 const META_GAP:RegExp[]=[
@@ -242,6 +249,11 @@ export function guardReply(input:{utterance:string;reply:string;realPerson:boole
   input={...input,utterance:normalizePrivateText(input.utterance),reply:normalizePrivateText(input.reply)};
   const level=input.level??'polite';
   const voice=(key:VoiceTextKey)=>voiceText(key,input.language,level,input.previousAssistantText,input.seed);
+  const plain=withoutMarkdown(input.reply);
+  if(plain!==input.reply) {
+    if(!/[\p{L}\p{N}]/u.test(plain)) return {reason:'formatting',content:voice('service_retry')};
+    return guardReply({...input,reply:plain})??{reason:'formatting',content:plain,edited:true};
+  }
   // "이 그림 AI야?" asks about an artwork, not the persona (unless it also addresses the persona).
   const identityQuestion=IDENTITY_QUESTION.some(pattern=>pattern.test(input.utterance))
     &&(!ART_UTTERANCE.test(input.utterance)||/(?:너|넌|당신|니가|네가)|\byou\b/i.test(input.utterance));

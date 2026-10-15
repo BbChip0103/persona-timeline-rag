@@ -3,7 +3,7 @@ import {CreateSessionSchema,SendTurnSchema,TimelineQuerySchema,type ChatMessage,
 import {CoreError,type ConversationStore,type TurnDelivery,type TurnEvents} from '../../../packages/core/src/ports';
 import {containsCredentialPattern} from '../../../packages/core/src/safety';
 import {requestFingerprint} from '../../../packages/core/src/request-fingerprint';
-import {aiDisclosurePrefix,greetingIndexFor} from '../../../packages/core/src/persona-card';
+import {greetingIndexFor} from '../../../packages/core/src/persona-card';
 import type {PersonaProjection} from '../../../contracts/llm/v1/validate';
 /** Backend domain operations only: no persona DB access, provider, safety model or graph composition. */
 export class SplitChatService {
@@ -18,7 +18,7 @@ export class SplitChatService {
     if(value.greetingIndex!==undefined&&value.greetingIndex>=greetings.length)throw new CoreError('INVALID_INPUT');
     const id=randomUUID(),index=value.greetingIndex??greetingIndexFor(id,greetings.length);
     const session:ChatSession={id,ownerId,personId:value.personId,personaId:persona.id,personaRevision:persona.revision,language:persona.language,timezone:value.timezone,retrievalMode:value.retrievalMode,...(value.ragCondition?{ragCondition:value.ragCondition}:value.executionProfile==='agent_loop'?{ragCondition:value.retrievalMode==='off'?'off' as const:'caption' as const}:{}),...(value.executionProfile?{executionProfile:value.executionProfile}:{}),createdAt:new Date().toISOString(),...(value.greetingIndex!==undefined||greetings.length>1?{greetingIndex:index}:{})};
-    await this.store.create(session,{id:randomUUID(),sessionId:id,turnId:null,role:'assistant',content:`${aiDisclosurePrefix(persona.language)}${greetings[index]}`,createdAt:session.createdAt});return session;
+    await this.store.create(session,{id:randomUUID(),sessionId:id,turnId:null,role:'assistant',content:greetings[index]!,createdAt:session.createdAt});return session;
   }
   async getSession(ownerId:string,id:string):Promise<ChatSession> {const session=await this.store.getOwnedSession(id,ownerId);if(!session)throw new CoreError('NOT_FOUND');return session;}
   listSessions(ownerId:string) {return this.store.listOwnedSessions(ownerId);}

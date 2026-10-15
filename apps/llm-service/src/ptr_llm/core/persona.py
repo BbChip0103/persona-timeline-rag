@@ -15,7 +15,7 @@ from .errors import CoreError
 from .policy import compile_js
 from .safety import contains_credential, contains_internal_path
 
-PERSONA_LINT_REVISION = "persona-lint-v5"
+PERSONA_LINT_REVISION = "persona-lint-v6"
 PERSONA_BLOCK_BYTE_LIMIT = 6144
 LORE_BYTE_LIMIT = 2048
 
@@ -37,6 +37,7 @@ class Strict(BaseModel):
 TrimmedText = Annotated[str, AfterValidator(str.strip)]
 Text200 = Annotated[TrimmedText, Field(min_length=1, max_length=200)]
 Text300 = Annotated[TrimmedText, Field(min_length=1, max_length=300)]
+Text60 = Annotated[TrimmedText, Field(min_length=1, max_length=60)]
 
 
 class Personality(Strict):
@@ -92,6 +93,8 @@ class Persona(Strict):
     boundaries: list[str]
     sourceRefs: list[Text200]
     greeting: str
+    tagline: Text60 | None = None
+    starters: list[Text60] | None = Field(default=None, max_length=4)
     alternateGreetings: list[Text300] | None = Field(default=None, max_length=4)
     personality: Personality | None = None
     background: Background | None = None
@@ -109,6 +112,8 @@ class Persona(Strict):
         return value
 
     @field_validator(
+        "tagline",
+        "starters",
         "alternateGreetings",
         "personality",
         "background",
@@ -215,12 +220,7 @@ def match_lore(persona, current, previous=()):
 def greeting_for(persona, session_id):
     greetings = [persona["greeting"]] + persona.get("alternateGreetings", [])
     index = int.from_bytes(hashlib.sha256(session_id.encode()).digest()[:4], "big") % len(greetings)
-    prefix = (
-        "AI 연구용 시뮬레이션입니다. "
-        if regex.match(r"^ko(?:$|[-_])", persona["language"], regex.I)
-        else "AI research simulation. "
-    )
-    return prefix + greetings[index]
+    return greetings[index]
 
 
 def catalogue(personas):
@@ -241,6 +241,7 @@ def catalogue(personas):
             **(
                 {"alternateGreetings": p["alternateGreetings"]} if "alternateGreetings" in p else {}
             ),
+            **{key: p[key] for key in ("tagline", "starters") if key in p},
         }
         for p in personas
     ]
@@ -256,6 +257,10 @@ _POLICY = json.loads(Path(__file__).with_name("persona_publish_policy.json").rea
 _FORBIDDEN = [(name, [compile_js(p) for p in patterns]) for name, patterns in _POLICY["FORBIDDEN"]]
 _PRIVATE = [compile_js(p) for p in _POLICY["PRIVATE_LIFE"]]
 _DATE_PLACE = [compile_js(p) for p in _POLICY["DATE_PLACE"]]
+_CARD_COPY_FORBIDDEN = regex.compile(
+    r"(?:연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|\b(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)\b)",
+    regex.I,
+)
 _CONFUSABLES = json.loads(Path(__file__).with_name("persona_confusables.json").read_text())
 
 
@@ -291,6 +296,10 @@ def _author_fields(p):
         ("greeting", "greeting"),
     ]:
         yield key, p[key], group
+    if "tagline" in p:
+        yield "tagline", p["tagline"], "card"
+    for i, text in enumerate(p.get("starters", [])):
+        yield f"starters[{i}]", text, "card"
     for key, group in [
         ("style", "core"),
         ("boundaries", "core"),
@@ -398,6 +407,9 @@ async def validate_publication(
         def matches(pattern):
             return bool(pattern.search(text) or pattern.search(folded))
 
+        if group == "card" and matches(_CARD_COPY_FORBIDDEN):
+            report(path, "card_copy")
+
         visible = text.replace("\n", "") if path == "meta.creatorNotes" else text
         visible = regex.sub(r"([0-9#*])\uFE0F\u20E3", r"\1", visible)
         visible = regex.sub(
@@ -446,7 +458,7 @@ async def validate_publication(
             report(path, "test_caption_overlap")
         if (
             real
-            and group in ("greeting", "personality", "background", "example", "lore")
+            and group in ("card", "greeting", "personality", "background", "example", "lore")
             and any(matches(pt) for pt in _PRIVATE)
         ):
             report(path, "private_life")

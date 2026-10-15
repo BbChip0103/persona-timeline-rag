@@ -20,7 +20,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v14-immersion"
+AGENT_PROMPT_REVISION = "character-agent-context-v15-formatting"
 
 
 class AgentState(TypedDict, total=False):
@@ -70,7 +70,7 @@ def _compiled_agent_graph():
 _AGENT_GRAPH = _compiled_agent_graph()
 
 
-def trim_to_sentence(text, cap=400):
+def trim_to_sentence(text, cap=180):
     if len(text) < cap:
         return text
     matches = list(
@@ -78,7 +78,8 @@ def trim_to_sentence(text, cap=400):
             r"""(?:[.!?。！？~…]+["'”’)\]]*|\p{Extended_Pictographic}\uFE0F?)(?=\s|$)""", text
         )
     )
-    return text[: matches[-1].end()].rstrip() if matches else text
+    within_cap = [match for match in matches if match.end() <= cap]
+    return text[: within_cap[-1].end()].rstrip() if within_cap else text
 
 
 def _remember(first, items):

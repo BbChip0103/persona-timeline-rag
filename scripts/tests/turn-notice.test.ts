@@ -1,29 +1,26 @@
 import { turnNotice } from '../../apps/web/lib/turn-notice';
-test('unresolved and missing provider responses stay explicit service notices without retry advice',()=>{
-  expect(turnNotice({state:'failed',errorCode:'PROVIDER_REQUEST_UNRESOLVED'})).toContain('같은 요청을 다시 제출하지 않았어요');
-  expect(turnNotice({state:'failed',errorCode:'PROVIDER_UNAVAILABLE'})).toContain('이전 메시지는 유지');
-  for(const code of ['PROVIDER_REQUEST_UNRESOLVED','PROVIDER_UNAVAILABLE']){
-    const value=turnNotice({state:'failed',errorCode:code});expect(value).toContain('자동 재전송하지');expect(value).not.toContain('기억');
+import { friendlyError } from '../../apps/web/lib/friendly-error';
+
+const codes=['QUEUE_FULL','QUEUE_TIMEOUT','WORKER_LOST','PROVIDER_REQUEST_UNRESOLVED','PROVIDER_UNAVAILABLE',
+  'CONTEXT_LIMIT','TURN_FAILED','TURN_TIMEOUT','INTERNAL_ERROR','API_UNAVAILABLE','INVALID_INPUT',
+  'PERSONA_UNAVAILABLE','SEMANTIC_UNAVAILABLE','TURN_ACTIVE','IDEMPOTENCY_CONFLICT','UNAUTHORIZED','NOT_FOUND',
+  'BODY_TOO_LARGE','unknown-private-code'];
+
+test('every error has warm Korean and English copy without operator details',()=>{
+  for(const code of codes){
+    const ko=turnNotice({state:'failed',errorCode:code},'ko');
+    const en=turnNotice({state:'failed',errorCode:code},'en');
+    expect(ko).toMatch(/[가-힣]/);expect(en).toMatch(/[A-Za-z]/);expect(en).not.toMatch(/[가-힣]/);
+    for(const copy of [ko,en])expect(copy).not.toMatch(/QUEUE|WORKER|PROVIDER|CONTEXT|TURN_|INTERNAL|API_|INVALID|SEMANTIC|PERSONA|IDEMPOTENCY|UNAUTHORIZED|NOT_FOUND|BODY_|bill|billing|token|retry id|재전송|과금|요청 ID/i);
   }
+  expect(turnNotice({state:'failed',errorCode:'QUEUE_FULL'},'ko')).toBe('지금 대화가 몰려서 조금 뒤에 다시 보내 줘!');
+  expect(turnNotice({state:'completed',errorCode:'QUEUE_FULL'})).toBe('');
+  expect(turnNotice({state:'cancelled'},'en')).toMatch(/stopped/i);
 });
-test('unknown codes are never surfaced; ordinary complete/cancel and context-limit states keep distinct wording',()=>{
-  expect(turnNotice({state:'failed',errorCode:'private-path-and-key'})).toBe('생성에 실패했습니다. 자동 재전송하지 않았습니다.');
-  expect(turnNotice({state:'completed',errorCode:'PROVIDER_REQUEST_UNRESOLVED'})).toBe('');
-  expect(turnNotice({state:'cancelled'})).toContain('취소');expect(turnNotice({state:'failed',errorCode:'CONTEXT_LIMIT'})).toContain('새 대화');
-});
-test('QUEUE_TIMEOUT (no worker started the turn in time) is a friendly try-again line in the session language, never system jargon',()=>{
-  const korean=turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'},'ko');
-  expect(korean).toContain('잠시 후 다시 시도해 주세요');
-  expect(turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'})).toBe(korean); // the Korean UI default
-  const english=turnNotice({state:'failed',errorCode:'QUEUE_TIMEOUT'},'en');
-  expect(english).toMatch(/try again in a moment/i);expect(english).not.toMatch(/[가-힣]/);
-  for(const value of [korean,english]) expect(value).not.toMatch(/QUEUE|TIMEOUT|queue|worker|timeout|큐|워커|타임아웃|대기열/);
-});
-test('WORKER_LOST (the worker died mid-turn) is a friendly temporary-problem line in the session language, never system jargon',()=>{
-  const korean=turnNotice({state:'failed',errorCode:'WORKER_LOST'},'ko');
-  expect(korean).toContain('잠시 후 다시 시도해 주세요');expect(korean).toContain('일시적');
-  expect(turnNotice({state:'failed',errorCode:'WORKER_LOST'})).toBe(korean);
-  const english=turnNotice({state:'failed',errorCode:'WORKER_LOST'},'en');
-  expect(english).toMatch(/temporary problem/i);expect(english).toMatch(/try again/i);expect(english).not.toMatch(/[가-힣]/);
-  for(const value of [korean,english]) expect(value).not.toMatch(/WORKER|LOST|\bworker|\blease\b|\blost\b|워커|리스|유실/);
+
+test('request errors use the same private-code-free copy in both languages',()=>{
+  for(const code of codes){
+    expect(friendlyError(code,'ko')).toBe(turnNotice({state:'failed',errorCode:code},'ko'));
+    expect(friendlyError(code,'en')).toBe(turnNotice({state:'failed',errorCode:code},'en'));
+  }
 });

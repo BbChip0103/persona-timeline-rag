@@ -20,6 +20,8 @@ async function main(): Promise<void> {
   try {
     app = await createApiApplication(runtime, process.env.PTR_API_TOKEN ?? '', {
       syntheticToken: process.env.PTR_API_SYNTHETIC_TOKEN || undefined,
+      operatorMode: process.env.PTR_WEB_OPERATOR_MODE === '1',
+      operatorOptions: process.env.PTR_API_OPERATOR_OPTIONS === '1',
     });
     await app.listen(port, host);
   } catch (error) {

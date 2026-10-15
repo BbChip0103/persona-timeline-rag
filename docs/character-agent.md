@@ -6,6 +6,11 @@
 - `legacy`: existing server-routed RAG → `answer/evidenceRefs` generation. Existing sessions without `executionProfile`, and direct core calls without an explicit profile, remain legacy. Historical baseline runners retain this profile explicitly; they are not the forward evaluation path.
 - `agent_loop`: default for **new API sessions**; persists the profile and RAG condition at creation. Missing condition becomes `off` for retrieval off, otherwise `caption`. Forward natural-character-chat evaluation pins this same profile across `off`, `caption`, and `caption_image`. Low-level direct core callers must still set it explicitly for backward compatibility. Profile cannot change mid-session.
 
+The production web token cannot request `caption_image`, the `legacy` execution profile, explicit turn `intent`, or
+timeline filters unless the API process sets `PTR_API_OPERATOR_OPTIONS=1` (default: off). The API returns 400 for these
+options when disabled. The separate synthetic harness token keeps access for local tests and smoke runs. The web
+operator console visibility is controlled independently by `PTR_WEB_OPERATOR_MODE=1`.
+
 ```json
 {"personId":"synthetic-person","executionProfile":"agent_loop","ragCondition":"caption_image"}
 ```

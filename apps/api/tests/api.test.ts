@@ -13,11 +13,11 @@ const ChatServiceGetTurn=SplitChatService.prototype.getTurn;
 const token='synthetic_api_token_abcdefghijklmnop';
 const productionToken='production_api_token_abcdefghijklmnop';
 const webOwner='local-0123456789abcdef0123456789abcdef01234567';
-const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',label:'Synthetic Painter',language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Synthetic conversation',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
+const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',label:'Synthetic Painter',tagline:'A fictional painter who likes warm colors',starters:['좋아하는 색은?','오늘 뭐 그렸어?'],language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',identity:'Fictional',concept:'Synthetic conversation',style:['brief'],boundaries:['AI disclosure'],sourceRefs:[],greeting:'안녕하세요.'};
 let app:INestApplication;let base:string;let runtime:SplitApiRuntime;let fixture:ReturnType<typeof splitRuntimeFixture>;let artifacts:CreativeArtifact[];
 async function call(path:string,options:{method?:string;body?:unknown;owner?:string;auth?:string}={}) {
   const response=await fetch(`${base}/api/${path}`,{method:options.method??'GET',headers:{Authorization:options.auth??`Bearer ${token}`,'X-PTR-Owner':options.owner??'owner_synthetic_a','Content-Type':'application/json'},...(options.body===undefined?{}:{body:JSON.stringify(options.body)})});
-  return {status:response.status,body:await response.json() as {session:ChatSession;turn:ChatTurn;personas:(Persona & {aiDisclosure:string})[];history:ChatMessage[];sessions:ChatSession[];artifact:CreativeArtifact;image:{code:string};cancelled:boolean}};
+  return {status:response.status,body:await response.json() as {session:ChatSession;turn:ChatTurn;personas:(Persona & {aiDisclosure:string})[];operatorMode:boolean;history:ChatMessage[];sessions:ChatSession[];artifact:CreativeArtifact;image:{code:string};cancelled:boolean}};
 }
 async function waitTurn(id:string):Promise<ChatTurn> {
   for(let i=0;i<100;i++) {const result=await call(`turns/${id}`);if(['completed','cancelled','failed'].includes(result.body.turn.state)) return result.body.turn;await new Promise(resolve=>setTimeout(resolve,5));}
@@ -49,7 +49,42 @@ test('health safe; authentication required and invalid owner rejected',async()=>
   expect((await call('health',{auth:'bad'})).body).toEqual({ok:true,service:'persona-timeline-rag',liveEnabled:false,checks:{database:'ok',redis:'ok'}});
   expect((await call('personas',{auth:'Bearer wrong'})).status).toBe(403);
   expect((await call('personas',{owner:'../unsafe'})).status).toBe(403);
-  const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toBe('AI 캐릭터 · 실제 인물이 아니에요');expect(listed.body.personas[0].identity).toBeUndefined();
+  const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toBe(`AI 캐릭터 · 실제 ${persona.label} 아님`);expect(listed.body.personas[0].identity).toBeUndefined();
+});
+test('public catalogue carries approved card copy and operator mode is off by default',async()=>{
+  const listed=(await call('personas')).body;
+  expect(listed.operatorMode).toBe(false);
+  expect(listed.personas[0]).toMatchObject({label:persona.label,tagline:persona.tagline,starters:persona.starters});
+  expect(listed.personas[0].reviewStatus).toBeUndefined();
+});
+test('server-only operator flag enables the catalogue operator projection',async()=>{
+  await app.close();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,operatorMode:true});
+  await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const listed=(await call('personas')).body;
+  expect(listed.operatorMode).toBe(true);
+  expect(listed.personas[0].reviewStatus).toBe('synthetic');
+});
+test('production token cannot submit operator-only options unless the API flag is enabled',async()=>{
+  const production=`Bearer ${productionToken}`;
+  for(const body of [
+    {personId:persona.personId,ragCondition:'caption_image'},
+    {personId:persona.personId,executionProfile:'legacy'},
+  ]) expect((await call('sessions',{method:'POST',auth:production,owner:webOwner,body})).status).toBe(400);
+  const created=await call('sessions',{method:'POST',auth:production,owner:webOwner,body:{personId:persona.personId}});
+  expect(created.status).toBe(201);
+  for(const extra of [{intent:'timeline'},{timeline:{dateBasis:'posted',limit:5}}])
+    expect((await call(`sessions/${created.body.session.id}/turns`,{method:'POST',auth:production,owner:webOwner,
+      body:{clientRequestId:`forbidden-${Object.keys(extra)[0]}`,text:'synthetic turn',...extra}})).status).toBe(400);
+  expect((await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition:'caption_image'}})).status).toBe(201);
+
+  await app.close();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,operatorOptions:true});
+  await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const allowed=await call('sessions',{method:'POST',auth:production,owner:webOwner,body:{personId:persona.personId,ragCondition:'caption_image'}});
+  expect(allowed.status).toBe(201);
+  expect((await call(`sessions/${allowed.body.session.id}/turns`,{method:'POST',auth:production,owner:webOwner,
+    body:{clientRequestId:'operator-turn',text:'synthetic turn',intent:'timeline',timeline:{dateBasis:'posted',limit:5}}})).status).toBe(201);
 });
 test('authentication runs before malformed or oversized JSON parsing',async()=>{
   for(const body of ['{bad json',' '.repeat(20000)+'{}']) {
@@ -95,7 +130,9 @@ test('web token hides research fields in poll and replay; harness token keeps th
 });
 test('sessions pin server persona revision, owner isolation and completed history',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});expect(created.status).toBe(201);
-  const id=created.body.session.id;expect(created.body.session.ownerId).toBeUndefined();expect(created.body.session.personaRevision).toBe(persona.revision);expect(created.body.session.retrievalMode).toBe('off');
+  const id=created.body.session.id;expect(created.body.session.ownerId).toBeUndefined();expect(created.body.session.personaRevision).toBe(persona.revision);
+  expect(created.body.session).toMatchObject({retrievalMode:'lexical',ragCondition:'caption'});
+  expect((await call(`sessions/${id}`)).body.history[0]?.content).toBe(persona.greeting);
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'synthetic_request_1',text:'안녕'}});const final=await waitTurn(sent.body.turn.id);expect(final.state).toBe('completed');expect(sent.body.turn.ownerId).toBeUndefined();
   const repeated=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'synthetic_request_1',text:'안녕'}});expect(repeated.body.turn.id).toBe(sent.body.turn.id);
   expect((await call(`sessions/${id}`)).body.history).toHaveLength(3);
@@ -156,7 +193,7 @@ test('explicit conditions persist, default algorithm consistently, reject contra
   for(const ragCondition of ['off','caption','caption_image']) {
     const created=await call('sessions',{method:'POST',body:{personId:persona.personId,ragCondition}});
     expect(created.status).toBe(201);expect(created.body.session.ragCondition).toBe(ragCondition);
-    expect(created.body.session.retrievalMode).toBe(ragCondition==='off'?'off':'semantic');
+    expect(created.body.session.retrievalMode).toBe(ragCondition==='off'?'off':'lexical');
     expect((await call(`sessions/${created.body.session.id}`)).body.session.ragCondition).toBe(ragCondition);
     expect((await call(`sessions/${created.body.session.id}`,{owner:'owner_synthetic_other'})).status).toBe(404);
   }

@@ -34,6 +34,32 @@ const fields:[string,(text:string)=>Persona][]=[
 ];
 
 describe('validatePersonaForPublish',()=>{
+  test('public card copy accepts character topics and rejects research/system wording',async()=>{
+    const card={...cardPersona,tagline:'붓과 색을 좋아하는 가상 화가',starters:['오늘은 어떤 색이 좋아?','요즘 뭐 그려?']};
+    expect(await errors(card)).toEqual([]);
+    for(const [path,text] of [
+      ['tagline','연구 페르소나와 대화해요'],['tagline','System prompt character'],
+      ['starters[0]','근거 자료를 보여줘'],['starters[0]','Show retrieval debug'],
+    ] as const) {
+      const changed=path==='tagline'?{...card,tagline:text}:{...card,starters:[text,card.starters[1]]};
+      expect(await errors(changed)).toContainEqual({path,rule:'card_copy',severity:'error'});
+    }
+    expect(await errors(real({...card,starters:['가족 이야기 해줘','요즘 뭐 그려?']}))).toContainEqual({path:'starters[0]',rule:'private_life',severity:'error'});
+  });
+  test('card copy uses Unicode word boundaries for English terms adjacent to Korean',async()=>{
+    for(const text of ['debug해','model이','api랑'])
+      expect((await rules({...cardPersona,tagline:text}))).not.toContain('card_copy');
+    for(const text of ['debug 해','model 이야','api 랑'])
+      expect((await rules({...cardPersona,tagline:text}))).toContain('card_copy');
+  });
+  test('public card copy length failures name the field and never echo text',async()=>{
+    for(const [card,path] of [[{...cardPersona,tagline:'가'.repeat(61)},'tagline'],[{...cardPersona,starters:['나'.repeat(61)]},'starters[0]']] as const) {
+      const report=await validatePersonaForPublish(card,ctx());
+      expect(report.issues).toContainEqual({path,rule:'schema',severity:'error'});
+      expect(JSON.stringify(report)).not.toContain('가'.repeat(61));
+      expect(JSON.stringify(report)).not.toContain('나'.repeat(61));
+    }
+  });
   test('clean v1 and full synthetic personas pass with no issue; the report carries the lint revision',async()=>{
     for(const persona of [v1Persona,cardPersona,real(cardPersona)]) {
       const report=await validatePersonaForPublish(persona,ctx());
@@ -91,6 +117,9 @@ describe('validatePersonaForPublish',()=>{
     expect(await rules(real({...cardPersona,greeting:'저는 서울에서 자랐어요'}))).toContain('biography');
     expect(await rules(real({...cardPersona,personality:{...cardPersona.personality!,summary:'my hometown hero'}}))).toContain('biography');
     expect(await rules(real({...cardPersona,background:{...cardPersona.background!,text:'Graduated from an art school'}}))).toEqual([]);
+  });
+  test('card copy is checked for ungrounded biography',async()=>{
+    expect(await rules(real({...cardPersona,tagline:'I grew up in a small town'}))).toContain('biography');
   });
   test('warn only: dates and places are reported but publishing is allowed',async()=>{
     const report=await validatePersonaForPublish({...cardPersona,background:{...cardPersona.background!,text:'2023년 전시를 준비했다'}},ctx());
@@ -232,6 +261,9 @@ describe('renderPersonaBlock',()=>{
     const all=JSON.stringify(renderPersonaBlock(cardPersona));
     for(const absent of [cardPersona.label,cardPersona.meta!.creatorNotes!,cardPersona.lore![0]!.content,cardPersona.alternateGreetings![0]!,cardPersona.greeting]) expect(all).not.toContain(absent);
   });
+  test('card copy stays out of the model persona block',()=>{
+    expect(renderPersonaBlock({...cardPersona,tagline:'Paint with me',starters:['Which colour?']})).toEqual(renderPersonaBlock(cardPersona));
+  });
   test('changing meta (or label) never changes the rendered bytes',()=>{
     const before=JSON.stringify(renderPersonaBlock(cardPersona));
     expect(JSON.stringify(renderPersonaBlock({...cardPersona,meta:{tags:['other'],creatorNotes:'changed'},label:'Other'}))).toBe(before);
@@ -344,5 +376,5 @@ describe('final review fixes: any foreign script in a Latin word, keycaps, unass
   test('unassigned code points are invisible_char',async()=>{
     expect(await errors({...cardPersona,concept:'synthetic ͸ text'})).toContainEqual({path:'concept',rule:'invisible_char',severity:'error'});
   });
-  test('lint revision is v5',()=>{expect(PERSONA_LINT_REVISION).toBe('persona-lint-v5');});
+  test('lint revision is v6',()=>{expect(PERSONA_LINT_REVISION).toBe('persona-lint-v6');});
 });

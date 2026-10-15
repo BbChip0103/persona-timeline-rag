@@ -30,6 +30,23 @@ export function replyText(key:ReplyTextKey,language:string):string {return TEXTS
  * seed selects one deterministically; if it repeats the preceding assistant text, selection rotates to the next one.
  */
 const VOICE_TEXTS={
+  "reentry": {
+    "casual": [
+      "다시 왔네~ 오늘은 뭐 얘기할까?",
+      "오, 다시 왔네! 어떻게 지냈어?",
+      "다시 만나서 반가워~ 이어서 얘기할래?"
+    ],
+    "polite": [
+      "다시 오셨네요~ 오늘은 무슨 얘기할까요?",
+      "오, 다시 오셨네요! 어떻게 지내셨어요?",
+      "다시 만나서 반가워요~ 이어서 얘기할까요?"
+    ],
+    "en": [
+      "You are back! What shall we chat about today?",
+      "Hey, welcome back! How have you been?",
+      "Good to see you again! Want to pick up where we left off?"
+    ]
+  },
   "decline_private": {
     "casual": [
       "에이, 그건 비밀~ 대신 너 요즘 뭐 하고 지내?",

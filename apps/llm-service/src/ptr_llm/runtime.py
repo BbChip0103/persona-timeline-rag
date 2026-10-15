@@ -321,6 +321,8 @@ class Runtime:
             "reviewStatus",
             "greeting",
             "alternateGreetings",
+            "tagline",
+            "starters",
         )
         # Only the approved public projection crosses the owner boundary.
         try:

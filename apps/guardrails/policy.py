@@ -321,6 +321,26 @@ def reply_decision(reply, metadata):
             ),
         }
 
+    plain = regex.sub(r"^[ \t]{0,3}(?:[-*•][ \t]+|[0-9]+[.)][ \t]+)", "", reply, flags=regex.M)
+    plain = regex.sub(
+        r"\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<![A-Za-z0-9_^])_([^_\n]+)_(?![A-Za-z0-9_^])",
+        lambda match: next(group for group in match.groups() if group is not None),
+        plain,
+    )
+    if plain != reply:
+        plain = regex.sub(
+            r"[ \t]*\n[ \t]*",
+            lambda match: (
+                " " if regex.search(r"[.!?。！？~…]$", plain[:match.start()].rstrip()) else ". "
+            ),
+            plain,
+        ).strip()
+        if not regex.search(r"[\p{L}\p{N}]", plain):
+            return replace("formatting", "service_retry")
+        return reply_decision(plain, metadata) or {
+            "reason": "formatting", "content": plain, "edited": True,
+        }
+
     sentences = [sentence for sentence in SENTENCES.split(reply.strip()) if sentence]
     kept = [
         sentence

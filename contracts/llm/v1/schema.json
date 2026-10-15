@@ -1648,6 +1648,22 @@
           "maxLength": 200,
           "x-maxUtf8Bytes": 800
         },
+        "tagline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "x-maxUtf8Bytes": 240
+        },
+        "starters": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60,
+            "x-maxUtf8Bytes": 240
+          },
+          "maxItems": 4
+        },
         "language": {
           "type": "string",
           "minLength": 1,

@@ -31,6 +31,13 @@ test('split public catalogue/session/reservation remain owner safe without LLM d
  const session=await call('/api/sessions',{personId:persona.personId,executionProfile:'agent_loop'});expect(session.status).toBe(201);expect(session.body.session.ownerId).toBeUndefined();expect(session.body.session.personaRevision).toBe('synthetic-v1');
  const sent=await call(`/api/sessions/${session.body.session.id}/turns`,{clientRequestId:randomUUID(),text:'synthetic hello'});expect(sent.status).toBe(201);expect(sent.body.turn.state).toBe('pending');expect(sent.body.turn.ownerId).toBeUndefined();
 });
+test('session default succeeds with semantic search disabled as by PTR_LLM_SEMANTIC_SEARCH=0',async()=>{
+ const store=new InMemoryConversationStore();
+ runtime.chat=new SplitChatService(store,async()=>[persona],{backlog:async()=>0,publish:async()=>undefined},{publish:async()=>undefined},256,false);
+ const created=await call('/api/sessions',{personId:persona.personId});
+ expect(created.status).toBe(201);
+ expect(created.body.session).toMatchObject({ragCondition:'caption',retrievalMode:'lexical'});
+});
 test('draft RPC keeps backend quota/artifact ownership and fictional marker',async()=>{
  const session=await call('/api/sessions',{personId:persona.personId});const draft=await call(`/api/sessions/${session.body.session.id}/drafts`,{brief:'synthetic brief',clientRequestId:'synthetic-request'});
  expect(draft.status).toBe(201);expect(draft.body.artifact.content).toContain('[가상 포스트 초안 · AI 생성]');expect(draft.body.artifact.ownerId).toBeUndefined();expect(artifacts[0].ownerId).toBe('owner_synthetic_split');expect(runtime.draftRemote).toHaveBeenCalledWith(expect.objectContaining({id:session.body.session.id}),'synthetic brief','draft:owner_synthetic_split:synthetic-request',expect.any(Number),expect.any(AbortSignal));
@@ -49,10 +56,10 @@ test('public raw16KiB counts whitespace, while authenticated internal reply may 
  const reply={sessionId:request.turnId,turnId:request.turnId,messageId:request.executionId,personId:persona.personId,personaRevision:persona.revision,responseKind:'small_talk',status:'answered',content:'한'.repeat(6000),claims:[],evidence:[],limitations:[]};
  expect((await call('/internal/llm/complete',{...request,generation:1,result:{kind:'completed',reply}},controlToken)).status).toBe(200);expect(control.complete).toHaveBeenCalledTimes(1);
 });
-test('split RAG sessions default to semantic when the capability is available',async()=>{
+test('split RAG sessions default to lexical at the public API even when semantic search is available',async()=>{
  for(const ragCondition of ['caption','caption_image'] as const) {
   const session=await call('/api/sessions',{personId:persona.personId,ragCondition});
-  expect(session.status).toBe(201);expect(session.body.session.retrievalMode).toBe('semantic');expect(session.body.session.ragCondition).toBe(ragCondition);
+  expect(session.status).toBe(201);expect(session.body.session.retrievalMode).toBe('lexical');expect(session.body.session.ragCondition).toBe(ragCondition);
  }
 });
 test('split semantic defaults fail explicitly without capability; lexical and RAG-off remain opt-in',async()=>{

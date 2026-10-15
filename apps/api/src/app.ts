@@ -22,6 +22,8 @@ const RUNTIME=Symbol('API_RUNTIME');
 const SSE=Symbol('SSE_OPTIONS');
 const DRAFT_LIMIT=Symbol('DRAFT_LIMIT');
 const METRICS=Symbol('API_METRICS');
+const OPERATOR_MODE=Symbol('OPERATOR_MODE');
+const OPERATOR_OPTIONS=Symbol('OPERATOR_OPTIONS');
 /** Per-owner draft requests per minute (in-process, every validator configuration): each draft costs up to two safety requests and one model call. */
 export const DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE=10;
 const sessionSchema=z.object({personId:z.string().trim().min(1).max(200),retrievalMode:RetrievalModeSchema.optional(),ragCondition:RagConditionSchema.optional(),timezone:TimezoneSchema.default('UTC'),executionProfile:ExecutionProfileSchema.default('agent_loop')}).strict();
@@ -83,6 +85,8 @@ class ApiController {
   private readonly admitDraft:(owner:string)=>Promise<void>;
   private readonly log=createLog('api');
   constructor(@Inject(RUNTIME) private readonly runtime:SplitApiRuntime,@Inject(SSE) private readonly sse:SseOptions,@Inject(DRAFT_LIMIT) draftLimit:number,
+    @Inject(OPERATOR_MODE) private readonly operatorMode:boolean,
+    @Inject(OPERATOR_OPTIONS) private readonly operatorOptions:boolean,
     @Inject(METRICS) private readonly metrics:ApiMetrics) {this.admitDraft=createDraftLimiter(draftLimit,runtime.draftLimiterClient?.());}
   /** D23: with a runtime that checks its dependencies, a failed database `SELECT 1` or Redis `PING` (1 s each) answers 503. */
   @Get('health') async health(@Res({passthrough:true}) response:Response) {
@@ -95,15 +99,21 @@ class ApiController {
   @Get('readyz') readyz(@Res({passthrough:true}) response:Response) {return this.health(response);}
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
-    return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'AI 캐릭터 · 실제 인물이 아니에요'}))};
+    return {operatorMode:this.operatorMode,personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,
+      ...(p.tagline?{tagline:p.tagline}:{}),...(p.starters?{starters:p.starters}:{}),
+      ...(this.operatorMode?{reviewStatus:p.reviewStatus}:{}),aiDisclosure:/^en(?:$|[-_])/i.test(p.language)?`AI character · not the real ${p.label}`:`AI 캐릭터 · 실제 ${p.label} 아님`}))};
   }
   @Get('sessions') async sessions(@Req() request:Request) {return {sessions:(await this.runtime.chat.listSessions(owner(request))).map(safeSession)};}
   @Post('sessions') @UseGuards(RequestOwnerGuard) async createSession(@Req() request:Request,@Body(new ZodSchemaPipe(sessionSchema)) input:z.output<typeof sessionSchema>) {
     const caller=owner(request);
+    if(projectionSpace(request)==='web'&&!this.operatorOptions&&(input.ragCondition==='caption_image'||input.executionProfile==='legacy'))
+      throw new CoreError('INVALID_INPUT');
     const candidates=(await this.runtime.listPersonas()).filter(p=>p.personId===input.personId);
     if(candidates.length!==1) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=candidates[0]!;
-    const session=await this.runtime.chat.createSession(caller,{...input,personaId:persona.id,personaRevision:persona.revision});
+    const ragCondition=input.ragCondition??(input.retrievalMode==='off'?'off':'caption');
+    const retrievalMode=input.retrievalMode??(ragCondition==='off'?'off':'lexical');
+    const session=await this.runtime.chat.createSession(caller,{...input,ragCondition,retrievalMode,personaId:persona.id,personaRevision:persona.revision});
     return {session:safeSession(session)};
   }
   @Get('sessions/:id') async session(@Req() request:Request,@Param('id') id:string) {
@@ -111,6 +121,8 @@ class ApiController {
   }
   @Post('sessions/:id/turns') @UseGuards(RequestOwnerGuard) async send(@Req() request:Request,@Param('id',new ZodSchemaPipe(SendTurnSchema.shape.sessionId)) id:string,@Body(new ZodSchemaPipe(sendBodySchema)) body:z.output<typeof sendBodySchema>) {
     const caller=owner(request);
+    if(projectionSpace(request)==='web'&&!this.operatorOptions&&(body.intent!==undefined||body.timeline!==undefined))
+      throw new CoreError('INVALID_INPUT');
     const input={...body,sessionId:id};
     if(forbiddenSecret.test(input.text)) throw new CoreError('INVALID_INPUT');
     const {turn,created}=await this.runtime.chat.submitTurn(caller,input);
@@ -162,7 +174,7 @@ class LlmControlController {
   @Post('complete') @HttpCode(200) async complete(@Body(new WireSchemaPipe<CompleteRequest>('CompleteRequest')) r:CompleteRequest) {const runtime=this.runtime;const ack=await runtime.control.complete(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.result.kind==='completed'?'completed':'failed',...(r.result.kind==='failed'?{errorCode:r.result.errorCode}:{})}).catch(()=>undefined);return ack;}
 }
 /** `syntheticToken`: the harness token (PTR_API_SYNTHETIC_TOKEN, demo layer); it must differ from the production token. */
-export async function createApiApplication(runtime:SplitApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string}={}):Promise<INestApplication> {
+export async function createApiApplication(runtime:SplitApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string;operatorMode?:boolean;operatorOptions?:boolean}={}):Promise<INestApplication> {
   const draftLimit=options.draftsPerOwnerPerMinute??DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE;
   if(!Number.isInteger(draftLimit)||draftLimit<1) throw new CoreError('INVALID_INPUT');
   const validToken=(value:string)=>value.length>=24 && value.length<=512;
@@ -175,7 +187,7 @@ export async function createApiApplication(runtime:SplitApiRuntime,token:string,
     onApplicationShutdown():Promise<void> {return this.closing??=Promise.resolve().then(()=>runtime.close());}
   }
   @Module({controllers:[ApiController,LlmControlController],providers:[{provide:RUNTIME,useValue:runtime},{provide:SSE,useValue:{...DEFAULT_SSE,...options.sse}},{provide:DRAFT_LIMIT,useValue:draftLimit},
-    {provide:METRICS,useValue:metrics},RuntimeLifecycle]})
+    {provide:OPERATOR_MODE,useValue:options.operatorMode===true},{provide:OPERATOR_OPTIONS,useValue:options.operatorOptions===true},{provide:METRICS,useValue:metrics},RuntimeLifecycle]})
   class ApiModule {}
   const app=await NestFactory.create<NestExpressApplication>(ApiModule,{logger:false,bodyParser:false});
   // Token middleware runs before body parsing so unauthenticated input has no effect.

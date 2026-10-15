@@ -70,6 +70,17 @@ async def test_generated_order_authored_override_and_append_use_canonical_cards(
     assert db == [card("unapproved-variant", "a"), c, b, a, authored_a]
 
 
+async def test_approved_catalogue_carries_only_public_card_copy(tmp_path):
+    approved = dict(card("a"), tagline="붓과 색", starters=["무슨 색?", "요즘 뭐 그려?"])
+    unapproved = dict(card("unapproved", "a"), tagline="비공개", starters=["보이면 안 돼"])
+    env = {"PTR_PERSONAS_FILE": write(tmp_path / "approved.json", [approved])}
+    public = await runtime([unapproved, approved], selection(env)).catalogue()
+    assert public[0]["tagline"] == "붓과 색"
+    assert public[0]["starters"] == ["무슨 색?", "요즘 뭐 그려?"]
+    assert "identity" not in public[0]
+    assert "비공개" not in json.dumps(public, ensure_ascii=False)
+
+
 async def test_unset_authored_file_is_not_discovered_and_plain_array_is_supported(
     tmp_path, monkeypatch
 ):

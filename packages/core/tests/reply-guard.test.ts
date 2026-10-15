@@ -1,5 +1,12 @@
 import { REPLY_GUARD_REVISION, guardReply, replyText, voiceText } from '../src';
 
+test('C2 removes model markdown markers while preserving ordinary punctuation',()=>{
+  expect(guardReply({utterance:'안녕',reply:'- **오늘은** 바람 좋다.\n2. *산책* 갈래?',realPerson:false,language:'ko'}))
+    .toEqual({reason:'formatting',content:'오늘은 바람 좋다. 산책 갈래?',edited:true});
+  expect(guardReply({utterance:'hi',reply:'A_B and C-D feel fine.',realPerson:false,language:'en'})).toBeUndefined();
+  expect(guardReply({utterance:'hi',reply:'- ',realPerson:false,language:'en'})?.content).toBe(voiceText('service_retry','en','polite'));
+});
+
 /**
  * Reply guard (S8 gates d/e): agent and experiment replies that impersonate a human, dodge an identity question without
  * acknowledging the AI, or (real-person personas) touch private life are replaced, fail-closed, by a fixed reply in the

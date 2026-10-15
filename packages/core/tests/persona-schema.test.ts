@@ -6,6 +6,20 @@ const parses=(patch:Record<string,unknown>)=>PersonaSchema.safeParse({...cardPer
 const cp=(n:number,char='가')=>char.repeat(n);
 
 describe('PersonaSchema v2 fields',()=>{
+  test('optional public card copy parses without changing the v1 document',()=>{
+    const withCard={...v1Persona,tagline:'색으로 하루를 그리는 화가',starters:['오늘은 어떤 색이 좋아?','요즘 뭐 그려?']};
+    expect(PersonaSchema.parse(withCard)).toEqual(withCard);
+    expect(PersonaSchema.parse(v1Persona)).toEqual(v1Persona);
+  });
+  test('public card copy has four starters at most and 60 code points per text',()=>{
+    expect(parses({tagline:'😀'.repeat(60),starters:['가'.repeat(60),'나','다','라']})).toBe(true);
+    expect(parses({tagline:'😀'.repeat(61)})).toBe(false);
+    expect(parses({starters:['가'.repeat(61)]})).toBe(false);
+    expect(parses({starters:['가','나','다','라','마']})).toBe(false);
+    expect(parses({tagline:'   '})).toBe(false);
+    expect(parses({starters:['  ']})).toBe(false);
+    expect(PersonaSchema.parse({...cardPersona,tagline:'  반가워  ',starters:['  얘기해 줘  ']})).toMatchObject({tagline:'반가워',starters:['얘기해 줘']});
+  });
   test('a v1 document (prepare-research shape) still parses, unchanged',()=>{
     expect(PersonaSchema.parse(v1Persona)).toEqual(v1Persona);
     expect(JSON.stringify(PersonaSchema.parse(v1Persona))).toBe(JSON.stringify(v1Persona));

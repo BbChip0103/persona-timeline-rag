@@ -99,6 +99,22 @@ describe('sentence boundary',()=>{
   test('no boundary at all: kept',()=>expect(trimToSentence('a'.repeat(10),10)).toBe('a'.repeat(10)));
 });
 describe('message cap (root cause of the 180-character cuts)',()=>{
+  test('C2 trims a long completed reply to a sentence near 180 characters',()=>{
+    const message=`${'This is a brief sentence. '.repeat(9)}Another sentence follows.`;
+    expect([...trimToSentence(message)].length).toBeLessThanOrEqual(180);
+    expect(trimToSentence(message)).toMatch(/sentence\.$/);
+  });
+  test('a 248-character reply trims identically in TS and production Python',()=>{
+    const message=`${'가'.repeat(170)}. ${'나'.repeat(76)}`;
+    expect([...message]).toHaveLength(248);
+    const {spawnSync}=require('node:child_process') as typeof import('node:child_process');
+    const python=spawnSync('uv',['run','--project','apps/llm-service','python','-c',
+      'import sys; from ptr_llm.core.agent import trim_to_sentence; print(trim_to_sentence(sys.stdin.read()), end="")'],
+    {cwd:process.cwd(),input:message,encoding:'utf8',timeout:15000});
+    expect(python.status).toBe(0);
+    expect(python.stdout).toBe(trimToSentence(message));
+    expect(python.stdout).toBe(`${'가'.repeat(170)}.`);
+  });
   test('the structured-output schema and the contract allow 400 code points, so guided decoding no longer closes the string at 180',()=>{
     expect(AGENT_MESSAGE_MAX_CODE_POINTS).toBe(400);expect(AGENT_RESPONSE_JSON_SCHEMA.properties.message.maxLength).toBe(400);
     const message='가'.repeat(400);
@@ -112,6 +128,9 @@ describe('message cap (root cause of the 180-character cuts)',()=>{
 });
 
 describe('policy (since v9/v12)',()=>{
+  test('C2 voice policy limits emoji and forbids lists and Markdown',()=>{
+    expect(REPLY_VOICE_POLICY).toContain('Use emoji only when it fits the persona style. Do not use lists or Markdown.');
+  });
   test('revisions and placement',()=>{
     expect(buildExperimentContext(base,[],'x',[]).messages[0]!.content).toContain(`${IDENTITY_PRIVACY_POLICY} ${REPLY_VOICE_POLICY} TIMELINE_JSON_REPLY:`);
   });
@@ -295,7 +314,7 @@ describe('re-review (M1, M2, L4-L7)',()=>{
 describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable policy lines; origin answered; one speech level)',()=>{
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
     expect(REPLY_GUARD_REVISION).toBe('reply-guard-v8');
   });
   test('the policies describe behaviour and carry no quotable example lines (gate b overlap, copied lines)',async()=>{
@@ -364,7 +383,7 @@ describe('v11/v14 (no meta talk about the persona\'s data or system; unknown det
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   const card:Persona={...realEn,background:{text:'A synthetic travel painter.',sourceRefs:['web:1']},lore:[{id:'l1',keys:['sea'],content:'Paints the sea at dawn.',priority:1,sourceRefs:['web:1']}]};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
   });
   test('no prompt text the model sees calls the persona data notes, a profile or records, or asks for an explicitly uncertain answer',async()=>{
     const texts=[await agentPolicy(),buildExperimentContext(base,[],'x',[]).messages[0]!.content,...renderPersonaBlock(card).map(m=>m.content),renderLoreMessage(card.lore!).content];

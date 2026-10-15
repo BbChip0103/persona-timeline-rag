@@ -2,7 +2,7 @@ import { guardReply, voiceText, type VoiceTextKey } from '../src';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const keys:VoiceTextKey[]=['decline_private','empathy_ask','identity','decline','fallback','clarification','ambiguous_reference','event_timezone','memory_ask_back','memory_topic_broaden','service_retry'];
+const keys:VoiceTextKey[]=['decline_private','empathy_ask','identity','decline','fallback','clarification','ambiguous_reference','event_timezone','memory_ask_back','memory_topic_broaden','service_retry','reentry'];
 const fixture=(...parts:string[])=>JSON.parse(readFileSync(join(__dirname,'..','..','..','apps',...parts),'utf8')) as unknown;
 const pythonVoices=fixture('llm-service','src','ptr_llm','core','voice_texts.json') as Record<VoiceTextKey,{casual:string[];polite:string[];en:string[]}>;
 const guardrailsVoices=fixture('guardrails','voice_texts.json') as typeof pythonVoices;
@@ -18,6 +18,7 @@ test('the shared Python/Guardrails policy goldens produce the same TS result',()
 });
 
 describe('C1 voice variants',()=>{
+  test('re-entry cue is a voice-text variant',()=>expect(voiceText('reentry','ko','casual')).toContain('다시 왔네'));
   test('both Python services use the same voice variants',()=>expect(guardrailsVoices).toEqual(pythonVoices));
   test.each(keys)('%s has three or four Python-identical deterministic variants in every register',key=>{
     for(const [language,level] of [['ko','casual'],['ko','polite'],['en','casual']] as const) {

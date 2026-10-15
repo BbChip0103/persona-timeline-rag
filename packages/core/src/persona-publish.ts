@@ -11,7 +11,7 @@ import { containsCredentialPattern, containsInternalPathPattern, containsUngroun
  * patterns are broad on purpose (N5): a harmless phrase that matches must be reworded, there is no exception list.
  * Bump the revision whenever a pattern or limit changes.
  */
-export const PERSONA_LINT_REVISION='persona-lint-v5';
+export const PERSONA_LINT_REVISION='persona-lint-v6';
 export interface PersonaPublishIssue { path:string; rule:string; severity:'error'|'warn' }
 export interface PersonaPublishReport { ok:boolean; issues:PersonaPublishIssue[]; lintRevision:string }
 export interface PersonaPublishContext {
@@ -100,12 +100,16 @@ const DATE_PLACE:RegExp[]=[
   /\b(?:19|20)\d{2}\b|\d{4}\s*년|\d{1,2}\s*월\s*\d{1,2}\s*일|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}\b/,
   /[가-힣]{1,10}(?:시|구|동|역|공항)에서|\b(?:in|at)\s+(?:[A-Z][a-z]+\s){1,3}(?:City|Station|Airport|Street|St\.|Avenue)\b/,
 ];
-type Group='label'|'core'|'greeting'|'personality'|'background'|'example'|'lore'|'meta';
+type Group='label'|'card'|'core'|'greeting'|'personality'|'background'|'example'|'lore'|'meta';
+/** Card copy is public character-facing text, not an operator or research surface. */
+const CARD_COPY_FORBIDDEN=/(?:연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|(?<![\p{L}\p{N}_])(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)(?![\p{L}\p{N}_]))/iu;
 /** Every author-written string that is rendered (plus label and meta, shown in the UI), with its report path. */
 function authorFields(p:Persona):{path:string;text:string;group:Group}[] {
   const out:{path:string;text:string;group:Group}[]=[];
   const add=(group:Group,path:string,text:string)=>{out.push({path,text,group});};
   add('label','label',p.label);add('core','id',p.id);add('core','language',p.language);add('core','identity',p.identity);add('core','concept',p.concept);
+  if(p.tagline!==undefined) add('card','tagline',p.tagline);
+  p.starters?.forEach((text,i)=>add('card',`starters[${i}]`,text));
   p.style.forEach((text,i)=>add('core',`style[${i}]`,text));p.boundaries.forEach((text,i)=>add('core',`boundaries[${i}]`,text));
   add('greeting','greeting',p.greeting);p.alternateGreetings?.forEach((text,i)=>add('greeting',`alternateGreetings[${i}]`,text));
   if(p.personality) {
@@ -213,6 +217,7 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
   const leaks=new Set(context.testCaptions.flatMap(caption=>windows(caption,TEST_CAPTION_OVERLAP_CODE_POINTS)));
   for(const {path,text,group} of authorFields(p)) {
     const folded=checkForm(text),matches=(pattern:RegExp)=>pattern.test(text)||pattern.test(folded);
+    if(group==='card'&&matches(CARD_COPY_FORBIDDEN)) report(path,'card_copy');
     if(INVISIBLE.test(withoutEmojiJoiners(path==='meta.creatorNotes'?text.replace(/\n/g,''):text))) report(path,'invisible_char');
     if(mixedScriptWord(text)) report(path,'homoglyph');
     for(const [rule,patterns] of FORBIDDEN) if(patterns.some(matches)) report(path,rule);
@@ -220,10 +225,10 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
     if(containsInternalPathPattern(text)||containsInternalPathPattern(folded)) report(path,'internal_path');
     const exempt=/^style\[/.test(path)&&exemptStyle.has(text)||/^boundaries\[/.test(path)&&exemptBoundaries.has(text);
     if(group!=='label'&&group!=='meta'&&leaks.size&&!exempt&&windows(text,TEST_CAPTION_OVERLAP_CODE_POINTS).some(window=>leaks.has(window))) report(path,'test_caption_overlap');
-    if(realPerson&&['greeting','personality','background','example','lore'].includes(group)&&PRIVATE_LIFE.some(matches)) report(path,'private_life');
+    if(realPerson&&['card','greeting','personality','background','example','lore'].includes(group)&&PRIVATE_LIFE.some(matches)) report(path,'private_life');
     // Background text is stored as a third-person character sheet (a storage format; the model speaks about it in the
     // first person): it gets the private-life check instead of the biography check .
-    if(['greeting','personality','example'].includes(group)&&(containsUngroundedBiography(text)||containsUngroundedBiography(folded))) report(path,'biography',realPerson?'error':'warn');
+    if(['card','greeting','personality','example'].includes(group)&&(containsUngroundedBiography(text)||containsUngroundedBiography(folded))) report(path,'biography',realPerson?'error':'warn');
     if(group!=='label'&&group!=='meta'&&DATE_PLACE.some(pattern=>pattern.test(text))) report(path,'date_place','warn');
   }
   const refs:[string,string][]=[...p.sourceRefs.map((ref,i)=>[`sourceRefs[${i}]`,ref] as [string,string]),

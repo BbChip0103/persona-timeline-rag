@@ -24,6 +24,8 @@ export const PersonaSchema = z.object({
   id, personId:id, label: z.string().min(1), language: z.string().min(1), revision: id,
   reviewStatus: ReviewStatusSchema, identity: z.string(), concept: z.string(),
   style: z.array(z.string()), boundaries: z.array(z.string()), sourceRefs: z.array(id), greeting: z.string().min(1),
+  /** Public catalogue card copy; never inserted into the model persona block. */
+  tagline: text(60).optional(), starters: z.array(text(60)).max(4).optional(),
   alternateGreetings: z.array(text(300)).max(4).optional(),
   personality: PersonalitySchema.optional(),
   background: z.object({ text: text(500), sourceRefs: z.array(id).min(1).max(20) }).strict().optional(),
@@ -38,6 +40,8 @@ export const CalendarDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine
   return !Number.isNaN(date.valueOf()) && date.toISOString().slice(0,10) === value;
 }, 'Invalid calendar date');
 export const TimezoneSchema = z.string().refine(value => {
+  // Intl also accepts numeric offsets; the Python retrieval path uses ZoneInfo names.
+  if(!/^(?:UTC|[A-Za-z][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._+-]+)+)$/u.test(value)) return false;
   try { new Intl.DateTimeFormat('en', {timeZone:value}); return true; } catch { return false; }
 }, 'Invalid IANA timezone');
 export const ImageAnnotationEvidenceSchema = z.object({
@@ -94,7 +98,7 @@ export interface ChatReply {
   /** Internal : lore entries rendered this turn (ids only) and matched entries left out by the caps. */
   personaContext?:{loreIds:string[];loreOmitted:number};
   /** Internal (S8 follow-up): reply guard outcome on the agent and experiment paths; a replaced reply carries the reason. */
-  replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'};
+  replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'|'formatting'};
   /**
    * Internal : which upstream answered each model call of the turn, in call order (`primary`, `secondary`,
    * `fake`, `openrouter`, `direct`, else `unknown`); `calls` = upstreams.length. Absent when no model was called.

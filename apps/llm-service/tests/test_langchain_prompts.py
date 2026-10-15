@@ -36,6 +36,12 @@ HISTORY = [
 TEXT = '{text.__class__} {text!r:>10} {{}} {% raw %} 한글 😁\n"quoted"'
 
 
+def test_c2_all_active_policies_limit_emoji_and_markdown():
+    line = "Use emoji only when it fits the persona style. Do not use lists or Markdown."
+    assert line in POLICY["REPLY_VOICE_POLICY"]
+    assert line in POLICY["EXPERIMENT_POLICY"]
+
+
 def source(index, caption=None, annotations=()):
     return {
         "id": f"synthetic-source-{index}",

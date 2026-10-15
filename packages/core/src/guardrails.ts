@@ -16,7 +16,7 @@ const inputResponse=z.object({revision:revisionSchema,action:z.enum(['none','sup
     ||value.action==='refuse'&&!refusal.includes(value.category??'')) context.addIssue({code:'custom',message:'invalid safety decision'});
 });
 const outputResponse=z.object({revision:revisionSchema,content:z.string().max(64000),
-  reason:z.enum(['human_impersonation','missing_ai_disclosure','private_life','background_denial','meta_talk']).optional(),
+  reason:z.enum(['human_impersonation','missing_ai_disclosure','private_life','background_denial','meta_talk','formatting']).optional(),
   edited:z.literal(true).optional()}).strict();
 
 export type GuardrailsInputResult=z.infer<typeof inputResponse>;
