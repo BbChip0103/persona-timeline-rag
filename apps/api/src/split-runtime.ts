@@ -19,7 +19,7 @@ export interface SplitApiRuntime {
   executionStore:TurnExecutionStore;delivery:BullMqTurnDelivery;events:RedisTurnEvents;eventSource:RedisTurnEventSource;
   providerName:string;model:string;billable:boolean;
   draftLimiterClient?:()=>ReturnType<typeof createRedisConnection>;
-  listPersonas():Promise<PersonaProjection[]>;saveArtifact(artifact:CreativeArtifact):Promise<void>;
+  listPersonas():Promise<PersonaProjection[]>;saveArtifact(artifact:CreativeArtifact,requestKey:string):Promise<void>;
   loadArtifact(ownerId:string,id:string):Promise<CreativeArtifact|null>;
   draftRemote(session:ChatSession,brief:string,requestKey:string,deadlineAt:number,signal:AbortSignal):Promise<{content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}}>;
   health():Promise<{database:boolean;redis:boolean}>;close():Promise<void>;
@@ -81,7 +81,7 @@ export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRu
   if(env.PTR_BACKEND_MAINTENANCE!=='0')maintenance.start();
   return {kind:'split',chat,control,controlToken,executionStore:store,delivery,events,eventSource,providerName:env.PTR_CHAT_PROVIDER??'fake',model:env.PTR_MODEL??'synthetic/fake-text-v1',billable,draftLimiterClient:redis,listPersonas,
     async draftRemote(session,brief,requestKey,deadlineAt,signal) {const payload=validateWire('DraftRequest',{contractVersion:2,session,brief,requestKey,deadlineAt});const result=await rpc('DraftResponse','/internal/llm/draft',payload,signal);const {contractVersion:_,...reply}=result;return reply as {content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}};},
-    saveArtifact:artifact=>artifacts.save(artifact),
+    saveArtifact:(artifact,requestKey)=>artifacts.save(artifact,requestKey),
     loadArtifact:(ownerId,id)=>artifacts.get<CreativeArtifact>(ownerId,id),
     async health() {const check=async(work:()=>Promise<unknown>)=>{try{await bounded(work,1000);return true;}catch{return false;}};const [database,redisOkay]=await Promise.all([check(()=>pool.query('SELECT 1')),check(()=>redis().ping())]);return {database,redis:redisOkay};},
     async close(){await maintenance.stop();await Promise.allSettled([delivery.close(),events.close(),eventSource.close(),queue?.close()]);connection?.disconnect();await pool.end();},

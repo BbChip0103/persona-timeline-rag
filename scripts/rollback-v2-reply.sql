@@ -26,9 +26,15 @@ WHERE document ? 'userMemoryConsent';
 -- Root fields are defensive cleanup for malformed earlier C4 receipts persisted as replies.
 
 UPDATE app.turns
-SET reply = reply
+SET reply = (CASE
+    WHEN reply #>> '{replyGuard,reason}' = 'formatting'
+    THEN reply #- '{replyGuard}'
+    ELSE reply
+  END)
   #- '{summaryUpdate}'
   #- '{userMemoryOps}'
+  #- '{operatorMetadata}'
+  #- '{operatorTrace}'
   #- '{agent,variables,speechLevel}'
   #- '{agent,variables,lastYearRecallUsed}'
   #- '{agent,variables,summary}'
@@ -36,7 +42,8 @@ SET reply = reply
   #- '{agent,variables,userMemoryConsent}'
   #- '{agent,variables,summaryUpdate}'
   #- '{agent,variables,userMemoryOps}'
-WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps']
+WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps', 'operatorMetadata', 'operatorTrace']
+  OR (reply #>> '{replyGuard,reason}') = 'formatting'
   OR (reply #> '{agent,variables}') ?| ARRAY[
     'speechLevel', 'lastYearRecallUsed', 'summary', 'userMemories', 'userMemoryConsent',
     'summaryUpdate', 'userMemoryOps'
@@ -49,7 +56,14 @@ BEGIN
   END IF;
   IF EXISTS (
     SELECT 1 FROM app.turns
-    WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps']
+    WHERE reply ?| ARRAY['summaryUpdate', 'userMemoryOps', 'operatorMetadata', 'operatorTrace']
+      OR (
+        (reply #> '{replyGuard,reason}') IS NOT NULL
+        AND COALESCE(reply #>> '{replyGuard,reason}', '') NOT IN (
+          'human_impersonation', 'missing_ai_disclosure', 'private_life',
+          'background_denial', 'meta_talk'
+        )
+      )
       OR (reply #> '{agent,variables}') ?| ARRAY[
       'speechLevel', 'lastYearRecallUsed', 'summary', 'userMemories', 'userMemoryConsent',
       'summaryUpdate', 'userMemoryOps'

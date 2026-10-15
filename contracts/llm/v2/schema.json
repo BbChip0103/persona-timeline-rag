@@ -914,7 +914,8 @@
                 "missing_ai_disclosure",
                 "private_life",
                 "background_denial",
-                "meta_talk"
+                "meta_talk",
+                "formatting"
               ]
             }
           },
@@ -922,6 +923,30 @@
             "revision",
             "action"
           ],
+          "additionalProperties": false
+        },
+        "operatorMetadata": {
+          "type": "object",
+          "properties": {
+            "guardStage": {"const": "output_guard"},
+            "exceptionClass": {"type": "string", "minLength": 1, "maxLength": 64},
+            "code": {"const": "GUARDRAILS_OUTPUT_UNAVAILABLE"}
+          },
+          "required": ["guardStage", "exceptionClass", "code"],
+          "additionalProperties": false
+        },
+        "operatorTrace": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "enum": ["model", "fixed", "ask_back", "guard_replacement", "guard_edit",
+                "fallback", "regeneration", "register_regeneration", "identity_variant", "voice_variant"]
+            },
+            "code": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Z_]+$"},
+            "repeatChecked": {"const": true},
+            "previousAvailable": {"type": "boolean"}
+          },
+          "required": ["path", "code", "repeatChecked", "previousAvailable"],
           "additionalProperties": false
         },
         "serving": {

@@ -21,7 +21,9 @@ _THREAD_TURN_SQL = (
     "(c.thread_id ~ '^python-call-v1:[0-9a-f]{64}:[0-9a-f]{64}$' "
     "AND split_part(c.thread_id,':',2) IN ("
     "encode(sha256(convert_to(t.id,'UTF8')),'hex'),"
-    "encode(sha256(convert_to(t.id||':summary','UTF8')),'hex')))"
+    "encode(sha256(convert_to(t.id||':summary','UTF8')),'hex'),"
+    "encode(sha256(convert_to(t.id||':regen','UTF8')),'hex'),"
+    "encode(sha256(convert_to(t.id||':register','UTF8')),'hex')))"
 )
 _SAVER_TABLES = tuple(
     f"llm.{prefix}{name}"
@@ -51,14 +53,21 @@ class RetentionOptions:
             raise ValueError("RETENTION_SCOPE_INVALID")
 
 
-def linked_thread_ids(threads: list[str], turn_ids: list[str]) -> list[str]:
+def linked_thread_ids(
+    threads: list[str], turn_ids: list[str], draft_request_keys: list[str] | None = None
+) -> list[str]:
     """Match exact, known native/legacy grammars; never deserialize checkpoint data."""
     turns = set(turn_ids)
     scopes = {
         hashlib.sha256(request_key.encode()).hexdigest()
         for turn in turns
-        for request_key in (turn, f"{turn}:summary")
+        for request_key in (turn, f"{turn}:summary", f"{turn}:regen", f"{turn}:register")
     }
+    scopes.update(
+        hashlib.sha256(key.encode()).hexdigest()
+        for key in (draft_request_keys or [])
+        if key.startswith("draft:")
+    )
     explicit = {f"{kind}:{turn}" for turn in turns for kind in ("turn", "character")}
     matched = []
     for thread in set(threads):
@@ -91,7 +100,8 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
 
     Deleted sessions bypass age retention and lose their application truth. Otherwise,
     billing tombstones, turn/message truth and active/resumable work survive. Missing
-    execution/turn scopes and opaque draft checkpoint hashes are retained, not guessed.
+    execution/turn scopes and stored session draft request keys are matched exactly.
+    Opaque or unlinked checkpoint hashes are retained, not guessed.
     Return only counts: no raw payloads, IDs, hashes, credentials or DSNs.
     """
     options = options or RetentionOptions()
@@ -122,19 +132,41 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             "llm.ptr_provider_requests",
         )
         present = {}
-        for table in mandatory + ("app.user_memories",) + _SAVER_TABLES:
+        for table in mandatory + ("app.user_memories", "app.generated_artifacts") + _SAVER_TABLES:
             row = await (
                 await connection.execute("SELECT to_regclass(%s) IS NOT NULL AS present", (table,))
             ).fetchone()
             present[table] = bool(row["present"])
         if not all(present[table] for table in mandatory + _SAVER_TABLES[:3]):
             raise ValueError("RETENTION_SCHEMA_NOT_READY")
+        has_request_key = False
+        if present.get("app.generated_artifacts"):
+            has_request_key = bool(
+                await (
+                    await connection.execute(
+                        "SELECT 1 FROM information_schema.columns WHERE table_schema='app' "
+                        "AND table_name='generated_artifacts' AND column_name='request_key'"
+                    )
+                ).fetchone()
+            )
+        if options.apply and has_request_key:
+            # Freeze draft inserts while selecting sessions and deleting their
+            # checkpoints, so a reused key cannot acquire a new live owner.
+            await connection.execute("LOCK TABLE app.generated_artifacts IN SHARE MODE")
         tables = [table for table in _SAVER_TABLES if present[table]]
         union = " UNION ".join(f"SELECT thread_id FROM {table}" for table in tables)
         sessions = await (
             await connection.execute(
                 "SELECT s.id FROM app.sessions s WHERE s.deleted_at IS NOT NULL "
-                "ORDER BY s.deleted_at,s.id LIMIT %s "
+                + (
+                    "AND NOT EXISTS(SELECT 1 FROM app.generated_artifacts a "
+                    "JOIN app.generated_artifacts b ON b.request_key=a.request_key AND b.id<>a.id "
+                    "JOIN app.sessions live ON live.id=b.session_id AND live.deleted_at IS NULL "
+                    "WHERE a.session_id=s.id AND a.request_key IS NOT NULL) "
+                    if has_request_key
+                    else ""
+                )
+                + "ORDER BY s.deleted_at,s.id LIMIT %s "
                 + ("FOR UPDATE OF s SKIP LOCKED" if options.apply else ""),
                 (options.limit,),
             )
@@ -148,6 +180,24 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             )
         ).fetchall()
         deleted_ids = [str(row["id"]) for row in deleted_turns]
+        draft_keys: list[str] = []
+        if session_ids and has_request_key:
+            draft_rows = await (
+                await connection.execute(
+                    "SELECT request_key FROM app.generated_artifacts "
+                    "WHERE session_id=ANY(%s::text[]) AND request_key IS NOT NULL "
+                    "ORDER BY id LIMIT 100001",
+                    (session_ids,),
+                )
+            ).fetchall()
+            if len(draft_rows) > 100000:
+                raise ValueError("RETENTION_METADATA_LIMIT_EXCEEDED")
+            draft_keys = [str(row["request_key"]) for row in draft_rows]
+        draft_scopes = [
+            hashlib.sha256(key.encode()).hexdigest()
+            for key in draft_keys
+            if key.startswith("draft:")
+        ]
         turns = await (
             await connection.execute(
                 "SELECT t.id FROM app.turns t WHERE t.state IN ('completed','failed','cancelled') "
@@ -180,9 +230,19 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
                 (ids,),
             )
         ).fetchall()
+        if draft_scopes:
+            draft_threads = await (
+                await connection.execute(
+                    f"SELECT DISTINCT c.thread_id FROM ({union}) c "
+                    "WHERE c.thread_id ~ '^python-call-v1:[0-9a-f]{64}:[0-9a-f]{64}$' "
+                    "AND split_part(c.thread_id,':',2)=ANY(%s::text[]) LIMIT 100001",
+                    (draft_scopes,),
+                )
+            ).fetchall()
+            thread_rows.extend(draft_threads)
         if len(thread_rows) > 100000:
             raise ValueError("RETENTION_METADATA_LIMIT_EXCEEDED")
-        threads = linked_thread_ids([str(row["thread_id"]) for row in thread_rows], ids)
+        threads = linked_thread_ids([str(row["thread_id"]) for row in thread_rows], ids, draft_keys)
         thread_count = await (
             await connection.execute(f"SELECT count(*) AS count FROM ({union}) c")
         ).fetchone()
@@ -256,7 +316,8 @@ async def retain_split_data(connection: Any, options: RetentionOptions | None = 
             forgotten = await (
                 await connection.execute(
                     "SELECT count(*) AS count FROM app.user_memories "
-                    "WHERE forgotten AND forgotten_at<%s", (cutoff,)
+                    "WHERE forgotten AND forgotten_at<%s",
+                    (cutoff,),
                 )
             ).fetchone()
             planned["forgottenMemories"] = forgotten["count"]

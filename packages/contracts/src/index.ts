@@ -99,6 +99,10 @@ export interface ChatReply {
   personaContext?:{loreIds:string[];loreOmitted:number};
   /** Internal (S8 follow-up): reply guard outcome on the agent and experiment paths; a replaced reply carries the reason. */
   replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'|'formatting'};
+  /** Sanitized output guard failure for the operator harness; no exception message or reply text. */
+  operatorMetadata?:{guardStage:'output_guard';exceptionClass:string;code:'GUARDRAILS_OUTPUT_UNAVAILABLE'};
+  /** Operator-only reply origin and repeat-check outcome; fixed codes, never text. */
+  operatorTrace?:{path:'model'|'fixed'|'ask_back'|'guard_replacement'|'guard_edit'|'fallback'|'regeneration'|'register_regeneration'|'identity_variant'|'voice_variant';code:string;repeatChecked:true;previousAvailable:boolean};
   /**
    * Internal : which upstream answered each model call of the turn, in call order (`primary`, `secondary`,
    * `fake`, `openrouter`, `direct`, else `unknown`); `calls` = upstreams.length. Absent when no model was called.

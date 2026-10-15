@@ -84,8 +84,13 @@ def test_enabled_observation_sanitizes_exception_and_drops_content():
     client.start_as_current_observation = context
     telemetry.client = client
     with pytest.raises(RuntimeError, match="private-provider-body"):
-        with telemetry.observation("generation", input="private-input") as observation:
-            observation.update(output="private-output", metadata={"kind": "synthetic"})
+        with telemetry.observation(
+            "generation", input={"operatorTrace": {"code": "SYNTHETIC_PRIVATE_TRACE"}}
+        ) as observation:
+            observation.update(
+                output={"operatorTrace": {"code": "SYNTHETIC_PRIVATE_TRACE"}},
+                metadata={"kind": "synthetic"},
+            )
             raise RuntimeError("private-provider-body")
     assert not exited
     assert sdk_span.update.call_args_list[0].kwargs == {"metadata": {"kind": "synthetic"}}

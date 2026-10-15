@@ -291,15 +291,19 @@ test('SSE: an already ended turn yields one snapshot and closes; another owner g
 });
 test('SSE snapshots use the token space projection for both web and harness',async()=>{
   fixture.reply={responseKind:'timeline',grounding:'source_bound_quotes',claims:[{text:'합성 주장',evidenceRefs:[]}],
-    evidence:[],limitations:['합성 한계'],promptEvidence:{sourceIds:['source'],annotationIds:[],omittedAnnotations:0,promptBytes:1}};
+    evidence:[],limitations:['합성 한계'],promptEvidence:{sourceIds:['source'],annotationIds:[],omittedAnnotations:0,promptBytes:1},
+    operatorTrace:{path:'register_regeneration',code:'SYNTHETIC_REGISTER',repeatChecked:true,previousAvailable:true}};
   for(const [auth,owner,hidden] of [[`Bearer ${productionToken}`,webOwner,true],[`Bearer ${token}`,'owner_synthetic_a',false]] as const) {
     const session=(await call('sessions',{method:'POST',auth,owner,body:{personId:persona.personId}})).body.session;
     const sent=await call(`sessions/${session.id}/turns`,{method:'POST',auth,owner,body:{clientRequestId:`sse_${owner}`,text:'합성 질문'}});
     const final=await (async()=>{for(let i=0;i<100;i++){const result=await call(`turns/${sent.body.turn.id}`,{auth,owner});if(result.body.turn.state==='completed')return result.body.turn;await new Promise(resolve=>setTimeout(resolve,5));}throw new Error('Synthetic turn did not settle');})();
+    expect(Object.hasOwn(final.reply??{},'operatorTrace')).toBe(!hidden);
     const stream=await readSse(`${base}/api/turns/${final.id}/events`,owner,3000,auth);
     expect(stream.status).toBe(200);expect(stream.closed).toBe(true);expect(stream.events).toHaveLength(1);
     const reply=stream.events[0]!.data.reply;
     for(const field of ['evidence','limitations','grounding','claims','promptEvidence'])expect(Object.hasOwn(reply??{},field)).toBe(!hidden);
+    expect(Object.hasOwn(reply??{},'operatorTrace')).toBe(!hidden);
+    expect(stream.wire.includes('operatorTrace')).toBe(!hidden);
   }
 });
 test('SSE: if pub/sub notices are lost, the periodic store re-check still delivers the end of the turn',async()=>{

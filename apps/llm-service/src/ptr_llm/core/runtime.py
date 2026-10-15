@@ -4,6 +4,7 @@ Every attempt reruns all cheap domain stages. The injected provider is the ONLY
 owner of durable costly-call receipts; these LangGraph graphs have no saver.
 """
 
+import asyncio
 import copy
 import logging
 import time
@@ -19,7 +20,12 @@ from ptr_llm.billing import ProviderError
 from ptr_llm.control import ControlRejected, ControlUnavailable
 from ptr_llm.worker import ExecutionStopped
 
-from .agent import AGENT_PROMPT_REVISION, AGENT_RUNTIME_REVISION, run_character_agent
+from .agent import (
+    AGENT_PROMPT_REVISION,
+    AGENT_RUNTIME_REVISION,
+    run_character_agent,
+    trim_to_sentence,
+)
 from .context import RETRIEVAL_CONTEXT_REVISION, remember_source_context, retrieval_context
 from .errors import CoreError
 from .evidence import (
@@ -38,9 +44,16 @@ from .memory import (
     summarize,
 )
 from .persona import dumps, match_lore, render_lore_message, serialized_bytes, validate_persona
-from .policy import REVISION, SENTENCES, VOICES, has_user_self_marker
+from .policy import (
+    REVISION,
+    SENTENCES,
+    VOICES,
+    has_user_self_marker,
+    identity_question,
+    reply_decision,
+)
 from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
-from .protocol import variables
+from .protocol import agent_response_schema, parse_agent_response, variables
 from .routing import (
     DEFAULT_SAFETY_THRESHOLDS,
     assess_safety,
@@ -51,6 +64,7 @@ from .routing import (
     sensitive,
 )
 from .safety import contains_credential, contains_internal_path, contains_ungrounded_biography
+from .speech_register import classify_speech_register
 from .texts import reply_text, speech_level, utterance_language, voice_text
 
 
@@ -135,6 +149,27 @@ def requested_speech_level(text):
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _same_reply(first: str, second: str) -> bool:
+    """Compare words after stripping whitespace and punctuation, across scripts."""
+    def normalized(value):
+        return regex.sub(r"[^\p{L}\p{N}]", "", value).casefold()
+
+    return bool(first and second and normalized(first) and normalized(first) == normalized(second))
+
+
+def _log_output_guard_failure(error: Exception) -> dict[str, str]:
+    details = {
+        "guardStage": "output_guard",
+        "exceptionClass": _fixed_exception_class(error),
+        "code": "GUARDRAILS_OUTPUT_UNAVAILABLE",
+    }
+    _LOGGER.warning(
+        "guard_failed guard_stage=%s exception_class=%s code=%s",
+        details["guardStage"], details["exceptionClass"], details["code"],
+    )
+    return details
 
 
 class TurnState(TypedDict):
@@ -479,9 +514,9 @@ class LLMEngine:
                 else session["language"],
                 "level": level,
                 "previousAssistantText": next(
-                    (m["content"] for m in reversed(prompt_history) if m["role"] == "assistant"),
+                    (m["content"] for m in reversed(history) if m["role"] == "assistant"),
                     "",
-                ),
+                ) or (previous or {}).get("content", ""),
             }
             return dict(
                 frame,
@@ -952,25 +987,14 @@ class LLMEngine:
                 served=served,
             )
 
-        async def evidence(frame):
-            if frame.get("output"):
-                return frame
-            snap = frame["snapshot"]
-            raw = frame["rawReply"]
-            agent_run = frame.get("agentRun")
-            agent = None
-            if agent_run:
-                agent = copy.deepcopy(agent_run["agent"])
+        def validate_reply_candidate(raw, frame, snap, request_key):
+            if frame.get("agentRun"):
                 output = validate_experiment_reply(
-                    raw,
-                    frame["memorySources"],
-                    session["personId"],
+                    raw, frame["memorySources"], session["personId"],
                     session.get("ragCondition")
                     or ("off" if session["retrievalMode"] == "off" else "caption"),
-                    snap["replyLanguage"],
-                    snap["level"],
-                    snap["previousAssistantText"],
-                    turn["id"],
+                    snap["replyLanguage"], snap["level"],
+                    snap["previousAssistantText"], request_key,
                 )
                 if not session.get("ragCondition") and frame["intent"] == "timeline":
                     output = validate_source_bound_reply(
@@ -981,13 +1005,48 @@ class LLMEngine:
                     and frame["intent"] == "small_talk"
                     and contains_ungrounded_biography(output["content"])
                 ):
-                    output = {
+                    return {
                         "status": "insufficient_evidence",
                         "content": reply_text("biography_guard", session["language"]),
-                        "claims": [],
-                        "evidence": [],
+                        "claims": [], "evidence": [],
                         "limitations": ["BIOGRAPHY_HEURISTIC_GUARD"],
                     }
+                return output
+            if session.get("ragCondition"):
+                return validate_experiment_reply(
+                    raw, frame["memorySources"], session["personId"],
+                    session["ragCondition"], snap["replyLanguage"], snap["level"],
+                    snap["previousAssistantText"], request_key,
+                )
+            if frame["intent"] == "timeline":
+                return validate_source_bound_reply(
+                    raw, frame["memorySources"], session["personId"]
+                )
+            safe = raw.strip()
+            if (
+                not safe or len(safe) > 8000
+                or contains_credential(safe) or contains_internal_path(safe)
+            ):
+                raise CoreError("TURN_FAILED", "REPLY_REJECTED")
+            biography = contains_ungrounded_biography(safe)
+            return {
+                "status": "insufficient_evidence" if biography else "answered",
+                "content": reply_text("biography_guard", session["language"])
+                if biography else safe,
+                "claims": [], "evidence": [],
+                "limitations": ["BIOGRAPHY_HEURISTIC_GUARD"] if biography else [],
+            }
+
+        async def evidence(frame):
+            if frame.get("output"):
+                return frame
+            snap = frame["snapshot"]
+            raw = frame["rawReply"]
+            agent_run = frame.get("agentRun")
+            agent = None
+            if agent_run:
+                agent = copy.deepcopy(agent_run["agent"])
+                output = validate_reply_candidate(raw, frame, snap, turn["id"])
                 agent["steps"].append({"phase": "validation", "iteration": agent["modelCalls"] - 1})
                 if self.agent_validator and (
                     output["status"] == "answered"
@@ -1038,41 +1097,8 @@ class LLMEngine:
                                 ]
                                 + ["AGENT_VALIDATOR_" + agent["validator"].upper()],
                             }
-            elif session.get("ragCondition"):
-                output = validate_experiment_reply(
-                    raw,
-                    frame["memorySources"],
-                    session["personId"],
-                    session["ragCondition"],
-                    snap["replyLanguage"],
-                    snap["level"],
-                    snap["previousAssistantText"],
-                    turn["id"],
-                )
-            elif frame["intent"] == "timeline":
-                output = validate_source_bound_reply(raw, frame["sources"], session["personId"])
             else:
-                safe = raw.strip()
-                if (
-                    not safe
-                    or len(safe) > 8000
-                    or contains_credential(safe)
-                    or contains_internal_path(safe)
-                ):
-                    raise CoreError("TURN_FAILED", "REPLY_REJECTED")
-                output = {
-                    "status": "insufficient_evidence"
-                    if contains_ungrounded_biography(safe)
-                    else "answered",
-                    "content": reply_text("biography_guard", session["language"])
-                    if contains_ungrounded_biography(safe)
-                    else safe,
-                    "claims": [],
-                    "evidence": [],
-                    "limitations": ["BIOGRAPHY_HEURISTIC_GUARD"]
-                    if contains_ungrounded_biography(safe)
-                    else [],
-                }
+                output = validate_reply_candidate(raw, frame, snap, turn["id"])
             ctx = agent_run["context"] if agent_run else frame.get("experiment")
             prompt_evidence = None
             if ctx:
@@ -1111,74 +1137,211 @@ class LLMEngine:
                     grounding="unverified_model",
                     limitations=["MEMORY_TOPIC_BROADEN" if broaden else "MEMORY_ASK_BACK"],
                 )
-            return dict(frame, output=output, agent=agent, promptEvidence=prompt_evidence)
+            return dict(
+                frame, output=output, agent=agent, promptEvidence=prompt_evidence,
+                **({"replyPath": "ask_back", "replyCode": output["limitations"][-1]}
+                   if output["limitations"] and output["limitations"][-1] in
+                   {"MEMORY_ASK_BACK", "MEMORY_TOPIC_BROADEN"} else {}),
+            )
 
         async def output_guard(frame):
             snap = frame["snapshot"]
             output = copy.deepcopy(frame["output"])
             guard = None
+            operator_metadata = None
+            path = "model" if "rawReply" in frame else frame.get("replyPath", "fixed")
+            if path == "fixed" and any(
+                isinstance(item, str) and item.endswith("_UNAVAILABLE")
+                for item in output.get("limitations", [])
+            ):
+                path = "fallback"
+            code = "MODEL" if path == "model" else frame.get("replyCode", next(
+                (item for item in output.get("limitations", [])
+                 if isinstance(item, str) and regex.fullmatch(r"[A-Z_]+", item)),
+                "FIXED_REPLY",
+            ))
+
+            def retry_output(code):
+                return {
+                    "status": "insufficient_evidence",
+                    "content": voice_text(
+                        "service_retry", snap["replyLanguage"], snap["level"],
+                        snap["previousAssistantText"], turn["id"],
+                    ),
+                    "claims": [], "evidence": [], "grounding": "unverified_model",
+                    "limitations": [code],
+                }
+
+            def guarded_candidate(candidate):
+                nonlocal operator_metadata
+                metadata = {
+                        "utterance": text,
+                        "realPerson": snap["persona"]["reviewStatus"] != "synthetic",
+                        "language": snap["replyLanguage"],
+                        "level": snap["level"],
+                        "previousAssistantText": snap["previousAssistantText"],
+                        "turnId": turn["id"],
+                }
+                recovered = False
+                try:
+                    guarded_reply = validate_output(candidate["content"], metadata)
+                except Exception as error:
+                    # The validator's policy is deterministic and in-process. If
+                    # Guardrails itself fails, apply the identical policy once.
+                    operator_metadata = _log_output_guard_failure(error)
+                    decision = reply_decision(candidate["content"], metadata)
+                    guarded_reply = decision or {"content": candidate["content"]}
+                    recovered = True
+                content = guarded_reply["content"]
+                if (
+                    not content.strip() or len(content) > 8000
+                    or contains_credential(content) or contains_internal_path(content)
+                ):
+                    raise ValueError("GUARDRAILS_OUTPUT_INVALID")
+                reason = guarded_reply.get("reason")
+                edited = guarded_reply.get("edited")
+                trace = {
+                    "revision": REVISION,
+                    "action": "edited" if reason and edited else "replaced" if reason else "none",
+                }
+                if reason:
+                    trace["reason"] = reason
+                if reason and not edited:
+                    candidate = {
+                        "status": "out_of_scope", "content": content, "claims": [],
+                        "evidence": [], "grounding": "unverified_model",
+                        "limitations": ["REPLY_GUARD_" + reason.upper()],
+                    }
+                else:
+                    candidate["content"] = content
+                    if reason:
+                        candidate["limitations"].append("REPLY_GUARD_" + reason.upper())
+                if recovered:
+                    candidate["limitations"].append("GUARDRAILS_OUTPUT_RECOVERED")
+                return candidate, trace
+
             if "rawReply" in frame:
                 try:
-                    guarded_reply = validate_output(
-                        output["content"],
-                        {
-                            "utterance": text,
-                            "realPerson": snap["persona"]["reviewStatus"] != "synthetic",
-                            "language": snap["replyLanguage"],
-                            "level": snap["level"],
-                            "previousAssistantText": snap["previousAssistantText"],
-                            "turnId": turn["id"],
-                        },
-                    )
-                    content = guarded_reply["content"]
-                    if (
-                        not content.strip()
-                        or len(content) > 8000
-                        or contains_credential(content)
-                        or contains_internal_path(content)
-                    ):
-                        raise ValueError()
-                    reason = guarded_reply.get("reason")
-                    edited = guarded_reply.get("edited")
-                    guard = {
-                        "revision": REVISION,
-                        "action": "edited"
-                        if reason and edited
-                        else "replaced"
-                        if reason
-                        else "none",
-                    }
-                    if reason:
-                        guard["reason"] = reason
-                    if reason and not edited:
-                        output = {
-                            "status": "out_of_scope",
-                            "content": content,
-                            "claims": [],
-                            "evidence": [],
-                            "grounding": "unverified_model",
-                            "limitations": ["REPLY_GUARD_" + reason.upper()],
-                        }
-                    else:
-                        output["content"] = content
-                        if reason:
-                            output["limitations"].append("REPLY_GUARD_" + reason.upper())
-                except Exception:
+                    output, guard = guarded_candidate(output)
+                    if guard["action"] == "replaced":
+                        path, code = "guard_replacement", "REPLY_GUARD_" + guard["reason"].upper()
+                    elif guard["action"] == "edited":
+                        path, code = "guard_edit", "REPLY_GUARD_" + guard["reason"].upper()
+                except Exception as error:
                     check()
-                    output = {
-                        "status": "insufficient_evidence",
-                        "content": voice_text(
-                            "service_retry",
-                            snap["replyLanguage"],
-                            snap["level"],
-                            snap["previousAssistantText"],
-                            turn["id"],
-                        ),
-                        "claims": [],
-                        "evidence": [],
-                        "grounding": "unverified_model",
-                        "limitations": ["GUARDRAILS_OUTPUT_UNAVAILABLE"],
-                    }
+                    operator_metadata = _log_output_guard_failure(error)
+                    output = retry_output("GUARDRAILS_OUTPUT_UNAVAILABLE")
+                    path, code = "fallback", "GUARDRAILS_OUTPUT_UNAVAILABLE"
+                async def regenerate(suffix, instruction):
+                    regeneration_deadline = deadline - 2000
+                    remaining = (regeneration_deadline - time.time() * 1000) / 1000
+                    if remaining <= 0 or cancelled.is_set():
+                        raise TimeoutError("COSMETIC_REGENERATION_DEADLINE")
+                    agent_run = frame.get("agentRun")
+                    ctx = agent_run["context"] if agent_run else frame.get("experiment")
+                    messages = copy.deepcopy(ctx["messages"])
+                    messages.append({"role": "system", "content": instruction})
+                    served = []
+                    async def call_local_model():
+                        await before_costly()
+                        return await self.provider.generate_local_only(
+                            messages, signal=cancelled, deadline_at=regeneration_deadline,
+                            request_key=turn["id"] + suffix,
+                            on_served=lambda name: served.append(
+                                name if isinstance(name, str)
+                                and regex.fullmatch(r"[a-z0-9_-]{1,40}", name) else "unknown"
+                            ),
+                            **({"response_schema": agent_response_schema(
+                                ctx["sources"],
+                                memory_consent=bool(context.get("userMemoryConsent")),
+                            )} if agent_run else {}),
+                        )
+
+                    regenerated = await asyncio.wait_for(call_local_model(), timeout=remaining)
+                    parsed = None
+                    if agent_run:
+                        parsed = parse_agent_response(
+                            regenerated,
+                            memory_consent=bool(context.get("userMemoryConsent")),
+                        )
+                        if "function" in parsed:
+                            raise ValueError("REGEN_TOOL_CALL")
+                        parsed["message"] = trim_to_sentence(parsed["message"])
+                        regenerated = dumps({
+                            "status": parsed["status"], "answer": parsed["message"],
+                            "evidenceRefs": parsed["evidenceRefs"],
+                        })
+                    replacement = validate_reply_candidate(
+                        regenerated, frame, snap, turn["id"] + suffix
+                    )
+                    replacement, new_guard = guarded_candidate(replacement)
+                    return replacement, new_guard, parsed, served
+
+                def accept_regeneration(replacement, new_guard, parsed, served):
+                    nonlocal output, guard
+                    output, guard = replacement, new_guard
+                    frame["served"].extend(served)
+                    agent_run = frame.get("agentRun")
+                    if agent_run:
+                        agent_run["response"] = parsed
+                        agent_run["agent"]["modelCalls"] += 1
+                        agent_run["agent"]["steps"].append({
+                            "phase": "validation",
+                            "iteration": agent_run["agent"]["modelCalls"] - 1,
+                        })
+
+                can_regenerate = (
+                    time.time() * 1000 <= deadline - 5000
+                    and callable(getattr(self.provider, "generate_local_only", None))
+                    and bool(frame.get("agentRun") or frame.get("experiment"))
+                )
+                if _same_reply(output["content"], snap["previousAssistantText"]):
+                    if identity_question(text):
+                        output = dict(output, content=voice_text(
+                            "identity", snap["replyLanguage"], snap["level"],
+                            snap["previousAssistantText"], turn["id"],
+                        ), claims=[], evidence=[], grounding="unverified_model")
+                        path, code = "identity_variant", "REPEATED_IDENTITY_REPLY"
+                    elif not can_regenerate:
+                        output = retry_output("REPEATED_ASSISTANT_REPLY")
+                        path, code = "fallback", "REPEATED_ASSISTANT_REPLY"
+                    else:
+                        try:
+                            replacement, new_guard, parsed, served = await regenerate(
+                                ":regen", "Your previous reply repeated your last message. "
+                                "Give one distinct reply in the same persona and JSON contract.",
+                            )
+                            if _same_reply(replacement["content"], snap["previousAssistantText"]):
+                                output = retry_output("REPEATED_ASSISTANT_REPLY")
+                                path, code = "fallback", "REPEATED_ASSISTANT_REPLY"
+                            else:
+                                accept_regeneration(replacement, new_guard, parsed, served)
+                                path, code = "regeneration", "REPEATED_ASSISTANT_REPLY"
+                        except Exception:
+                            output = retry_output("REPEATED_ASSISTANT_REPLY")
+                            path, code = "fallback", "REPEATED_ASSISTANT_REPLY"
+                elif (
+                    output["status"] == "answered"
+                    and snap["replyLanguage"].lower().startswith("ko")
+                    and classify_speech_register(output["content"]) not in
+                    {"unknown", snap["level"]}
+                    and can_regenerate
+                ):
+                    try:
+                        replacement, new_guard, parsed, served = await regenerate(
+                            ":register", "Your previous reply used the wrong Korean speech "
+                            "register. Rewrite it in "
+                            + ("반말 (~해, ~야?)" if snap["level"] == "casual"
+                               else "해요체 (~해요, ~인가요?)")
+                            + ". Never mix registers in one reply. Keep the same persona, "
+                            "meaning and JSON contract.",
+                        )
+                        if (replacement["status"] == "answered" and
+                                classify_speech_register(replacement["content"]) == snap["level"]):
+                            accept_regeneration(replacement, new_guard, parsed, served)
+                            path, code = "register_regeneration", "SPEECH_REGISTER_REWRITE"
+                    except Exception:
+                        pass
             agent = frame.get("agent")
             agent_run = frame.get("agentRun")
             if agent and agent_run:
@@ -1246,8 +1409,34 @@ class LLMEngine:
                     grounding="unverified_model",
                     status="insufficient_evidence",
                 )
+                path, code = "ask_back", "RECALL_ASK_BACK"
             elif RECALL.search(output["content"]):
                 recall_used = True
+            # This runs for model text, guard replacements, fixed replies, ask-back,
+            # fallbacks, register rewrites and the recall replacement above.
+            previous_text = snap["previousAssistantText"]
+            if _same_reply(output["content"], previous_text):
+                key = "identity" if identity_question(text) else next(
+                    (name for name, levels in VOICES.items()
+                     if any(output["content"] in variants for variants in levels.values())),
+                    "service_retry",
+                )
+                replacement = voice_text(
+                    key, snap["replyLanguage"], snap["level"], previous_text, turn["id"]
+                )
+                if _same_reply(replacement, previous_text):
+                    replacement = voice_text(
+                        "service_retry", snap["replyLanguage"], snap["level"],
+                        previous_text, turn["id"],
+                    )
+                if _same_reply(replacement, previous_text):
+                    raise CoreError("TURN_FAILED", "REPEATED_ASSISTANT_REPLY")
+                output.update(content=replacement, claims=[], evidence=[],
+                              grounding="unverified_model")
+                path, code = (
+                    ("identity_variant", "REPEATED_IDENTITY_REPLY")
+                    if key == "identity" else ("voice_variant", "REPEATED_ASSISTANT_REPLY")
+                )
             if agent and recall_used:
                 agent["variables"]["lastYearRecallUsed"] = True
             remembered = remember_source_context(frame["memorySources"], output["evidence"])
@@ -1274,9 +1463,14 @@ class LLMEngine:
                 ("promptEvidence", frame.get("promptEvidence")),
                 ("personaContext", frame.get("personaContext")),
                 ("replyGuard", guard),
+                ("operatorMetadata", operator_metadata),
             ]:
                 if item is not None:
                     reply[key] = item
+            reply["operatorTrace"] = {
+                "path": path, "code": code, "repeatChecked": True,
+                "previousAvailable": bool(previous_text),
+            }
             if agent_run and not frame.get("deflect"):
                 ops = memory_ops(
                     agent_run["response"].get("variableUpdates", {}).get("userMemory"),

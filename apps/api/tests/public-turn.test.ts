@@ -35,3 +35,25 @@ test('web projection omits research fields while harness projection keeps them',
   expect(JSON.stringify(web)).not.toContain('합성 인용');
   expect(JSON.stringify(harness)).toContain('합성 인용');
 });
+
+test('operator guard diagnostics expose only fixed class, stage and code to harness',()=>{
+  const turn:ChatTurn={id:'turn',sessionId:'session',ownerId:'owner',clientRequestId:'req',userText:'합성 질문',sequence:1,state:'completed',createdAt:'2024-01-01T00:00:00Z',reply:{
+    sessionId:'session',turnId:'turn',messageId:'message',personId:'person',personaRevision:'v1',responseKind:'small_talk',status:'insufficient_evidence',content:'다시 말해 줘.',claims:[],evidence:[],limitations:['GUARDRAILS_OUTPUT_UNAVAILABLE'],
+    operatorMetadata:{guardStage:'output_guard',exceptionClass:'ValueError',code:'GUARDRAILS_OUTPUT_UNAVAILABLE'},
+  }};
+  expect(publicTurn(turn,'web').reply).not.toHaveProperty('operatorMetadata');
+  expect(publicTurn(turn,'harness').reply).toHaveProperty('operatorMetadata',{
+    guardStage:'output_guard',exceptionClass:'ValueError',code:'GUARDRAILS_OUTPUT_UNAVAILABLE',
+  });
+});
+
+test('reply origin and repeat check stay in the operator harness',()=>{
+  const turn:ChatTurn={id:'turn',sessionId:'session',ownerId:'owner',clientRequestId:'req',userText:'합성 질문',sequence:2,state:'completed',createdAt:'2024-01-01T00:00:00Z',reply:{
+    sessionId:'session',turnId:'turn',messageId:'message',personId:'person',personaRevision:'v1',responseKind:'small_talk',status:'answered',content:'합성 답변',claims:[],evidence:[],limitations:[],
+    operatorTrace:{path:'identity_variant',code:'REPEATED_IDENTITY_REPLY',repeatChecked:true,previousAvailable:true},
+  }};
+  expect(publicTurn(turn,'web').reply).not.toHaveProperty('operatorTrace');
+  expect(publicTurn(turn,'harness').reply).toHaveProperty('operatorTrace',{
+    path:'identity_variant',code:'REPEATED_IDENTITY_REPLY',repeatChecked:true,previousAvailable:true,
+  });
+});

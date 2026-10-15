@@ -6,6 +6,14 @@ describe('local database isolation guard', () => {
   it('accepts only the dedicated loopback database', () => expect(assertLocalDatabaseUrl(valid)).toBe(valid));
   it('accepts the separate synthetic load-test database with its own role', () => expect(assertLocalDatabaseUrl(loadtest)).toBe(loadtest));
   it('accepts only exact split role/database/58432 pairs',()=>{const split='postgresql://ptr_split_app:synthetic-password@127.0.0.1:58432/ptr_split_test';expect(assertLocalDatabaseUrl(split)).toBe(split);expect(()=>assertLocalDatabaseUrl(split.replace('58432','56432'))).toThrow();expect(()=>assertLocalDatabaseUrl(split.replace('ptr_split_app:','ptr_researcher:'))).toThrow();});
+  it('allows only an explicitly named disposable immersion test port',()=>{
+    const url='postgresql://ptr_split_app:synthetic-password@127.0.0.1:54321/ptr_split_test';
+    const env={PTR_IMMERSION_GATE_PROJECT:'ptr-immersion-0123456789',PTR_IMMERSION_GATE_DB_PORT:'54321'};
+    expect(assertLocalDatabaseUrl(url,env)).toBe(url);
+    expect(()=>assertLocalDatabaseUrl(url,{...env,PTR_IMMERSION_GATE_PROJECT:''})).toThrow();
+    expect(()=>assertLocalDatabaseUrl(url.replace('ptr_split_test','ptr_split_research'),env)).toThrow();
+    expect(()=>assertLocalDatabaseUrl(url.replace('54321','58432'),env)).not.toThrow();
+  });
   it.each([
     loadtest.replace('ptr_loadtester:', 'ptr_researcher:'),
     valid.replace('ptr_researcher:', 'ptr_loadtester:'),

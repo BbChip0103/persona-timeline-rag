@@ -21,7 +21,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v17-consent-memory"
+AGENT_PROMPT_REVISION = "character-agent-context-v18-speech-register"
 
 
 class AgentState(TypedDict, total=False):
@@ -190,13 +190,22 @@ async def run_character_agent(
                 "role": "system",
                 "content": "AGENT_STATE_JSON_DATA "
                 + dumps(
-                    dict(
-                        run["variables"],
-                        replyLanguage=language_name,
-                        speechLevel="반말" if level == "casual" else "해요체",
-                        today="오늘",
-                        sinceLastUserMessage=since_last,
-                    )
+                    {
+                        "registerInstruction": (
+                            "Use 반말 throughout this reply."
+                            if level == "casual" else "Use 해요체 throughout this reply."
+                        ),
+                        "registerExamples": (
+                            ["~해.", "~야?"] if level == "casual"
+                            else ["~해요.", "~인가요?"]
+                        ),
+                        "registerRule": "Never mix registers in one reply.",
+                        **run["variables"],
+                        "replyLanguage": language_name,
+                        "speechLevel": "반말" if level == "casual" else "해요체",
+                        "today": "오늘",
+                        "sinceLastUserMessage": since_last,
+                    }
                 ),
             }
         ]

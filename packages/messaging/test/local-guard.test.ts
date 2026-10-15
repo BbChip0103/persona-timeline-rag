@@ -5,6 +5,13 @@ describe('assertLocalRedisUrl', () => {
     expect(assertLocalRedisUrl('redis://:s3cret@127.0.0.1:56479/0')).toBe('redis://:s3cret@127.0.0.1:56479/0');
   });
   it('accepts the independently owned split proof Redis only on its exact guarded port',()=>{expect(assertLocalRedisUrl('redis://:synthetic-password@127.0.0.1:58479/0')).toContain(':58479/0');expect(()=>assertLocalRedisUrl('redis://:synthetic-password@127.0.0.1:58478/0')).toThrow();});
+  it('allows only a named disposable immersion Redis port with a password',()=>{
+    const url='redis://:synthetic-password@127.0.0.1:54321/0';
+    const env={PTR_IMMERSION_GATE_PROJECT:'ptr-immersion-0123456789',PTR_IMMERSION_GATE_REDIS_PORT:'54321'};
+    expect(assertLocalRedisUrl(url,env)).toBe(url);
+    expect(()=>assertLocalRedisUrl(url,{...env,PTR_IMMERSION_GATE_PROJECT:''})).toThrow();
+    expect(()=>assertLocalRedisUrl(url.replace('synthetic-password@',''),env)).toThrow();
+  });
   it.each([
     ['other host', 'redis://:s3cret@10.0.0.5:56479/0'],
     ['localhost name', 'redis://:s3cret@localhost:56479/0'],

@@ -29,7 +29,7 @@ export const AGENT_RUNTIME_REVISION='langgraph-json-action-v1';
  * is left for a prompt that does not fit without posts.
  * v13: explicitly bind caption quotes to sourceId only, and image quotes to the exact parent and annotation.
  */
-export const AGENT_PROMPT_REVISION='character-agent-context-v16-natural-recall';
+export const AGENT_PROMPT_REVISION='character-agent-context-v18-speech-register';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
@@ -138,7 +138,7 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<AgentRunRes
       const context=buildExperimentContext(input.persona,input.history,input.text,run.sources,{
         policy:`${safety}${recollectionVoice}${protocol}`,...(input.policyNote?{policyNote:input.policyNote}:{}),
         today,
-        afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify({...run.variables,replyLanguage:languageName,speechLevel:level==='casual'?'반말':'해요체',today:'오늘',sinceLastUserMessage})}`},...(input.lore?[input.lore]:[]),
+        afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify({registerInstruction:level==='casual'?'Use 반말 throughout this reply.':'Use 해요체 throughout this reply.',registerExamples:level==='casual'?['~해.','~야?']:['~해요.','~인가요?'],registerRule:'Never mix registers in one reply.',...run.variables,replyLanguage:languageName,speechLevel:level==='casual'?'반말':'해요체',today:'오늘',sinceLastUserMessage})}`},...(input.lore?[input.lore]:[]),
           {role:'system',content:`AGENT_TOOLS_JSON_DATA ${JSON.stringify(input.search&&run.iteration<max?['timeline_search']:[])}`}],
         afterUser:run.transcript,
       });

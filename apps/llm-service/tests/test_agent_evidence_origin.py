@@ -38,7 +38,7 @@ async def run_reply(refs, condition="caption_image"):
     assert result["kind"] == "completed"
     assert len(provider.messages) == 1
     assert result["reply"]["agent"]["promptRevision"] == (
-        "character-agent-context-v17-consent-memory"
+        "character-agent-context-v18-speech-register"
     )
     return result["reply"], provider.messages[0]
 

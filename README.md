@@ -57,6 +57,12 @@ PYTHONPATH=src python -m persona_timeline_rag audit
 
 현재 연구 타겟은 후보 중 4명입니다. 별도 `data/manifests/targets.json`과 `data/processed/target_posts.jsonl`에 실험 범위를 기록하며, 기존 20명 후보와 전체 정규화 코퍼스는 보존합니다. 데이터 준비 CLI는 기존 후보 manifest를 계속 사용하고, 연구 설정 예시는 4명 부분집합을 가리킵니다. 실제 대상과 수량은 비공개 `reports/targets4.md`에서 확인합니다.
 
+### 배포 전 몰입 게이트
+
+`apps/llm-service/.venv/bin/python scripts/immersion-gate.py`는 이 checkout의 API·Python worker와 일회용 로컬 PostgreSQL·Redis를 고유 실행 이름으로 띄워 합성 페르소나 2명 × 40턴을 평가합니다. DB는 `ptr_split_test`이며 모든 SQL migration(분리 스키마 0005·0006·0007 포함)을 적용합니다. 페르소나와 타임라인은 전부 허구이며, 검수 상태만 `silver`로 설정해 운영 사생활 가드 분기를 시험합니다. `caption` + `lexical`을 쓰고 embedding·Jev·스필오버를 끕니다. 운영 worker의 Compose 참조 env에 `PTR_LLM_SPILLOVER=off`가 있어야 실행되며, 그렇지 않으면 명시적 `--allow-live-spill-on` 플래그가 필요합니다. 이 플래그를 써도 게이트의 일회용 worker는 스필오버를 끕니다. 로컬 모델의 세 설정 값은 일회용 worker 프로세스 환경으로만 전달하고 임시 env 파일에 기록하지 않습니다. 호출은 로컬 프록시에서 동시 2개로 제한하고 횟수를 기록합니다. 운영 컨테이너와 DB는 변경하지 않습니다.
+
+결과는 Git 제외 경로 `reports/immersion-gate/<timestamp>.json`과 사람 판정용 `<timestamp>-human-20.md`에 0600으로 남습니다. 사람 시트에는 합성 사용자 문장과 캐릭터 답만 20개 무작위로 담으며 판정은 비워 둡니다. 자동 규칙이 실패하면 보고서의 합성 실패 예를 검토하고 프롬프트 변경은 별도로 결정합니다. 실행이 끝나면 생성한 컨테이너 ID만 제거합니다.
+
 ## 구조
 
 ```text

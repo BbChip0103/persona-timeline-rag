@@ -11,6 +11,68 @@ from jsonschema import Draft202012Validator
 ROOT = Path(__file__).resolve().parents[1]
 SQL = ROOT / "scripts/rollback-v2-reply.sql"
 V1_SCHEMA = ROOT / "contracts/llm/v1/schema.json"
+V2_SCHEMA = ROOT / "contracts/llm/v2/schema.json"
+
+
+def _enums(value, path=()):
+    if isinstance(value, dict):
+        if "enum" in value:
+            yield "/".join(path), set(value["enum"])
+        for key, child in value.items():
+            if key != "enum":
+                yield from _enums(child, (*path, key))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _enums(child, (*path, str(index)))
+
+
+def test_rollback_strips_every_v2_only_reply_key():
+    v1 = json.loads(V1_SCHEMA.read_text(encoding="utf-8"))
+    v2 = json.loads(V2_SCHEMA.read_text(encoding="utf-8"))
+    only_v2 = set(v2["$defs"]["Reply"]["properties"]) - set(
+        v1["$defs"]["Reply"]["properties"]
+    )
+    assert only_v2 == {"operatorMetadata", "operatorTrace"}
+    sql = SQL.read_text(encoding="utf-8")
+    for key in only_v2:
+        assert f"#- '{{{key}}}'" in sql
+        assert sql.count(f"'{key}'") >= 2  # WHERE and final check
+    v1_variables = v1["$defs"]["Agent"]["properties"]["variables"]["properties"]
+    v2_variables = v2["$defs"]["Agent"]["properties"]["variables"]["properties"]
+    nested_only_v2 = set(v2_variables) - set(v1_variables)
+    assert nested_only_v2 == {"speechLevel", "lastYearRecallUsed"}
+    for key in nested_only_v2:
+        assert f"#- '{{agent,variables,{key}}}'" in sql
+        assert sql.count(f"'{key}'") >= 2  # WHERE and final check
+    v1_guard = v1["$defs"]["Reply"]["properties"]["replyGuard"]
+    v2_guard = v2["$defs"]["Reply"]["properties"]["replyGuard"]
+    assert "replyGuard" not in v1["$defs"]["Reply"]["required"]
+    assert set(v2_guard["properties"]["reason"]["enum"]) - set(
+        v1_guard["properties"]["reason"]["enum"]
+    ) == {"formatting"}
+    assert "#- '{replyGuard}'" in sql
+    assert sql.count("'{replyGuard,reason}'") >= 2  # WHERE and final check
+    v1_enums = dict(_enums(v1))
+    v2_only_values = {
+        path: values - v1_enums.get(path, set())
+        for path, values in _enums(v2)
+        if values - v1_enums.get(path, set())
+    }
+    assert v2_only_values == {
+        "$defs/Agent/properties/variables/properties/speechLevel": {"casual", "polite"},
+        "$defs/Reply/properties/operatorTrace/properties/path": {
+            "model", "fixed", "ask_back", "guard_replacement", "guard_edit",
+            "fallback", "regeneration", "register_regeneration", "identity_variant",
+            "voice_variant",
+        },
+        "$defs/Reply/properties/replyGuard/properties/reason": {"formatting"},
+        "$defs/UserMemory/properties/kind": {
+            "name", "like", "dislike", "recent_event", "other",
+        },
+        "$defs/UserMemoryOp/properties/kind": {
+            "name", "like", "dislike", "recent_event", "other",
+        },
+    }
 
 
 def _psql(container: str, statements: str) -> list[str]:
@@ -27,7 +89,7 @@ def _psql(container: str, statements: str) -> list[str]:
             "-A",
             "-t",
             "-U",
-            "postgres",
+            os.getenv("PTR_ROLLBACK_TEST_ROLE", "postgres"),
             "-d",
             "ptr_split_test",
         ],
@@ -41,7 +103,8 @@ def _psql(container: str, statements: str) -> list[str]:
 
 
 @pytest.mark.parametrize("nested_variables", [True, False])
-def test_rollback_sql_restores_c2_previous_reply_schema(nested_variables):
+@pytest.mark.parametrize("guard_reason", ["formatting", "meta_talk"])
+def test_rollback_sql_restores_c2_previous_reply_schema(nested_variables, guard_reason):
     container = os.getenv("PTR_ROLLBACK_TEST_CONTAINER")
     if not container:
         pytest.skip(
@@ -62,6 +125,22 @@ def test_rollback_sql_restores_c2_previous_reply_schema(nested_variables):
         "responseKind": "small_talk",
         "status": "answered",
         "content": "Synthetic reply.",
+        "replyGuard": {
+            "revision": "synthetic-guard",
+            "action": "edited",
+            "reason": guard_reason,
+        },
+        "operatorTrace": {
+            "path": "register_regeneration",
+            "code": "SYNTHETIC_REGISTER",
+            "repeatChecked": True,
+            "previousAvailable": True,
+        },
+        "operatorMetadata": {
+            "guardStage": "output_guard",
+            "exceptionClass": "ValueError",
+            "code": "GUARDRAILS_OUTPUT_UNAVAILABLE",
+        },
         "summaryUpdate": {"text": "Synthetic summary", "lastMessageId": "synthetic-message"},
         "userMemoryOps": [{"op": "add", "kind": "like", "text": "Synthetic tea"}],
         "claims": [],
@@ -91,6 +170,9 @@ def test_rollback_sql_restores_c2_previous_reply_schema(nested_variables):
         reply["agent"]["variables"] = {
             "conversationTopic": "synthetic-topic", "tone": "neutral"
         }
+    Draft202012Validator(
+        json.loads(V2_SCHEMA.read_text(encoding="utf-8"))["$defs"]["Reply"]["properties"]["replyGuard"]
+    ).validate(reply["replyGuard"])
     assert not validator.is_valid(reply)
     session = {
         "id": uid,
@@ -137,7 +219,7 @@ DELETE FROM app.sessions WHERE id='{deleted_id}' AND deleted_at IS NOT NULL;
 SELECT 'PROOF:' || reply::text FROM app.turns WHERE id='{turn_id}';
 {SQL.read_text(encoding="utf-8")}
 SELECT 'PROOF:' || reply::text FROM app.turns WHERE id='{turn_id}';
-SELECT 'PROOF:SESSION:' || document::text FROM app.sessions;
+SELECT 'PROOF:SESSION:' || document::text FROM app.sessions WHERE id='{uid}';
 ROLLBACK;
 """
     rows = _psql(container, prelude + queries)
@@ -146,6 +228,10 @@ ROLLBACK;
     assert before == reply
     assert cleaned == repeated
     validator.validate(cleaned)
+    if guard_reason == "formatting":
+        assert "replyGuard" not in cleaned
+    else:
+        assert cleaned["replyGuard"] == reply["replyGuard"]
     session_documents = [json.loads(row.removeprefix("PROOF:SESSION:")) for row in rows[3:]]
     assert len(session_documents) == 1
     assert all(session_validator.is_valid(document) for document in session_documents)
@@ -154,3 +240,15 @@ ROLLBACK;
         "conversationTopic": "synthetic-topic",
         "tone": "neutral",
     }
+    if nested_variables and guard_reason == "formatting":
+        invalid_reason = f"""
+DELETE FROM app.sessions WHERE id='{deleted_id}' AND deleted_at IS NOT NULL;
+UPDATE app.turns
+SET reply = jsonb_set(reply, '{{replyGuard,reason}}', '"future_reason"'::jsonb)
+WHERE id='{turn_id}';
+{SQL.read_text(encoding="utf-8")}
+ROLLBACK;
+"""
+        with pytest.raises(subprocess.CalledProcessError) as invalid:
+            _psql(container, prelude + invalid_reason)
+        assert "ROLLBACK_V2_REPLY_KEYS_REMAIN" in invalid.value.stderr

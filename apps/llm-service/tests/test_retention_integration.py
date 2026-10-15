@@ -62,7 +62,7 @@ async def isolated_pg():
     )
     print(f"C4_RETENTION_CONTAINER_STARTED={container_id}")
     try:
-        inspected = json.loads(docker("inspect", name))[0]
+        inspected = json.loads(docker("inspect", container_id))[0]
         assert inspected["Config"]["Labels"]["ptr.retention.owner"] == name
         port = inspected["NetworkSettings"]["Ports"]["5432/tcp"][0]["HostPort"]
         url = f"postgresql://ptr_split_owner@127.0.0.1:{port}/ptr_split_test"
@@ -80,9 +80,9 @@ async def isolated_pg():
                 await asyncio.sleep(0.1)
         yield url
     finally:
-        inspected = json.loads(docker("inspect", name))[0]
+        inspected = json.loads(docker("inspect", container_id))[0]
         assert inspected["Config"]["Labels"]["ptr.retention.owner"] == name
-        docker("rm", "-f", name)
+        docker("rm", "-f", container_id)
         print(f"C4_RETENTION_CONTAINER_REMOVED={container_id}")
 
 
@@ -93,6 +93,9 @@ async def seed(connection):
         CREATE TABLE app.turns(id text PRIMARY KEY,state text,finished_at timestamptz,
             session_id text REFERENCES app.sessions(id),deleted_at timestamptz);
         CREATE TABLE app.turn_outbox(turn_id text);
+        CREATE TABLE app.generated_artifacts(id text PRIMARY KEY,
+            session_id text REFERENCES app.sessions(id) ON DELETE CASCADE,
+            request_key text);
         CREATE TABLE app.turn_execution_grants(execution_id text PRIMARY KEY,turn_id text,
             context jsonb,result jsonb);
         CREATE TABLE llm.result_receipts(execution_id text PRIMARY KEY,result_json jsonb,
@@ -169,6 +172,7 @@ async def snapshot(connection):
         for table in (
             "app.sessions",
             "app.turns",
+            "app.generated_artifacts",
             "app.turn_execution_grants",
             "llm.result_receipts",
             "llm.ptr_provider_requests",
@@ -185,7 +189,8 @@ async def test_real_transaction_dry_run_purge_progress_and_tombstones(isolated_p
         old_summary_thread = (
             "python-call-v1:"
             + hashlib.sha256(f"{turns[0]}:summary".encode()).hexdigest()
-            + ":" + "a" * 64
+            + ":"
+            + "a" * 64
         )
         await connection.execute(
             "INSERT INTO llm.checkpoints VALUES(%s,%s)",
@@ -348,13 +353,35 @@ async def test_deleted_session_purges_recent_artifacts_on_next_run(isolated_pg):
         summary_thread = (
             "python-call-v1:"
             + hashlib.sha256(f"{target}:summary".encode()).hexdigest()
-            + ":" + "a" * 64
+            + ":"
+            + "a" * 64
         )
         await connection.execute(
             "INSERT INTO llm.checkpoints VALUES(%s,%s)",
             (summary_thread, "synthetic-summary-with-history"),
         )
         await connection.execute("INSERT INTO app.sessions VALUES('deleted',%s)", (NOW,))
+        draft_key = "draft:lt-synthetic:synthetic-request"
+        draft_thread = (
+            "python-call-v1:" + hashlib.sha256(draft_key.encode()).hexdigest() + ":" + "d" * 64
+        )
+        unrelated_thread = (
+            "python-call-v1:"
+            + hashlib.sha256(b"draft:lt-synthetic:other-session").hexdigest()
+            + ":"
+            + "d" * 64
+        )
+        await connection.execute(
+            "INSERT INTO app.generated_artifacts VALUES('synthetic-draft','deleted',%s)",
+            (draft_key,),
+        )
+        for table in TABLES:
+            await connection.execute(
+                f"INSERT INTO llm.{table} VALUES(%s,'synthetic-draft')", (draft_thread,)
+            )
+        await connection.execute(
+            "INSERT INTO llm.checkpoints VALUES(%s,'unrelated-draft')", (unrelated_thread,)
+        )
         await connection.execute(
             "UPDATE app.turns SET session_id='deleted',deleted_at=%s WHERE id=%s", (NOW, target)
         )
@@ -371,6 +398,20 @@ async def test_deleted_session_purges_recent_artifacts_on_next_run(isolated_pg):
         )
         assert result["deleted"]["sessions"] == 1
         assert result["deleted"]["turns"] == 1
+        assert result["planned"]["checkpointThreads"] >= 3
+        assert not await (
+            await connection.execute(
+                "SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (draft_thread,)
+            )
+        ).fetchall()
+        assert await (
+            await connection.execute(
+                "SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (unrelated_thread,)
+            )
+        ).fetchall()
+        assert not await (
+            await connection.execute("SELECT 1 FROM app.generated_artifacts")
+        ).fetchall()
         assert not await (
             await connection.execute(
                 "SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (summary_thread,)
@@ -406,3 +447,36 @@ async def test_deleted_session_purges_recent_artifacts_on_next_run(isolated_pg):
                     ),
                 )
             ).fetchall()
+
+
+async def test_shared_draft_request_key_waits_for_live_session(isolated_pg):
+    async with await psycopg.AsyncConnection.connect(
+        isolated_pg, autocommit=True, row_factory=dict_row
+    ) as connection:
+        await seed(connection)
+        key = "draft:lt-synthetic:shared-request"
+        thread = "python-call-v1:" + hashlib.sha256(key.encode()).hexdigest() + ":" + "d" * 64
+        await connection.execute(
+            "INSERT INTO app.sessions VALUES('deleted',%s),('live',NULL)", (NOW,)
+        )
+        await connection.execute(
+            "INSERT INTO app.generated_artifacts VALUES('draft-deleted','deleted',%s),"
+            "('draft-live','live',%s)",
+            (key, key),
+        )
+        await connection.execute("INSERT INTO llm.checkpoints VALUES(%s,'synthetic')", (thread,))
+        first = await retain_split_data(
+            connection, RetentionOptions(now=NOW, apply=True, confirm_database="ptr_split_test")
+        )
+        assert first["planned"]["deletedSessions"] == 0
+        assert await (
+            await connection.execute("SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (thread,))
+        ).fetchone()
+        await connection.execute("UPDATE app.sessions SET deleted_at=%s WHERE id='live'", (NOW,))
+        second = await retain_split_data(
+            connection, RetentionOptions(now=NOW, apply=True, confirm_database="ptr_split_test")
+        )
+        assert second["deleted"]["sessions"] == 2
+        assert not await (
+            await connection.execute("SELECT 1 FROM llm.checkpoints WHERE thread_id=%s", (thread,))
+        ).fetchone()

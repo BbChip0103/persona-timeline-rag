@@ -46,11 +46,7 @@ def _only_pg_sslmode(query: str) -> bool:
         pairs = parse_qsl(query, strict_parsing=True, keep_blank_values=False)
     except ValueError:
         return False
-    return (
-        len(pairs) == 1
-        and pairs[0][0] == "sslmode"
-        and pairs[0][1] in _POSTGRES_SSLMODES
-    )
+    return len(pairs) == 1 and pairs[0][0] == "sslmode" and pairs[0][1] in _POSTGRES_SSLMODES
 
 
 def _cluster_database_allowed(parsed) -> bool:
@@ -78,10 +74,23 @@ def assert_llm_database_url(url: str) -> None:
             )
             allowed = base_allowed and ssl_allowed and _cluster_database_allowed(parsed)
         else:
+            gate_port = (
+                bool(
+                    re.fullmatch(
+                        r"ptr-immersion-[0-9a-f]{10}",
+                        os.environ.get("PTR_IMMERSION_GATE_PROJECT", ""),
+                    )
+                )
+                and parsed.hostname == "127.0.0.1"
+                and parsed.path == "/ptr_split_test"
+                and parsed.port != 58432
+                and str(parsed.port) == os.environ.get("PTR_IMMERSION_GATE_DB_PORT")
+                and os.environ.get("PTR_LLM_SPILLOVER") == "off"
+            )
             allowed = (
                 base_allowed
                 and parsed.hostname in ("127.0.0.1", "localhost", "::1")
-                and parsed.port == 58432
+                and (parsed.port == 58432 or gate_port)
                 and parsed.username in ("ptr_split_llm", "ptr_split_owner")
                 and parsed.path in ("/ptr_split_test", "/ptr_split_research")
                 and not parsed.query

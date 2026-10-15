@@ -14,10 +14,11 @@ test('save selects an owned session and load filters by owner',async()=>{
     .mockResolvedValueOnce({rowCount:1,rows:[{payload:artifact}]})
     .mockResolvedValueOnce({rowCount:0,rows:[]});
   const store=new PostgresCreativeArtifactStore({query} as unknown as Pool);
-  await store.save(artifact);
+  const requestKey='draft:owner_synthetic_a:synthetic-request';
+  await store.save(artifact,requestKey);
   expect(query.mock.calls[0][0]).toMatch(/INSERT INTO app\.generated_artifacts[\s\S]*FROM app\.sessions/);
   expect(query.mock.calls[0][0]).toContain('s.deleted_at IS NULL');
-  expect(query.mock.calls[0][1]).toEqual([artifact.id,artifact.sessionId,artifact.ownerId,artifact]);
+  expect(query.mock.calls[0][1]).toEqual([artifact.id,artifact.sessionId,artifact.ownerId,artifact,requestKey]);
   await expect(store.get(artifact.ownerId,artifact.id)).resolves.toEqual(artifact);
   await expect(store.get('owner_synthetic_other',artifact.id)).resolves.toBeNull();
   expect(query.mock.calls[1][0]).toMatch(/JOIN app\.sessions s[\s\S]*s\.deleted_at IS NULL/);
@@ -28,5 +29,5 @@ test('save selects an owned session and load filters by owner',async()=>{
 
 test('save rejects a missing or foreign session',async()=>{
   const store=new PostgresCreativeArtifactStore({query:jest.fn().mockResolvedValue({rowCount:0,rows:[]})} as unknown as Pool);
-  await expect(store.save(artifact)).rejects.toThrow();
+  await expect(store.save(artifact,'draft:owner_synthetic_a:synthetic-request')).rejects.toThrow();
 });

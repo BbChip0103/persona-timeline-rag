@@ -297,6 +297,14 @@ def voice(key, language, level, previous="", seed=None):
     raise ValueError(f"voice key {key} has no variant different from previous reply")
 
 
+def identity_question(utterance):
+    utterance = _normalize_private_text(utterance)
+    return any_match("IDENTITY_QUESTION", utterance) and (
+        not PATTERNS["ART_UTTERANCE"].search(utterance)
+        or regex.search(r"(?:너|넌|당신|니가|네가)|\byou\b", utterance, regex.I)
+    )
+
+
 def reply_decision(reply, metadata):
     utterance = _normalize_private_text(metadata["utterance"])
     reply = _normalize_private_text(reply)
@@ -304,10 +312,7 @@ def reply_decision(reply, metadata):
     language = metadata["language"]
     level = metadata.get("level", "polite")
     private_question = _private_question(utterance)
-    identity = any_match("IDENTITY_QUESTION", utterance) and (
-        not PATTERNS["ART_UTTERANCE"].search(utterance)
-        or regex.search(r"(?:너|넌|당신|니가|네가)|\byou\b", utterance, regex.I)
-    )
+    identity = identity_question(utterance)
 
     def replace(reason, key):
         return {

@@ -43,6 +43,8 @@ def test_thread_matching_never_guesses_or_uses_substring():
     turn = "00000000-0000-4000-8000-000000000001"
     scope = hashlib.sha256(turn.encode()).hexdigest()
     summary_scope = hashlib.sha256(f"{turn}:summary".encode()).hexdigest()
+    regen_scope = hashlib.sha256(f"{turn}:regen".encode()).hexdigest()
+    register_scope = hashlib.sha256(f"{turn}:register".encode()).hexdigest()
     fp = "a" * 64
     valid = [
         f"turn:{turn}",
@@ -50,16 +52,29 @@ def test_thread_matching_never_guesses_or_uses_substring():
         f"model:{turn}:{fp}",
         f"python-call-v1:{scope}:{fp}",
         f"python-call-v1:{summary_scope}:{fp}",
+        f"python-call-v1:{regen_scope}:{fp}",
+        f"python-call-v1:{register_scope}:{fp}",
     ]
     invalid = [
         f"turn:{turn}:other",
         f"python-call-v1:{scope}:oops",
         f"python-call-v1:{'b' * 64}:{fp}",
         f"python-call-v1:{hashlib.sha256(f'{turn}:summary:other'.encode()).hexdigest()}:{fp}",
+        f"python-call-v1:{hashlib.sha256(f'{turn}:regen:other'.encode()).hexdigest()}:{fp}",
+        f"python-call-v1:{hashlib.sha256(f'{turn}:register:other'.encode()).hexdigest()}:{fp}",
         f"model:{turn}:bad",
         "unlinked",
     ]
     assert linked_thread_ids(valid + invalid, [turn]) == sorted(valid)
+
+
+def test_draft_thread_requires_its_stored_request_key():
+    from ptr_llm.retention import linked_thread_ids
+
+    key = "draft:lt-synthetic:owned-request"
+    thread = f"python-call-v1:{hashlib.sha256(key.encode()).hexdigest()}:{'a' * 64}"
+    assert linked_thread_ids([thread], []) == []
+    assert linked_thread_ids([thread], [], [key]) == [thread]
 
 
 def test_retention_arguments_are_bounded_and_timezone_aware():

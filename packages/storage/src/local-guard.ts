@@ -11,6 +11,9 @@ export function isIsolatedDatabaseIdentity(database: unknown, user: unknown): bo
 type GuardEnv = Record<string,string|undefined>;
 const isClusterMode=(env:GuardEnv)=>env.PTR_NETWORK_MODE==='cluster'&&!!env.KUBERNETES_SERVICE_HOST;
 const list=(raw:string|undefined)=>raw?.split(',').map(value=>value.trim()).filter(Boolean)??[];
+const immersionGatePort=(url:URL,env:GuardEnv)=>env.PTR_IMMERSION_GATE_PROJECT?.match(/^ptr-immersion-[0-9a-f]{10}$/)
+  && url.pathname==='/ptr_split_test'&&url.hostname==='127.0.0.1'&&url.port!==''&&url.port!=='58432'
+  && url.port===env.PTR_IMMERSION_GATE_DB_PORT;
 const hasClusterDatabaseTarget=(url:URL,env:GuardEnv)=>list(env.PTR_CLUSTER_DATABASE_URL_ALLOWLIST).some(raw=>{
   let allowed:URL;try{allowed=new URL(raw);}catch{return false;}
   return ['postgres:','postgresql:'].includes(allowed.protocol)&&!allowed.username&&!allowed.password&&!allowed.search&&!allowed.hash
@@ -41,7 +44,7 @@ export function assertLocalDatabaseUrl(raw: string, env: GuardEnv = process.env)
   }
   if (!['postgres:', 'postgresql:'].includes(url.protocol)
     || url.hostname !== '127.0.0.1'
-    || (url.pathname.startsWith('/ptr_split_') ? url.port !== '58432' : url.pathname === '/ptr_framework_test' ? url.port !== '57432' : url.port !== '56432')
+    || (url.pathname.startsWith('/ptr_split_') ? url.port !== '58432'&&!immersionGatePort(url,env) : url.pathname === '/ptr_framework_test' ? url.port !== '57432' : url.port !== '56432')
     || !isIsolatedDatabaseIdentity(url.pathname.slice(1), decodeURIComponent(url.username))
     || !url.password
     || url.search || url.hash) {

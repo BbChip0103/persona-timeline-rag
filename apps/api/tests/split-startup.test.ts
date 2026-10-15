@@ -92,8 +92,8 @@ test('split runtime routes generated artifacts to the Postgres store',async()=>{
     PTR_REDIS_URL:'redis://:synthetic@127.0.0.1:58479/0',PTR_LLM_CONTROL_TOKEN:'synthetic-control-token-1234567890',
     PTR_BACKEND_MAINTENANCE:'0'});
   try {
-    await runtime.saveArtifact(artifact);
-    expect(save).toHaveBeenCalledWith(artifact);
+    await runtime.saveArtifact(artifact,'draft:owner_synthetic_a:synthetic-request');
+    expect(save).toHaveBeenCalledWith(artifact,'draft:owner_synthetic_a:synthetic-request');
     await expect(runtime.loadArtifact(artifact.ownerId,artifact.id)).resolves.toBe(artifact);
     expect(get).toHaveBeenCalledWith(artifact.ownerId,artifact.id);
   } finally {await runtime.close();save.mockRestore();get.mockRestore();}

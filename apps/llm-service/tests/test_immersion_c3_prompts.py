@@ -73,6 +73,9 @@ async def test_agent_uses_service_speech_level_and_private_clock():
         if m["content"].startswith("AGENT_STATE_JSON_DATA ")
     )
     assert '"speechLevel":"해요체"' in state
+    assert state.index('"registerInstruction"') < state.index('"speechLevel"')
+    assert '"registerExamples":["~해요.","~인가요?"]' in state
+    assert 'Never mix registers in one reply.' in state
     assert '"today":"오늘"' in state
     assert "2026-10-16" not in state
     evidence = next(

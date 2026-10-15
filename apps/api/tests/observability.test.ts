@@ -96,6 +96,18 @@ describe('api /metrics/prom and health ',()=>{
 });
 
 describe('worker and outbox observability',()=>{
+  test('info logs and metrics omit operator-only reply traces',async()=>{
+    const lines:string[]=[];
+    const observed=workerObservability({activeTurns:()=>0,write:line=>lines.push(line)});
+    observed.chatHooks.onTurnCompleted({turnId:'synthetic-turn',reply:{sessionId:'session',turnId:'synthetic-turn',messageId:'message',
+      personId:'person',personaRevision:'v1',responseKind:'small_talk',status:'answered',content:'합성 답변',claims:[],evidence:[],limitations:[],
+      operatorTrace:{path:'register_regeneration',code:'SYNTHETIC_REGISTER',repeatChecked:true,previousAvailable:true}}});
+    observed.onFinished({turnId:'synthetic-turn',queueWaitMs:1,durationMs:2});
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('operatorTrace');
+    expect(lines[0]).not.toContain('SYNTHETIC_REGISTER');
+    expect(await observed.render()).not.toContain('operatorTrace');
+  });
   test('worker: exact names; finished by outcome and code, durations, model calls by upstream, reply guard, safety fallback; JSON logs with turnId only',async()=>{
     const lines:string[]=[];
     const observed=workerObservability({activeTurns:()=>2,write:line=>lines.push(line)});

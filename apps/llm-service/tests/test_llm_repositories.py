@@ -58,12 +58,24 @@ def test_db_guard_valid_and_pool_binding():
         PostgresPersonaRepository(Pool(), URL)
 
 
+def test_disposable_immersion_database_port_requires_exact_opt_in(monkeypatch):
+    url = URL.replace("58432", "54321")
+    monkeypatch.setenv("PTR_IMMERSION_GATE_PROJECT", "ptr-immersion-0123456789")
+    monkeypatch.setenv("PTR_IMMERSION_GATE_DB_PORT", "54321")
+    monkeypatch.setenv("PTR_LLM_SPILLOVER", "off")
+    assert_llm_database_url(url)
+    with pytest.raises(ProviderError, match="UNSAFE_DATABASE_URL"):
+        assert_llm_database_url(url.replace("ptr_split_test", "ptr_split_research"))
+    monkeypatch.delenv("PTR_IMMERSION_GATE_PROJECT")
+    with pytest.raises(ProviderError, match="UNSAFE_DATABASE_URL"):
+        assert_llm_database_url(url)
+
+
 @pytest.mark.parametrize(
     ("url", "allowlist"),
     [
         (
-            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
-            "ptr_split_research",
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/ptr_split_research",
             "postgresql://ptr_split_llm@postgres.ptr-data.svc:5432/ptr_split_research",
         ),
         (
@@ -89,8 +101,7 @@ def test_database_guard_cluster_allowlist(monkeypatch, url, allowlist):
     ("url", "allowlist"),
     [
         (
-            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/"
-            "ptr_split_research",
+            "postgresql://ptr_split_llm:synthetic@postgres.ptr-data.svc:5432/ptr_split_research",
             "",
         ),
         (

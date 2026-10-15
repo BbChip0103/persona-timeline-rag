@@ -19,7 +19,7 @@ export interface ApiRuntime {
   /** Queued execution: the API reserves and publishes; worker processes execute; the worker maintains the durable outbox. */
   leases:TurnLeaseStore;delivery:TurnDelivery;events:TurnEvents;eventSource:TurnEventSource;
   listPersonas():Promise<Persona[]>;
-  saveArtifact(artifact:CreativeArtifact):Promise<void>;
+  saveArtifact(artifact:CreativeArtifact,requestKey:string):Promise<void>;
   guardrails?:GuardrailsClient;telemetry?:FrameworkTelemetry;billable?:boolean;
   providerName:string;model:string;close?():Promise<void>;
   /** Dependency checks for /api/health (D23): database `SELECT 1` and Redis `PING`, 1 s each. */
@@ -241,7 +241,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
       const registry=await approvedPersonas();
       return registry.map(selected=>result.rows.map(row=>PersonaSchema.parse(row.document)).find(p=>p.id===selected.id&&p.personId===selected.personId&&p.revision===selected.revision)).filter((p):p is Persona=>Boolean(p));
     },
-    async saveArtifact(artifact) {
+    async saveArtifact(artifact,_requestKey) {
       const directory=join(process.cwd(),'data','generated');await mkdir(directory,{recursive:true,mode:0o700});
       await writeFile(join(directory,`${artifact.id}.json`),JSON.stringify(artifact,null,2),{flag:'wx',mode:0o600});
     },

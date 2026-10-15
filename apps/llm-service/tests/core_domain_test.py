@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from ptr_llm.billing import ProviderError
-from ptr_llm.control import ControlRejected, ControlUnavailable
+from ptr_llm.control import ControlRejected, ControlUnavailable, validate_wire
 from ptr_llm.core.context import retrieval_context
 from ptr_llm.core.errors import CoreError
 from ptr_llm.core.evidence import filter_evidence, formatted_quote, validate_experiment_reply
@@ -136,6 +136,330 @@ def grant(text="Hi!", **session_updates):
             "refusedTurnIds": [],
         },
     }
+
+
+async def test_output_guard_failure_records_only_class_code_and_stage(monkeypatch, caplog):
+    from ptr_llm.core import runtime
+
+    def fail(_reply, _metadata):
+        raise ValueError("synthetic-private-content-must-not-log")
+
+    monkeypatch.setattr(runtime, "validate_output", fail)
+    engine = LLMEngine(provider=Provider([response("Hello there.")]), personas=Personas())
+    result = await engine.handle(
+        grant(), before_costly=lambda: asyncio.sleep(0), cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    reply = result["reply"]
+    assert reply["content"] == "Hello there."
+    assert "GUARDRAILS_OUTPUT_RECOVERED" in reply["limitations"]
+    assert reply["operatorMetadata"] == {
+        "guardStage": "output_guard",
+        "exceptionClass": "ValueError",
+        "code": "GUARDRAILS_OUTPUT_UNAVAILABLE",
+    }
+    assert "exception_class=ValueError" in caplog.text
+    assert "guard_stage=output_guard" in caplog.text
+    assert "synthetic-private-content-must-not-log" not in caplog.text
+
+
+async def test_repeated_reply_regenerates_once_with_distinct_local_key():
+    class LocalProvider(Provider):
+        provider_name = "local"
+
+        def __init__(self):
+            super().__init__([response("Hello, there!"), response("A new fictional thought.")])
+            self.keys = []
+
+        async def generate(self, messages, **kwargs):
+            self.keys.append(kwargs["request_key"])
+            return await super().generate(messages, **kwargs)
+
+        async def generate_local_only(self, messages, **kwargs):
+            return await self.generate(messages, **kwargs)
+
+    provider = LocalProvider()
+    request = grant()
+    request["context"]["history"] = [
+        {"role": "user", "content": "Hi!", "turnId": "synthetic-previous"},
+        {"role": "assistant", "content": "Hello there.", "turnId": "synthetic-previous"},
+    ]
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        request, before_costly=lambda: asyncio.sleep(0), cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] == "A new fictional thought."
+    assert provider.keys == ["synthetic-turn", "synthetic-turn:regen"]
+
+
+async def test_repeated_reply_near_deadline_uses_service_retry_without_regeneration():
+    class LocalProvider(Provider):
+        provider_name = "local"
+
+        def __init__(self):
+            super().__init__([response("Hello there.")])
+            self.keys = []
+
+        async def generate(self, messages, **kwargs):
+            self.keys.append(kwargs["request_key"])
+            return await super().generate(messages, **kwargs)
+
+    provider = LocalProvider()
+    request = grant()
+    request["deadlineAt"] = int(time.time() * 1000) + 4500
+    request["context"]["history"] = [
+        {"role": "assistant", "content": "Hello there!", "turnId": "synthetic-previous"}
+    ]
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        request, before_costly=lambda: asyncio.sleep(0), cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] != "Hello there."
+    assert result["reply"]["limitations"] == ["REPEATED_ASSISTANT_REPLY"]
+    assert provider.keys == ["synthetic-turn"]
+
+
+async def test_same_identity_question_twice_discloses_ai_in_distinct_words():
+    persona = copy.deepcopy(PERSONA)
+    persona["language"] = "ko"
+    persona["style"] = ["반말"]
+
+    class KoreanPersonas:
+        async def get(self, *_):
+            return copy.deepcopy(persona)
+
+    original = "응, 나는 AI야. 그래도 같이 이야기하자!"
+    provider = Provider([response(original), response(original)])
+    engine = LLMEngine(provider=provider, personas=KoreanPersonas())
+    first = await engine.handle(grant("너 AI야?", language="ko"), before_costly=noop,
+                                cancelled=asyncio.Event())
+    assert first["kind"] == "completed"
+    second_request = grant("너 AI야?", language="ko")
+    second_request["context"]["turn"]["id"] = "synthetic-turn-2"
+    second_request["context"]["history"] = [
+        {"role": "user", "content": "너 AI야?", "turnId": "synthetic-turn"},
+        {"role": "assistant", "content": first["reply"]["content"], "turnId": "synthetic-turn"},
+    ]
+    second = await engine.handle(second_request, before_costly=noop,
+                                 cancelled=asyncio.Event())
+    assert second["kind"] == "completed"
+    assert "AI" in second["reply"]["content"]
+    assert second["reply"]["content"] != first["reply"]["content"]
+    assert second["reply"]["operatorTrace"]["repeatChecked"] is True
+    assert second["reply"]["operatorTrace"]["previousAvailable"] is True
+    assert second["reply"]["operatorTrace"]["path"] == "identity_variant"
+    wire_reply = next(row["value"] for row in json.loads(
+        (Path(__file__).resolve().parents[3] / "contracts/llm/v2/corpus.json").read_text()
+    ) if row["name"] == "valid_reply")
+    wire_reply["operatorTrace"] = second["reply"]["operatorTrace"]
+    result = validate_wire("Result", {"kind": "completed", "reply": wire_reply})
+    assert result["reply"] == wire_reply
+
+
+async def test_repeat_check_uses_last_assistant_even_when_prompt_history_excludes_it():
+    original = "A fictional answer."
+    request = grant("Hi again!")
+    request["context"]["history"] = [
+        {"role": "assistant", "content": original, "turnId": "synthetic-refused"}
+    ]
+    request["context"]["refusedTurnIds"] = ["synthetic-refused"]
+    result = await LLMEngine(provider=Provider([response(original)]), personas=Personas()).handle(
+        request, before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] != original
+    assert result["reply"]["operatorTrace"]["previousAvailable"] is True
+
+
+async def test_guard_identity_replacement_compares_with_previous_assistant():
+    previous = VOICES["identity"]["casual"][0]
+    request = korean_grant(previous=previous, speech_level="casual")
+    request["context"]["input"]["text"] = "너 AI야?"
+    engine = LLMEngine(provider=Provider([response("응, 안녕!")]), personas=Personas())
+    result = await engine.handle(
+        request, before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    assert "AI" in result["reply"]["content"]
+    assert result["reply"]["content"] != previous
+    assert result["reply"]["operatorTrace"] == {
+        "path": "guard_replacement", "code": "REPLY_GUARD_MISSING_AI_DISCLOSURE",
+        "repeatChecked": True, "previousAvailable": True,
+    }
+
+
+async def test_input_guard_fallback_compares_with_previous_assistant(monkeypatch):
+    from ptr_llm.core import runtime
+
+    monkeypatch.setattr(runtime, "validate_input", lambda *_: (_ for _ in ()).throw(ValueError()))
+    previous = VOICES["service_retry"]["en"][0]
+    request = grant("Hello?")
+    request["context"]["history"] = [
+        {"role": "assistant", "content": previous, "turnId": "synthetic-previous"}
+    ]
+    result = await LLMEngine(provider=Provider([]), personas=Personas()).handle(
+        request, before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] != previous
+    assert result["reply"]["operatorTrace"] == {
+        "path": "fallback", "code": "GUARDRAILS_INPUT_UNAVAILABLE",
+        "repeatChecked": True, "previousAvailable": True,
+    }
+
+
+class RegisterProvider(Provider):
+    def __init__(self, original, regenerated):
+        super().__init__([response(original)])
+        self.regenerated = response(regenerated)
+        self.primary_keys = []
+        self.local_keys = []
+
+    async def generate(self, messages, **kwargs):
+        self.primary_keys.append(kwargs["request_key"])
+        return await super().generate(messages, **kwargs)
+
+    async def generate_local_only(self, messages, **kwargs):
+        self.local_keys.append(kwargs["request_key"])
+        kwargs.get("on_served", lambda _: None)("local")
+        return self.regenerated
+
+
+def korean_grant(*, deadline_ms=30000, previous=None, speech_level=None):
+    request = grant("가상 그림 이야기하자", language="ko")
+    request["deadlineAt"] = int(time.time() * 1000) + deadline_ms
+    if previous is not None:
+        reply = {"sessionId": "synthetic-session", "personId": PERSONA["personId"],
+                 "personaRevision": PERSONA["revision"], "agent": {"variables": {}}}
+        if speech_level:
+            reply["agent"]["variables"]["speechLevel"] = speech_level
+        request["context"]["previousReply"] = reply
+        request["context"]["history"] = [
+            {"role": "assistant", "content": previous, "turnId": "synthetic-previous"}
+        ]
+    return request
+
+
+@pytest.mark.parametrize(("original", "regenerated", "expected"), [
+    ("같이 해요.", "같이 해.", "같이 해."),
+    ("같이 해요.", "다시 해요.", "같이 해요."),
+])
+async def test_register_regeneration_is_local_once_and_keeps_original_on_second_mismatch(
+    original, regenerated, expected
+):
+    provider = RegisterProvider(original, regenerated)
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        korean_grant(previous="전에 그렸어.", speech_level="casual"),
+        before_costly=noop, cancelled=asyncio.Event(),
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] == expected
+    assert provider.primary_keys == ["synthetic-turn"]
+    assert provider.local_keys == ["synthetic-turn:register"]
+
+
+async def test_register_deadline_and_unknown_skip_regeneration():
+    for original, remaining in [("같이 해요.", 4500), ("그림", 30000)]:
+        provider = RegisterProvider(original, "같이 해.")
+        result = await LLMEngine(provider=provider, personas=Personas()).handle(
+            korean_grant(deadline_ms=remaining, previous="전에 그렸어.", speech_level="casual"),
+            before_costly=noop, cancelled=asyncio.Event(),
+        )
+        assert result["kind"] == "completed"
+        assert result["reply"]["content"] == original
+        assert provider.local_keys == []
+
+
+async def test_repeat_regeneration_has_priority_over_register_regeneration():
+    provider = RegisterProvider("같이 해요.", "같이 해.")
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        korean_grant(previous="같이 해요!", speech_level="casual"),
+        before_costly=noop, cancelled=asyncio.Event(),
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] == "같이 해."
+    assert provider.local_keys == ["synthetic-turn:regen"]
+
+
+@pytest.mark.parametrize(("previous", "expected"), [
+    ("전에 그렸어.", "같이 해요."),
+    ("같이 해요!", None),
+])
+async def test_cosmetic_regeneration_timeout_completes_with_safe_original(
+    previous, expected
+):
+    class TimeoutProvider(RegisterProvider):
+        async def generate_local_only(self, messages, **kwargs):
+            self.local_keys.append(kwargs["request_key"])
+            assert kwargs["deadline_at"] <= request["deadlineAt"] - 2000
+            raise TimeoutError("synthetic cosmetic timeout")
+
+    provider = TimeoutProvider("같이 해요.", "unused")
+    request = korean_grant(previous=previous, speech_level="casual")
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        request, before_costly=noop, cancelled=asyncio.Event(),
+    )
+    assert result["kind"] == "completed"
+    if expected is None:
+        assert result["reply"]["content"] in VOICES["service_retry"]["casual"]
+        assert result["reply"]["content"] != previous
+    else:
+        assert result["reply"]["content"] == expected
+    assert provider.local_keys == [
+        "synthetic-turn:regen" if expected is None else "synthetic-turn:register"
+    ]
+
+
+async def test_regeneration_wait_for_expires_before_turn_deadline():
+    class SlowProvider(RegisterProvider):
+        async def generate_local_only(self, messages, **kwargs):
+            self.local_keys.append(kwargs["request_key"])
+            await asyncio.sleep(10)
+            return self.regenerated
+
+    provider = SlowProvider("같이 해요.", "같이 해.")
+    request = korean_grant(deadline_ms=6500, previous="전에 그렸어.", speech_level="casual")
+    result = await LLMEngine(provider=provider, personas=Personas()).handle(
+        request, before_costly=noop, cancelled=asyncio.Event(),
+    )
+    assert result["kind"] == "completed"
+    assert result["reply"]["content"] == "같이 해요."
+    assert provider.local_keys == ["synthetic-turn:register"]
+
+
+async def test_regeneration_without_rag_reuses_primary_biography_validation():
+    class LocalProvider(Provider):
+        def __init__(self):
+            super().__init__([response("Hello there.")])
+
+        async def generate_local_only(self, messages, **kwargs):
+            return response("I grew up in a small town.")
+
+    request = grant()
+    request["context"]["session"].pop("ragCondition")
+    request["context"]["history"] = [
+        {"role": "assistant", "content": "Hello there!", "turnId": "synthetic-previous"}
+    ]
+    result = await LLMEngine(provider=LocalProvider(), personas=Personas()).handle(
+        request, before_costly=noop, cancelled=asyncio.Event(),
+    )
+    primary_request = grant()
+    primary_request["context"]["session"].pop("ragCondition")
+    primary = await LLMEngine(
+        provider=Provider([response("I grew up in a small town.")]), personas=Personas()
+    ).handle(primary_request, before_costly=noop, cancelled=asyncio.Event())
+    assert result["kind"] == "completed"
+    assert primary["kind"] == "completed"
+    assert result["reply"]["content"] == primary["reply"]["content"]
+    assert result["reply"]["status"] == primary["reply"]["status"]
+    assert result["reply"]["limitations"] == primary["reply"]["limitations"]
+    assert "BIOGRAPHY_HEURISTIC_GUARD" in result["reply"]["limitations"]
+
+
+def test_voice_policy_forbids_verbatim_previous_reply():
+    from ptr_llm.core.prompts import POLICY
+
+    assert "Never repeat your previous message verbatim." in POLICY["REPLY_VOICE_POLICY"]
 
 
 async def noop():

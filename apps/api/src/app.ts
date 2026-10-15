@@ -168,11 +168,11 @@ class ApiController {
     let cancel!:()=>void;
     const cancelled=new Promise<never>((_,reject)=>{cancel=()=>reject(new CoreError('TURN_FAILED'));controller.signal.addEventListener('abort',cancel,{once:true});});
     const run=async()=>{
-      const draftId=randomUUID(),result=await this.runtime.draftRemote(session,brief,`draft:${caller}:${clientRequestId??draftId}`,deadlineAt,controller.signal);check();
+      const draftId=randomUUID(),requestKey=`draft:${caller}:${clientRequestId??draftId}`,result=await this.runtime.draftRemote(session,brief,requestKey,deadlineAt,controller.signal);check();
       if('notice' in result){if(containsCredentialPattern(result.notice.content)||containsInternalPathPattern(result.notice.content))throw new CoreError('TURN_FAILED');return {notice:result.notice,image:imageUnavailable};}
       if(!result.content.trim()||result.content.length>8000||containsCredentialPattern(result.content)||containsInternalPathPattern(result.content))throw new CoreError('TURN_FAILED');
       const artifact:CreativeArtifact={id:draftId,ownerId:caller,personId:session.personId,personaRevision:session.personaRevision,sessionId:id,kind:'post_draft',origin:'generated',fictional:true,status:'draft',content:`[가상 포스트 초안 · AI 생성]\n${result.content}`,promptRevision:'fictional-post-draft-v1',provider:result.provider,model:result.model,createdAt:new Date().toISOString()};
-      await this.runtime.saveArtifact(artifact);check();const {ownerId:_,...safeArtifact}=artifact;return {artifact:safeArtifact,image:imageUnavailable};
+      await this.runtime.saveArtifact(artifact,requestKey);check();const {ownerId:_,...safeArtifact}=artifact;return {artifact:safeArtifact,image:imageUnavailable};
     };
     try {
       return await Promise.race([run(),cancelled]);
