@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,33 @@ APP_COMPOSE = ROOT / "infra/compose.app.yml"
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_current_rollback_restores_three_services_before_sql_and_start(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        redeploy = runbook.split("## Direct-path redeploy procedure", 1)[1]
+        rollback = redeploy.split("For a full rollback", 1)[1]
+        steps = (
+            "stop -t 90 api worker web",
+            "docker image load",
+            " tag-images",
+            "--apply >/dev/null",
+            "dst=/rollback.sql,readonly",
+            'assert set(manifest["expected_services"]) == {"api", "web", "worker"}',
+            '"up", "-d"',
+        )
+        positions = [rollback.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("planned.deletedSessions", rollback)
+        self.assertIn("OPENROUTER_SOURCE_ENV", redeploy)
+        self.assertIn("older private", redeploy)
+        self.assertNotIn("--remove-orphans", redeploy.split("7. Reconcile", 1)[1])
+        for command in rollback.split("```sh")[1:]:
+            shell = command.split("```", 1)[0]
+            result = subprocess.run(
+                ["bash", "-n"], input=textwrap.dedent(shell), text=True,
+                capture_output=True, timeout=10
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_redeploy_data_preflight_uses_snapshot_sources(self):
         runbook = (ROOT / "docs/operational-deployment.md").read_text()
         step = runbook.split("3. Prepare the new private configuration", 1)[1].split(

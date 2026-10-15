@@ -13,6 +13,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("operational-snapshot.py")
 SERVICES = ("api", "web", "worker", "model-gateway", "model-gateway-db", "model-gateway-redis")
+CURRENT_SERVICES = ("api", "web", "worker")
 TEST_TMP = Path("/var/tmp") if Path("/var/tmp").is_dir() else Path.home()
 
 
@@ -60,7 +61,9 @@ class OperationalSnapshotTests(unittest.TestCase):
     def tempdir(self):
         return tempfile.TemporaryDirectory(dir=TEST_TMP)
 
-    def write_fixture(self, folder: Path, owner: str = "owner-nonce") -> tuple[Path, Path]:
+    def write_fixture(
+        self, folder: Path, owner: str = "owner-nonce", services: tuple[str, ...] = SERVICES,
+    ) -> tuple[Path, Path]:
         project = "ptr-op"
         deployed = folder / "deployed"
         (deployed / "infra" / "split").mkdir(parents=True)
@@ -79,14 +82,15 @@ class OperationalSnapshotTests(unittest.TestCase):
         )
         (deployed / "data" / "generated").mkdir(parents=True)
         (deployed / "data" / "generated" / "draft.json").write_text('{"draft":true}\n')
-        for service in SERVICES:
+        for service in services:
             (deployed / "private" / f"{service}.env").write_text(
                 f"SECRET_{service}=hidden\n", encoding="utf-8"
             )
             (deployed / "private" / f"{service}.env").chmod(0o600)
         fixture = folder / "inspect.json"
-        rows = [inspect_row(service, project, owner, deployed) for service in SERVICES]
-        rows[3]["Config"]["Image"] = "example/gateway:stable@sha256:" + "a" * 64
+        rows = [inspect_row(service, project, owner, deployed) for service in services]
+        if "model-gateway" in services:
+            rows[services.index("model-gateway")]["Config"]["Image"] = "example/gateway:stable@sha256:" + "a" * 64
         rows[0]["Mounts"].append(
             {
                 "Type": "bind",
@@ -94,19 +98,23 @@ class OperationalSnapshotTests(unittest.TestCase):
                 "Destination": "/app/data/generated",
             }
         )
-        rows[2]["Mounts"].append({"Type": "bind", "Source": str(deployed / "private" / "worker.env"),
-                                    "Destination": "/app/published-personas.private.json"})
-        gateway = rows[3]["Mounts"]
-        gateway.append({"Type": "bind", "Source": str(deployed / "private" / "model-gateway.env"),
-                        "Destination": "/app/ptr-config.yaml"})
-        for name, target in (("router.py", "/app/ptr_routing.py"),
-                             ("state.py", "/app/routing_state.py"),
-                             ("telemetry.py", "/app/routing_telemetry.py"),
-                             ("budget.py", "/app/persona_timeline_rag/gateway_budget.py")):
-            source = deployed / "mounted-code" / "gateway" / name
-            if not source.exists():
-                source.write_text("SYNTHETIC = True\n")
-            gateway.append({"Type": "bind", "Source": str(source), "Destination": target})
+        if "worker" in services:
+            rows[services.index("worker")]["Mounts"].append(
+                {"Type": "bind", "Source": str(deployed / "private" / "worker.env"),
+                 "Destination": "/app/published-personas.private.json"}
+            )
+        if "model-gateway" in services:
+            gateway = rows[services.index("model-gateway")]["Mounts"]
+            gateway.append({"Type": "bind", "Source": str(deployed / "private" / "model-gateway.env"),
+                            "Destination": "/app/ptr-config.yaml"})
+            for name, target in (("router.py", "/app/ptr_routing.py"),
+                                 ("state.py", "/app/routing_state.py"),
+                                 ("telemetry.py", "/app/routing_telemetry.py"),
+                                 ("budget.py", "/app/persona_timeline_rag/gateway_budget.py")):
+                source = deployed / "mounted-code" / "gateway" / name
+                if not source.exists():
+                    source.write_text("SYNTHETIC = True\n")
+                gateway.append({"Type": "bind", "Source": str(source), "Destination": target})
         fixture.write_text(
             json.dumps(rows),
             encoding="utf-8",
@@ -118,6 +126,7 @@ class OperationalSnapshotTests(unittest.TestCase):
         mismatch_service: str = "api",
         compose_version: str = "v5.5.1", missing_env_file_service: str | None = None,
         missing_config_service: str | None = None,
+        compose_services: tuple[str, ...] | None = None,
     ) -> dict[str, str]:
         rows = json.loads(fixture.read_text())
         hashes = {
@@ -149,6 +158,9 @@ class OperationalSnapshotTests(unittest.TestCase):
                 },
             )
             group["services"].append(row_labels["com.docker.compose.service"])
+        if compose_services is not None:
+            for group in groups.values():
+                group["services"] = list(compose_services)
         executable.write_text(
             "#!/usr/bin/env python3\nimport os,sys\n"
             f"groups = {groups!r}\n"
@@ -211,6 +223,68 @@ class OperationalSnapshotTests(unittest.TestCase):
             )
         fixture.write_text(json.dumps(rows))
         return first, second, fixture
+
+    def test_current_three_service_capture_and_dry_run(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder, services=CURRENT_SERVICES)
+            env = self.fake_docker(folder, fixture)
+            snapshot = folder / "snapshot"
+            dry = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--dry-run", "--inspect-fixture", fixture, env=env,
+            )
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertIn("services=api,web,worker", dry.stdout)
+            self.assertIn("checks=pass", dry.stdout)
+            self.assertFalse(snapshot.exists())
+            captured = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--output", snapshot, "--inspect-fixture", fixture, env=env,
+            )
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            self.assertEqual(manifest["expected_services"], list(CURRENT_SERVICES))
+            self.assertEqual({row["service"] for row in manifest["services"]}, set(CURRENT_SERVICES))
+            self.assertEqual(manifest["compose_groups"][0]["services"], list(CURRENT_SERVICES))
+
+    def test_current_compose_missing_service_fails_closed(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder, services=("api", "web"))
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--dry-run", "--inspect-fixture", fixture,
+                env=self.fake_docker(folder, fixture, compose_services=CURRENT_SERVICES),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing expected services: worker", result.stderr)
+
+    def test_current_compose_extra_service_fails_closed(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder, services=(*CURRENT_SERVICES, "extra"))
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--dry-run", "--inspect-fixture", fixture,
+                env=self.fake_docker(folder, fixture, compose_services=CURRENT_SERVICES),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexpected service in project: extra", result.stderr)
+
+    def test_current_compose_stopped_service_fails_closed(self) -> None:
+        with self.tempdir() as raw:
+            folder = Path(raw)
+            _, fixture = self.write_fixture(folder, services=CURRENT_SERVICES)
+            rows = json.loads(fixture.read_text())
+            rows[1]["State"]["Running"] = False
+            fixture.write_text(json.dumps(rows))
+            result = run(
+                "capture", "--project", "ptr-op", "--owner", "owner-nonce",
+                "--dry-run", "--inspect-fixture", fixture,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("service is not running: web", result.stderr)
 
     def test_capture_records_owned_sources_and_restores_from_snapshot_tool(self) -> None:
         with self.tempdir() as raw:
@@ -477,13 +551,14 @@ class OperationalSnapshotTests(unittest.TestCase):
                 env=self.fake_docker(folder, fixture, missing_config_service="api"),
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("missing deployed services: api", result.stderr)
+            self.assertIn("unexpected service in project: api", result.stderr)
             self.assertFalse(snapshot.exists())
 
     def test_two_groups_refuse_missing_service(self) -> None:
         with self.tempdir() as raw:
             folder = Path(raw)
             _, _, fixture = self.write_two_group_fixture(folder)
+            env = self.fake_docker(folder, fixture)
             rows = json.loads(fixture.read_text())
             fixture.write_text(json.dumps([
                 row for row in rows
@@ -492,6 +567,7 @@ class OperationalSnapshotTests(unittest.TestCase):
             result = run(
                 "capture", "--project", "ptr-op", "--owner", "owner-nonce",
                 "--output", folder / "snapshot", "--inspect-fixture", fixture,
+                env=env,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("missing expected services: worker", result.stderr)

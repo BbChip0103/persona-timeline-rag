@@ -236,10 +236,7 @@ OLD_WORKER_ENV='<old-worker-env-file>'
 NEW_BACKEND_ENV='<new-private-backend-env-file>'
 NEW_WEB_ENV='<new-private-web-env-file>'
 NEW_WORKER_ENV='<new-private-worker-env-file>'
-GATEWAY_ENV='<gateway-env-file>'
-GATEWAY_DB_ENV='<gateway-database-env-file>'
-GATEWAY_REDIS_ENV='<gateway-redis-env-file>'
-GATEWAY_CONFIG='<gateway-config-file>'
+OPENROUTER_SOURCE_ENV='<named-private-source-env-file-from-an-older-gateway-snapshot-if-spillover-is-approved>'
 SNAPSHOT='<private-snapshot-directory>'
 OWNER_DB_ENV='<private-owner-maintenance-env-file>'
 E2E_ENV='<private-e2e-env-file>'
@@ -269,9 +266,8 @@ PY
 )
 ```
 
-1. Preflight the existing project and owner. The redeploy must reuse the same
-   Compose project name because Compose orphans are scoped only inside one
-   project. A new project name would leave the old stack running on the host
+1. Preflight the existing project and owner. Reuse the same Compose project
+   name; a new project would leave the current stack running on the host
    network, creating port collisions and two workers consuming one queue.
 
    ```sh
@@ -284,17 +280,16 @@ PY
      | awk -v expected="${OWNER_NONCE}" '$4 != expected {print; bad=1} END {exit bad}'
    ```
 
-   The first command must show the expected old `api`, `web`, `worker` and
-   `model-gateway*` services with the same owner label. The second command must
+   The first command must show exactly `api`, `web` and `worker` with the same
+   owner label. The second command must
    print nothing and exit zero. If it prints a container or fails, stop: the
    project contains a different or missing owner label.
 
 2. Create the rollback set before changing anything. Set `SNAPSHOT` to persistent
    host storage. Never use `/tmp` or a path beneath
-   it: a reboot can remove the only rollback set. The live stack from the
-   2026-10-11 cutover has a group whose working directory and bind mounts are
-   under `/tmp`; a host reboot can wipe those sources. This redeploy moves the
-   stack to the repository checkout.
+   it: a reboot can remove the only rollback set. Earlier cutovers used
+   working directories under `/tmp`; capture the actual labeled sources before
+   changing this stack.
 
    The snapshot helper reads Docker labels, bind mount paths, image references
    and running state. Use a new private snapshot path: older manifests lack the
@@ -306,8 +301,9 @@ PY
    and compares the exact service/hash set with those containers'
    `com.docker.compose.config-hash` labels. A mismatch or dirty labeled git checkout
    in any group stops capture. The checkout HEAD
-   alone is not evidence of what was deployed. The helper also refuses a missing
-   service, unexpected service, owner mismatch, or a snapshot directory inside a
+   alone is not evidence of what was deployed. The helper derives each group's
+   exact services from its labeled Compose files. It refuses a missing service,
+   unexpected service, owner mismatch, or a snapshot directory inside a
    captured source tree. It skips Docker named volumes and allowlisted data bind
    mounts, including `/app/data/generated`, which remain in place. Unknown bind
    mount targets stop capture until classified in the helper. It copies allowlisted
@@ -327,6 +323,14 @@ PY
    image ID with those tags before Compose starts. This also supports images
    whose original reference is a registry digest. It prints only
    key names, paths and counts; never env values.
+
+   ```sh
+   timeout 120 python3 scripts/operational-snapshot.py capture \
+     --project "${PROJECT}" --owner "${OWNER_NONCE}" --dry-run
+   ```
+
+   The dry-run prints the services and check result without creating a snapshot.
+   After it passes, capture to persistent storage:
 
    ```sh
    (
@@ -437,15 +441,18 @@ PY
    startup path.
 
    To enable Compose spillover, prepare the worker using the helper's explicit
-   spillover option and the snapshotted old gateway env as the dedicated-key
-   source. Choose this command instead of the default `prepare worker` command
-   above, before the new file exists. Set `SNAPSHOT_GATEWAY_ENV` to the captured
-   gateway env path under `${SNAPSHOT}/root` from the manifest:
+   spillover option and `OPENROUTER_SOURCE_ENV` as the named key source. The
+   current three-service snapshot has no gateway env. Point this variable to
+   the gateway env captured under `${OLDER_SNAPSHOT}/root` in an older private
+   snapshot, or to another explicitly approved private source env file. Carry
+   only `OPENROUTER_API_KEY` by name; never print its value. Choose this command
+   instead of the default `prepare worker` command above, before the new file exists:
 
    ```sh
+   test -r "${OPENROUTER_SOURCE_ENV}"
    python3 scripts/operational-env-migrate.py prepare worker \
      "${SNAPSHOT_WORKER_ENV}" "${NEW_WORKER_ENV}" \
-     --spillover-openrouter --openrouter-source "${SNAPSHOT_GATEWAY_ENV}"
+     --spillover-openrouter --openrouter-source "${OPENROUTER_SOURCE_ENV}"
    ```
 
    Transfer only that approved research key by name without printing its
@@ -634,22 +641,22 @@ PY
    startup event, one local smoke and the slot state. Never saturate the GPU or
    make a real paid call deliberately for deployment verification.
 
-7. Remove the old gateway orphans with the same project name. The same project
-   name is required for `--remove-orphans` to see the old `model-gateway*`
-   containers. This removes orphaned containers only; Compose named volumes for
-   the old gateway database/Redis remain.
+7. Reconcile the current three-service project without orphan removal. Verify
+   its owned service names again after the redeploy.
 
    ```sh
    docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
      -f infra/compose.app.yml -f "${NEW_COMPOSE}" \
-     up -d --no-build --remove-orphans
+     up -d --no-build
    docker ps -a \
      --filter "label=com.docker.compose.project=${PROJECT}" \
-     --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}}' \
-     | awk '$3 ~ /^model-gateway/ {print}'
+     --format '{{.ID}} {{.Names}} {{.Label "com.docker.compose.service"}} {{.Label "ptr.operational.owner"}}'
    ```
 
-   Keep the gateway volumes until rollback is no longer needed.
+   The result must contain only `api`, `web` and `worker`, all with
+   `OWNER_NONCE`. Removing `model-gateway*` orphans and retaining their old
+   database/Redis volumes belonged to the earlier gateway cutover; those
+   services are absent from the current rollback set.
 
 8. To disable spillover while keeping the current direct path, set
    `PTR_LLM_SPILLOVER=off`, remove the OpenRouter key from the private worker env,
@@ -671,7 +678,6 @@ PY
    mounts resolve to the same host paths as before cutover. The restore helper
    reads every group's working directory, files, env path and service list from
    the private `SNAPSHOT` manifest, not the current checkout.
-   The old gateway named volumes still exist because step 7 did not remove them.
    Ledger, receipts and queue are not reset. Keep intake paused, drain all v2
    work as in step 5, stop the new API, worker and web with the same verified
    project/owner identity. **Before the SQL rollback**, run the current C4
@@ -681,8 +687,9 @@ PY
    `SELECT count(*) FROM app.sessions WHERE deleted_at IS NOT NULL` returns zero.
    This purges deleted-session receipts, checkpoints, turns and session rows
    before the old peers, which do not understand C4 deletion, become visible.
-   The rollback SQL refuses to run while deleted sessions remain. Then run the
-   snapshot's `rollback-v2-reply.sql` with the verified `ptr_split_owner`
+   The rollback SQL refuses to run while deleted sessions remain. After the
+   saved `api`, `web` and `worker` images and configuration are restored, run
+   the snapshot's `rollback-v2-reply.sql` with the verified `ptr_split_owner`
    connection before starting the old C2 worker. It removes v2-only session
    document and agent-variable keys from stored previous replies using
    idempotent jsonb `#-` operations. The script leaves C4 summary and memory
@@ -699,9 +706,32 @@ PY
      set -euo pipefail
      test -r "${OWNER_DB_ENV}"
      test -s "${SNAPSHOT}/tools/rollback-v2-reply.sql"
-     PG_IMAGE='postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94'
      timeout 100 docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
        -f infra/compose.app.yml -f "${NEW_COMPOSE}" stop -t 90 api worker web
+   )
+   ```
+
+   Finish the deleted-session retention purge and verify zero deleted sessions
+   as described above. Then restore the three saved images and their config
+   before the SQL cleanup. Keep the stopped services stopped until SQL succeeds.
+
+   ```sh
+   (
+     set -euo pipefail
+     timeout 600 docker image load -i "${SNAPSHOT}/images/operational-images.tar" >/dev/null
+     timeout 120 python3 "${SNAPSHOT}/tools/operational-snapshot.py" tag-images \
+       --snapshot "${SNAPSHOT}" >/dev/null
+     timeout 120 python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
+       --snapshot "${SNAPSHOT}" --dry-run >/dev/null
+     timeout 120 python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
+       --snapshot "${SNAPSHOT}" --apply >/dev/null
+   )
+   ```
+
+   ```sh
+   (
+     set -euo pipefail
+     PG_IMAGE='postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94'
      timeout 45 docker run --rm --network host \
        --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
        --mount "type=bind,src=${SNAPSHOT}/tools/rollback-v2-reply.sql,dst=/rollback.sql,readonly" \
@@ -710,16 +740,12 @@ PY
    )
    ```
 
+   Start exactly the three services from the restored manifest and saved image
+   tags only after the SQL cleanup succeeds:
+
    ```sh
    (
      set -euo pipefail
-     docker image load -i "${SNAPSHOT}/images/operational-images.tar" >/dev/null
-     python3 "${SNAPSHOT}/tools/operational-snapshot.py" tag-images \
-       --snapshot "${SNAPSHOT}" >/dev/null
-     python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
-       --snapshot "${SNAPSHOT}" --dry-run >/dev/null
-     python3 "${SNAPSHOT}/tools/operational-snapshot.py" restore \
-       --snapshot "${SNAPSHOT}" --apply >/dev/null
      python3 - "${SNAPSHOT}" <<'PY'
    import json
    import subprocess
@@ -730,8 +756,9 @@ PY
    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
    project = manifest["project"]
    groups = manifest["compose_groups"]
-   primary = {"api", "model-gateway-db", "model-gateway-redis"}
-   first = [group for group in groups if primary <= set(group["services"])]
+   assert set(manifest["expected_services"]) == {"api", "web", "worker"}
+   assert {service for group in groups for service in group["services"]} == {"api", "web", "worker"}
+   first = [group for group in groups if "api" in group["services"]]
    assert len(first) == 1
    groups = first + sorted(
        (group for group in groups if group is not first[0]),
@@ -766,18 +793,14 @@ PY
    )
    ```
 
-   The group with `model-gateway-db`, `model-gateway-redis` and `api` starts first;
-   the other group follows. Compose waits for health where `--wait` is supported.
+   The group with `api` starts first; any other group follows. Compose waits
+   for health where `--wait` is supported.
    Each `up` uses the same `-p <project>`, that group's restored files and env
    path, and the saved rollback image tags. `--no-deps` limits it to the group's
    listed services; do not remove orphans while the other groups share that project.
 
-9. Only after the rollback window closes without a rollback, remove the old
-   gateway named volumes by their exact names. Never use `down -v` here.
-
-   ```sh
-   docker volume rm "${PROJECT}_model_gateway_postgres" "${PROJECT}_model_gateway_redis"
-   ```
+The earlier gateway cutover retained its old named volumes until that rollback
+window closed. Gateway volume removal is not part of this three-service procedure.
 
 The parent operator handles acceptance recovery phases only after checking exact
 container ID, owner label, Compose service/project and immutable image. Stop and

@@ -22,16 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Historical pre-L2 Compose service names are required to capture and restore
-# the deployed rollback snapshot; current deployments never start these roles.
-EXPECTED_SERVICES = {
-    "api",
-    "web",
-    "worker",
-    "model-gateway",
-    "model-gateway-db",
-    "model-gateway-redis",
-}
 OWNER_LABEL = "ptr.operational.owner"
 PROJECT_LABEL = "com.docker.compose.project"
 SERVICE_LABEL = "com.docker.compose.service"
@@ -164,7 +154,7 @@ def docker_inspections(project: str) -> list[dict[str, Any]]:
     ids = [
         line.strip()
         for line in docker(
-            ["ps", "--filter", f"label={PROJECT_LABEL}={project}", "--format", "{{.ID}}"]
+            ["ps", "-a", "--filter", f"label={PROJECT_LABEL}={project}", "--format", "{{.ID}}"]
         ).splitlines()
         if line.strip()
     ]
@@ -258,11 +248,10 @@ def checkout_states(working_dirs: Iterable[Path]) -> dict[Path, str]:
 def rollback_groups(
     groups: dict[tuple[Path, tuple[Path, ...], Path], list[str]],
 ) -> list[tuple[tuple[Path, tuple[Path, ...], Path], list[str]]]:
-    primary = {"api", "model-gateway-db", "model-gateway-redis"}
     ordered = sorted(groups.items(), key=lambda item: (str(item[0][0]), sorted(item[1])))
-    first = [item for item in ordered if primary <= set(item[1])]
+    first = [item for item in ordered if "api" in item[1]]
     if len(first) != 1:
-        fail("rollback requires api and gateway db/redis in one Compose group")
+        fail("rollback requires api in exactly one Compose group")
     return first + [item for item in ordered if item is not first[0]]
 
 
@@ -288,8 +277,7 @@ def compose_hashes(
 
 def compose_file_references(
     project: str, env_file: Path, config_files: list[Path], working_dir: Path,
-    expected_services: list[str],
-) -> list[Path]:
+) -> tuple[list[Path], set[str]]:
     """Read resolved file paths only; never log Compose's expanded JSON or environment."""
     command = ["docker", "compose", "--env-file", str(env_file), "-p", project]
     for path in config_files:
@@ -308,9 +296,9 @@ def compose_file_references(
         fail("invalid Compose file references")
     if not services:
         fail("Compose config missing services and env_file references")
-    missing_services = set(expected_services) - services.keys()
-    if missing_services:
-        fail(f"Compose config missing deployed services: {', '.join(sorted(missing_services))}")
+    configured = set(services)
+    if any(not isinstance(name, str) or not name for name in configured):
+        fail("invalid Compose service name")
     for service_name, service in services.items():
         if not isinstance(service, dict):
             fail("invalid Compose service")
@@ -332,7 +320,7 @@ def compose_file_references(
         raw = definition.get("file")
         if isinstance(raw, str):
             add_unique(paths, resolve_compose_reference(raw, config_files, working_dir))
-    return paths
+    return paths, configured
 
 
 def resolve_compose_reference(raw: str, config_files: list[Path], working_dir: Path) -> Path:
@@ -398,7 +386,8 @@ def add_source(
 
 
 def validate_services(
-    inspections: list[dict[str, Any]], project: str, owner: str
+    inspections: list[dict[str, Any]], project: str, owner: str,
+    expected_services: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     by_service: dict[str, dict[str, Any]] = {}
     for row in inspections:
@@ -408,17 +397,21 @@ def validate_services(
         if row_labels.get(OWNER_LABEL) != owner:
             fail("container owner label mismatch")
         service = row_labels.get(SERVICE_LABEL)
-        if service not in EXPECTED_SERVICES:
-            fail(f"unexpected service in project: {service}")
+        if not isinstance(service, str) or not service:
+            fail("container missing service label")
         if service in by_service:
             fail(f"duplicate service in project: {service}")
         state = row.get("State")
         if not isinstance(state, dict) or state.get("Running") is not True:
             fail(f"service is not running: {service}")
         by_service[service] = row
-    missing = sorted(EXPECTED_SERVICES - set(by_service))
-    if missing:
-        fail("missing expected services: " + ", ".join(missing))
+    if expected_services is not None:
+        extra = sorted(set(by_service) - expected_services)
+        missing = sorted(expected_services - set(by_service))
+        if extra:
+            fail("unexpected service in project: " + ", ".join(extra))
+        if missing:
+            fail("missing expected services: " + ", ".join(missing))
     return by_service
 
 
@@ -582,8 +575,10 @@ def tag_images(args: argparse.Namespace) -> int:
 
 
 def capture(args: argparse.Namespace) -> int:
-    output = args.output.resolve()
-    if output == Path("/tmp") or Path("/tmp") in output.parents:
+    if args.dry_run == (args.output is not None):
+        fail("capture requires --dry-run or --output, exactly one")
+    output = args.output.resolve() if args.output is not None else None
+    if output is not None and (output == Path("/tmp") or Path("/tmp") in output.parents):
         fail("snapshot output must be on persistent storage, outside /tmp")
     inspections = (
         read_json(args.inspect_fixture)
@@ -636,8 +631,24 @@ def capture(args: argparse.Namespace) -> int:
     git_states = checkout_states(working_dirs)
     ordered_groups = rollback_groups(groups)
     hashes: dict[str, str] = {}
+    expected_services: set[str] = set()
     for (working_dir, service_configs, env_path), group_services in groups.items():
         expected = sorted(group_services)
+        references, configured = compose_file_references(
+            args.project, env_path, list(service_configs), working_dir
+        )
+        group_extra = sorted(set(expected) - configured)
+        group_missing = sorted(configured - set(expected))
+        if group_extra:
+            fail("unexpected service in project: " + ", ".join(group_extra))
+        if group_missing:
+            fail("missing expected services: " + ", ".join(group_missing))
+        for service in configured:
+            if service in expected_services:
+                fail(f"service defined in multiple Compose groups: {service}")
+            expected_services.add(service)
+        for path in references:
+            add_unique(referenced_files, path)
         group_hashes = compose_hashes(
             args.project, env_path, list(service_configs), working_dir, expected
         )
@@ -647,35 +658,22 @@ def capture(args: argparse.Namespace) -> int:
         ):
             fail(HASH_MISMATCH)
         hashes.update(group_hashes)
-        for path in compose_file_references(
-            args.project, env_path, list(service_configs), working_dir, expected
-        ):
-            add_unique(referenced_files, path)
+    validate_services(inspections, args.project, args.owner, expected_services)
 
-    assert_output_outside_sources(
-        output, [*working_dirs, *config_files, *env_files, *referenced_files, *mount_paths]
-    )
+    if output is not None:
+        assert_output_outside_sources(
+            output, [*working_dirs, *config_files, *env_files, *referenced_files, *mount_paths]
+        )
+    source_root = output if output is not None else Path("/")
     for config_file in config_files:
-        add_source(files, directories, links, config_file, output, "compose_config")
+        add_source(files, directories, links, config_file, source_root, "compose_config")
     for env_file in env_files:
-        add_source(files, directories, links, env_file, output, "compose_env")
+        add_source(files, directories, links, env_file, source_root, "compose_env")
     for reference in referenced_files:
-        add_source(files, directories, links, reference, output, "compose_reference")
+        add_source(files, directories, links, reference, source_root, "compose_reference")
     for service, row in services.items():
         for mount_path in mount_sources(row):
-            add_source(files, directories, links, mount_path, output, f"mount:{service}")
-    output = ensure_private_output(args.output)
-    for directory in sorted(directories, key=lambda path: (len(path.parts), str(path))):
-        private_dir(snapshot_path_for(directory, output))
-    for captured in files.values():
-        copy_private_file(captured.source, captured.snapshot)
-    for link in links.values():
-        private_dir(link.snapshot.parent)
-        link.snapshot.symlink_to(link.target)
-
-    script_source = Path(__file__).resolve()
-    copy_private_file(script_source, output / "tools" / "operational-snapshot.py")
-
+            add_source(files, directories, links, mount_path, source_root, f"mount:{service}")
     service_rows = []
     image_ids: list[str] = []
     for service in sorted(services):
@@ -701,6 +699,22 @@ def capture(args: argparse.Namespace) -> int:
                 "config_hash": hashes[service],
             }
         )
+    if args.dry_run:
+        print(f"services={','.join(sorted(services))}")
+        print("checks=pass")
+        return 0
+    assert output is not None
+    output = ensure_private_output(args.output)
+    for directory in sorted(directories, key=lambda path: (len(path.parts), str(path))):
+        private_dir(snapshot_path_for(directory, output))
+    for captured in files.values():
+        copy_private_file(captured.source, captured.snapshot)
+    for link in links.values():
+        private_dir(link.snapshot.parent)
+        link.snapshot.symlink_to(link.target)
+
+    script_source = Path(__file__).resolve()
+    copy_private_file(script_source, output / "tools" / "operational-snapshot.py")
 
     write_rollback_images(output, service_rows)
     if not args.inspect_fixture:
@@ -711,7 +725,7 @@ def capture(args: argparse.Namespace) -> int:
         "project": args.project,
         "owner_label": OWNER_LABEL,
         "owner": args.owner,
-        "expected_services": sorted(EXPECTED_SERVICES),
+        "expected_services": sorted(expected_services),
         "services": service_rows,
         "data_mounts": data_mounts(services),
         "working_dirs": [str(path) for path in working_dirs],
@@ -864,7 +878,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser = sub.add_parser("capture")
     capture_parser.add_argument("--project", required=True)
     capture_parser.add_argument("--owner", required=True)
-    capture_parser.add_argument("--output", required=True, type=Path)
+    capture_parser.add_argument("--output", type=Path)
+    capture_parser.add_argument("--dry-run", action="store_true")
     capture_parser.add_argument("--inspect-fixture", type=Path)
     capture_parser.set_defaults(func=capture)
     data_parser = sub.add_parser("data-dir")
