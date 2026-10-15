@@ -8,7 +8,7 @@ export class ConfigError extends Error {
   constructor(readonly report:ConfigReport) {super('config_invalid');this.name='ConfigError';}
 }
 
-/** One production validator: operator tooling calls the same framework loader as API/worker startup. */
+/** Framework-profile validator for operator tooling; packaged split services use their own startup checks. */
 export function roleProblems(role:EnvRole,env:NodeJS.ProcessEnv):Problem[] {
   if(role==='web') return webSchemaProblems(env);
   try {loadFrameworkConfig(role,env);return [];}
@@ -19,7 +19,7 @@ export function checkRole(role:EnvRole,env:NodeJS.ProcessEnv):ConfigReport {
   const unique=new Map([...shared.errors,...roleProblems(role,env)].map(problem=>[`${problem.key}:${problem.rule}`,problem]));
   return {role,errors:[...unique.values()],warnings:shared.warnings};
 }
-/** Operator-only reporting wrapper; production API/worker directly use loadFrameworkConfig. */
+/** Operator-only reporting wrapper for framework-profile env files. */
 export function loadConfig(role:EnvRole,env:NodeJS.ProcessEnv=process.env,write:(line:string)=>void=line=>process.stderr.write(`${line}\n`)):ConfigReport {
   const report=checkRole(role,env);
   if(report.warnings.length)write(JSON.stringify({event:'config_warning',role,problems:report.warnings}));

@@ -57,8 +57,10 @@ export function loadFrameworkConfig(role:FrameworkRole,env:NodeJS.ProcessEnv=pro
     for(const key of ['PTR_LLM_LOCAL_BASE_URL','PTR_LLM_LOCAL_MODEL','PTR_GUARDRAILS_URL','PTR_GUARDRAILS_TOKEN'] as const)
       if(!config[key])problems.push({key,rule:'required_for_local'});
   }
-  if(config.PTR_PAID_SPILLOVER==='1'&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))problems.push({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
-  if(config.PTR_CHAT_PROVIDER==='local'&&config.PTR_PAID_SPILLOVER==='1')problems.push({key:'PTR_PAID_SPILLOVER',rule:'local_has_no_spillover_ledger'});
+  // The split API only reports billable drafts; the Python worker owns paid gates and its ledger.
+  const splitApi=role==='api'&&env.PTR_LLM_SERVICE_MODE==='split';
+  if(!splitApi&&config.PTR_PAID_SPILLOVER==='1'&&(env.GOAL1_LIVE_ENABLED!=='true'||env.GOAL1_ALLOW_EXTERNAL_DATA!=='true'))problems.push({key:'GOAL1_LIVE_ENABLED',rule:'paid_transfer_not_enabled'});
+  if(!splitApi&&config.PTR_CHAT_PROVIDER==='local'&&config.PTR_PAID_SPILLOVER==='1')problems.push({key:'PTR_PAID_SPILLOVER',rule:'local_has_no_spillover_ledger'});
   if(config.PTR_ENVIRONMENT==='production'&&(config.PTR_LANGFUSE_ENABLED!=='1'||!config.PTR_GUARDRAILS_URL||!config.PTR_GUARDRAILS_TOKEN))
     problems.push({key:'PTR_ENVIRONMENT',rule:'production_observability_and_validation_required'});
   if(config.PTR_INTENT_CLASSIFIER==='jev'||config.PTR_SAFETY_FILTER==='jev') {

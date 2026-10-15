@@ -9,6 +9,7 @@ import pytest
 from redis.asyncio import Redis
 
 from ptr_llm.billing import ProviderError
+from ptr_llm.providers import local as local_provider
 from ptr_llm.providers.local import DirectLocalTextProvider
 from ptr_llm.providers.local_slots import LocalSlots
 
@@ -61,17 +62,33 @@ async def test_slot_acquire_error_cleans_ambiguous_lease():
     assert calls == [("ptr:synthetic:llm:local-slots", "lease-1")]
 
 
-async def test_slot_wait_cancellation_releases(owned_redis):
+async def test_slot_wait_cancellation_releases(owned_redis, monkeypatch):
     _, url = owned_redis
     redis = Redis.from_url(url, decode_responses=True)
     slots = LocalSlots(redis, f"ptr:synthetic:{uuid4().hex}:llm:local-slots", 1)
     signal = asyncio.Event()
     try:
-        assert await slots.acquire("first", 1)
+        assert await slots.acquire("first", 5)
         polled = asyncio.Event()
         original_acquire = slots.acquire
+        observed = []
+        deadline = time.time() * 1000 + 2000
+
+        class Clock:
+            last_time = 0.0
+
+            def time(self):
+                self.last_time = time.time()
+                return self.last_time
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+        clock = Clock()
+        monkeypatch.setattr(local_provider, "time", clock)
 
         async def observe_acquire(lease, ttl):
+            observed.append((clock.last_time, ttl))
             acquired = await original_acquire(lease, ttl)
             polled.set()
             return acquired
@@ -84,9 +101,14 @@ async def test_slot_wait_cancellation_releases(owned_redis):
             transport=httpx.MockTransport(lambda _: pytest.fail("local must wait")),
         )
         waiter = asyncio.create_task(
-            provider.generate([{"role": "user", "content": "synthetic"}], signal=signal)
+            provider.generate(
+                [{"role": "user", "content": "synthetic"}], signal=signal, deadline_at=deadline
+            )
         )
         await asyncio.wait_for(polled.wait(), 3)
+        assert (
+            observed and round(observed[0][1] - (deadline - observed[0][0] * 1000) / 1000, 6) <= 1.9
+        )
         started = time.monotonic()
         signal.set()
         with pytest.raises(ProviderError, match="CANCELLED"):

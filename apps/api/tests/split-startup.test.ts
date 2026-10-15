@@ -108,10 +108,12 @@ test.each([
     PTR_BACKEND_MAINTENANCE:'0',...(value===undefined?{}:{PTR_PAID_SPILLOVER:value})});
   try {expect(runtime.billable).toBe(billable);} finally {await runtime.close();}
 });
-test('split runtime rejects local plus paid spillover because TS has no spillover ledger',()=>{
-  expect(()=>createSplitRuntime({PTR_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_test',
+test('split runtime allows local plus paid spillover and marks drafts billable',async()=>{
+  const runtime=createSplitRuntime({PTR_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_test',
     PTR_REDIS_URL:'redis://:synthetic@127.0.0.1:58479/0',PTR_LLM_CONTROL_TOKEN:'synthetic-control-token-1234567890',
-    PTR_BACKEND_MAINTENANCE:'0',PTR_CHAT_PROVIDER:'local',PTR_PAID_SPILLOVER:'1'})).toThrow();
+    PTR_BACKEND_MAINTENANCE:'0',PTR_CHAT_PROVIDER:'local',PTR_PAID_SPILLOVER:'1'});
+  try {expect(runtime.billable).toBe(true);expect(runtime.providerName).toBe('local');}
+  finally {await runtime.close();}
 });
 
 test('generated artifact migration stays in app schema with private grants and no source table',()=>{

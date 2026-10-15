@@ -20,6 +20,14 @@ services:
       ptr.operational.owner: ${PTR_OPERATIONAL_OWNER:?required}
   worker:
     image: ${PTR_OPERATIONAL_WORKER_IMAGE:?select the verified Python image}
+    # PTR_LLM_SPILLOVER, OPENROUTER_API_KEY and
+    # PTR_LLM_OPENROUTER_KEY_MAX_LIMIT_USD come only from the private worker env.
+    # These three defaults match infra/split/llm.env.example; override them
+    # through the private Compose env when GPU capacity is measured differently.
+    environment:
+      PTR_LLM_LOCAL_SLOTS: ${PTR_LLM_LOCAL_SLOTS:-8}
+      PTR_LLM_CONCURRENCY: ${PTR_LLM_CONCURRENCY:-10}
+      PTR_LLM_SPILLOVER_WAIT_MS: ${PTR_LLM_SPILLOVER_WAIT_MS:-2000}
     # Publish only the verified database-bound snapshot; never expose all imported
     # historical/synthetic cards or mount the operator credential directory.
     volumes: !override

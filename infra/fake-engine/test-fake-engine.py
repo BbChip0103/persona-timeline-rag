@@ -169,6 +169,25 @@ class FixtureTests(unittest.TestCase):
         finally:
             os.environ.pop("PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS", None)
 
+    def test_generation_stall_once_only_delays_first_call_for_marker(self):
+        os.environ["PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS"] = "250"
+        marker = "K4_ID:fixture-once __STALL_GENERATION_ONCE__"
+        try:
+            with urllib.request.urlopen(self.base + "/counts", timeout=2) as response:
+                before = json.load(response)["stalled_generation"]
+            with self.assertRaises(TimeoutError):
+                self.call(user=marker, request_id="fixture-once-first", timeout=0.05)
+            self.call(user=marker, request_id="fixture-once-retry")
+            with urllib.request.urlopen(self.base + "/counts", timeout=2) as response:
+                counts = json.load(response)
+            self.assertEqual(counts["stalled_generation"] - before, 1)
+            self.assertEqual(
+                counts["marker_request_ids"]["fixture-once"],
+                ["fixture-once-first", "fixture-once-retry"],
+            )
+        finally:
+            os.environ.pop("PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS", None)
+
     def test_health_stall_mode_is_opt_in(self):
         os.environ["PTR_SYNTHETIC_ENGINE_STALL_MODE"] = "health"
         os.environ["PTR_SYNTHETIC_ENGINE_HEALTH_STALL_MS"] = "250"

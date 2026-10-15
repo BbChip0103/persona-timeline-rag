@@ -26,16 +26,17 @@
 
 ## 외부 전송
 
-연구 책임자(사용자)가 2026-10-09에 아래 세 경로를 현행대로 허용했습니다. 모두 기본값은 꺼짐이거나 운영자가 직접 켜야 하는 구성이며, 켜면 아래 데이터가 이 컴퓨터 밖으로 나갑니다. 유료 호출은 공통 예산 원장(Postgres `ptr_provider_requests`·`ptr_provider_budget`)을 거칩니다. 비용 상한과 호출 수 상한은 환경변수가 아니라 Postgres `ptr_provider_budget` 행(`id='global'`의 `cap_microusd`·`call_cap`)입니다.
+연구 책임자(사용자)가 2026-10-09에 아래 외부 전송 경로를 허용했습니다. Compose 스필오버는 2026-10-15에 추가된 명시적 운영 설정을 따릅니다. 모두 기본값은 꺼짐이거나 운영자가 직접 켜야 하는 구성이며, 켜면 아래 데이터가 이 컴퓨터 밖으로 나갑니다. 유료 호출은 공통 예산 원장(Postgres `ptr_provider_requests`·`ptr_provider_budget`)을 거칩니다. 비용 상한과 호출 수 상한은 환경변수가 아니라 Postgres `ptr_provider_budget` 행(`id='global'`의 `cap_microusd`·`call_cap`)입니다.
 
 | 경로 | 켜는 조건 | 보내는 데이터 | 받는 곳 |
 |---|---|---|---|
 | Jev 의도 분류 | `PTR_INTENT_CLASSIFIER=jev` + `GOAL1_LIVE_ENABLED=true` + `GOAL1_ALLOW_EXTERNAL_DATA=true` + `OPENROUTER_API_KEY` | 규칙으로 의도가 정해지지 않은 턴에서만(검색 없는 대조 세션 제외): 이번 사용자 발화 앞 500자, 같은 세션의 직전 사용자 발화 최대 2개(각 300자, 자격 정보 패턴·민감 발화 제외), 고정 질문문 | OpenRouter Decisions API, 모델 `typesafe/jev-1.13`(TypeSafe) |
 | Jev 입력 안전 검사 | `PTR_SAFETY_FILTER=jev` + 위 live 조건 | 모든 턴(규칙이 이미 거절한 턴은 자해 질문만): 이번 사용자 발화 전체(첫 500자 창 + 4100자 창들), 직전 사용자 발화 최대 2개, 고정 질문문. 창작 초안 요청이면 초안 지시문(최대 2000자) | 같음 |
-| Kubernetes paid spillover | `PTR_LLM_PROVIDER=local` + `PTR_LLM_SPILLOVER=openrouter` + 위 live 조건 + 원장 DB + worker-only OpenRouter key. EPP `rejected-saturated` 또는 `rejected-ttl-expired` drop reason일 때만 | 그 턴의 프롬프트 전체: 정책 문구, 페르소나 카드(실존 인물 페르소나의 배경 포함), 근거 게시물 최대 3건의 원본 캡션(이미지 조건이면 AI 이미지 설명 포함), 최근 대화, 사용자 발화. 엔진 5xx, bare 503, timeout, reset은 spillover grant가 아닙니다 | OpenRouter, 모델은 `PTR_LLM_OPENROUTER_MODEL` |
+| Compose / Kubernetes paid spillover (기본 off) | `PTR_LLM_PROVIDER=local` + `PTR_LLM_SPILLOVER=openrouter` + `PTR_LLM_LIVE_ENABLED=1` + `PTR_LLM_ALLOW_EXTERNAL_DATA=1` + 원장 DB + worker-only OpenRouter key. Compose는 `PTR_LLM_LOCAL_SLOTS` 설정과 Redis 공유 슬롯 2초 대기 초과, Kubernetes는 EPP `rejected-saturated` 또는 `rejected-ttl-expired` 첫 시도 drop reason일 때만. DeepInfra ZDR 확인 필수 | 그 턴의 프롬프트 전체: 정책 문구, 페르소나 카드(실존 인물 페르소나의 배경 포함), 근거 게시물 최대 3건의 원본 캡션(이미지 조건이면 AI 이미지 설명 포함), 최근 대화, 사용자 발화. 엔진 5xx, bare 503, timeout, reset은 spillover grant가 아닙니다 | OpenRouter → DeepInfra 고정, 모델은 `PTR_LLM_OPENROUTER_MODEL` |
 | 자체 엔진(RunPod) | `PTR_LLM_PROVIDER=local` 또는 Kubernetes EPP/InferencePool local route | 모든 채팅 턴의 프롬프트 전체(실존 인물 데이터 포함) | RunPod에서 빌린 GPU 호스트(제3자 하드웨어)의 vLLM/SGLang. Compose는 127.0.0.1 SSH 터널로만 접속하고, Kubernetes는 EPP/InferencePool을 통해 접속합니다 |
 
 - OpenRouter 요청(Jev·spillover)은 `data_collection: deny`, `zdr: true`, `allow_fallbacks: false`와 가격 상한을 붙여 보냅니다. 이것은 요청 조건이며, OpenRouter와 그 뒤 제공자가 실제로 지키는지는 이 코드가 검증하지 못합니다.
+- Paid spillover는 DeepInfra ZDR endpoint 확인에 실패하면 꺼집니다. 60초마다 키·가격·ZDR을 다시 확인하며 ZDR 조건을 제거해서 보내지 않습니다. 프롬프트/완성 가격 상한은 백만 token당 US$0.1/US$0.5, 누적 원장 상한은 US$1이며 전용 worker key의 lifetime credit limit도 US$1 이하여야 합니다. 검증은 가짜 OpenRouter만 사용하며 실제 유료 제출은 GPU가 실제 포화일 때만 허용합니다. 제출 전 거절은 로컬 대기로 돌아가고, 제출 후 실패/unknown은 재제출하지 않습니다.
 - Paid spillover는 턴 id를 원장 멱등 키로 씁니다. 같은 턴의 재시도는 끝난 응답을 재사용하거나, 결과가 미확정이면 다시 보내지 않습니다(이중 과금 없음). 예산은 durable ledger와 worker-only provider key credit limit으로 제한합니다.
 - Jev 호출이 실패하거나 시간을 넘기면 규칙만으로 처리합니다(fail-open). 페르소나 카드·캡션·모델 응답은 Jev로 보내지 않습니다.
 - RunPod 호스트는 이 저장소 밖의 제3자 장비입니다. 프롬프트는 그 호스트의 엔진 프로세스가 처리하며, 호스트의 디스크·로그 보존과 접근 통제는 이 코드가 관리하지 않습니다. 접속 정보와 호스트 정보는 저장소에 두지 않습니다.

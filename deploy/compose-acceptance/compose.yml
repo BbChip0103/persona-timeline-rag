@@ -1,0 +1,41 @@
+# No host ports, existing env files, external networks, or persistent volumes.
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg15
+    command: [postgres, -p, '58432', -c, log_statement=none, -c, log_min_error_statement=panic]
+    environment:
+      POSTGRES_USER: ptr_split_owner
+      POSTGRES_PASSWORD: synthetic-acceptance-only
+      POSTGRES_DB: ptr_split_test
+    tmpfs: [/var/lib/postgresql/data]
+    networks: [isolated]
+    healthcheck:
+      test: [CMD, pg_isready, -p, '58432', -U, ptr_split_owner, -d, ptr_split_test]
+      interval: 1s
+      timeout: 2s
+      retries: 40
+  redis:
+    image: redis:8-alpine
+    network_mode: service:postgres
+    command: [redis-server, --save, '', --appendonly, 'no']
+    depends_on:
+      postgres:
+        condition: service_healthy
+  runner:
+    image: ${PTR_ACCEPTANCE_IMAGE:-ptr_llm:operational-capacity-spillover-v1}
+    network_mode: service:postgres
+    working_dir: /source/deploy/compose-acceptance
+    environment:
+      PYTHONPATH: /source/apps/llm-service/src:/source/src:/source/apps/llm-service/.venv/lib/python3.13/site-packages
+      PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE: '1'
+    volumes:
+      - ../..:/source:ro
+    command: [python, harness.py]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+networks:
+  isolated:
+    internal: true

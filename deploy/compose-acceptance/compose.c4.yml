@@ -1,0 +1,122 @@
+# Entire application crash probe is confined to the same disposable loopback namespace.
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg15
+    command: [postgres, -p, '58432', -c, log_statement=none, -c, log_min_error_statement=panic]
+    environment:
+      POSTGRES_USER: ptr_split_owner
+      POSTGRES_PASSWORD: synthetic-acceptance-only
+      POSTGRES_DB: ptr_split_test
+    tmpfs: [/var/lib/postgresql/data]
+    networks: [isolated]
+    healthcheck:
+      test: [CMD, pg_isready, -p, '58432', -U, ptr_split_owner, -d, ptr_split_test]
+      interval: 1s
+      timeout: 2s
+      retries: 40
+  redis:
+    image: redis:8-alpine
+    network_mode: service:postgres
+    command: [redis-server, --port, '58479', --requirepass, synthetic-acceptance-only, --save, '', --appendonly, 'no']
+    depends_on:
+      postgres:
+        condition: service_healthy
+  bootstrap:
+    image: ${PTR_ACCEPTANCE_IMAGE:-ptr_llm:operational-capacity-spillover-v1}
+    network_mode: service:postgres
+    working_dir: /source
+    environment:
+      PYTHONPATH: /source/apps/llm-service/src:/source/src:/source/apps/llm-service/.venv/lib/python3.13/site-packages
+    volumes:
+      - ../..:/source:ro
+      - ${PTR_C4_EVIDENCE_DIR:?private evidence directory}:/evidence
+    command: [python, deploy/compose-acceptance/c4_bootstrap.py]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    image: ptr-backend:515f3fc
+    network_mode: service:postgres
+    working_dir: /source
+    environment:
+      PTR_APP_DATABASE_URL: postgresql://ptr_split_app:synthetic-acceptance-only@127.0.0.1:58432/ptr_split_test
+      PTR_REDIS_URL: redis://:synthetic-acceptance-only@127.0.0.1:58479/0
+      PTR_LLM_SERVICE_MODE: split
+      PTR_LLM_SERVICE_URL: http://127.0.0.1:58442
+      PTR_LLM_CONTROL_TOKEN: synthetic-control-token-for-c4-only-123456
+      PTR_API_TOKEN: synthetic-api-token-for-c4-only-123456789
+      PTR_API_SYNTHETIC_TOKEN: synthetic-test-token-for-c4-only-123456789
+      PTR_API_PORT: '56441'
+      PTR_TURN_QUEUE: c4-turns
+      PTR_EVENTS_NAMESPACE: c4-events
+      PTR_CHAT_PROVIDER: local
+      PTR_MODEL: ptr-synthetic
+      PTR_PAID_SPILLOVER: '0'
+      PTR_TURN_TIMEOUT_MS: '10000'
+      PTR_DISPATCH_INTERVAL_MS: '1000'
+      PTR_DISPATCH_GRACE_MS: '3000'
+    volumes: [../..:/source:ro]
+    command: [node, --import, tsx, apps/api/src/packaged-main.ts]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+  worker:
+    image: ${PTR_ACCEPTANCE_IMAGE:-ptr_llm:operational-capacity-spillover-v1}
+    network_mode: service:postgres
+    working_dir: /source
+    environment:
+      PYTHONPATH: /source/apps/llm-service/src:/source/src:/source/apps/llm-service/.venv/lib/python3.13/site-packages
+      PTR_LLM_DATABASE_URL: postgresql://ptr_split_llm:synthetic-acceptance-only@127.0.0.1:58432/ptr_split_test
+      PTR_LLM_REDIS_URL: redis://:synthetic-acceptance-only@127.0.0.1:58479/0
+      PTR_LLM_BACKEND_URL: http://127.0.0.1:56441
+      PTR_LLM_CONTROL_TOKEN: synthetic-control-token-for-c4-only-123456
+      PTR_LLM_QUEUE_NAME: c4-turns
+      PTR_LLM_QUEUE_PREFIX: ptr
+      PTR_LLM_CONCURRENCY: '1'
+      PTR_LLM_HOST: 127.0.0.1
+      PTR_LLM_PORT: '58442'
+      PTR_LLM_PROVIDER: local
+      PTR_LLM_LOCAL_BASE_URL: http://127.0.0.1:18001/v1
+      PTR_LLM_LOCAL_MODEL: ptr-synthetic
+      PTR_LLM_LOCAL_API_KEY: synthetic-local-only-key
+      PTR_LLM_SPILLOVER: 'off'
+      PTR_LLM_LOCAL_SLOTS: '1'
+      PTR_LLM_MODEL_TIMEOUT_MS: '20000'
+      PTR_LLM_LOCK_DURATION_MS: '1000'
+      PTR_LLM_STALLED_INTERVAL_MS: '100'
+      PTR_LLM_MAX_STALLED_COUNT: '0'
+      PTR_LLM_INTENT_CLASSIFIER: 'off'
+      PTR_LLM_SAFETY_FILTER: 'off'
+      PTR_LLM_EMBEDDING_PROVIDER: 'off'
+      PTR_LLM_CONTRACTS_DIR: /source/contracts/llm/v1
+      PTR_LLM_PUBLISHED_PERSONAS_FILE: /evidence/personas.json
+      LANGFUSE_ENABLED: 'false'
+    volumes:
+      - ../..:/source:ro
+      - ${PTR_C4_EVIDENCE_DIR:?private evidence directory}:/evidence:ro
+    command: [python, -m, ptr_llm, worker]
+    depends_on:
+      api:
+        condition: service_started
+  probe:
+    image: ${PTR_ACCEPTANCE_IMAGE:-ptr_llm:operational-capacity-spillover-v1}
+    network_mode: service:postgres
+    working_dir: /source
+    environment:
+      PYTHONPATH: /source/apps/llm-service/src:/source/src:/source/apps/llm-service/.venv/lib/python3.13/site-packages
+      PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS: '15000'
+      PTR_SYNTHETIC_ENGINE_DELAY_MS: '0'
+    volumes:
+      - ../..:/source:ro
+      - ${PTR_C4_EVIDENCE_DIR:?private evidence directory}:/evidence
+    command: [python, deploy/compose-acceptance/c4_probe.py]
+    depends_on:
+      api:
+        condition: service_started
+      worker:
+        condition: service_started
+networks:
+  isolated:
+    internal: true

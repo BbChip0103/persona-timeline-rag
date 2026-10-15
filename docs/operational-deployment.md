@@ -29,12 +29,33 @@ In the worker-only env file set `PTR_LLM_PROVIDER=local`,
 `PTR_LLM_LOCAL_MODEL=<served model ID>`, `PTR_LLM_LOCAL_API_KEY=<vLLM key>` and
 `PTR_LLM_LOCAL_AUTH_REQUIRED=1` and `PTR_LLM_SPILLOVER=off`. The base URL is the
 authenticated loopback SSH-tunnel endpoint that the old gateway used for vLLM.
-Keep both OpenRouter key names out of the worker env. Compose has no central EPP
-admission signal, so excess work waits in local vLLM instead of spilling into
-paid calls. Set the backend's `PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to the
-same served model ID. Set `PTR_PAID_SPILLOVER=0` for this local-only Compose
-path: local chat costs zero and drafts require `clientRequestId` only when paid
-spillover is possible.
+Spillover defaults to off. To enable it during the redeploy preparation below,
+set `PTR_LLM_SPILLOVER=openrouter`, `PTR_LLM_LOCAL_SLOTS` (1–256) and
+`PTR_LLM_SPILLOVER_WAIT_MS=2000` (100–10000 ms). The Redis shared slot count
+must match the operating vLLM `max-num-seqs`; inspect the owned GPU deployment
+record without changing RunPod/vLLM. If the value cannot be established, start
+with 8 and review the metrics. Set worker concurrency to ceil(slots × 1.25),
+for example 10 for 8 slots; concurrency at or below slots cannot create overflow
+and produces a startup warning. Only the worker receives the dedicated
+OpenRouter key. Set the backend's `PTR_CHAT_PROVIDER=local` and `PTR_MODEL` to
+the same served model ID, and `PTR_PAID_SPILLOVER=1` when enabling spillover so
+paid-capable drafts require `clientRequestId` (`0` when spillover is off).
+The SPLIT API does not call a provider; its flag marks drafts billable and the
+worker owns the spill ledger. Set `PTR_LLM_LIVE_ENABLED=1` and
+`PTR_LLM_ALLOW_EXTERNAL_DATA=1` in the worker file for an approved spillover
+run, and keep both `0` when spillover is off.
+
+Compose waits for a Redis slot for two seconds before considering OpenRouter.
+Only actual GPU capacity overflow permits paid submission; Redis errors and
+other local failures do not. Before submission, unavailable spillover (including
+budget, price, key or DeepInfra ZDR checks) returns to local slot waiting until
+the turn deadline. After submission, failure or unknown results retain their
+existing accounting and are never resubmitted locally or externally. The
+cumulative ledger cap is US$1, with a separate dedicated key lifetime credit
+limit no greater than US$1; check current cumulative usage before enabling.
+DeepInfra is pinned, with prompt/completion price caps of US$0.1/US$0.5 per
+million tokens. DeepInfra must appear in the ZDR endpoint list; absence disables
+spillover. Key, price and ZDR availability are rechecked every 60 seconds.
 
 ```sh
 docker compose --env-file /private/compose.env \
@@ -66,7 +87,7 @@ network availability or multi-engine performance.
 removes the gateway from the active operational path. The durable provider
 ledger and the provider key's credit limit enforce paid budget, the EPP owns
 local routing/admission in Kubernetes, and the paid key lives only in the
-Kubernetes worker. Compose is local-only. Rollback restores the old gateway from
+worker. Compose uses Redis shared slots for admission; Kubernetes uses EPP. Rollback restores the old gateway from
 the private snapshot rather than from this checkout.
 
 Apply `supabase/split/0004_cumulative_budget_cap.sql` with the selected research
@@ -173,8 +194,8 @@ ACK. It stores only counts/state/private hashes, never persona IDs/labels/replie
 Native success counters corroborate successful generations; they do not prove an
 atomic provider admission hard cap or unsupported error counters. Semantic
 retrieval/Jev and human answer quality are separate acceptance stages.
-Compose workers no longer run Jev, OpenRouter embeddings or the `openrouter`
-provider (design §3.3). Use the Kubernetes path for Jev and semantic acceptance.
+Compose workers do not run Jev, OpenRouter embeddings or the direct `openrouter`
+provider. Their local provider can use explicitly enabled paid spillover. Use the Kubernetes path for Jev and semantic acceptance.
 
 ## Direct-path redeploy procedure
 
@@ -333,8 +354,8 @@ PY
    then; this procedure does not remove it.
 
 3. Prepare the new private configuration from the snapshots before migration.
-   Keep the old files untouched. The helper copies existing keys, removes the
-   LiteLLM/gateway and both OpenRouter key names, and adds the direct-local keys
+   Keep the old files untouched. The default helper removes LiteLLM/gateway and
+   OpenRouter key names and adds the direct-local keys
    with empty fields for operator-supplied values. It creates `0600` files and
    prints key names only. Fill the empty fields with a private editor; do not
    display file contents. In `NEW_WORKER_ENV`, fill
@@ -393,6 +414,40 @@ PY
            --snapshot "${SNAPSHOT}" --rendered-config -
    )
    ```
+
+   These are the split deployment checks. `pnpm ops:check-env` validates the
+   historical framework profile and is not part of the operational Compose
+   startup path.
+
+   To enable Compose spillover, prepare the worker using the helper's explicit
+   spillover option and the snapshotted old gateway env as the dedicated-key
+   source. Choose this command instead of the default `prepare worker` command
+   above, before the new file exists. Set `SNAPSHOT_GATEWAY_ENV` to the captured
+   gateway env path under `${SNAPSHOT}/root` from the manifest:
+
+   ```sh
+   python3 scripts/operational-env-migrate.py prepare worker \
+     "${SNAPSHOT_WORKER_ENV}" "${NEW_WORKER_ENV}" \
+     --spillover-openrouter --openrouter-source "${SNAPSHOT_GATEWAY_ENV}"
+   ```
+
+   Transfer only that approved research key by name without printing its
+   value. Set `PTR_LLM_SPILLOVER=openrouter`, `PTR_LLM_LOCAL_SLOTS`, the wait
+   threshold and worker concurrency as above. Set matching
+   `PTR_LLM_LOCAL_SLOTS`, `PTR_LLM_SPILLOVER_WAIT_MS` and
+   `PTR_LLM_CONCURRENCY` in `NEW_OP_ENV` when they differ from 8, 2000 and 10;
+   the operational Compose override supplies those effective defaults. Set
+   `PTR_PAID_SPILLOVER=1` in `NEW_BACKEND_ENV`. The explicit worker preparation
+   command sets `PTR_LLM_LIVE_ENABLED=1` and `PTR_LLM_ALLOW_EXTERNAL_DATA=1`;
+   `check worker` and `check compose` require both while spillover is on. Keep
+   these gates enabled only for the approved research run. Check the worker,
+   backend and Compose env files again
+   after these edits. The helper must reject a missing/duplicate key, slots
+   outside 1–256, waits outside 100–10000 ms, a paid key while spillover is off,
+   and `PTR_LLM_SYNTHETIC_PROVIDER_FIXTURE=1` in operational configuration.
+   Startup separately verifies the dedicated key lifetime limit ≤ US$1, prices
+   and DeepInfra ZDR. Tests use synthetic fixtures only; never enable that flag
+   against `ptr_split_research`.
 
    Check that the `NEW_OP_ENV` path entries point to these new private files.
    `config -q` and `data_mounts_match=true` must pass without printing expanded
@@ -480,8 +535,16 @@ PY
    The smoke must be one synthetic RAG-off turn against local vLLM, with local
    chat cost `0`, no embedding rows and no paid provider rows. The one-turn
    mode does not pause or restart either service. `ops:status` checks the local
-   model readiness; the Python worker has no `/metrics/prom` endpoint, so use
-   its `/health/ready` check and the completed smoke turn for worker proof.
+   model readiness. Check worker `/metrics` (not API `/metrics/prom`) for
+   `ptr_llm_spillover_available`, and inspect the redacted startup event
+   `OPENROUTER_SPILLOVER_ENABLED` including DeepInfra ZDR verification. A gauge
+   of 1 means verified spillover and enough ledger balance for one maximum
+   reservation; a gauge of 0 means unavailable and local waiting continues.
+   It refreshes every 60 seconds and drops immediately on budget refusal.
+   Inspect only the Redis `{queue_prefix}:llm:local-slots` ZSET's cardinality and
+   expiry scores; ensure the smoke releases its lease. Deployment proof is this
+   startup event, one local smoke and the slot state. Never saturate the GPU or
+   make a real paid call deliberately for deployment verification.
 
 7. Remove the old gateway orphans with the same project name. The same project
    name is required for `--remove-orphans` to see the old `model-gateway*`
@@ -500,7 +563,17 @@ PY
 
    Keep the gateway volumes until rollback is no longer needed.
 
-8. Roll back from the snapshot alone. Load the saved images, restore captured
+8. To disable spillover while keeping the current direct path, set
+   `PTR_LLM_SPILLOVER=off`, remove the OpenRouter key from the private worker env,
+   set worker `PTR_LLM_LIVE_ENABLED=0` and `PTR_LLM_ALLOW_EXTERNAL_DATA=0`,
+   set backend `PTR_PAID_SPILLOVER=0`, check both env files and `config -q`, then
+   drain/recreate only the owned worker (and recreate the API for its changed
+   flag). A plain container restart does not reload an env file: use
+   `up -d --no-deps --no-build --force-recreate worker api` after the owned
+   worker drain. Verify readiness, gauge 0 and a local-only smoke. Preserve all
+   ledger rows, unknown reservations and receipts.
+
+   For a full rollback, roll back from the snapshot alone. Load the saved images, restore captured
    config/code bind-mounted sources, private env/config files, Compose files and working
    directory paths for every group to their original absolute locations with the
    helper copied into the snapshot, then bring each group's services back under

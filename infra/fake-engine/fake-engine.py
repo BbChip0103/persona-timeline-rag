@@ -28,6 +28,7 @@ _counts = {
 }
 _requests = {}
 _marker_requests = {}
+_one_shot_stalls = set()
 
 # Tests and probes intentionally exercise client timeouts; do not let those
 # stalled fixture handlers delay process shutdown.
@@ -140,10 +141,13 @@ class Handler(BaseHTTPRequestHandler):
                     if int(value["count"]) > 1
                 }
                 counts["marker_request_ids"] = {
-                    marker: sorted(requests) for marker, requests in sorted(_marker_requests.items())
+                    marker: sorted(requests)
+                    for marker, requests in sorted(_marker_requests.items())
                 }
                 counts["marker_duplicates"] = {
-                    marker: {key: int(value) for key, value in sorted(requests.items()) if int(value) > 1}
+                    marker: {
+                        key: int(value) for key, value in sorted(requests.items()) if int(value) > 1
+                    }
                     for marker, requests in sorted(_marker_requests.items())
                     if any(int(value) > 1 for value in requests.values())
                 }
@@ -188,8 +192,15 @@ class Handler(BaseHTTPRequestHandler):
             _counts["active"] += 1
             _counts["max_active"] = max(_counts["active"], _counts["max_active"])
             _record_request(request_id, marker)
+            one_shot_stall = (
+                "__STALL_GENERATION_ONCE__" in text
+                and marker != "unlabeled"
+                and marker not in _one_shot_stalls
+            )
+            if one_shot_stall:
+                _one_shot_stalls.add(marker)
             self._submitted = True
-        if "__STALL_GENERATION__" in text or "generation" in _stall_modes():
+        if one_shot_stall or "__STALL_GENERATION__" in text or "generation" in _stall_modes():
             with _lock:
                 _counts["stalled_generation"] += 1
             _sleep_ms(_bounded_ms("PTR_SYNTHETIC_ENGINE_GENERATION_STALL_MS", 120000))

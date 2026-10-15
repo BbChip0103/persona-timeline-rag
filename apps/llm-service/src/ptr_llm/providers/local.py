@@ -508,8 +508,10 @@ class DirectLocalTextProvider:
                     raise ProviderError(timeout_code)
                 if self.local_slots is not None and not lease_acquired:
                     assert lease_id is not None
+                    # Reserve 100ms for Redis scheduling so a killed worker's slot
+                    # expires by deadline + 2s.
                     lease_acquired = await bounded(
-                        self.local_slots.acquire(lease_id, remaining_ms / 1000 + 2),
+                        self.local_slots.acquire(lease_id, remaining_ms / 1000 + 1.9),
                         timeout=remaining_ms / 1000,
                         signal=signal,
                         timeout_code=timeout_code,
