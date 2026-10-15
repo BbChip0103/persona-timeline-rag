@@ -47,8 +47,8 @@ integration('real Postgres LangGraph checkpoint recovery through public turn exe
     const retrieval={search:jest.fn(async()=>[source])};
     const assess=jest.fn(async()=>({safety:zero}));
     const guardrails:jest.Mocked<Pick<GuardrailsClient,'validateInput'|'validateReply'>>={
-      validateInput:jest.fn<ReturnType<GuardrailsClient['validateInput']>,Parameters<GuardrailsClient['validateInput']>>(async input=>({revision:'reply-guard-v8',...safetyAction(input.probabilities,input.thresholds)})),
-      validateReply:jest.fn<ReturnType<GuardrailsClient['validateReply']>,Parameters<GuardrailsClient['validateReply']>>(async input=>({revision:'reply-guard-v8',content:input.reply}))};
+      validateInput:jest.fn<ReturnType<GuardrailsClient['validateInput']>,Parameters<GuardrailsClient['validateInput']>>(async input=>({revision:'reply-guard-v9',...safetyAction(input.probabilities,input.thresholds)})),
+      validateReply:jest.fn<ReturnType<GuardrailsClient['validateReply']>,Parameters<GuardrailsClient['validateReply']>>(async input=>({revision:'reply-guard-v9',content:input.reply}))};
     return {provider,retrieval,assess,guardrails};
   }
   function service(db:Pool,saver:PostgresSaver,p:ReturnType<typeof ports>,extra:Partial<ChatServiceOptions>={}) {

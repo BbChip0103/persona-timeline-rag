@@ -58,6 +58,7 @@ from .routing import (
     DEFAULT_SAFETY_THRESHOLDS,
     assess_safety,
     intent_signals,
+    is_reentry,
     needs_classifier,
     route_intent,
     safety_reply,
@@ -114,7 +115,7 @@ def _ask_back_streak(history):
 def requested_speech_level(text):
     """Only a direct user request may change the session's Korean register."""
     if regex.search(
-        r"\?|(?:지\s*마|don't|do\s+not|never)\b|\b(?:he|she|they)\s+(?:told\s+me\b|said\s*:)",
+        r"(?:지\s*마|don't|do\s+not|never)\b|\b(?:he|she|they)\s+(?:told\s+me\b|said\s*:)",
         text,
         regex.I,
     ):
@@ -148,6 +149,18 @@ def requested_speech_level(text):
     return None
 
 
+def speech_request_only(text):
+    """A short direct register request can be answered without a model call."""
+    return bool(regex.fullmatch(
+        r"\s*(?:(?:말\s*편하게|반말|존댓말|존대|해요체)(?:로)?\s*"
+        r"(?:해\s*(?:줘|주세요)?|하자|써\s*줘)|말\s*놓자|"
+        r"(?:please\s+)?(?:(?:speak|talk)\s+(?:casually|informally|politely|formally)|"
+        r"(?:use|speak(?:\s+in)?)\s+(?:casual|informal|polite|formal|honorific)"
+        r"(?:\s+(?:speech|language|tone))?)(?:\s+with\s+me)?)\s*[.!~]*\s*",
+        text, regex.I,
+    ))
+
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -157,6 +170,12 @@ def _same_reply(first: str, second: str) -> bool:
         return regex.sub(r"[^\p{L}\p{N}]", "", value).casefold()
 
     return bool(first and second and normalized(first) and normalized(first) == normalized(second))
+
+
+_SHORT_REACTION = regex.compile(
+    r"^\s*(?:nice|cool|really|wow|omg|lol|ㅋㅋ+|ㅎㅎ+|ㄷㄷ+|헐|와|오|대박|좋다|진짜)[!?.~\s]*$",
+    regex.I,
+)
 
 
 def _log_output_guard_failure(error: Exception) -> dict[str, str]:
@@ -701,6 +720,12 @@ class LLMEngine:
                     "limitations": list(limitations),
                 }
 
+            if snap["speechLevel"] and speech_request_only(text):
+                key = "speech_ack_casual" if level == "casual" else "speech_ack_polite"
+                return dict(frame, output=output("answered", voice_text(
+                    key, language, level, snap["previousAssistantText"], turn["id"]
+                )), replyPath="fixed", replyCode="SPEECH_ACK")
+
             if intent in ("clarification", "unsupported"):
                 category = frame.get("safetyCategory")
                 reply = safety_reply(category, language) if category else fixed("rule_refusal")
@@ -711,6 +736,30 @@ class LLMEngine:
                         fixed("clarification") if intent == "clarification" else reply,
                         ["SAFETY_SUPPORT"] if category == "self_harm" else [],
                     ),
+                )
+            if (intent == "small_talk" and not frame.get("deflect") and is_reentry(text)
+                    and not (context.get("userMemoryConsent")
+                             and context.get("previousSessionUserSaid"))):
+                return dict(frame, output=output("answered", voice_text(
+                    "reentry_recap", language, level, snap["previousAssistantText"], turn["id"]
+                )), replyPath="fixed", replyCode="REENTRY_RECAP")
+            if (
+                intent == "small_talk"
+                and not frame.get("deflect")
+                and _SHORT_REACTION.fullmatch(text)
+            ):
+                return dict(
+                    frame,
+                    output=output("answered", voice_text(
+                        "reaction_confirm" if "?" in text or "？" in text else
+                        "reaction_surprise" if regex.match(
+                            r"\s*(?:헐|wow|omg|와|대박|ㄷㄷ)", text, regex.I
+                        )
+                        else "reaction",
+                        language, level, snap["previousAssistantText"], turn["id"]
+                    )),
+                    replyPath="fixed",
+                    replyCode="SHORT_REACTION",
                 )
             if intent == "timeline" and session["retrievalMode"] != "off" and snap["ambiguous"]:
                 return dict(
@@ -901,7 +950,13 @@ class LLMEngine:
                 }
                 if matched["entries"]:
                     lore = render_lore_message(matched["entries"])
-            note = POLICY["SAFETY_DEFLECTION_NOTE"] if frame.get("deflect") else None
+            notes = [POLICY["SAFETY_DEFLECTION_NOTE"]] if frame.get("deflect") else []
+            if snap["speechLevel"] and not speech_request_only(text):
+                notes.append(
+                    "Acknowledge the register switch briefly in the new register; "
+                    "never repeat the request."
+                )
+            note = " ".join(notes) or None
             served = []
 
             async def tool_search(tool_query):
@@ -1149,13 +1204,13 @@ class LLMEngine:
             output = copy.deepcopy(frame["output"])
             guard = None
             operator_metadata = None
-            path = "model" if "rawReply" in frame else frame.get("replyPath", "fixed")
+            path = frame.get("replyPath", "model" if "rawReply" in frame else "fixed")
             if path == "fixed" and any(
                 isinstance(item, str) and item.endswith("_UNAVAILABLE")
                 for item in output.get("limitations", [])
             ):
                 path = "fallback"
-            code = "MODEL" if path == "model" else frame.get("replyCode", next(
+            code = frame.get("replyCode", "MODEL" if path == "model" else next(
                 (item for item in output.get("limitations", [])
                  if isinstance(item, str) and regex.fullmatch(r"[A-Z_]+", item)),
                 "FIXED_REPLY",

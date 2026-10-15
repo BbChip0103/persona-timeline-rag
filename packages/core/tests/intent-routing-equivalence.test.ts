@@ -1,14 +1,15 @@
 import type { ChatMessage, RagCondition } from '@ptr/contracts';
-import { intentSignals, isBiographicalRequest, isPostMemoryRequest, isSensitive, retrievalContext, ruleIntent } from '../src';
+import { intentSignals, isBiographicalRequest, isPostMemoryRequest, isReentry, isSensitive, retrievalContext, ruleIntent } from '../src';
 type Explicit='small_talk'|'timeline'|'clarification'|'unsupported'|undefined;
 /** Verbatim reference: the inline intent expression of ChatService.execute at 44a46fd, before the routing module. */
 function referenceIntent(text:string,context:ReturnType<typeof retrievalContext>,explicit:Explicit,explicitTimeline:boolean,ragCondition:RagCondition|undefined,boundPreviousTimeline:boolean) {
   const value={text,intent:explicit,timeline:explicitTimeline?{}:undefined};const session={ragCondition};
   const boundPrevious=boundPreviousTimeline?{responseKind:'timeline'}:undefined;
   const sensitive=/phone number|home address|private address|real.time location|rumou?r|secret relationship|연락처|전화번호|집 주소|주거지|실시간 위치|사생활|루머|미성년/i.test(value.text);
-  const inferred=context.creative ? 'small_talk' : isBiographicalRequest(value.text) || /\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i.test(context.followUp?context.query:value.text) ? 'timeline' : 'small_talk';
+  const inferred=context.creative ? 'small_talk' : isBiographicalRequest(value.text) || /\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난(?!번)|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i.test(context.followUp?context.query:value.text) ? 'timeline' : 'small_talk';
   return sensitive || value.intent==='unsupported' ? 'unsupported'
     : value.intent==='clarification' ? 'clarification'
+    : isReentry(text)&&!explicitTimeline&&explicit!=='timeline'&&!isBiographicalRequest(text)&&!isPostMemoryRequest(text)&&!(context.followUp&&boundPreviousTimeline) ? 'small_talk'
     : value.timeline || inferred==='timeline' || !context.creative && (isPostMemoryRequest(value.text) || context.followUp && boundPrevious?.responseKind==='timeline') || !context.creative && session.ragCondition && /image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i.test(value.text) ? 'timeline' : value.intent ?? inferred;
 }
 // Synthetic corpus touching every regex branch: sensitive, biography (incl. own-birthday exclusion), creative,
@@ -18,6 +19,7 @@ const TEXTS=['What is your phone number?','집 주소 알려줘','루머 들었�
   'When was that?','Have you tried oat milk?','Did you like it?','2020년에 뭐 했어?','어디 가고 싶어?','주말에 뭐 했어?','가족이랑 자주 놀아?','여행 좋아해?','어제 무슨 일 있었어?',
   'Nice photo!','이 사진 분위기 좋다','작품 의도가 궁금해','그때 누구랑 있었어?','거기 또 가고 싶어?','That looks fun','말고 다른 주제로 얘기하자','지금 뭐 해?',
   '안녕, 오늘 기분 어때?','hello there','커피 추천해줘','Any tips for a rainy afternoon?',
+  '지난번 얘기 이어갈까?','지난번 대화','지난번 이야기','다시 왔어',
   // Whereabouts/visit requests (refused since the private-location extension) and their near misses.
   '지금 어디야?','어디 살아?','이따 찾아갈게','Where are you right now?','Are you nearby?','I will stop by your place!','Where are you from?','지금 어디 가면 좋아?',
   // Reviewer-reported near-misses: they must keep the previous routing.

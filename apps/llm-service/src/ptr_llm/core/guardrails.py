@@ -52,6 +52,13 @@ class PersonaOutput(Validator):
 _thread_guards = local()
 
 
+class OutputValidationError(ValueError):
+    code = "GUARDRAILS_OUTPUT_MISSING"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
 def _get_guard(kind):
     guards = getattr(_thread_guards, "guards", None)
     if guards is None:
@@ -94,6 +101,11 @@ def validate_input(text, metadata):
 
 def validate_output(reply, metadata):
     outcome = _validate("output", reply, metadata)
+    if outcome.validated_output is None:
+        decision = reply_decision(reply, metadata)
+        if decision is not None and not decision.get("edited"):
+            return decision
+        raise OutputValidationError()
     summaries = outcome.validation_summaries
     if not summaries:
         return {"content": outcome.validated_output}

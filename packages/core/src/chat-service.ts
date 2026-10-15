@@ -6,7 +6,7 @@ import { buildExperimentContext, buildPrompt } from './prompts';
 import { requestFingerprint } from './request-fingerprint';
 import { rememberSourceContext, retrievalContext, RETRIEVAL_CONTEXT_REVISION } from './conversation-context';
 import { containsCredentialPattern, containsInternalPathPattern, containsUngroundedBiography } from './safety';
-import { intentSignals, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, classifierFallbackReason, type IntentClassification, type IntentSignals, type TurnIntent, type IntentClassifierOptions } from './intent-routing';
+import { intentSignals, isReentry, isSensitive, needsIntentClassifier, routeIntent, ruleIntent, classifierFallbackReason, type IntentClassification, type IntentSignals, type TurnIntent, type IntentClassifierOptions } from './intent-routing';
 import { DEFAULT_SAFETY_THRESHOLDS, RULE_PATH_CATEGORIES, SAFETY_CATEGORIES, SAFETY_DEFLECTION_NOTE, safetyOutcome, safetyReply, startSafetyAssessment, withoutRefusedTurns, type InputSafetyOptions, type SafetyCategory } from './input-safety';
 import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
@@ -365,6 +365,15 @@ export class ChatService {
       return structuredClone({sources,memoryTrace});
     });
     const generate=task('turn-generate',async(frame:TurnFrame):Promise<TurnFrame>=>{
+      if(frame.intent==='small_talk'&&!frame.deflect&&isReentry(value.text)) {
+        const snap=frame.snapshot!;
+        return {...frame,output:{status:'answered',content:voiceText('reentry_recap',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),claims:[],evidence:[],grounding:'unverified_model',limitations:[]}};
+      }
+      if(frame.intent==='small_talk'&&!frame.deflect&&/^\s*(?:nice|cool|really|wow|omg|lol|ㅋㅋ+|ㅎㅎ+|ㄷㄷ+|헐|와|오|대박|좋다|진짜)[!?.~\s]*$/iu.test(value.text)) {
+        const snap=frame.snapshot!;
+        const key=/[?？]/u.test(value.text)?'reaction_confirm':/^\s*(?:헐|wow|omg|와|대박|ㄷㄷ)/iu.test(value.text)?'reaction_surprise':'reaction';
+        return {...frame,output:{status:'answered',content:voiceText(key,snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),claims:[],evidence:[],grounding:'unverified_model',limitations:[]}};
+      }
       const {persona,promptHistory,cardPath,context,query,ownedPrevious}=frame.snapshot!;let lore:ProviderMessage|undefined,personaContext:ChatReply['personaContext'];
       if(cardPath&&persona.lore?.length) {
         const previous:string[]=[];

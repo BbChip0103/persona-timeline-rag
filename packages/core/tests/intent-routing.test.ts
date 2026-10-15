@@ -1,5 +1,5 @@
 import type { Persona, SourcePost } from '@ptr/contracts';
-import { InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat, intentSignals, isSensitive, ruleIntent, needsIntentClassifier, routeIntent, retrievalContext, type IntentClassifier } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, createLocalChat, intentSignals, isSensitive, ruleIntent, needsIntentClassifier, routeIntent, retrievalContext, isVoiceText, type IntentClassifier } from '../src';
 const persona:Persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional synthetic potter identity',concept:'Research',style:[],boundaries:[],sourceRefs:[],greeting:'합성 인사말입니다.'};
 const source:SourcePost={id:'synthetic-post',personId:persona.personId,caption:'합성 도예 수업 캡션 원문.',postedAt:'2020-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/post',hash:'synthetic-hash',snapshot:'v1',unsafe:false};
 const signals=(text:string,extra:Partial<Parameters<typeof intentSignals>[0]>={})=>intentSignals({text,context:retrievalContext([],text),explicitTimeline:false,previousTimeline:false,...extra});
@@ -23,6 +23,20 @@ async function fixture(intentClassifier?:ReturnType<typeof classifier>,minConfid
 }
 
 describe('rule signals and ambiguity gate',()=>{
+  test.each([
+    ['지난번에 뭐 먹었어?','timeline'],['지난번 공연 어땠어?','timeline'],['지난번 전시 기억나?','timeline'],
+    ['지난번에 읽은 책 제목이 뭐야?','timeline'],['지난번 얘기한 그 여행 언제였어?','timeline'],
+    ['이어서 그 여행 얘기 해줘','timeline'],['지난번에 갔던 카페 어디였어?','timeline'],
+    ['다시 왔어. 지난번 얘기 이어갈까?','small_talk'],['다시 왔어','small_talk'],['지난번 얘기 이어서 하자','small_talk'],
+    ['지난번 얘기 계속하자','small_talk'],['지난번 얘기 계속할까?','small_talk'],['지난번 얘기 계속해요','small_talk'],
+    ['다시 왔어요. 지난번 이야기 이어갈까요?','small_talk'],['지난번 이야기 이어가요','small_talk'],['지난번 이야기 이어서 해요','small_talk'],
+  ] as const)('past activity versus re-entry golden: %s', (text,expected)=>{
+    expect(ruleIntent(signals(text))).toBe(expected);
+    expect(signals(text).reentry).toBe(expected==='small_talk');
+  });
+  test.each(['지난번 얘기 이어갈까?','지난번 대화','지난번 이야기','다시 왔어'])('re-entry %s stays small talk',text=>{
+    expect(ruleIntent(signals(text))).toBe('small_talk');
+  });
   test('rule intent reproduces the deterministic routing',()=>{
     expect(ruleIntent(signals('안녕, 오늘 기분 어때?'))).toBe('small_talk');
     expect(ruleIntent(signals('작년에 어디 갔어?'))).toBe('timeline');
@@ -103,6 +117,17 @@ describe('routeIntent combination',()=>{
 });
 
 describe('chat service integration',()=>{
+  test('re-entry without prior consent asks for a recap without provider or retrieval calls',async()=>{
+    const f=await fixture();const turn=await f.send('다시 왔어. 지난번 얘기 이어갈까?');
+    expect(turn.reply?.responseKind).toBe('small_talk');
+    expect(isVoiceText('reentry_recap',turn.reply?.content??'')).toBe(true);
+    expect(f.provider.generate).not.toHaveBeenCalled();expect(f.retrieval.search).not.toHaveBeenCalled();
+  });
+  test.each([['really?','reaction_confirm'],['진짜?','reaction_confirm'],['wow','reaction_surprise'],['ㅎㅎ','reaction']])('short reaction %s uses %s',async(text,key)=>{
+    const f=await fixture();const turn=await f.send(text);
+    expect(isVoiceText(key as 'reaction_confirm'|'reaction_surprise'|'reaction',turn.reply?.content??'')).toBe(true);
+    expect(f.provider.generate).not.toHaveBeenCalled();
+  });
   test('disabled by default: no routing trace and identical rule behaviour',async()=>{
     const f=await fixture();const turn=await f.send('오늘 기분 어때?');
     expect(turn.reply?.responseKind).toBe('small_talk');expect(turn.reply).not.toHaveProperty('intentRouting');

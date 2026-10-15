@@ -4,7 +4,7 @@ import { SAFETY_CATEGORIES, type SafetyCategory, type SafetyProbabilities, type 
 import type { SpeechLevel } from './reply-texts';
 
 const categorySchema=z.enum(SAFETY_CATEGORIES);
-const revisionSchema=z.literal('reply-guard-v8');
+const revisionSchema=z.literal('reply-guard-v9');
 const intentSchema=z.object({label:z.enum(['timeline','small_talk']),confidence:z.number().min(0).max(1),
   probabilities:z.object({timeline:z.number().min(0).max(1),small_talk:z.number().min(0).max(1)}).strict()}).strict();
 const inputResponse=z.object({revision:revisionSchema,action:z.enum(['none','support','refuse','deflect']),

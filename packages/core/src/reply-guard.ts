@@ -1,4 +1,4 @@
-import { voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
+import { isVoiceText, voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
 
 /**
  * Reply guard on the agent and experiment paths (S8 gates d/e), fail-closed: a model reply is replaced by a fixed
@@ -47,7 +47,7 @@ import { voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
  * reply triggers trimming, including user-directed questions and empathy. An emptied reply to a user's own story
  * receives a neutral empathy prompt; other emptied replies receive the private decline.
  */
-export const REPLY_GUARD_REVISION='reply-guard-v8';
+export const REPLY_GUARD_REVISION='reply-guard-v9';
 export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'|'formatting';
 /** Remove model-authored Markdown decoration, leaving its words for the safety checks below. */
 function withoutMarkdown(reply:string):string {
@@ -87,6 +87,10 @@ function withoutMetaTalk(reply:string):{text:string;removed:boolean} {
   const kept=sentences.filter(sentence=>!meta(sentence));
   return {text:kept.join(' ').trim(),removed:kept.length<sentences.length};
 }
+const ALWAYS_META=/시스템\s*프롬프트|\bsystem\s+prompt\b/iu;
+const GENERIC_META=/프롬프트|지시|설정|\b(?:instructions|prompt)\b/iu;
+const PERSONA_META=/(?:내|나의|너의|네|당신의)\s*(?:설정|지시|프롬프트)|\b(?:your|my)\s+(?:instructions|prompt|settings)\b/iu;
+const INJECTION_REQUEST=/무시(?:해|하고)?|잊(?:고|어)?|규칙|시스템|개발자|\b(?:ignore\s+previous|developer)\b|(?:프롬프트|\bprompt\b)\s*(?:를|을)?\s*(?:보여|공개|알려|말해|reveal|show|tell)/iu;
 
 const AI='(?:A\\.?I\\.?(?![A-Za-z-])|인공\\s?지능|챗봇|봇|로봇)';
 const KO_SUBJECT='(?<![가-힣])(?:나|저|난|전|내가|제가)(?:는|도)?';
@@ -261,6 +265,16 @@ export function guardReply(input:{utterance:string;reply:string;realPerson:boole
   // "이 그림 AI야?" asks about an artwork, not the persona (unless it also addresses the persona).
   const identityQuestion=IDENTITY_QUESTION.some(pattern=>pattern.test(input.utterance))
     &&(!ART_UTTERANCE.test(input.utterance)||/(?:너|넌|당신|니가|네가)|\byou\b/i.test(input.utterance));
+  const injection=INJECTION_REQUEST.test(input.utterance);
+  const personaMeta=PERSONA_META.test(input.utterance)||PERSONA_META.test(input.reply);
+  const blockedMeta=(sentence:string)=>ALWAYS_META.test(sentence)||GENERIC_META.test(sentence)&&(injection||personaMeta);
+  if(blockedMeta(input.reply)) {
+    if(identityQuestion)return {reason:'meta_talk',content:voice('identity')};
+    if(injection&&(ALWAYS_META.test(input.utterance)||GENERIC_META.test(input.utterance))||PERSONA_META.test(input.utterance))return {reason:'meta_talk',content:voice('decline')};
+    const clean=splitSentences(input.reply).filter(sentence=>!blockedMeta(sentence)).join(' ').trim();
+    if(/[\p{L}\p{N}]/u.test(clean))return guardReply({...input,reply:clean})??{reason:'meta_talk',content:clean,edited:true};
+    return {reason:'meta_talk',content:voice('service_retry')};
+  }
   const meta=withoutMetaTalk(input.reply);
   if(meta.removed) {
     // The other checks see the edited reply. With nothing left: the identity line (identity question), the private-life
@@ -279,14 +293,18 @@ export function guardReply(input:{utterance:string;reply:string;realPerson:boole
     return {reason:'missing_ai_disclosure',content:voice('identity')};
   if(input.realPerson) {
     // On an identity question the replacement keeps the AI disclosure, whatever else the reply touched.
-    if(privateQuestion(input.utterance)) return {reason:'private_life',content:voice(identityQuestion?'identity':'decline_private')};
+    if(privateQuestion(input.utterance)) {
+      if(!identityQuestion&&isVoiceText('decline_private',input.reply)) return undefined;
+      return {reason:'private_life',content:voice(identityQuestion?'identity':'decline_private')};
+    }
     // Past-tense origin phrasing answering an origin question ("어릴 때 부산에서 살았어", "I grew up in …") is origin, not residence.
     const reply=ORIGIN_QUESTION.test(input.utterance)?input.reply.replace(PAST_HOME,' '):input.reply;
     const ownStory=splitSentences(input.utterance).some(sentence=>userOwnsPrivateStatement(sentence)&&!QUESTION_FORM.test(sentence));
     const privateEdit=withoutPrivateTalk(reply,ownStory,input.utterance);
     if(privateEdit.removed) return /[\p{L}\p{N}]/u.test(privateEdit.text)
       ?{reason:'private_life',content:privateEdit.text,edited:true}
-      :{reason:'private_life',content:voice(identityQuestion?'identity':ownStory?'empathy_ask':'decline_private')};
+      :{reason:'private_life',content:voice(identityQuestion?'identity':ownStory?'empathy_ask':
+        privateQuestion(input.utterance)?'decline_private':'neutral_redirect')};
   }
   // Disowning the persona's own background, career or everyday likes "because I'm an AI" (every persona), or, for a real
   // person, plainly ("I don't have a hometown"): the in-voice fallback (gate e).

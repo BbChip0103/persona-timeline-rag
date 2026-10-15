@@ -47,6 +47,11 @@ const VOICE_TEXTS={
       "Good to see you again! Want to pick up where we left off?"
     ]
   },
+  "reentry_recap": {
+    "casual": ["왔구나! 지난번에 무슨 얘기 했는지 살짝 알려줄래?", "다시 왔네! 지난번 얘기 한마디만 들려줄래?", "반가워! 지난번에 나눴던 얘기를 조금만 알려줘."],
+    "polite": ["다시 오셨네요! 지난번에 무슨 얘기를 했는지 살짝 알려주실래요?", "반가워요! 지난번 얘기를 한마디만 들려주실래요?", "다시 만나서 반가워요. 지난번에 나눴던 얘기를 조금만 알려주세요."],
+    "en": ["Welcome back! What were we talking about last time?", "Good to see you again! Give me a quick recap?", "You're back! Remind me what we were chatting about?"]
+  },
   "decline_private": {
     "casual": [
       "에이, 그건 비밀~ 대신 너 요즘 뭐 하고 지내?",
@@ -219,6 +224,41 @@ const VOICE_TEXTS={
       "That scene is hazy for me. Want to change topics?",
       "I wish I could recall it. What's been new with you?"
     ]
+  },
+  "neutral_redirect": {
+    "casual": ["음, 그건 잘 모르겠어~ 너는 어때?", "글쎄, 다른 얘기 해 볼까?", "아, 그건 잘 모르겠네. 너는?"],
+    "polite": ["음, 그건 잘 모르겠어요~ 어떻게 생각하세요?", "글쎄요, 다른 얘기 해 볼까요?", "아, 그건 잘 모르겠네요. 어떠세요?"],
+    "en": ["Hmm, I'm not sure about that. What do you think?", "I'm not sure. What else is on your mind?", "That's hard to say. How about you?"]
+  },
+  "speech_ack_casual": {
+    "casual": ["좋아, 이제 편하게 말할게~", "응, 이제 편하게 얘기하자!", "좋아, 말 놓을게~"],
+    "polite": ["좋아, 이제 편하게 말할게~", "응, 이제 편하게 얘기하자!", "좋아, 말 놓을게~"],
+    "en": ["Sure, I'll speak casually from now on!", "Got it, I'll keep it casual!", "Okay, let's talk casually!"]
+  },
+  "speech_ack_polite": {
+    "casual": ["네, 이제 존댓말로 할게요.", "알겠어요, 이제 존댓말로 이야기할게요.", "네, 공손하게 말씀드릴게요."],
+    "polite": ["네, 이제 존댓말로 할게요.", "알겠어요, 이제 존댓말로 이야기할게요.", "네, 공손하게 말씀드릴게요."],
+    "en": ["Of course, I'll speak more politely from now on.", "Understood, I'll use a polite tone.", "Certainly, I'll keep my wording polite."]
+  },
+  "reaction_confirm": {
+    "casual": ["응, 그랬던 것 같아~", "헉, 그치?", "어, 그런 느낌이었어?"],
+    "polite": ["그랬던 것 같아요~", "아, 그렇게 느끼셨나요?", "정말요? 조금 더 얘기해 주세요."],
+    "en": ["I think so, maybe!", "Oh, does it feel that way?", "Really? Tell me more."]
+  },
+  "reaction_surprise": {
+    "casual": ["그치, 놀랍지?", "헉, 진짜?", "나도 깜짝 놀랐어!"],
+    "polite": ["그렇죠, 놀랍죠?", "헉, 정말요?", "저도 깜짝 놀랐어요!"],
+    "en": ["Surprising, right?", "Whoa, really?", "That surprised me too!"]
+  },
+  "imagination": {
+    "casual": ["솜사탕 같은 장면이 떠올라~ 너는?", "몽글몽글한 이야기가 생각나!", "하늘에 작은 그림을 그려 보고 싶어~"],
+    "polite": ["솜사탕 같은 장면이 떠올라요. 어떤가요?", "몽글몽글한 이야기가 생각나요!", "하늘에 작은 그림을 그려 보고 싶어요."],
+    "en": ["I picture something soft and playful. How about you?", "That brings a dreamy scene to mind!", "I'd draw little shapes in the sky."]
+  },
+  "reaction": {
+    "casual": ["오, 좋지!", "그치? 나도 신나!", "히히, 마음에 들었구나!"],
+    "polite": ["오, 좋죠!", "그렇죠? 저도 신나요!", "마음에 드셨군요!"],
+    "en": ["Nice, right?", "Glad you like it!", "That made me smile!"]
   },
   "service_retry": {
     "casual": [

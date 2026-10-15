@@ -43,9 +43,13 @@ export function isSensitive(text:string):boolean { return SENSITIVE.test(text)||
 /** Generic past-tense/time/place words: a weak cue that also matches ordinary small talk ("have you tried…?", "어디 가고 싶어?"). */
 const TIMELINE_CUE=/\b(when|where|visited|trip|travel|activity|posted|yesterday|last year|in 20\d\d|did you|were you|have you|your past|your family)\b|\d{4}[-년]|언제|어디|활동|여행|방문|그날|게시|지난|어제|그 여행|무슨 일|뭐 했|뭘 했|갔어|했어|가족/i;
 const IMAGE_CUE=/image|photo|picture|visual|이미지|사진|그림|작품|의도|분위기/i;
+const REENTRY_TIMELINE_CUE=/언제|어디|여행|공연|전시|책|먹었|갔|봤|했던|읽|카페/i;
+const REENTRY_MESSAGE=/^\s*(?=\S)(?:다시\s*왔(?:어|어요|습니다)(?:[.!?~]\s*)?)?(?:지난번\s*(?:얘기|대화|이야기)(?:\s*(?:이어갈까|이어갈까요|이어가자|이어가요|계속하자|계속할까|계속해요|이어서(?:\s*(?:하자|할까|해요|얘기하자|이야기하자))?))?|이어서\s*(?:얘기|이야기|대화)\s*(?:하자|할까))?[.!?~\s]*$/i;
+export const isReentry=(text:string):boolean=>!REENTRY_TIMELINE_CUE.test(text)&&REENTRY_MESSAGE.test(text)&&/지난번|이어서|다시\s*왔/i.test(text);
 
 export interface IntentSignals {
   sensitive:boolean; explicitIntent?:TurnIntent; creative:boolean;
+  reentry:boolean;
   /** Authoritative timeline routes: explicit timeline query, biography, post-memory request, follow-up of a timeline reply. */
   strongTimeline:boolean;
   /** Lexical-only timeline routes: the generic timeline cue, or image words in a RAG session. */
@@ -53,7 +57,7 @@ export interface IntentSignals {
 }
 export function intentSignals(input:{text:string;context:ReturnType<typeof retrievalContext>;explicitIntent?:TurnIntent;explicitTimeline:boolean;ragCondition?:RagCondition;previousTimeline:boolean}):IntentSignals {
   const {text,context}=input;const creative=context.creative;
-  return {sensitive:isSensitive(text),...(input.explicitIntent?{explicitIntent:input.explicitIntent}:{}),creative,
+  return {sensitive:isSensitive(text),...(input.explicitIntent?{explicitIntent:input.explicitIntent}:{}),creative,reentry:isReentry(text)&&!input.explicitTimeline,
     strongTimeline:input.explicitTimeline||!creative&&(isBiographicalRequest(text)||isPostMemoryRequest(text)||context.followUp&&input.previousTimeline),
     weakTimeline:!creative&&(TIMELINE_CUE.test(context.followUp?context.query:text)||!!input.ragCondition&&IMAGE_CUE.test(text))};
 }
@@ -61,6 +65,7 @@ export function intentSignals(input:{text:string;context:ReturnType<typeof retri
 export function ruleIntent(signals:IntentSignals):TurnIntent {
   if(signals.sensitive||signals.explicitIntent==='unsupported') return 'unsupported';
   if(signals.explicitIntent==='clarification') return 'clarification';
+  if(signals.reentry&&!signals.strongTimeline&&signals.explicitIntent!=='timeline') return 'small_talk';
   if(signals.strongTimeline||signals.weakTimeline) return 'timeline';
   return signals.explicitIntent??'small_talk';
 }
@@ -69,7 +74,7 @@ export function ruleIntent(signals:IntentSignals):TurnIntent {
  * (or no cue). Sensitive, explicit, creative and strong-timeline requests stay rule-decided.
  */
 export function needsIntentClassifier(signals:IntentSignals):boolean {
-  return !signals.sensitive&&!signals.explicitIntent&&!signals.creative&&!signals.strongTimeline;
+  return !signals.sensitive&&!signals.explicitIntent&&!signals.creative&&!signals.strongTimeline&&!signals.reentry;
 }
 /** Failure class of a classifier call (shared with the input safety filter). */
 export function classifierFallbackReason(error:unknown,turn:AbortSignal):'aborted'|'timeout'|'budget'|'subcap'|'unresolved'|'error' {

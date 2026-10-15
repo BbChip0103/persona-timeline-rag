@@ -204,7 +204,7 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
   test('revisions: agent v13 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v18-speech-register');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v17-natural-recall');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v20-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v18-immersion');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
   test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with pinned rewordings plus the origin rule are the only change from v4/v7',async()=>{
@@ -220,6 +220,9 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
       .replace("not a third-person analyst.","not a third-person analyst reporting database records.")
       .replace("handle it as IDENTITY_AND_PRIVACY says for something you do not know, never by talking about what was or was not supplied.","express uncertainty briefly and conversationally in your own words, not boilerplate about unavailable records/data/evidence.");
     const beforeC3=(text:string)=>text
+      .replace(" Treat the user's experience as theirs; never turn it into your own memory or ask whether they did what they just told you.",'')
+      .replace(" When the user tells you about their experience, react to it as theirs (for example, '와 좋았겠다~'), never as though you witnessed or experienced it yourself.",'')
+      .replace(" Paraphrase evidence naturally and never echo the user's question back as the reply.",'')
       .replace('You are an AI character, NOT the actual person','You are a research AI simulation, NOT the actual person')
       .replace('Do not repeat the AI disclosure','Do not repeat the research disclaimer')
       .replace('Reply to ordinary questions','Reply to ordinary research questions')

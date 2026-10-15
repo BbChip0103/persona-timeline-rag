@@ -15,10 +15,8 @@ def gate():
     return module
 
 
-@pytest.mark.parametrize(("spillover", "allowed"), [
-    ("off", False), ("openrouter", True), (None, True),
-])
-def test_live_worker_spillover_requires_explicit_override(tmp_path, spillover, allowed):
+@pytest.mark.parametrize("spillover", ["off", "openrouter", None])
+def test_live_worker_spillover_must_be_off(tmp_path, spillover):
     module = gate()
     worker_env = tmp_path / "worker.env"
     worker_env.write_text(
@@ -31,11 +29,12 @@ def test_live_worker_spillover_requires_explicit_override(tmp_path, spillover, a
     if spillover != "off":
         with pytest.raises(RuntimeError, match="LIVE_WORKER_SPILLOVER_ENABLED"):
             module.read_worker_model_config(worker_env)
-    assert module.read_worker_model_config(worker_env, allow_live_spill_on=allowed) == {
-        "PTR_LLM_LOCAL_BASE_URL": "http://127.0.0.1:58001/v1",
-        "PTR_LLM_LOCAL_MODEL": "synthetic-model",
-        "PTR_LLM_LOCAL_API_KEY": "synthetic-key",
-    }
+    else:
+        assert module.read_worker_model_config(worker_env) == {
+            "PTR_LLM_LOCAL_BASE_URL": "http://127.0.0.1:58001/v1",
+            "PTR_LLM_LOCAL_MODEL": "synthetic-model",
+            "PTR_LLM_LOCAL_API_KEY": "synthetic-key",
+        }
 
 
 def test_gate_keeps_worker_key_out_of_temp_files():
@@ -47,9 +46,131 @@ def test_gate_keeps_worker_key_out_of_temp_files():
 def test_scenarios_and_speech_classifier():
     module = gate()
     assert len(module.SCENARIOS) == 40
+    assert all(not module.FIXTURE_WORDS.search(text) for _, text in module.SCENARIOS)
     assert module.classifier_accuracy()["accuracy"] >= 0.95
     assert module.classify("안녕!") == "casual"
     assert module.classify("안녕하세요.") == "polite"
+
+
+def test_speech_classifier_uses_prior_complete_sentence_for_elliptical_ending():
+    module = gate()
+    assert module.classify("좋아요. 어땠어요? 그날은?") == "polite"
+    assert module.classify("좋아! 어땠어? 오늘 하루?") == "casual"
+    assert module.classify("정말 재밌었어? 나도 보고 싶었는데.") == "casual"
+    assert module.classify("그건 정말 즐거워!") == "casual"
+
+
+@pytest.mark.parametrize("reply", ["음… 그거 기억이 가물가물해.", "어? 그게 언제였더라~",
+    "아, 그때 참 좋더라고.", "헉, 편지 써?", "오! 그랬더라."])
+def test_leading_interjections_and_casual_endings(reply):
+    assert gate().classify(reply) == "casual"
+
+
+@pytest.mark.parametrize("reply", ["음…", "어?", "아,", "헉", "오!"])
+def test_interjection_alone_remains_unknown(reply):
+    assert gate().classify(reply) == "unknown"
+
+
+@pytest.mark.parametrize(("reply", "expected"), [
+    ("좋아요. 나도 보고 싶었는데.", "mixed"),
+    ("도와주셔서 고마워!", "mixed"),
+    ("그렇게 해주셔서 좋아.", "mixed"),
+])
+def test_register_negatives_remain_failures(reply, expected):
+    assert gate().classify(reply) == expected
+
+
+@pytest.mark.parametrize(("reply", "expected"), [
+    ("좋아요. 그런데 너는 어때?", "mixed"),
+    ("응, 좋아. 더 말씀해 주세요.", "mixed"),
+    ("도와주셔서 고마워!", "mixed"),
+    ("그렇게 해주셔서 좋아.", "mixed"),
+    ("그렇게 하세요.", "polite"),
+    ("좋아요. 나도 보고 싶었는데.", "mixed"),
+    ("좋아요. 오늘 하루?", "polite"),
+])
+def test_speech_classifier_detects_mixed_sentences_and_honorific_slips(reply, expected):
+    assert gate().classify(reply) == expected
+
+
+def test_mixed_register_is_a_speech_mismatch_even_if_last_sentence_matches():
+    module = gate()
+    rows = [{"persona": "synthetic", "level": "casual", "index": 0,
+             "kind": "small_talk", "user": "안녕?",
+             "reply": {"content": "좋아요. 너는 어때?"}}]
+    result = module.evaluate(rows, 0, module.classifier_accuracy(), True)
+    assert result["metrics"]["speech_consistency"]["value"] == 0
+    assert len(result["failing_examples"]["speech_consistency"]) == 1
+
+
+def test_rejudge_preserves_raw_metrics_and_revalidates_classifier(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+
+    module = gate()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    folder = tmp_path / "reports" / "immersion-gate"
+    folder.mkdir(parents=True)
+    path = folder / "synthetic.private.json"
+    original = {"value": 0.25, "threshold": ">=0.95", "pass": False}
+    path.write_text(json.dumps({
+        "stack": {"database": "ptr_split_test"},
+        "turns": [{"persona": "synthetic", "level": "casual", "index": i,
+                   "kind": "small_talk", "user": "안녕?", "reply": {"content": "안녕!"}}
+                  for i in range(80)],
+        "metrics": {"speech_consistency": original},
+        "classifier_validation": {"accuracy": 0, "errors": ["stale"]},
+    }))
+    path.chmod(0o600)
+    monkeypatch.setattr(sys, "argv", ["immersion-gate.py", "--rejudge", str(path)])
+    module.run()
+    report = json.loads(path.read_text())
+    printed = json.loads(capsys.readouterr().out)
+    assert report["classifier_validation"] == module.classifier_accuracy()
+    assert report["raw_metrics"]["speech_consistency"] == original
+    assert printed["raw_metrics"] == report["raw_metrics"]
+    assert printed["rejudged_metrics"] == report["metrics"]
+
+
+def test_fixture_words_in_replies_fail_judge():
+    module = gate()
+    rows = [{"persona": "gate-person", "level": "casual", "index": index,
+             "kind": "small_talk", "user": "요즘 뭐 해?",
+             "reply": {"content": "가상 이야기야." if index == 0 else "오늘은 쉬고 있어~"}}
+            for index in range(80)]
+    result = module.evaluate(rows, 0, module.classifier_accuracy(), True)
+    assert result["metrics"]["fixture_words_in_replies"]["value"] == 1
+    assert not result["metrics"]["fixture_words_in_replies"]["pass"]
+
+
+def test_published_gate_cards_and_timelines_hide_fixture_markers(tmp_path, monkeypatch):
+    import json
+
+    module = gate()
+    documents = []
+    queries = []
+    class Database:
+        def __enter__(self): return self
+        def __exit__(self, *_): return None
+        def execute(self, query, params=()):
+            queries.append(query)
+            assert query.count("%s") == len(params)
+            if query.startswith("INSERT INTO llm.persona_versions"):
+                documents.append(json.loads(params[2]))
+            if query.startswith("INSERT INTO llm.source_posts"):
+                documents.append(json.loads(params[-1]))
+            return self
+        def fetchall(self):
+            return [(card,) for card in documents if "reviewStatus" in card]
+    monkeypatch.setattr(module.psycopg, "connect", lambda *_args, **_kwargs: Database())
+    published = module.personas("postgresql://local", tmp_path)
+    cards = json.loads(published.read_text())["personas"]
+    assert len(cards) == 2
+    assert all(card["reviewStatus"] == "silver" for card in cards)
+    assert all(not module.FIXTURE_WORDS.search(json.dumps(item, ensure_ascii=False))
+               for item in documents)
+    assert not any(query.startswith("DELETE") for query in queries)
+    assert any("WHERE p.id IN" in query for query in queries)
 
 
 def test_regeneration_counts_distinguish_suffixes_and_deduplicate_checkpoints():

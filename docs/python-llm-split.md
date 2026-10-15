@@ -6,6 +6,10 @@ serving. The worker uses `PTR_LLM_PROVIDER=local` with the authenticated loopbac
 `PTR_LLM_LOCAL_AUTH_REQUIRED=1`, with `PTR_LLM_SPILLOVER=off`; it must not carry
 OpenRouter keys in Compose mode.
 The historical TS worker is retired; the API rejects `PTR_LLM_SERVICE_MODE=legacy`.
+Speech-request detection and the fixed `speech_ack` reply are currently implemented
+only in the Python worker. The TypeScript chat implementation has no equivalent
+speech-request branch; it is not on the live serving path. TypeScript routing and
+reply-text parity tests do not establish parity for this branch.
 The former Nest → Python → LiteLLM proxy route is historical after L4; rollback
 uses the private operational snapshot, not active repository files. See
 `apps/llm-service/README.md` for native Python experiments, reviews, ingestion

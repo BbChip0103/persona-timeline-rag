@@ -42,7 +42,7 @@ def test_split_private_keyword_leaves_no_predicate_fragment():
     )
     assert decision and decision["reason"] == "private_life"
     assert "했어" not in decision["content"]
-    assert decision["content"] in VOICES["decline_private"]["polite"]
+    assert decision["content"] in VOICES["neutral_redirect"]["polite"]
 
 
 @pytest.mark.asyncio

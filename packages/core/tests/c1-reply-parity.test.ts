@@ -2,7 +2,7 @@ import { guardReply, voiceText, type VoiceTextKey } from '../src';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const keys:VoiceTextKey[]=['decline_private','empathy_ask','identity','decline','fallback','clarification','ambiguous_reference','event_timezone','memory_ask_back','memory_topic_broaden','service_retry','reentry'];
+const keys:VoiceTextKey[]=['decline_private','neutral_redirect','empathy_ask','identity','decline','fallback','clarification','ambiguous_reference','event_timezone','memory_ask_back','memory_topic_broaden','speech_ack_casual','speech_ack_polite','reaction_surprise','reaction_confirm','service_retry','reentry','reentry_recap'];
 const fixture=(...parts:string[])=>JSON.parse(readFileSync(join(__dirname,'..','..','..','apps',...parts),'utf8')) as unknown;
 const pythonVoices=fixture('llm-service','src','ptr_llm','core','voice_texts.json') as Record<VoiceTextKey,{casual:string[];polite:string[];en:string[]}>;
 const guardrailsVoices=fixture('guardrails','voice_texts.json') as typeof pythonVoices;

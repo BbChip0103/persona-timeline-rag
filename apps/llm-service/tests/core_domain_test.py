@@ -515,19 +515,15 @@ def test_persisted_speech_level_passes_strict_wire_contract():
     assert validate_wire("Agent", agent) == agent
 
 
-async def test_speech_request_persists_on_non_answered_turn():
-    raw = json.dumps({
-        "message": "응, 편하게 얘기하자.",
-        "status": "needs_clarification",
-        "evidenceRefs": [],
-        "variableUpdates": {"speechLevel": "polite"},
-    })
-    provider = Provider([raw, response("응, 계속 얘기하자.")])
+async def test_speech_request_persists_without_model_turn():
+    provider = Provider([response("응, 계속 얘기하자.")])
     engine = LLMEngine(provider=provider, personas=Personas())
     first = await engine.handle(
         grant("말 편하게 해"), before_costly=noop, cancelled=asyncio.Event()
     )
     assert first["kind"] == "completed"
+    assert first["reply"]["operatorTrace"]["code"] == "SPEECH_ACK"
+    assert provider.messages == []
     assert first["reply"]["agent"]["variables"]["speechLevel"] == "casual"
     second_grant = grant("계속 이야기해")
     second_grant["context"]["previousReply"] = first["reply"]
@@ -535,7 +531,7 @@ async def test_speech_request_persists_on_non_answered_turn():
     assert second["kind"] == "completed"
     assert second["reply"]["agent"]["variables"]["speechLevel"] == "casual"
     state = next(
-        m["content"] for m in provider.messages[1]
+        m["content"] for m in provider.messages[0]
         if m["content"].startswith("AGENT_STATE_JSON_DATA ")
     )
     assert json.loads(state.split(" ", 1)[1])["speechLevel"] == "반말"
@@ -790,6 +786,35 @@ async def test_publication_fail_closed_without_licensed_sources():
 
 
 ROUTING_GOLDENS = json.loads(Path(__file__).with_name("core_routing_golden.json").read_text())
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("지난번에 뭐 먹었어?", "timeline"),
+        ("지난번 공연 어땠어?", "timeline"),
+        ("지난번 전시 기억나?", "timeline"),
+        ("지난번에 읽은 책 제목이 뭐야?", "timeline"),
+        ("지난번 얘기한 그 여행 언제였어?", "timeline"),
+        ("이어서 그 여행 얘기 해줘", "timeline"),
+        ("지난번에 갔던 카페 어디였어?", "timeline"),
+        ("다시 왔어. 지난번 얘기 이어갈까?", "small_talk"),
+        ("다시 왔어", "small_talk"),
+        ("지난번 얘기 이어서 하자", "small_talk"),
+        ("지난번 얘기 계속하자", "small_talk"),
+        ("지난번 얘기 계속할까?", "small_talk"),
+        ("지난번 얘기 계속해요", "small_talk"),
+        ("다시 왔어요. 지난번 이야기 이어갈까요?", "small_talk"),
+        ("지난번 이야기 이어가요", "small_talk"),
+        ("지난번 이야기 이어서 해요", "small_talk"),
+    ],
+)
+def test_reentry_vs_past_activity_routing_golden(text, expected):
+    from ptr_llm.core.routing import intent_signals, rule_intent
+
+    signals = intent_signals(text, retrieval_context([], text))
+    assert rule_intent(signals) == expected
+    assert signals["reentry"] is (expected == "small_talk")
 
 
 @pytest.mark.parametrize("case", ROUTING_GOLDENS, ids=lambda c: c["text"])

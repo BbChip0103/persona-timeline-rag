@@ -38,6 +38,16 @@ SENTENCES = regex.compile(
     "ed_Pictographic}\\p{Regional_Indicator}])"
 )
 QUESTION = regex.compile(r"[?？]\s*\p{Extended_Pictographic}*️?\s*$")
+ALWAYS_META = regex.compile(r"시스템\s*프롬프트|\bsystem\s+prompt\b", regex.I)
+GENERIC_META = regex.compile(r"프롬프트|지시|설정|\b(?:instructions|prompt)\b", regex.I)
+PERSONA_META = regex.compile(
+    r"(?:내|나의|너의|네|당신의)\s*(?:설정|지시|프롬프트)"
+    r"|\b(?:your|my)\s+(?:instructions|prompt|settings)\b", regex.I
+)
+INJECTION_REQUEST = regex.compile(
+    r"무시(?:해|하고)?|잊(?:고|어)?|규칙|시스템|개발자|\b(?:ignore\s+previous|developer)\b|"
+    r"(?:프롬프트|\bprompt\b)\s*(?:를|을)?\s*(?:보여|공개|알려|말해|reveal|show|tell)", regex.I
+)
 CLAUSES = regex.compile(r"\s*,\s*|(?<!에고)(?<=(?:는데|지만|다시피|잖아|고))(?=\s)")
 _KOREAN_SELF = regex.compile(
     r"(?<![가-힣])(?:나는|나도|난|내가|나의|나|내|제가|저는|저도|저희|제)"
@@ -346,6 +356,28 @@ def reply_decision(reply, metadata):
             "reason": "formatting", "content": plain, "edited": True,
         }
 
+    injection = bool(INJECTION_REQUEST.search(utterance))
+    persona_meta = bool(PERSONA_META.search(utterance) or PERSONA_META.search(reply))
+    def blocked_meta(sentence):
+        return bool(ALWAYS_META.search(sentence) or
+                    GENERIC_META.search(sentence) and (injection or persona_meta))
+
+    if blocked_meta(reply):
+        if identity:
+            return replace("meta_talk", "identity")
+        if (injection and (ALWAYS_META.search(utterance) or GENERIC_META.search(utterance))
+                or PERSONA_META.search(utterance)):
+            return replace("meta_talk", "decline")
+        clean = " ".join(
+            sentence for sentence in SENTENCES.split(reply.strip())
+            if sentence and not blocked_meta(sentence)
+        ).strip()
+        if regex.search(r"[\p{L}\p{N}]", clean):
+            return reply_decision(clean, metadata) or {
+                "reason": "meta_talk", "content": clean, "edited": True,
+            }
+        return replace("meta_talk", "service_retry")
+
     sentences = [sentence for sentence in SENTENCES.split(reply.strip()) if sentence]
     kept = [
         sentence
@@ -372,6 +404,12 @@ def reply_decision(reply, metadata):
         return replace("missing_ai_disclosure", "identity")
     if real_person:
         if private_question:
+            # A model may already produce an approved decline. Re-fixing it to
+            # the same text makes Guardrails return validated_output=None.
+            if not identity and any(
+                reply in variants for variants in VOICES["decline_private"].values()
+            ):
+                return None
             return replace("private_life", "identity" if identity else "decline_private")
         checked = (
             PATTERNS["PAST_HOME"].sub(" ", reply)
@@ -410,7 +448,9 @@ def reply_decision(reply, metadata):
                     "content": text,
                     "edited": True,
                 }
-            key = "identity" if identity else "empathy_ask" if own_story else "decline_private"
+            key = "identity" if identity else "empathy_ask" if own_story else (
+                "decline_private" if private_question else "neutral_redirect"
+            )
             return replace("private_life", key)
     if (
         not identity

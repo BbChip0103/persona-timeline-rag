@@ -38,6 +38,42 @@ def test_python_policy_copies_match_on_every_shared_fixture():
         )
 
 
+@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("replace", [False, True])
+def test_missing_guardrails_validated_output_is_explicit(monkeypatch, standalone, replace):
+    """Force the wrapper's None result, independent of its current decline wording."""
+    from types import SimpleNamespace
+
+    if standalone:
+        import sys
+        original = sys.path[:]
+        try:
+            sys.path.insert(0, str(ROOT / "apps/guardrails"))
+            import validators as guard_module
+            from policy import reply_decision as decision_for
+            from validators import validate_output as guard_output
+        finally:
+            sys.path[:] = original
+    else:
+        import ptr_llm.core.guardrails as guard_module
+        from ptr_llm.core.policy import reply_decision as decision_for
+        guard_output = guard_module.validate_output
+
+    metadata = {"utterance": "synthetic", "realPerson": True, "language": "en"}
+    reply = "I am a real person." if replace else "A fictional painting."
+    monkeypatch.setattr(guard_module, "_validate", lambda *_: SimpleNamespace(
+        validated_output=None, validation_summaries=[]
+    ))
+    if replace:
+        decision = decision_for(reply, metadata)
+        assert decision is not None and not decision.get("edited")
+        assert guard_output(reply, metadata) == decision
+    else:
+        with pytest.raises(ValueError, match="GUARDRAILS_OUTPUT_MISSING") as error:
+            guard_output(reply, metadata)
+        assert error.value.code == "GUARDRAILS_OUTPUT_MISSING"
+
+
 def test_private_noun_sources_are_the_private_keyword_union():
     from ptr_llm.core.policy import (
         _ADDITIONAL_PRIVATE,
@@ -468,7 +504,7 @@ def test_empathy_replacement_avoids_previous_assistant_text():
     assert decision["content"] != first
 
 
-def test_private_reply_replacement_uses_private_decline_not_unknown_fallback():
+def test_private_reply_replacement_uses_neutral_redirect_for_nonprivate_turn():
     from ptr_llm.core.policy import reply_decision, voice
 
     decision = reply_decision(
@@ -477,7 +513,7 @@ def test_private_reply_replacement_uses_private_decline_not_unknown_fallback():
     )
     assert decision == {
         "reason": "private_life",
-        "content": voice("decline_private", "ko", "polite"),
+        "content": voice("neutral_redirect", "ko", "polite"),
     }
 
 

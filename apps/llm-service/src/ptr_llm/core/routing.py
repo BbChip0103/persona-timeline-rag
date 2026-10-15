@@ -19,6 +19,21 @@ def sensitive(text):
     return rules_decision(text)["action"] != "none"
 
 
+def is_reentry(text):
+    # Only a whole-message invitation to resume qualifies. A past-activity
+    # question may contain the same words and must keep its timeline route.
+    if js_search(r"언제|어디|여행|공연|전시|책|먹었|갔|봤|했던|읽|카페", text, regex.I):
+        return False
+    return bool(js_search(
+        r"^\s*(?=\S)(?:다시\s*왔(?:어|어요|습니다)(?:[.!?~]\s*)?)?"
+        r"(?:지난번\s*(?:얘기|대화|이야기)(?:\s*(?:이어갈까|이어갈까요|이어가자|이어가요|"
+        r"계속하자|계속할까|계속해요|이어서"
+        r"(?:\s*(?:하자|할까|해요|얘기하자|이야기하자))?))?"
+        r"|이어서\s*(?:얘기|이야기|대화)\s*(?:하자|할까))?"
+        r"[.!?~\s]*$", text, regex.I
+    )) and bool(js_search(r"지난번|이어서|다시\s*왔", text, regex.I))
+
+
 def intent_signals(
     text,
     context,
@@ -56,6 +71,7 @@ def intent_signals(
         "sensitive": sensitive(text),
         "explicitIntent": explicit_intent,
         "creative": creative,
+        "reentry": is_reentry(text) and not explicit_timeline,
         "strongTimeline": bool(strong),
         "weakTimeline": bool(not creative and (cue or image)),
     }
@@ -66,6 +82,9 @@ def rule_intent(signals):
         return "unsupported"
     if signals.get("explicitIntent") == "clarification":
         return "clarification"
+    if (signals.get("reentry") and not signals["strongTimeline"]
+            and signals.get("explicitIntent") != "timeline"):
+        return "small_talk"
     if signals["strongTimeline"] or signals["weakTimeline"]:
         return "timeline"
     return signals.get("explicitIntent") or "small_talk"
@@ -78,6 +97,7 @@ def needs_classifier(signals):
             signals.get("explicitIntent"),
             signals["creative"],
             signals["strongTimeline"],
+            signals.get("reentry"),
         ]
     )
 
