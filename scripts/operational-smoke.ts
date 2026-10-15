@@ -116,7 +116,9 @@ export async function operationalSmoke(config:Config,dependencies:SmokeDependenc
     report.preflight={ownedTwoTiers:true,exactResearchRoles:true,readiness:true,nativeModelMetrics:true,unauthenticatedDenied:true};
     if(!config.execute){report.passed=true;return report;}
     // Catalogue is read once into memory; neither IDs nor labels/revisions are saved or logged.
-    const catalogue=await api('personas');check(Array.isArray(catalogue.personas),'CATALOGUE_INVALID');const candidate=catalogue.personas.map(record).find(row=>['synthetic','silver','human_reviewed'].includes(String(row.reviewStatus)));check(candidate,'PUBLISHED_PERSONA_REQUIRED');const personId=string(candidate.personId),query='짧게 인사만 해 주세요.',replyLanguage=utteranceLanguage(query,string(candidate.language));
+    const catalogue=await api('personas');check(Array.isArray(catalogue.personas),'CATALOGUE_INVALID');check(catalogue.personas.length>0,'PUBLISHED_PERSONA_REQUIRED');
+    // The worker publishes only approved cards; the public API intentionally omits reviewStatus.
+    const candidate=record(catalogue.personas[0]),personId=string(candidate.personId),query='짧게 인사만 해 주세요.',replyLanguage=utteranceLanguage(query,string(candidate.language));
     const paidBefore=await paid();
     const session=async()=>string(record((await api('sessions','POST',{personId,retrievalMode:'off',executionProfile:'agent_loop'})).session).id);
     const submit=async(sessionId:string,clientRequestId:string,reserve=true)=>{if(reserve)budget.reserve();const turn=record((await api(`sessions/${encodeURIComponent(sessionId)}/turns`,'POST',{clientRequestId,text:query,intent:'small_talk'})).turn);return string(turn.id);};

@@ -92,7 +92,7 @@ async function syntheticProtocol(providerRowsAfter=0,singleTurn=false){
   const fake:typeof fetch=async(input,options)=>{
     const url=new URL(String(input)),headers=new Headers(options?.headers);const actor=headers.get('X-PTR-Owner')??'';let body:unknown={};let status=200;
     if(url.pathname==='/metrics')return new Response(`vllm:request_success_total ${successes}\nvllm:num_requests_running 0\nvllm:num_requests_waiting 0`);
-    if(url.pathname==='/api/personas'){if(!headers.has('Authorization'))return new Response('{}',{status:403});firstOwner=actor;body={personas:[{personId:'synthetic-published-person',reviewStatus:'human_reviewed',language:'ko'}]};}
+    if(url.pathname==='/api/personas'){if(!headers.has('Authorization'))return new Response('{}',{status:403});firstOwner=actor;body={operatorMode:false,personas:[{personId:'synthetic-published-person',label:'Synthetic Painter',language:'ko',tagline:'Fictional painter',starters:['What color?'],aiDisclosure:'AI character'}]};}
     else if(url.pathname==='/api/sessions'){if(paused)return new Response('{}',{status:503});body={session:{id:`synthetic-session-${++sessions}`}};}
     else if(url.pathname.endsWith('/turns')){const data=JSON.parse(String(options?.body)) as {clientRequestId:string};let turn=turns.find(t=>t.client===data.clientRequestId);if(!turn){turn={id:`synthetic-turn-${turns.length}`,client:data.clientRequestId,state:paused?'pending':'completed'};turns.push(turn);if(!paused)successes++;}body={turn};}
     else if(url.pathname.includes('/api/turns/')){const id=url.pathname.split('/')[3],turn=turns.find(t=>t.id===id)!;if(actor!==firstOwner)status=404;else if(url.pathname.endsWith('/cancel')){turn.state='cancelled';body={cancelled:true};}else body={turn:{...turn,...(turn.state==='completed'?{reply:{status:'answered',content:'synthetic reply only',evidence:[],limitations:['RETRIEVAL_OFF','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','ko'),replyText('limitation_posted_date','ko')]}}:{})}};}
@@ -107,7 +107,7 @@ it('runs the complete synthetic protocol with exactly-once ACK, owner denial, id
   expect(report).toMatchObject({passed:true,localDistinctTurnSubmissions:3,modelCallCreditsReserved:9,paid:{embeddingRowsDelta:0,committedMicrousdDelta:0},nativeCounters:{successDelta:2,admissions:null,errorDelta:null}});
   expect(turns).toHaveLength(3);expect((report.stages as unknown[])).toHaveLength(4);expect(JSON.stringify(artifacts)).not.toMatch(/synthetic-published-person|synthetic reply only|synthetic-turn-/);
 });
-it('runs one owned local smoke turn with zero paid cost and no recovery signals',async()=>{
+it('runs one owned local smoke turn from a public published card without reviewStatus',async()=>{
   const {report,turns,sessionCountAtPause,artifacts}=await syntheticProtocol(0,true);
   expect(report).toMatchObject({passed:true,mode:'single-turn-operational',localDistinctTurnSubmissions:1,modelCallCreditsReserved:3,paid:{providerRequestRowsDelta:0,embeddingRowsDelta:0,committedMicrousdDelta:0}});
   expect(turns).toHaveLength(1);expect(sessionCountAtPause).toBe(0);
