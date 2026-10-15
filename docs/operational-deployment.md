@@ -146,6 +146,30 @@ point to the deployed checkout. For Kubernetes, verify the
 `ptr-maintenance-daily-split-retention` CronJob is not suspended and its latest
 Job completed successfully. An enabled schedule without a successful run does
 not prove deletion. Inspect status/counts only, without private dialogue content.
+
+Before repointing the host maintenance timers' `WorkingDirectory` to a newly
+pulled release, prepare that host checkout. The timers run
+`uv run --no-sync --project apps/llm-service`, so they cannot install a newly
+locked dependency themselves. From `<checkout>`, run the following after the
+pull and before changing either unit. Use only the approved private maintenance
+env file for the verified loopback owner connection; the retention command is a
+dry run (no `--apply`) and must exit 0. The Langfuse and review jobs also need
+the checkout's `node_modules` because they use `pnpm exec tsx`.
+
+```sh
+cd '<checkout>'
+uv sync --frozen --project apps/llm-service
+pnpm install --frozen-lockfile
+uv run --no-sync --env-file '<maintenance-env>' --project apps/llm-service ptr-llm retention
+```
+
+Only after all three commands succeed, update the reviewed timer units, reload
+the user manager and verify their next runs. If the timer repoint fails, restore
+the saved unit backups, then run `systemctl --user daemon-reload`. A scheduled
+daily run on 2026-10-16 exited 1 after a redeploy because the stale host venv
+lacked `prometheus-client`, added for spillover metrics; the service succeeded
+after the venv sync.
+
 Deleted sessions bypass ordinary retention age and are cleared on the next daily
 cleanup. Keep `LANGFUSE_CAPTURE_CONTENT=false`; session deletion does not erase
 Langfuse content if that setting was enabled. About once per 20 messages, the C4
@@ -249,6 +273,7 @@ OWNER_DB_ENV='<private-owner-maintenance-env-file>'
 E2E_ENV='<private-e2e-env-file>'
 APP_BASE='http://127.0.0.1:<api-port>'
 WORKER_BASE='http://127.0.0.1:<worker-port>'
+WEB_BASE='<private-web-base-url>'
 ```
 
 Before step 1, check the required host tools. Compose must be v5.0.0 or later
@@ -520,23 +545,44 @@ PY
    The last command must show `ptr_split_research`, `ptr_split_owner`, `t` and
    `t`. Do not run it with runtime app or LLM credentials.
 
-5. Begin a short maintenance window. At the host-owned client ingress, block
-   new session-turn and draft POST requests with HTTP 503 and `잠시 점검 중` while
-   leaving existing turn reads and worker control traffic available. Verify the
-   gate from every exposed client path before proceeding; the old C2 API does
-   not understand `PTR_API_INTAKE_PAUSED`. For later v2-only rollouts, an API
-   started with `PTR_API_INTAKE_PAUSED=1` returns HTTP 503 with code
-   `INTAKE_PAUSED` and that message on those POST routes. Changing that env flag
-   requires an API restart, so the ingress gate is the pause mechanism for this
-   C2-to-v2 swap. Keep the gate closed until step 6 is healthy.
+5. Begin the one-time maintenance window while the old API image still predates
+   `PTR_API_INTAKE_PAUSED`. Record the UTC start timestamp. Close intake by
+   stopping **only** the old, labelled `web` container by its exact ID from the
+   snapshot. Recheck its project, service and owner labels immediately before
+   stopping it; keep the old API and worker running for the drain. Verify the
+   client entry point is unavailable before proceeding.
+
+   ```sh
+   (
+     set -euo pipefail
+     WINDOW_START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     OLD_WEB_ID="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(next(row["id"] for row in m["services"] if row["service"] == "web"))' "${SNAPSHOT}/manifest.json")"
+     test "$(docker inspect "${OLD_WEB_ID}" --format \
+       '{{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{index .Config.Labels "ptr.operational.owner"}}')" \
+       = "${PROJECT} web ${OWNER_NONCE}"
+     docker stop "${OLD_WEB_ID}" >/dev/null
+     test "$(docker inspect "${OLD_WEB_ID}" --format '{{.State.Running}}')" = false
+     if curl --fail --silent --max-time 2 --output /dev/null "${WEB_BASE}/login"; then
+       echo 'client entry point still available; stop before draining' >&2
+       exit 1
+     fi
+     printf 'maintenance_window_start_utc=%s\n' "${WINDOW_START_UTC}"
+   )
+   ```
+
+   Later deploys should use `PTR_API_INTAKE_PAUSED=1` on an API that supports
+   it. That flag returns HTTP 503 with code `INTAKE_PAUSED` and `잠시 점검 중` on
+   new session-turn and draft POST routes; changing the flag requires an API
+   restart.
 
    Let the old worker finish all queued and in-flight turns. Confirm the queue
    has no waiting or active jobs, `app.turns` has no `pending`, `retrieving`,
    `generating` or `validating` rows, and `app.turn_outbox` has no pending rows.
-   Repeat the checks after a short interval while intake remains blocked. If
-   any count is nonzero, keep waiting and investigate; do not replace either
-   peer. Use the owned app connection and bound timeouts, without printing
-   reply content or private configuration.
+   Require two consecutive zero counts of queued jobs, active turns and outbox
+   rows while the web container remains stopped. Repeat the checks after a short
+   interval. If any count is nonzero, keep waiting and investigate; do not
+   replace either peer. Use the owned app connection and bound timeouts, without
+   printing reply content or private configuration.
 
    Read only counts through the owned old API container, which already has the
    app DB and Redis connections. Repeat until every count is zero twice. This
@@ -598,8 +644,8 @@ PY
 6. Stop the drained old worker and replace API, worker and web in one maintenance
    operation. The worker stop uses the configured 90 second grace period. Take
    its exact container ID from the snapshot and recheck its project, service
-   and owner labels immediately before stopping it. Keep the ingress gate
-   closed until both v2 services are ready.
+   and owner labels immediately before stopping it. Keep intake closed until
+   the new web becomes ready.
 
    ```sh
    (
@@ -620,6 +666,13 @@ PY
    curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/health"
    curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/readyz"
    for attempt in $(seq 1 45); do
+     if curl --fail --silent --max-time 2 --output /dev/null "${WEB_BASE}/login"; then break; fi
+     sleep 2
+   done
+   curl --fail --silent --show-error --max-time 10 --output /dev/null "${WEB_BASE}/login"
+   WINDOW_END_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   printf 'maintenance_window_end_utc=%s\n' "${WINDOW_END_UTC}"
+   for attempt in $(seq 1 45); do
      if curl --fail --silent --max-time 2 --output /dev/null "${WORKER_BASE}/health/ready"; then break; fi
      sleep 2
    done
@@ -633,8 +686,10 @@ PY
      --execute --single-turn --owner-nonce "${OWNER_NONCE}"
    ```
 
-   Keep intake paused for readiness and wire-version checks. Run the synthetic
-   smoke through an operator-only local path, then reopen the client ingress.
+   The new web becoming ready ends the maintenance window; record both UTC
+   timestamps. Run the synthetic smoke through an operator-only local path.
+   It selects the first card in the published catalogue. `reviewStatus` is an
+   operator-only field and must not be used to filter the public catalogue.
 
    The smoke must be one synthetic RAG-off turn against local vLLM, with local
    chat cost `0`, no embedding rows and no paid provider rows. The one-turn

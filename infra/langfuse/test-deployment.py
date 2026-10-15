@@ -18,6 +18,61 @@ APP_COMPOSE = ROOT / "infra/compose.app.yml"
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_redeploy_host_timer_release_sync_precedes_repoint(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        timer = runbook.split("Before every redeploy", 1)[1].split("Deleted sessions", 1)[0]
+        self.assertLess(timer.index("uv sync --frozen --project apps/llm-service"),
+                        timer.index("update the reviewed timer units"))
+        self.assertIn("uv run --no-sync --project apps/llm-service", timer)
+        self.assertIn("pnpm install --frozen-lockfile", timer)
+        self.assertIn("pnpm exec tsx", timer)
+        self.assertIn("systemctl --user daemon-reload", timer)
+        self.assertIn("restore\nthe saved unit backups", timer)
+        self.assertIn("prometheus-client", timer)
+        command = timer.split("```sh", 1)[1].split("```", 1)[0]
+        self.assertIn("--env-file '<maintenance-env>'", command)
+        self.assertIn("ptr-llm retention", command)
+        self.assertNotIn("--apply", command)
+        result = subprocess.run(["bash", "-n"], input=command, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_old_api_intake_window_stops_only_owned_web_and_records_both_ends(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        step = runbook.split("5. Begin the one-time maintenance window", 1)[1].split(
+            "6. Stop the drained old worker", 1
+        )[0]
+        self.assertIn("PTR_API_INTAKE_PAUSED", step)
+        self.assertIn("WINDOW_START_UTC", step)
+        self.assertIn('= "${PROJECT} web ${OWNER_NONCE}"', step)
+        self.assertIn('docker stop "${OLD_WEB_ID}"', step)
+        self.assertIn("two consecutive zero counts", step)
+        self.assertIn("queued jobs, active turns and outbox", step)
+        swap = runbook.split("6. Stop the drained old worker", 1)[1].split(
+            "7. Reconcile", 1
+        )[0]
+        self.assertIn("up -d --no-deps --no-build api worker web", swap)
+        self.assertIn('"${WEB_BASE}/login"', swap)
+        self.assertIn("WINDOW_END_UTC", swap)
+        self.assertLess(swap.index('"${WEB_BASE}/login"'), swap.index("WINDOW_END_UTC"))
+        self.assertLess(swap.index("WINDOW_END_UTC"),
+                        swap.index('"${WORKER_BASE}/health/ready"'))
+        for section in (step, swap):
+            for command in section.split("```sh")[1:]:
+                shell = command.split("```", 1)[0]
+                result = subprocess.run(["bash", "-n"], input=shell, text=True,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_redeploy_smoke_uses_first_published_card_without_operator_field(self):
+        runbook = (ROOT / "docs/operational-deployment.md").read_text()
+        smoke = runbook.split("6. Stop the drained old worker", 1)[1].split(
+            "7. Reconcile", 1
+        )[0]
+        self.assertIn("first card in the published catalogue", smoke)
+        self.assertIn("`reviewStatus` is an\n   operator-only field", smoke)
+        self.assertIn("must not be used to filter the public catalogue", smoke)
+
     def test_current_rollback_restores_three_services_before_sql_and_start(self):
         runbook = (ROOT / "docs/operational-deployment.md").read_text()
         redeploy = runbook.split("## Direct-path redeploy procedure", 1)[1]
