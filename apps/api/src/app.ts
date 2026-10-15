@@ -11,7 +11,7 @@ import {containsCredentialPattern,containsInternalPathPattern} from '../../../pa
 import {createLog} from '../../../packages/ops/src/log';
 import {servePrometheus} from '../../../packages/ops/src/http-metrics';
 import { ApiMetrics, routeLabel } from './observability';
-import { publicTurn } from './public-turn';
+import { publicTurn, type OwnerSpace } from './public-turn';
 import { DEFAULT_SSE, streamTurn, type SseOptions } from './turn-sse';
 import type {CreativeArtifact} from './creative-artifact';
 import {createDraftLimiter} from './draft-limiter';
@@ -36,12 +36,12 @@ const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason
  */
 const WEB_OWNER=/^local-[a-f0-9]{40}$/;
 const SYNTHETIC_OWNER=/^(?:lt-[a-z0-9-]{1,40}|owner_synthetic_[a-z0-9_]{1,40})$/;
-const ownerSpace=new WeakMap<Request,RegExp>();
+const ownerSpace=new WeakMap<Request,OwnerSpace>();
 /** Metrics of the app that received the request (set by the token middleware). */
 const requestMetrics=new WeakMap<Request,ApiMetrics>();
 function owner(request:Request):string {
   const value=request.header('X-PTR-Owner');const space=ownerSpace.get(request);
-  if(!value || !space?.test(value)) {
+  if(!value || !space || !(space==='web'?WEB_OWNER:SYNTHETIC_OWNER).test(value)) {
     // `space`: a valid owner of the other token's space ; `format`: no valid owner at all.
     const reason=!value?'missing':WEB_OWNER.test(value)||SYNTHETIC_OWNER.test(value)?'space':'format';
     requestMetrics.get(request)?.ownerRejected.inc({reason});
@@ -49,12 +49,16 @@ function owner(request:Request):string {
   }
   return value;
 }
+function projectionSpace(request:Request):OwnerSpace {
+  const space=ownerSpace.get(request);
+  if(!space) throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
+  return space;
+}
 /** These routes previously authorized the owner before parsing their field schemas. */
 class RequestOwnerGuard implements CanActivate {
   canActivate(context:ExecutionContext):boolean {owner(context.switchToHttp().getRequest<Request>());return true;}
 }
 function safeSession(session:ChatSession) { const {ownerId:_,...safe}=session;return safe; }
-const safeTurn=publicTurn;
 @Catch()
 class SafeErrorFilter implements ExceptionFilter {
   catch(error:unknown,host:ArgumentsHost) {
@@ -91,7 +95,7 @@ class ApiController {
   @Get('readyz') readyz(@Res({passthrough:true}) response:Response) {return this.health(response);}
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
-    return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'연구용 AI 시뮬레이션 · 비공식'}))};
+    return {personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,reviewStatus:p.reviewStatus,aiDisclosure:'AI 캐릭터 · 실제 인물이 아니에요'}))};
   }
   @Get('sessions') async sessions(@Req() request:Request) {return {sessions:(await this.runtime.chat.listSessions(owner(request))).map(safeSession)};}
   @Post('sessions') @UseGuards(RequestOwnerGuard) async createSession(@Req() request:Request,@Body(new ZodSchemaPipe(sessionSchema)) input:z.output<typeof sessionSchema>) {
@@ -111,13 +115,13 @@ class ApiController {
     if(forbiddenSecret.test(input.text)) throw new CoreError('INVALID_INPUT');
     const {turn,created}=await this.runtime.chat.submitTurn(caller,input);
     if(created) {this.metrics.turnsCreated.inc();this.log('turn_created',{turnId:turn.id});}
-    return {turn:safeTurn(turn)};
+    return {turn:publicTurn(turn,projectionSpace(request))};
   }
-  @Get('turns/:id') async turn(@Req() request:Request,@Param('id') id:string) {return {turn:safeTurn(await this.runtime.chat.getTurn(owner(request),id))};}
+  @Get('turns/:id') async turn(@Req() request:Request,@Param('id') id:string) {return {turn:publicTurn(await this.runtime.chat.getTurn(owner(request),id),projectionSpace(request))};}
   /** Server-sent events instead of client polling: state notices plus the final public turn. */
   @Get('turns/:id/events') async turnEvents(@Req() request:Request,@Res() response:Response,@Param('id') id:string) {
     this.metrics.sseOpen.inc();response.once('close',()=>{this.metrics.sseOpen.dec();});
-    await streamTurn(this.runtime.chat,this.runtime.eventSource,owner(request),id,request,response,this.sse);
+    await streamTurn(this.runtime.chat,this.runtime.eventSource,owner(request),id,request,response,this.sse,projectionSpace(request));
   }
   @Post('turns/:id/cancel') async cancel(@Req() request:Request,@Param('id') id:string,@Body(new ZodSchemaPipe(cancelBodySchema)) _body:z.output<typeof cancelBodySchema>) {
     return {cancelled:await this.runtime.chat.cancelTurn(owner(request),id)};
@@ -194,8 +198,8 @@ export async function createApiApplication(runtime:SplitApiRuntime,token:string,
       if(!hashed||!timingSafeEqual(digest(runtime.controlToken),hashed))return response.status(403).json({error:{code:'UNAUTHORIZED'}});
       return next();
     }
-    if(hashed && timingSafeEqual(expected,hashed)) ownerSpace.set(request,WEB_OWNER);
-    else if(hashed && expectedSynthetic && timingSafeEqual(expectedSynthetic,hashed)) ownerSpace.set(request,SYNTHETIC_OWNER);
+    if(hashed && timingSafeEqual(expected,hashed)) ownerSpace.set(request,'web');
+    else if(hashed && expectedSynthetic && timingSafeEqual(expectedSynthetic,hashed)) ownerSpace.set(request,'harness');
     else return response.status(403).json({error:{code:'UNAUTHORIZED'}});
     return next();
   });

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { CheckpointedTextProvider } from '../src/checkpointed-provider';
 import type { Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
-import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat, voiceText } from '../src';
+import { InMemoryConversationStore, InMemoryPersonaRepository, runCharacterAgent, EXPERIMENT_PROMPT_BYTE_LIMIT, AGENT_PROMPT_REVISION, createLocalChat, voiceText, isVoiceText } from '../src';
 const persona:Persona={id:'agent-synthetic',personId:'agent-person',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional artist',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
 const source:SourcePost={id:'agent-post',personId:persona.personId,caption:'합성 숲을 그렸어요.',postedAt:'2024-01-01T00:00:00Z',eventDate:null,sourceUrl:'https://example.invalid/synthetic',hash:'synthetic-hash',snapshot:'v1',unsafe:false,imageAnnotations:[{id:'agent-photo',imageHash:'ih',annotationHash:'ah',revision:'v1',text:'짙은 초록의 숲.',model:'synthetic',humanReviewed:false}]};
 const final=(patch:object={})=>JSON.stringify({status:'answered',message:'편하게 이야기해요.',evidenceRefs:[],variableUpdates:{},...patch});
@@ -14,13 +14,57 @@ function setup(outputs:string[]=[]) {
   return {provider,retrieval,store,chat,failures};
 }
 async function send(h:ReturnType<typeof setup>,sessionId:string,text='안녕',clientRequestId='req') {return h.chat.sendTurn('owner',{sessionId,text,clientRequestId});}
+test('unbound timeline questions ask back twice, then broaden the topic; small talk stays natural',async()=>{
+  const h=setup([final({message:'모델 답'}),final({message:'모델 답'}),final({message:'모델 답'}),final({message:'그림 얘기 좋아'})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  for(let index=0;index<3;index++) {
+    const turn=await send(h,session.id,'그 합성 숲 언제 그렸어?',`q${index}`);
+    expect(turn.state).toBe('completed');
+    expect(turn.reply?.limitations).toContain(index<2?'MEMORY_ASK_BACK':'MEMORY_TOPIC_BROADEN');
+    expect(isVoiceText(index<2?'memory_ask_back':'memory_topic_broaden',turn.reply?.content??'')).toBe(true);
+    expect(turn.reply?.evidence).toEqual([]);
+  }
+  const smallTalk=await send(h,session.id,'안녕','small');
+  expect(smallTalk.reply?.content).toBe('그림 얘기 좋아');
+});
+test.each([
+  '난 몰라 너 언제 갔어?',
+  '난 몰라.너 언제 갔어?',
+])('question sentence asks back despite preceding self statement: %s',async text=>{
+  const h=setup([final({message:'그랬구나!'})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  const turn=await send(h,session.id,text);
+  expect(turn.reply?.limitations).toContain('MEMORY_ASK_BACK');
+});
+test.each(['내일 어디 가?','다음에 어디 가?','어디 갈 거야?','어디 갈래?','여행 갔었어'])('future plan or bare past statement does not ask back: %s',async text=>{
+  const h=setup([final({message:'그랬구나!'})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  const turn=await send(h,session.id,text);
+  expect(turn.reply?.limitations).not.toContain('MEMORY_ASK_BACK');
+});
+test.each([
+  '나 어제 친구랑 여행 갔어','그 그림 분위기 좋다','나중에 얘기해줄게','우리 엄마랑 싸웠어','오늘 병원 다녀왔어 내가',
+  '내가 어제 숲에 갔어','나는 그 사진이 좋아','제가 친구에게 그림을 줬어요','저희 가족과 여행했어요','My friend visited yesterday',
+])('own-story golden does not ask back: %s',async text=>{
+  const h=setup([final({message:'그랬구나!'})]);
+  const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
+  const turn=await send(h,session.id,text);
+  expect(turn.reply?.content).toBe('그랬구나!');
+  expect(turn.reply?.limitations).not.toContain('MEMORY_ASK_BACK');
+});
 function state(messages:ProviderMessage[]) {return JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length));}
+test('agent state anchors today and a coarse prior-user gap in the session timezone',async()=>{
+  const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>final())};
+  await runCharacterAgent({provider,persona,history:[{id:'u1',sessionId:'s1',turnId:'t1',role:'user',content:'안녕',createdAt:'2024-01-01T21:00:00Z'}],
+    text:'또 왔어',sources:[],signal:new AbortController().signal,createdAt:'2024-01-01T23:00:00Z',timezone:'Asia/Seoul'});
+  expect(state(provider.generate.mock.calls[0][0])).toMatchObject({today:'2024-01-02',sinceLastUserMessage:'몇 시간 전'});
+});
 
 test.each(['off','caption','caption_image'] as const)('recollection voice reaches %s agent policy without removing safety or changing user/history',async condition=>{
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
   expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('handle it as IDENTITY_AND_PRIVACY says for something you do not know');
@@ -70,7 +114,7 @@ test('one-call structured final: state, compact decision summary, public message
   const first=await send(h,session.id);expect(first.state).toBe('completed');
   expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'그림',tone:'warm'},decisionSummary:'합성 응답 요약',validator:'disabled'});
   await send(h,session.id,'계속 이야기하자','req2');
-  expect(state(h.provider.generate.mock.calls[1][0])).toEqual({conversationTopic:'그림',tone:'warm',replyLanguage:'Korean',speechLevel:'반말'});
+  expect(state(h.provider.generate.mock.calls[1][0])).toMatchObject({conversationTopic:'그림',tone:'warm',replyLanguage:'Korean',speechLevel:'반말'});
   expect((await h.chat.history('owner',session.id)).map(m=>m.content).join('')).not.toContain('합성 응답 요약');
   expect(h.retrieval.search).not.toHaveBeenCalled();
   await expect(h.chat.sendTurn('owner',{sessionId:session.id,text:'hi',clientRequestId:'override',executionProfile:'legacy'} as never)).rejects.toMatchObject({code:'INVALID_INPUT'});
@@ -107,30 +151,39 @@ test('scoped tool cannot select different person, date or algorithm; bad sources
   const data=h.provider.generate.mock.calls[1][0].find(m=>m.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA '))!.content;
   expect(data).not.toContain('wrong-date');expect(data).not.toContain('unsafe');expect(data).not.toContain('"sourceId":"other"');
 });
-test.each([tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('malformed actions answer once with the persona-voice fallback : no retrieval, no state writes',async raw=>{
+test.each([tool('숲',{function:{name:'delete_everything',arguments:{query:'x'}}}), 'not JSON'])('malformed actions answer once with service_retry: no retrieval, no state writes',async raw=>{
   const h=setup([raw]);const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const turn=await send(h,session.id);expect(turn.state).toBe('completed');
-  expect(turn.reply).toMatchObject({status:'insufficient_evidence',content:voiceText('fallback','ko','casual'),evidence:[],agent:{variables:{conversationTopic:'',tone:'neutral'}}});
+  expect(turn.reply).toMatchObject({status:'insufficient_evidence',content:voiceText('service_retry','ko','casual',undefined,turn.id),evidence:[],agent:{variables:{conversationTopic:'',tone:'neutral'}}});
   expect(turn.reply?.limitations).toContain('AGENT_REPLY_INVALID');
   expect(h.provider.generate).toHaveBeenCalledTimes(1);expect(h.retrieval.search).not.toHaveBeenCalled();
 });
-test('duplicate tool query and max loop exhaustion stop without extra calls',async()=>{
+test('duplicate tool query and max loop exhaustion answer with service_retry without extra calls',async()=>{
   for(const outputs of [[tool(),tool()],[tool('one'),tool('two'),tool('three')]]) {
     const expectedModels=outputs.length,expectedTools=outputs.length-1;
     const h=setup(outputs);const session=await h.chat.createSession('owner',{...create,ragCondition:'caption'});
-    const turn=await send(h,session.id);expect(turn.state).toBe('failed');expect(h.provider.generate.mock.calls.length).toBe(expectedModels);
+    const turn=await send(h,session.id);expect(turn.state).toBe('completed');expect(turn.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,turn.id));expect(h.provider.generate.mock.calls.length).toBe(expectedModels);
     expect(h.retrieval.search.mock.calls.length).toBe(expectedTools);
   }
 });
 test.each([
   {reason:'REPLY_REJECTED',outputs:[final({message:'see /home/agent/notes'})]},
   {reason:'TOOL_QUERY_REJECTED',outputs:[tool('file:///etc/passwd')]},
-  {reason:'TOOL_LIMIT',outputs:[tool('one'),tool('two'),tool('three')]},
-  {reason:'TOOL_REPEATED',outputs:[tool('숲'),tool('숲')]},
 ])('a failed turn names its reason: $reason',async({reason,outputs})=>{
   const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>outputs.shift()??final())};
   await expect(runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[source],signal:new AbortController().signal,search:async()=>[source]}))
     .rejects.toMatchObject({code:'TURN_FAILED',message:reason});
+});
+test.each([
+  {reason:'TOOL_LIMIT',outputs:[tool('one'),tool('two'),tool('three')]},
+  {reason:'TOOL_REPEATED',outputs:[tool('숲'),tool('숲')]},
+])('tool policy %s yields service retry with no extra search',async({reason,outputs})=>{
+  const provider={generate:jest.fn(async()=>outputs.shift()??final())};
+  const search=jest.fn(async()=>[source]);
+  const run=await runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[source],signal:new AbortController().signal,search});
+  expect(run.response.message).toBe(voiceText('service_retry','ko','casual'));
+  expect(run.serviceLimitation).toBe(reason);
+  expect(search).toHaveBeenCalledTimes(reason==='TOOL_LIMIT'?2:1);
 });
 test('empty search results yield one follow-up model and unverified final, never fabricated references',async()=>{
   const h=setup([tool(),final({status:'insufficient_evidence',message:'자료가 없네요.'})]);h.retrieval.search.mockResolvedValue([]);
@@ -213,12 +266,12 @@ test('configured validator accept permits only final state patch, with no model 
 });
 
 
-test('off unavailable tool answers once with the persona-voice fallback (no service notice) and permits a later normal turn without new state',async()=>{
+test('off unavailable tool answers once with service retry and permits a later normal turn without new state',async()=>{
   const h=setup([tool(),final({message:'그래, 다른 얘기 하자ㅋㅋ'})]);
   const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const first=await send(h,session.id);expect(first.state).toBe('completed');
   expect(first.reply?.status).toBe('insufficient_evidence');expect(first.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE');
-  expect(first.reply?.content).toBe(voiceText('fallback','ko','casual'));expect(first.reply?.content).not.toContain('서비스');
+  expect(first.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,first.id));expect(first.reply?.content).not.toContain('서비스');
   expect(first.reply?.agent).toMatchObject({modelCalls:1,toolCalls:0,variables:{conversationTopic:'',tone:'neutral'}});
   expect(first.reply?.evidence).toEqual([]);expect(h.provider.generate).toHaveBeenCalledTimes(1);
   const next=await send(h,session.id,'다른 얘기 하자','next');expect(next.reply?.content).toBe('그래, 다른 얘기 하자ㅋㅋ');

@@ -22,6 +22,7 @@ from ptr_llm.core.persona import (
     validate_persona,
     validate_publication,
 )
+from ptr_llm.core.policy import VOICES
 from ptr_llm.core.prompts import build_experiment_context
 from ptr_llm.core.routing import safety_windows
 from ptr_llm.core.runtime import LLMEngine
@@ -231,14 +232,16 @@ async def test_invalid_reply_fallback_and_human_impersonation_guard():
         assert result["reply"]["evidence"] == []
 
 
-async def test_repeated_tool_rejected_without_model_retry():
+async def test_repeated_tool_returns_service_retry_without_model_retry():
     provider = Provider([response("", function="same"), response("", function="same")])
     result = await LLMEngine(provider=provider, personas=Personas(), retrieval=Retrieval()).handle(
         grant("remember your photo?", retrievalMode="lexical", ragCondition="caption"),
         before_costly=noop,
         cancelled=asyncio.Event(),
     )
-    assert result == {"kind": "failed", "errorCode": "TURN_FAILED"}
+    assert result["kind"] == "completed"
+    assert "TOOL_REPEATED" in result["reply"]["limitations"]
+    assert result["reply"]["content"] in VOICES["service_retry"]["en"]
     assert len(provider.messages) == 2
 
 

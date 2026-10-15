@@ -12,9 +12,9 @@ import { AgentVariablesSchema } from './agent-protocol';
 import { AGENT_RUNTIME_REVISION, AGENT_PROMPT_REVISION, runCharacterAgent, type AgentValidator } from './agent-runtime';
 import { filterEvidence, validateExperimentReply, validateSourceBoundReply } from './evidence';
 import { aiDisclosurePrefix, greetingIndexFor, greetingsOf, matchLore, renderLoreMessage } from './persona-card';
-import { REPLY_GUARD_REVISION, guardReply } from './reply-guard';
+import { REPLY_GUARD_REVISION, guardReply, hasUserSelfMarker, splitSentences } from './reply-guard';
 import type { GuardrailsClient } from './guardrails';
-import { replyText, speechLevel, utteranceLanguage, voiceText, type VoiceTextKey } from './reply-texts';
+import { replyText, speechLevel, utteranceLanguage, voiceText, isVoiceText, type VoiceTextKey } from './reply-texts';
 export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRepository;provider:TextProvider;retrieval?:Retrieval;timeoutMs?:number;maxHistoryMessages?:number;maxToolRounds?:number;agentValidator?:AgentValidator;
   /** Turns always run queued: startTurn reserves (with an outbox entry) and publishes; TurnWorker calls executeQueued. */
   leases:TurnLeaseStore;delivery:TurnDelivery;
@@ -48,9 +48,29 @@ export interface ChatServiceOptions {store:ConversationStore;personas:PersonaRep
   /** Observability: a turn completed with this stored reply (metrics read its internal trace, never its text). */
   onTurnCompleted?:(event:{turnId:string;reply:ChatReply})=>void}
 type TurnOutput=Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'>;
+function shouldAskBack(intent:TurnIntent|undefined,condition:ChatSession['ragCondition'],text:string,evidence:ChatReply['evidence']):boolean {
+  const sentences=splitSentences(text);
+  const question=sentences.some(sentence=>{
+    const asked=sentence.split(/(?<=몰라)\s+(?=너|네가|니가|당신)/u).at(-1)??sentence;
+    return (/[?？]|(?<![A-Za-z])(?:언제|어디|뭐|누구|어떤|왜|how|when|where|what|who|which)(?![A-Za-z])|(?:니|냐|나요|지)\s*$/iu.test(asked))
+      &&!/(?:내일|모레|다음에|다음\s?(?:주|달|번)|앞으로|tomorrow|next\s+(?:week|month)|(?:할|갈)\s?거(?:야|예요)?|(?:할|갈)래|[가-힣]+(?:을|ㄹ)\s?거(?:야|예요)?|[가-힣]+(?:을|ㄹ)래)/iu.test(asked)
+      &&!hasUserSelfMarker(asked);
+  });
+  return intent==='timeline'&&condition!==undefined&&condition!=='off'&&question&&evidence.length===0;
+}
+function askBackStreak(history:ChatMessage[]):number {
+  let count=0;
+  for(const message of [...history].reverse()) {
+    if(message.role!=='assistant')continue;
+    if(!isVoiceText('memory_ask_back',message.content))break;
+    count++;
+    if(count===2)break;
+  }
+  return count;
+}
 interface TurnSnapshot {
   persona:Persona;history:ChatMessage[];promptHistory:ChatMessage[];context:ReturnType<typeof retrievalContext>;
-  query:ReturnType<typeof TimelineQuerySchema.parse>;ownedPrevious?:ChatReply;references:ChatReply['evidence'];ambiguous:boolean;
+  query:ReturnType<typeof TimelineQuerySchema.parse>;ownedPrevious?:ChatReply;previousAssistantText?:string;references:ChatReply['evidence'];ambiguous:boolean;
   signals:IntentSignals;recentUserTurns:string[];control:boolean;combined:boolean;rule?:NonNullable<InputSafetyTrace['rule']>;
   cardPath:boolean;replyLanguage:string;level:ReturnType<typeof speechLevel>;
 }
@@ -151,7 +171,7 @@ export class ChatService {
         trace={...(trace??{decidedBy:'rule' as const}),action:decision.action,category:decision.category,fired:decision.fired};
       } catch {
         if(signal.aborted)throw new CoreError('TURN_FAILED','TURN_ABORTED');
-        return {trace,reply:voiceText('fallback',utteranceLanguage(brief,language),'polite'),limitations:['GUARDRAILS_INPUT_UNAVAILABLE']};
+        return {trace,reply:voiceText('service_retry',utteranceLanguage(brief,language),'polite',undefined,seed),limitations:['GUARDRAILS_INPUT_UNAVAILABLE']};
       }
     }
     if(!trace)return {limitations:[]};
@@ -282,8 +302,9 @@ export class ChatService {
       const rule=signals.sensitive?'sensitive_pattern' as const:signals.explicitIntent==='unsupported'?'client_unsupported' as const:undefined;
       const combined=!!this.options.inputSafety&&!!this.options.intentClassifier&&!control&&needsIntentClassifier(signals);
       const cardPath=!!session.ragCondition||session.executionProfile==='agent_loop';
-      return structuredClone({sources:[],memorySources:[],served:[],snapshot:{persona,history,promptHistory,context,query,ownedPrevious,references,ambiguous,signals,recentUserTurns,control,combined,rule,
-        cardPath,replyLanguage:cardPath?utteranceLanguage(value.text,session.language):session.language,level:speechLevel(persona)},
+      const previousAssistantText=[...promptHistory].reverse().find(message=>message.role==='assistant')?.content;
+      return structuredClone({sources:[],memorySources:[],served:[],snapshot:{persona,history,promptHistory,context,query,ownedPrevious,previousAssistantText,references,ambiguous,signals,recentUserTurns,control,combined,rule,
+        cardPath,replyLanguage:cardPath?utteranceLanguage(value.text,session.language,promptHistory):session.language,level:speechLevel(persona)},
         memoryTrace:{revision:RETRIEVAL_CONTEXT_REVISION,action:'none',contextTurnIds:context.contextTurnIds,reusedSourceIds:[]}});
     });
     const assess=task('turn-safety',async(frame:TurnFrame):Promise<Pick<TurnFrame,'safety'|'combinedIntent'|'intentFailure'|'output'>>=>{
@@ -309,7 +330,7 @@ export class ChatService {
             action:decision.action,category:decision.category,fired:decision.fired};
           if(decision.intent)combinedIntent=decision.intent;
         } catch {
-          check();return {safety,combinedIntent,intentFailure,output:{status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_INPUT_UNAVAILABLE']}};
+          check();return {safety,combinedIntent,intentFailure,output:{status:'insufficient_evidence',content:voiceText('service_retry',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_INPUT_UNAVAILABLE']}};
         }
       }
       return {safety,combinedIntent,intentFailure};
@@ -358,6 +379,7 @@ export class ChatService {
         policyNote||lore?{...(policyNote?{policyNote}:{}),...(lore?{afterHistory:[lore]}:{})}:undefined):undefined;
       let memoryTrace=frame.memoryTrace!;
       const agentRun=session.executionProfile==='agent_loop'?await runCharacterAgent({provider,persona,history:promptHistory,text:value.text,sources:frame.sources,signal:controller.signal,
+        replyLanguage:frame.snapshot!.replyLanguage,createdAt:turn.createdAt,timezone:session.timezone,
         maxToolRounds:this.options.maxToolRounds,requestKey:turn.id,deadlineAt,variables:AgentVariablesSchema.parse(ownedPrevious?.agent?.variables),
         ...(policyNote?{policyNote}:{}),...(lore?{lore}:{}),
         ...(session.retrievalMode!=='off'&&!context.creative&&!frame.deflect&&this.options.retrieval?{search:async(toolQuery:string)=>{
@@ -385,16 +407,17 @@ export class ChatService {
       if(!snap.cardPath&&!this.options.guardrails)return {output:candidate};
       if(this.options.guardrails) {
         try {
-          const guarded=await this.options.guardrails.validateReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level},{signal:controller.signal});
+          const guarded=await this.options.guardrails.validateReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level,
+            previousAssistantText:snap.previousAssistantText,turnId:turn.id},{signal:controller.signal});
           if(!guarded.content.trim()||guarded.content.length>8000||containsCredentialPattern(guarded.content)||containsInternalPathPattern(guarded.content))throw new Error('invalid validator output');
           const replyGuard:ChatReply['replyGuard']={revision:guarded.revision,action:guarded.reason?guarded.edited?'edited':'replaced':'none',...(guarded.reason?{reason:guarded.reason}:{})};
           if(guarded.reason&&guarded.edited)return {replyGuard,output:{...candidate,content:guarded.content,limitations:[...candidate.limitations,`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
           if(guarded.reason)return {replyGuard,output:{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
           return {replyGuard,output:{...candidate,content:guarded.content}};
-        } catch {check();return {output:{status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_OUTPUT_UNAVAILABLE']}};}
+        } catch {check();return {output:{status:'insufficient_evidence',content:voiceText('service_retry',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),claims:[],evidence:[],grounding:'unverified_model',limitations:['GUARDRAILS_OUTPUT_UNAVAILABLE']}};}
       }
       // Offline domain harness only: production supplies Guardrails and never falls back here on a service failure.
-      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level});
+      const guarded=guardReply({utterance:value.text,reply:candidate.content,realPerson:snap.persona.reviewStatus!=='synthetic',language:snap.replyLanguage,level:snap.level,previousAssistantText:snap.previousAssistantText,seed:turn.id});
       const replyGuard:ChatReply['replyGuard']=guarded?{revision:REPLY_GUARD_REVISION,action:guarded.edited?'edited':'replaced',reason:guarded.reason}:{revision:REPLY_GUARD_REVISION,action:'none'};
       if(guarded?.edited)return {replyGuard,output:{...candidate,content:guarded.content,limitations:[...candidate.limitations,`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}};
       return {replyGuard,output:guarded?{status:'out_of_scope',content:guarded.content,claims:[],evidence:[],grounding:'unverified_model',limitations:[`REPLY_GUARD_${guarded.reason.toUpperCase()}`]}:candidate};
@@ -424,7 +447,7 @@ export class ChatService {
       .addNode('retrieve',stage('retrieve',async frame=>{
         const snap=frame.snapshot!,intent=frame.intent!;
         const fixed=(key:'rule_refusal'|'clarification'|'ambiguous_reference'|'event_timezone')=>snap.cardPath
-          ?voiceText(({rule_refusal:'decline',clarification:'clarification',ambiguous_reference:'ambiguous_reference',event_timezone:'event_timezone'} as const satisfies Record<string,VoiceTextKey>)[key],snap.replyLanguage,snap.level):replyText(key,session.language);
+          ?voiceText(({rule_refusal:'decline',clarification:'clarification',ambiguous_reference:'ambiguous_reference',event_timezone:'event_timezone'} as const satisfies Record<string,VoiceTextKey>)[key],snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id):replyText(key,session.language);
         if(frame.output)return frame;
         if(intent==='clarification'||intent==='unsupported')return {...frame,output:{status:intent==='clarification'?'needs_clarification':'out_of_scope',content:intent==='clarification'?fixed('clarification'):frame.safetyCategory?safetyReply(frame.safetyCategory,snap.replyLanguage):fixed('rule_refusal'),claims:[],evidence:[],limitations:frame.safetyCategory==='self_harm'?['SAFETY_SUPPORT']:[]}};
         if(intent==='timeline'&&session.retrievalMode!=='off'&&snap.ambiguous)return {...frame,memoryTrace:{...frame.memoryTrace!,action:'clarify'},output:{status:'needs_clarification',content:fixed('ambiguous_reference'),claims:[],evidence:[],limitations:['AMBIGUOUS_SOURCE_REFERENCE']}};
@@ -445,17 +468,17 @@ export class ChatService {
         const snap=frame.snapshot!,result=frame.rawReply!,memorySources=frame.memorySources;let output:TurnOutput;let agent:ChatReply['agent'],promptEvidence:ChatReply['promptEvidence'];
         if(frame.agentRun) {
           agent=structuredClone(frame.agentRun.agent);
-          output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),snap.replyLanguage,snap.level);
+          output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition??(session.retrievalMode==='off'?'off':'caption'),snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id);
           if(!session.ragCondition&&frame.intent==='timeline')output=validateSourceBoundReply(result,memorySources,session.personId);
           if(!session.ragCondition&&frame.intent==='small_talk'&&containsUngroundedBiography(output.content))output={status:'insufficient_evidence',content:replyText('biography_guard',session.language),claims:[],evidence:[],limitations:['BIOGRAPHY_HEURISTIC_GUARD']};
           agent.steps.push({phase:'validation',iteration:agent.modelCalls-1});
-          if(this.options.agentValidator&&(output.status==='answered'||output.limitations.includes('INVALID_MODEL_EVIDENCE')&&output.content!==voiceText('fallback',snap.replyLanguage,snap.level))) {
+          if(this.options.agentValidator&&(output.status==='answered'||output.limitations.includes('INVALID_MODEL_EVIDENCE')&&output.content!==voiceText('service_retry',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id))) {
             if(agent.toolCalls)agent.validator='skipped_tool_followup';else {
               agent.validator=await validateAgent({...frame,output});
-              if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:voiceText('fallback',snap.replyLanguage,snap.level),claims:[],evidence:[],grounding:'unverified_model',limitations:[...output.limitations.filter(code=>/^[A-Z_]+$/.test(code)),`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
+              if(agent.validator!=='accepted')output={status:'insufficient_evidence',content:voiceText('service_retry',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),claims:[],evidence:[],grounding:'unverified_model',limitations:[...output.limitations.filter(code=>/^[A-Z_]+$/.test(code)),`AGENT_VALIDATOR_${agent.validator.toUpperCase()}`]};
             }
           }
-        } else if(session.ragCondition)output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition,snap.replyLanguage,snap.level);
+        } else if(session.ragCondition)output=validateExperimentReply(result,memorySources,session.personId,session.ragCondition,snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id);
         else if(frame.intent==='timeline')output=validateSourceBoundReply(result,frame.sources,session.personId);
         else {
           const safe=result.trim();if(!safe||safe.length>8000||containsCredentialPattern(safe))throw new CoreError('TURN_FAILED','REPLY_REJECTED');
@@ -463,6 +486,13 @@ export class ChatService {
         }
         const context=frame.agentRun?.context??frame.experiment;
         if(context)promptEvidence={sourceIds:context.sources.map(source=>source.id),annotationIds:context.sources.flatMap(source=>source.imageAnnotations?.map(annotation=>annotation.id)??[]),omittedAnnotations:context.omittedAnnotations,promptBytes:Buffer.byteLength(JSON.stringify(context.messages),'utf8'),...(context.omittedSourceIds.length?{omittedSourceIds:context.omittedSourceIds}:{})};
+        if(shouldAskBack(frame.intent,session.ragCondition,value.text,output.evidence)
+          &&!frame.agentRun?.serviceLimitation&&!output.limitations.some(code=>code.startsWith('AGENT_VALIDATOR_'))
+          &&!isVoiceText('service_retry',output.content)) {
+          const broaden=askBackStreak(snap.promptHistory)>=2;
+          output={status:'needs_clarification',content:voiceText(broaden?'memory_topic_broaden':'memory_ask_back',snap.replyLanguage,snap.level,snap.previousAssistantText,turn.id),
+            claims:[],evidence:[],grounding:'unverified_model',limitations:[broaden?'MEMORY_TOPIC_BROADEN':'MEMORY_ASK_BACK']};
+        }
         return {...frame,output,agent,promptEvidence};
       }))
       .addNode('output_guard',stage('output_guard',async frame=>{

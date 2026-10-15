@@ -204,7 +204,7 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
   test('revisions: agent v13 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
   test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with pinned rewordings plus the origin rule are the only change from v4/v7',async()=>{

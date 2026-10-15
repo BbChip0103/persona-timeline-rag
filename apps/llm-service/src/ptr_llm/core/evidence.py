@@ -303,10 +303,12 @@ def _bind(selections, sources, person_id, condition, canonicalize):
     return (refs, evidence, canonicalized)
 
 
-def validate_experiment_reply(raw, sources, person_id, condition, language="ko", level="polite"):
+def validate_experiment_reply(
+    raw, sources, person_id, condition, language="ko", level="polite", previous="", seed=None
+):
     fallback = {
         "status": "insufficient_evidence",
-        "content": voice_text("fallback", language, level),
+        "content": voice_text("service_retry", language, level, previous, seed),
         "claims": [],
         "evidence": [],
         "grounding": "unverified_model",

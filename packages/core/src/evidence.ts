@@ -100,14 +100,14 @@ function formattedQuote(text:string,quote:string):{start:number;end:number;quote
  * gets the persona-voice fallback, also when its citations are valid (they stay in `evidence`/`claims`). INVALID_MODEL_EVIDENCE
  * stays in the limitations (metadata).
  */
-export function validateExperimentReply(raw:string,sources:SourcePost[],personId:string,condition:'off'|'caption'|'caption_image',language='ko',level:SpeechLevel='polite'):Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'> {
-  const fallbackText=voiceText('fallback',language,level);
-  const fallback={status:'insufficient_evidence' as const,content:fallbackText,claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked',language)]};
+export function validateExperimentReply(raw:string,sources:SourcePost[],personId:string,condition:'off'|'caption'|'caption_image',language='ko',level:SpeechLevel='polite',previousAssistantText?:string,seed?:string):Pick<ChatReply,'status'|'content'|'claims'|'evidence'|'limitations'|'grounding'> {
+  const retryText=voiceText('service_retry',language,level,previousAssistantText,seed);
+  const fallback={status:'insufficient_evidence' as const,content:retryText,claims:[],evidence:[],grounding:'unverified_model' as const,limitations:['INVALID_MODEL_EVIDENCE',replyText('limitation_semantic_unchecked',language)]};
   let result:z.infer<typeof ExperimentModelReplySchema>;
   try { result=ExperimentModelReplySchema.parse(JSON.parse(raw)); } catch { return fallback; }
   if(containsCredentialPattern(result.answer) || containsInternalPathPattern(result.answer) || result.answer.length>8000) throw new CoreError('TURN_FAILED','REPLY_REJECTED');
   const answer=result.answer.trim();
-  const unverified={...fallback,content:answer||fallbackText,limitations:[...(condition==='off'?['RETRIEVAL_OFF']:[]),'INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language),replyText('limitation_semantic_unchecked',language)]};
+  const unverified={...fallback,content:answer||retryText,limitations:[...(condition==='off'?['RETRIEVAL_OFF']:[]),'INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model',language),replyText('limitation_semantic_unchecked',language)]};
   if(condition==='off' && result.evidenceRefs.length) return unverified;
   const evidence:ChatReply['evidence']=[];
   const refs:EvidenceRef[]=[];
@@ -135,7 +135,7 @@ export function validateExperimentReply(raw:string,sources:SourcePost[],personId
   // Verified claims refer only to exact source text, never to the generated answer's entailment.
   const claims=refs.map(ref=>({text:`${replyText(ref.annotationId?'claim_image_annotation':'claim_caption',language)}: ${ref.quote}`,evidenceRefs:[ref]}));
   // An empty answer never shows the claim lines ("캡션 원문: …"): they stay metadata (review M2).
-  const content=answer || fallbackText;
+  const content=answer || retryText;
   return {status:answer?result.status:'insufficient_evidence',content,claims,evidence,grounding:evidence.length?'source_bound_quotes':'unverified_model',limitations:[
     ...(condition==='off'?['RETRIEVAL_OFF']:[]),
     ...(canonicalized?['QUOTE_WHITESPACE_CANONICALIZED']:[]),

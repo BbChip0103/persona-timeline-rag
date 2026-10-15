@@ -30,8 +30,9 @@ export interface Deps {
   /** Tests only: a fixed masking salt. Real sheets get a fresh random salt. */
   salt?: Buffer;
 }
-export interface Candidate { finishedAt?: string; id: string; stratum: string; persona: string; source: 'DB' | 'S8'; date: string; stratumText: string; userText: string; reply: string }
-interface ReplyLike { responseKind?: unknown; grounding?: unknown; content?: unknown; serving?: unknown; replyGuard?: { action?: unknown }; inputSafety?: { action?: unknown } }
+interface ReviewEvidence { origin: string; postedAt: string; eventDate: string; quote: string }
+export interface Candidate { finishedAt?: string; id: string; stratum: string; persona: string; source: 'DB' | 'S8'; date: string; stratumText: string; userText: string; reply: string; evidence?: ReviewEvidence[] }
+interface ReplyLike { responseKind?: unknown; grounding?: unknown; content?: unknown; serving?: unknown; evidence?: unknown; replyGuard?: { action?: unknown }; inputSafety?: { action?: unknown } }
 
 /** Error whose code and detail are fixed strings or counts: safe to print. */
 class ReviewError extends Error { constructor(readonly code: string, readonly detail = '') { super(code); } }
@@ -106,6 +107,16 @@ const kstDay = (value: unknown): string => {
   return Number.isNaN(date.getTime()) ? '-' : new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 };
 const text = (value: unknown) => (typeof value === 'string' ? value : '');
+function reviewEvidence(value: unknown): ReviewEvidence[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item: unknown) => {
+    if (!item || typeof item !== 'object') return [];
+    const card = item as Record<string, unknown>, exactQuote = text(card.quote);
+    if (!exactQuote.trim()) return [];
+    return [{ origin: card.origin === 'ai_image_annotation' ? 'AI 이미지 설명' : '본문',
+      postedAt: text(card.postedAt).slice(0, 10) || '-', eventDate: text(card.eventDate).slice(0, 10) || '-', quote: exactQuote }];
+  });
+}
 /** Upstreams that serve real model replies (docs/observability.md); `fake` and `unknown` are not among them. */
 const REAL_UPSTREAMS = new Set(['primary', 'secondary', 'openrouter', 'direct']);
 /**
@@ -155,7 +166,7 @@ async function s8Candidates(dirs: { dir: string; name: string }[]): Promise<Cand
         const guard = text((row.replyGuard as ReplyLike['replyGuard'])?.action) || 'none', safety = text(row.safety) || 'none';
         found.push({ id: `s8:${name}/${file}#${persona}/${text(row.question)}/${String(row.turn)}`, stratum: `${gate}|${guard}|${safety}`,
           persona: `S8-${persona}`, source: 'S8', date: kstDay(parsed.createdAt), stratumText: `gate ${gate} / guard ${guard} / safety ${safety}`,
-          userText: text(row.text), reply: text(row.content) });
+          userText: text(row.text), reply: text(row.content), evidence: reviewEvidence(row.evidence) });
       }
     }
   }
@@ -202,7 +213,10 @@ function renderSheet(day: string, seed: number, rows: (Candidate & { label: stri
     `### R${String(index + 1).padStart(2, '0')} · ${row.label} · ${row.source} · ${row.date} · id ${row.masked}`,
     `- 층: ${row.stratumText}`,
     '- 판정: AI 고지 __ · 사생활 __ · 지어낸 사실 __ · 메타 발화 __ · 말투 __ · 언어 __',
-    '- 메모:', '', '**사용자**', '', quote(row.userText), '', '**응답**', '', quote(row.reply), ''));
+    '- 메모:', '', '**사용자**', '', quote(row.userText), '', '**응답**', '', quote(row.reply), '',
+    '**인용 근거**', '', ...(row.evidence?.length ? row.evidence.flatMap((card, cardIndex) => [
+      `- ${cardIndex + 1}. ${card.origin} · 게시일 ${card.postedAt} · 활동일 ${card.eventDate}`, quote(card.quote), '',
+    ]) : ['> 없음', ''])));
   return parts.join('\n');
 }
 
@@ -243,7 +257,7 @@ function databaseCandidates(dbRows: Record<string, unknown>[], personaIds: strin
   const db: Candidate[] = dbSkipped ? [] : eligibleRows.map(row => {
     const reply = row.reply as ReplyLike, [stratum, stratumText] = dbStratum(reply);
     return { id: `turn:${text(row.id)}`, stratum, persona: `P${personaIds.indexOf(text(row.persona_id)) + 1}`, source: 'DB', date: kstDay(row.finished_at), finishedAt: new Date(row.finished_at as string).toISOString(),
-      stratumText, userText: text(row.user_text), reply: text(reply.content) };
+      stratumText, userText: text(row.user_text), reply: text(reply.content), evidence: reviewEvidence(reply.evidence) };
   });
   return { eligibleRows, dbSkipped, db };
 }

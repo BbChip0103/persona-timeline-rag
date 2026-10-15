@@ -176,8 +176,8 @@ describe('turnId correlation through the real local OpenAI-compatible transport'
     expect(finished.turnId).toBe(turn.id);expect(requests).toBe(1);
     const done=await chat.getTurn('lt-obs',turn.id);
     expect(done.reply?.serving).toEqual({calls:1,upstreams:['local'],secondaryCalls:0});
-    expect(publicTurn(done).reply).not.toHaveProperty('serving');
-    expect(JSON.stringify(publicTurn(done))).not.toContain('serving');
+    expect(publicTurn(done,'web').reply).not.toHaveProperty('serving');
+    expect(JSON.stringify(publicTurn(done,'web'))).not.toContain('serving');
     expect(workerLines.join('')).not.toContain('SENTINEL');
     expect(value(await observed.render(),'ptr_model_calls_total',{upstream_kind:'local'})).toBe(1);
   });

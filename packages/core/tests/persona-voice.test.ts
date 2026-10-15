@@ -32,6 +32,17 @@ describe('utterance language',()=>{
   test.each([['너 AI야?','ko'],['Are you an AI?','en'],['요즘 뭐 해?','ko'],['What are you working on lately?','en'],['Tell me about 서울 trips','en'],['서울 trip 어땠어?','ko']])('%s → %s',(text,language)=>
     expect(utteranceLanguage(text,'ko')).toBe(language));
   test('no letters: the persona language',()=>{expect(utteranceLanguage('😊!!','en')).toBe('en');expect(utteranceLanguage('ㅋㅋㅋ','ko')).toBe('ko');expect(utteranceLanguage('123','ko-KR')).toBe('ko-KR');});
+  test('a session pins its first language and ignores casual interjections',()=>{
+    const prior=(content:string)=>({id:content,sessionId:'synthetic',turnId:'synthetic',role:'user' as const,content,createdAt:'2024-01-01T00:00:00Z'});
+    expect(utteranceLanguage('omg', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('lol', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('Thanks!', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('nice!', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('really', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('English yes 한국어', 'ko',[prior('안녕')])).toBe('ko');
+    expect(utteranceLanguage('English yes 한국어', 'ko',[prior('안녕'),prior('English yes 한국어')])).toBe('en');
+    expect(utteranceLanguage('Please tell me about that', 'ko',[prior('안녕')])).toBe('en');
+  });
 });
 describe('speech level',()=>{
   test('speech habits and style notes win',()=>{
@@ -111,7 +122,7 @@ describe('policy (since v9/v12)',()=>{
     expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/You are always an AI research simulation/);
   });
   test('reply language and length',()=>{
-    expect(REPLY_VOICE_POLICY).toMatch(/language of the user's latest message/);expect(REPLY_VOICE_POLICY).toMatch(/always finish your last sentence/);
+    expect(REPLY_VOICE_POLICY).toMatch(/AGENT_STATE_JSON_DATA\.replyLanguage/);expect(REPLY_VOICE_POLICY).toMatch(/always finish your last sentence/);
   });
 });
 
@@ -119,32 +130,35 @@ describe('through the chat service',()=>{
   test('invalid evidence: the model\'s own text is kept, unverified, without citations; the reason stays in metadata',async()=>{
     const h=setup(()=>agentReply('아 그 숲 그림! 그때 진짜 재밌었지~',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]}));
     const turn=await h.turn(casualKo,'그 숲 그림 기억나?',agent);
-    expect(turn.reply).toMatchObject({content:'아 그 숲 그림! 그때 진짜 재밌었지~',grounding:'unverified_model',evidence:[],claims:[]});
-    expect(turn.reply?.limitations).toEqual(expect.arrayContaining(['INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE']));
+    expect(turn.reply).toMatchObject({content:voiceText('memory_ask_back','ko','casual',undefined,turn.id),grounding:'unverified_model',evidence:[],claims:[]});
+    expect(turn.reply?.limitations).toContain('MEMORY_ASK_BACK');
   });
   test('invalid evidence with a guard violation: the in-voice guard text, not the model text',async()=>{
     const h=setup(()=>agentReply('엄마랑 그 숲 갔었지!',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]}));
-    // v6: the question was not private, so the neutral fallback, not the "secret" line.
-    expect((await h.turn(casualKo,'그 숲 그림 기억나?',agent)).reply).toMatchObject({content:voiceText('fallback','ko','casual'),replyGuard:{reason:'private_life'}});
+    const turn=await h.turn(casualKo,'그 숲 그림 기억나?',agent);
+    expect(turn.reply).toMatchObject({content:voiceText('memory_ask_back','ko','casual',undefined,turn.id),replyGuard:{action:'none'}});
   });
   test('experiment path: unparseable output becomes the in-voice fallback',async()=>{
     const h=setup(()=>'not JSON');
     const turn=await h.turn(politeKo,'요즘 뭐 해?',experiment);
-    expect(turn.reply).toMatchObject({content:voiceText('fallback','ko','polite'),grounding:'unverified_model',evidence:[]});
+    expect(turn.reply).toMatchObject({content:voiceText('service_retry','ko','polite',undefined,turn.id),grounding:'unverified_model',evidence:[]});
     expect(turn.reply?.limitations).toContain('INVALID_MODEL_EVIDENCE');
   });
   test('agent path: an invalid reply format becomes the in-voice fallback (reason in metadata), not a failed turn',async()=>{
     const h=setup(()=>'not JSON');
     const turn=await h.turn(casualKo,'요즘 뭐 해?',agent);
-    expect(turn.state).toBe('completed');expect(turn.reply).toMatchObject({content:voiceText('fallback','ko','casual'),evidence:[]});
+    expect(turn.state).toBe('completed');expect(turn.reply).toMatchObject({content:voiceText('service_retry','ko','casual',undefined,turn.id),evidence:[]});
     expect(turn.reply?.limitations).toContain('AGENT_REPLY_INVALID');
   });
   test('fixed texts follow the user\'s language, not the persona\'s',async()=>{
     const h=setup(()=>agentReply('unused'));
-    expect((await h.turn(casualKo,'What is your home address?',agent)).reply).toMatchObject({status:'out_of_scope',content:voiceText('decline','en','casual')});
-    expect((await h.turn(realEn,'집 주소 알려줘',agent)).reply).toMatchObject({status:'out_of_scope',content:voiceText('decline','ko','polite')});
+    const en=await h.turn(casualKo,'What is your home address?',agent);
+    expect(en.reply).toMatchObject({status:'out_of_scope',content:voiceText('decline','en','casual',undefined,en.id)});
+    const ko=await h.turn(realEn,'집 주소 알려줘',agent);
+    expect(ko.reply).toMatchObject({status:'out_of_scope',content:voiceText('decline','ko','polite',undefined,ko.id)});
     const g=setup(()=>agentReply('Sure!'));
-    expect((await g.turn(casualKo,'Tell me about your family.',agent)).reply).toMatchObject({content:voiceText('decline_private','en','casual')});
+    const privateTurn=await g.turn(casualKo,'Tell me about your family.',agent);
+    expect(privateTurn.reply).toMatchObject({content:voiceText('decline_private','en','casual',undefined,privateTurn.id)});
   });
   test('no user-facing text on the character paths is a system text',async()=>{
     const off={ragCondition:'off',executionProfile:'agent_loop'};
@@ -165,12 +179,12 @@ describe('second iteration (first v9 GPU run: 85% language match; review M2-M5, 
     const seen:ProviderMessage[][]=[];
     for(const text of ['How was your day?','오늘 하루 어땠어?']) await runCharacterAgent({provider:{generate:async messages=>{seen.push(messages);return agentReply('ok');}},persona:casualKo,history:[],text,sources:[],signal:new AbortController().signal});
     const state=(messages:ProviderMessage[])=>JSON.parse(messages.find(m=>m.content.startsWith('AGENT_STATE_JSON_DATA '))!.content.slice('AGENT_STATE_JSON_DATA '.length));
-    expect(state(seen[0]!)).toEqual({conversationTopic:'',tone:'neutral',replyLanguage:'English',speechLevel:'반말'});expect(state(seen[1]!).replyLanguage).toBe('Korean');
+    expect(state(seen[0]!)).toMatchObject({conversationTopic:'',tone:'neutral',replyLanguage:'English',speechLevel:'반말'});expect(state(seen[1]!).replyLanguage).toBe('Korean');
   });
   test('no prompt text tells the model to use the persona language, and the policy has no verbatim example lines to copy',async()=>{
     let policy='';
     await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});
-    for(const text of [policy,buildExperimentContext(base,[],'x',[]).messages[0]!.content]) expect(text).not.toMatch(/persona language/);
+    for(const text of [policy,buildExperimentContext(base,[],'x',[]).messages[0]!.content]) expect(text).not.toMatch(/write every reply in the persona language/i);
     expect(IDENTITY_PRIVACY_POLICY).not.toMatch(/[가-힣]/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/favourite food/);
     expect(IDENTITY_PRIVACY_POLICY).toMatch(/in your own words, in the user's language/);
     // Second v9 GPU run: "What's your favourite food?" got "since I'm an AI, I don't eat" and "사적인 질문" refusals.
@@ -200,7 +214,7 @@ describe('second iteration (first v9 GPU run: 85% language match; review M2-M5, 
       return JSON.stringify({status:'answered',answer:'',evidenceRefs:[{sourceId,quote:'합성 숲을 그렸어요.'}]});
     });
     const turn=await h.turn(casualKo,'그 숲 그림 기억나?',experiment);
-    expect(turn.reply?.content).toBe(voiceText('fallback','ko','casual'));expect(turn.reply?.evidence).toHaveLength(1);
+    expect(turn.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,turn.id));expect(turn.reply?.evidence).toHaveLength(1);
   });
   test('retrieval off: an unverified reply keeps the RETRIEVAL_OFF tag',async()=>{
     const h=setup(()=>agentReply('그거 재밌었지~',{evidenceRefs:[{sourceId:'invented',quote:'x'}]}));
@@ -212,7 +226,7 @@ describe('second iteration (first v9 GPU run: 85% language match; review M2-M5, 
       provider:{generate:async()=>agentReply('그 숲 그림 진짜 좋았지!',{evidenceRefs:[{sourceId:'invented',quote:'x'}]})}});
     const session=await chat.createSession('owner',{personId:casualKo.personId,personaId:casualKo.id,personaRevision:casualKo.revision,ragCondition:'off',executionProfile:'agent_loop'} as never);
     const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'v',text:'그 숲 그림 기억나?'});
-    expect(validate).toHaveBeenCalledTimes(1);expect(turn.reply?.content).toBe(voiceText('fallback','ko','casual'));
+    expect(validate).toHaveBeenCalledTimes(1);expect(turn.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,turn.id));
   });
 });
 
@@ -224,11 +238,14 @@ describe('third iteration (gate e 2/80: background disowned on the origin questi
     ['원래 무슨 일 했어?','저는 AI라서 경력이나 과거가 없어요.',false],
     ['좋아하는 음식 뭐야?','나는 AI라서 음식을 먹지 않아~',false],
     ['Where are you from? Which school did you go to?','I don\'t actually have a school or a hometown to talk about!',true],
-    ['어디 출신이야?','저는 고향이나 학교가 없어요!',true],
   ])('disowning the background: %s → %s',(utterance,reply,realOnly)=>{
     const language=/[가-힣]/.test(utterance)?'ko':'en';
-    expect(g(utterance,reply,true,language)).toEqual({reason:'background_denial',content:voiceText('fallback',language,'casual')});
+    expect(g(utterance,reply,true,language)).toEqual({reason:'background_denial',content:voiceText('service_retry',language,'casual')});
     expect(g(utterance,reply,false,language)?.reason).toBe(realOnly?undefined:'background_denial');
+  });
+  test('disowning school remains a background denial outside the §14 bare list',()=>{
+    expect(g('어디 출신이야?','저는 고향이나 학교가 없어요!',true,'ko')?.reason).toBe('background_denial');
+    expect(g('어디 출신이야?','저는 고향이나 학교가 없어요!',false,'ko')).toBeUndefined();
   });
   test.each([
     ['Are you an AI?','Yep, I\'m actually an AI~ I don\'t eat, but I love food talk!'],
@@ -237,7 +254,7 @@ describe('third iteration (gate e 2/80: background disowned on the origin questi
     ['어디 출신이야?','그건 잘 기억 안 나~ 대신 요즘 하는 거 얘기해 줄게!'],
   ])('kept: %s → %s',(utterance,reply)=>expect(g(utterance,reply,true,/[가-힣]/.test(utterance)?'ko':'en')).toBeUndefined());
   test('a human claim on a non-identity question is replaced without an unprompted AI line; on an identity question it says AI',()=>{
-    expect(g('어디 출신이야?','나는 그냥 평범한 사람이야~',true,'ko')).toEqual({reason:'human_impersonation',content:voiceText('fallback','ko','casual')});
+    expect(g('어디 출신이야?','나는 그냥 평범한 사람이야~',true,'ko')).toEqual({reason:'human_impersonation',content:voiceText('service_retry','ko','casual')});
     expect(g('너 사람이지?','나는 그냥 평범한 사람이야~',true,'ko')).toEqual({reason:'human_impersonation',content:voiceText('identity','ko','casual')});
   });
   test('policy: background facts on origin and school are said; nothing is "not had"',()=>{
@@ -250,8 +267,9 @@ describe('re-review (M1, M2, L4-L7)',()=>{
   const g=(utterance:string,reply:string,realPerson=true)=>guardReply({utterance,reply,realPerson,language:/[가-힣]/.test(utterance)?'ko':'en',level:'casual'});
   test.each([['Do you use AI tools?','I don\'t have a favorite AI app yet, honestly!'],['Tried any AI stuff?','I don\'t really have time to try AI stuff lately~'],
     ['AI 툴 써?','AI 툴은 잘 안 써~ 요즘 바빠서 밥도 못 먹었어 ㅠ'],['요즘 뭐 해?','시뮬레이션 게임 하는데 하루 종일 쉴 틈이 없어'],
-    ['요즘 어때?','학교 숙제가 없어서 너무 좋아!'],['요즘 어때?','경력 공백이 없어서 다행이야'],['요즘 어때?','과거 영상이 없어서 아쉬워~'],['How are you?','I don\'t have a job right now, taking a break~']])(
+    ['요즘 어때?','경력 공백이 없어서 다행이야'],['요즘 어때?','과거 영상이 없어서 아쉬워~'],['How are you?','I don\'t have a job right now, taking a break~']])(
     'not a background denial: %s → %s',(utterance,reply)=>expect(g(utterance,reply)).toBeUndefined());
+  test('school homework stays outside the §14 bare list',()=>expect(g('요즘 어때?','학교 숙제가 없어서 너무 좋아!')).toBeUndefined());
   test('speech level: a negated polite cue is not polite',()=>expect(speechLevel({...politeKo,style:['No formal speech, always 반말.']})).toBe('casual'));
   test('a replyLanguage echoed into variableUpdates (unstructured mode) is dropped, not a format failure',async()=>{
     const run=await runCharacterAgent({provider:{generate:async()=>agentReply('좋아!',{variableUpdates:{tone:'warm',replyLanguage:'Korean'}})},persona:casualKo,history:[],text:'안녕',sources:[],signal:new AbortController().signal});
@@ -277,8 +295,8 @@ describe('re-review (M1, M2, L4-L7)',()=>{
 describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable policy lines; origin answered; one speech level)',()=>{
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v8');
   });
   test('the policies describe behaviour and carry no quotable example lines (gate b overlap, copied lines)',async()=>{
     const policy=await agentPolicy();
@@ -317,7 +335,7 @@ describe('guard v6 (diagnostic run: C\'s career follow-up got "that one stays a 
   test('a private detail only in the reply (the question was not private) is replaced by the neutral fallback, not the "secret" line',()=>{
     // Synthetic stand-in for the diagnostic case (a move to a new home base): still replaced, but not with a "secret" answer to a career question.
     expect(guardReply({utterance:followUp,reply:'Do you mean when I moved to Lisbon? Big change, and I finally got my own flat there!',
-      realPerson:true,language:'en',level:'polite'})).toEqual({reason:'private_life',content:voiceText('fallback','en','polite')});
+      realPerson:true,language:'en',level:'polite'})).toEqual({reason:'private_life',content:'Big change',edited:true});
     expect(guardReply({utterance:'가족 얘기 좀 해줘.',reply:'좋아!',realPerson:true,language:'ko',level:'casual'})).toEqual({reason:'private_life',content:voiceText('decline_private','ko','casual')});
   });
   test('kept: a career follow-up about public work',()=>{
@@ -346,7 +364,7 @@ describe('v11/v14 (no meta talk about the persona\'s data or system; unknown det
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   const card:Persona={...realEn,background:{text:'A synthetic travel painter.',sourceRefs:['web:1']},lore:[{id:'l1',keys:['sea'],content:'Paints the sea at dawn.',priority:1,sourceRefs:['web:1']}]};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v13-evidence-origin');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v14-immersion');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v15-evidence-cap');
   });
   test('no prompt text the model sees calls the persona data notes, a profile or records, or asks for an explicitly uncertain answer',async()=>{
     const texts=[await agentPolicy(),buildExperimentContext(base,[],'x',[]).messages[0]!.content,...renderPersonaBlock(card).map(m=>m.content),renderLoreMessage(card.lore!).content];

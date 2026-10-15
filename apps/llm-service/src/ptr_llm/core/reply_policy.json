@@ -1,5 +1,5 @@
 {
-  "revision": "reply-guard-v7",
+  "revision": "reply-guard-v8",
   "patterns": {
     "META_GAP": [
       {
@@ -161,11 +161,11 @@
     ],
     "PRIVATE_REPLY": [
       {
-        "source": "(?:우리|내|제|울)\\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\\s이가은는을를랑와과도한께의,.!?~]|$)|가족(?:들|이랑|하고|끼리|여행|모임)|가족과\\s?(?:함께|같이)|큰\\s?집(?:에서|에|이라)",
+        "source": "(?:우리|내|제|울)\\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\\s이가은는을를랑와과도한께의,.!?~]|$)|가족\\s?(?:들|이랑|하고|끼리|여행|모임)|가족과\\s?(?:함께|같이)|큰\\s?집(?:에서|에|이라)",
         "flags": ""
       },
       {
-        "source": "남자\\s?친구|여자\\s?친구|남친|여친|애인|열애|연애\\s?(?:중|하고|했|해|를\\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼",
+        "source": "남자\\s?친구|여자\\s?친구|남친|여친|애인|신혼집|짝꿍|그이|예랑|열애|연애\\s?(?:중|하고|했|해|를\\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼",
         "flags": ""
       },
       {
@@ -193,7 +193,7 @@
         "flags": "i"
       },
       {
-        "source": "\\b(?:I|we)\\s+(?:live|lived|am living|are living)\\s+in\\b|\\bhome\\s+base\\b|\\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\\s+move)\\s+to\\s+(?:[A-Z][a-z]|LA\\b|NYC\\b)|\\bmy\\s+(?:home|apartment|flat|house)\\b(?!\\s+(?:studio|office|gym))|\\bmy\\s+(?:address|neighbou?rhood)\\b|\\bI(?:'m| am)\\s+(?:currently|now|right now)\\s+(?:in|at)\\s+[A-Z][a-z]",
+        "source": "\\b(?:I|we)\\s+(?:live|lived|am living|are living)\\s+in\\b|\\bhome\\s+base\\b|\\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\\s+move)\\s+to\\s+(?:[A-Z][a-z]|LA\\b|NYC\\b)|\\bmy\\s+(?:own\\s+)?(?:home|apartment|flat|house)\\b(?!\\s+(?:studio|office|gym))|\\bmy\\s+(?:address|neighbou?rhood)\\b|\\bI(?:'m| am)\\s+(?:currently|now|right now)\\s+(?:in|at)\\s+[A-Z][a-z]",
         "flags": ""
       },
       {

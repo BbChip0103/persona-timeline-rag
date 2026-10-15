@@ -4,7 +4,7 @@ import { SseStream } from '@nestjs/core/router/sse-stream';
 import { EMPTY, Observable, Subject, Subscription, catchError, concatMap, firstValueFrom, from, fromEvent, interval, take, timeout, timer } from 'rxjs';
 import type { ChatTurn } from '@ptr/contracts';
 import type {TurnEventSource} from '../../../packages/core/src/ports';
-import { publicTurn } from './public-turn';
+import { publicTurn, type OwnerSpace } from './public-turn';
 
 export interface TurnReader {getTurn(ownerId:string,id:string):Promise<ChatTurn>}
 
@@ -41,7 +41,7 @@ export class ExactTurnSseStream extends SseStream {
  * Two store reads per normal turn instead of one per client poll. If the subscription fails or is slow (Redis
  * trouble), the stream degrades to frequent store re-checks instead of failing.
  */
-export async function streamTurn(chat:TurnReader,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions):Promise<void> {
+export async function streamTurn(chat:TurnReader,events:TurnEventSource,ownerId:string,turnId:string,request:Request,response:Response,options:SseOptions,space:OwnerSpace):Promise<void> {
   let finished=false;let lastRank=-1;let checking:Promise<void>|undefined;let again=false;
   const clocks=new Subscription(),lifetime=new Subscription();
   const frames=new Subject<TurnFrame>();
@@ -70,7 +70,7 @@ export async function streamTurn(chat:TurnReader,events:TurnEventSource,ownerId:
     if(checking){again=true;return checking;} // a newer notice arrived mid-read: read again afterwards
     checking=chat.getTurn(ownerId,turnId).then(turn=>{
       if(finished)return;
-      if(ended(turn.state)){send('turn',publicTurn(turn));finish();}
+      if(ended(turn.state)){send('turn',publicTurn(turn,space));finish();}
       else forward(turn.state);
     }).catch(()=>finish()).finally(()=>{checking=undefined;if(again&&!finished){again=false;void sync();}});
     return checking;
@@ -107,7 +107,7 @@ export async function streamTurn(chat:TurnReader,events:TurnEventSource,ownerId:
   lifetime.add(timer(options.maxMs).subscribe(hardStop));
   const snapshot=await chat.getTurn(ownerId,turnId).catch(()=>undefined);
   if(!snapshot||finished){finish();return;}
-  lastRank=RANK[snapshot.state];send('turn',publicTurn(snapshot));started=true;
+  lastRank=RANK[snapshot.state];send('turn',publicTurn(snapshot,space));started=true;
   if(ended(snapshot.state)){finish();return;}
   if(endedEarly) void sync();
   clocks.add(interval(subscribed?options.recheckMs:Math.min(options.recheckMs,1000)).subscribe(()=>void sync()));

@@ -49,7 +49,7 @@ test('health safe; authentication required and invalid owner rejected',async()=>
   expect((await call('health',{auth:'bad'})).body).toEqual({ok:true,service:'persona-timeline-rag',liveEnabled:false,checks:{database:'ok',redis:'ok'}});
   expect((await call('personas',{auth:'Bearer wrong'})).status).toBe(403);
   expect((await call('personas',{owner:'../unsafe'})).status).toBe(403);
-  const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toContain('AI');expect(listed.body.personas[0].identity).toBeUndefined();
+  const listed=await call('personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].aiDisclosure).toBe('AI 캐릭터 · 실제 인물이 아니에요');expect(listed.body.personas[0].identity).toBeUndefined();
 });
 test('authentication runs before malformed or oversized JSON parsing',async()=>{
   for(const body of ['{bad json',' '.repeat(20000)+'{}']) {
@@ -76,6 +76,22 @@ test('owner spaces: the production token takes only web owners, the harness toke
 test('the harness token must differ from the production token and pass the token length rule',async()=>{
   await expect(createApiApplication(runtime,productionToken,{syntheticToken:productionToken})).rejects.toThrow();
   await expect(createApiApplication(runtime,productionToken,{syntheticToken:'short'})).rejects.toThrow();
+});
+test('web token hides research fields in poll and replay; harness token keeps them',async()=>{
+  fixture.reply={responseKind:'timeline',grounding:'source_bound_quotes',claims:[{text:'합성 주장',evidenceRefs:[{sourceId:'source',quote:'합성 인용',start:0,end:5}]}],
+    evidence:[{sourceId:'source',personId:persona.personId,sourceUrl:'https://example.invalid/source',postedAt:'2024-01-01T00:00:00Z',eventDate:null,snapshot:'합성',hash:'hash',quote:'합성 인용'}],
+    limitations:['합성 한계'],promptEvidence:{sourceIds:['source'],annotationIds:[],omittedAnnotations:0,promptBytes:1}};
+  for(const [auth,owner,hidden] of [[`Bearer ${productionToken}`,webOwner,true],[`Bearer ${token}`,'owner_synthetic_a',false]] as const) {
+    const session=(await call('sessions',{method:'POST',auth,owner,body:{personId:persona.personId}})).body.session;
+    const input={clientRequestId:`request_${owner}`,text:'합성 질문'};
+    const submitted=await call(`sessions/${session.id}/turns`,{method:'POST',auth,owner,body:input});
+    const final=await (async()=>{for(let i=0;i<100;i++){const result=await call(`turns/${submitted.body.turn.id}`,{auth,owner});if(result.body.turn.state==='completed')return result.body.turn;await new Promise(resolve=>setTimeout(resolve,5));}throw new Error('Synthetic turn did not settle');})();
+    const replay=(await call(`sessions/${session.id}/turns`,{method:'POST',auth,owner,body:input})).body.turn;
+    for(const turn of [final,replay]) {
+      for(const field of ['evidence','limitations','grounding','claims','promptEvidence'])expect(Object.hasOwn(turn.reply??{},field)).toBe(!hidden);
+      expect(JSON.stringify(turn).includes('합성 인용')).toBe(!hidden);
+    }
+  }
 });
 test('sessions pin server persona revision, owner isolation and completed history',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});expect(created.status).toBe(201);
@@ -174,9 +190,9 @@ test('new API sessions default agent_loop; explicit legacy remains pinned; inter
 
 type SseEvent={event:string;data:{state?:string;id?:string;reply?:{content?:string};[key:string]:unknown}};
 /** Reads an SSE response to its end (or until limitMs) and parses `event:`/`data:` frames; comments are skipped. */
-async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000):Promise<{status:number;type:string|null;events:SseEvent[];closed:boolean;wire:string}> {
+async function readSse(url:string,owner='owner_synthetic_a',limitMs=3000,auth=`Bearer ${token}`):Promise<{status:number;type:string|null;events:SseEvent[];closed:boolean;wire:string}> {
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),limitMs);
-  const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`,'X-PTR-Owner':owner},signal:controller.signal});
+  const response=await fetch(url,{headers:{Authorization:auth,'X-PTR-Owner':owner},signal:controller.signal});
   const events:SseEvent[]=[];let closed=false;let text='';
   if(response.headers.get('content-type')?.startsWith('text/event-stream')) {
     const reader=response.body!.getReader();const decoder=new TextDecoder();
@@ -209,6 +225,19 @@ test('SSE: a turn streams its state changes and the final public turn, then the 
   for(const e of states) expect(Object.keys(e.data).sort()).toEqual(['state']);
   expect(JSON.stringify(events)).not.toContain('"agent"');expect(JSON.stringify(events)).not.toContain('ownerId');
 });
+test('SSE final re-read hides research fields for a live web stream',async()=>{
+  const {held}=heldSplit();Object.assign(runtime,held.runtime);
+  const session=(await call('sessions',{method:'POST',auth:`Bearer ${productionToken}`,owner:webOwner,body:{personId:persona.personId}})).body.session;
+  const sent=await call(`sessions/${session.id}/turns`,{method:'POST',auth:`Bearer ${productionToken}`,owner:webOwner,body:{clientRequestId:'live_web_stream',text:'합성 질문'}});
+  const reading=readSse(`${base}/api/turns/${sent.body.turn.id}/events`,webOwner,3000,`Bearer ${productionToken}`);
+  await new Promise(resolve=>setTimeout(resolve,50));
+  await held.complete(sent.body.turn.id,{responseKind:'timeline',grounding:'source_bound_quotes',claims:[{text:'합성 주장',evidenceRefs:[]}],evidence:[],limitations:['합성 한계'],promptEvidence:{sourceIds:['source'],annotationIds:[],omittedAnnotations:0,promptBytes:1}});
+  const stream=await reading;
+  expect(stream.status).toBe(200);expect(stream.closed).toBe(true);
+  expect(stream.events[0]!.data.state).not.toBe('completed');
+  const final=stream.events.at(-1)!;expect(final.event).toBe('turn');expect(final.data.state).toBe('completed');
+  for(const field of ['evidence','limitations','grounding','claims','promptEvidence'])expect(final.data.reply).not.toHaveProperty(field);
+});
 test('SSE: an already ended turn yields one snapshot and closes; another owner gets a plain 404',async()=>{
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   const sent=await call(`sessions/${id}/turns`,{method:'POST',body:{clientRequestId:'sse_2',text:'안녕'}});const final=await waitTurn(sent.body.turn.id);
@@ -216,6 +245,19 @@ test('SSE: an already ended turn yields one snapshot and closes; another owner g
   expect(done.closed).toBe(true);expect(done.events).toHaveLength(1);expect(done.events[0]!.data.state).toBe('completed');
   const other=await readSse(`${base}/api/turns/${final.id}/events`,'owner_synthetic_b');
   expect(other.status).toBe(404);expect(other.type).toMatch(/^application\/json/);
+});
+test('SSE snapshots use the token space projection for both web and harness',async()=>{
+  fixture.reply={responseKind:'timeline',grounding:'source_bound_quotes',claims:[{text:'합성 주장',evidenceRefs:[]}],
+    evidence:[],limitations:['합성 한계'],promptEvidence:{sourceIds:['source'],annotationIds:[],omittedAnnotations:0,promptBytes:1}};
+  for(const [auth,owner,hidden] of [[`Bearer ${productionToken}`,webOwner,true],[`Bearer ${token}`,'owner_synthetic_a',false]] as const) {
+    const session=(await call('sessions',{method:'POST',auth,owner,body:{personId:persona.personId}})).body.session;
+    const sent=await call(`sessions/${session.id}/turns`,{method:'POST',auth,owner,body:{clientRequestId:`sse_${owner}`,text:'합성 질문'}});
+    const final=await (async()=>{for(let i=0;i<100;i++){const result=await call(`turns/${sent.body.turn.id}`,{auth,owner});if(result.body.turn.state==='completed')return result.body.turn;await new Promise(resolve=>setTimeout(resolve,5));}throw new Error('Synthetic turn did not settle');})();
+    const stream=await readSse(`${base}/api/turns/${final.id}/events`,owner,3000,auth);
+    expect(stream.status).toBe(200);expect(stream.closed).toBe(true);expect(stream.events).toHaveLength(1);
+    const reply=stream.events[0]!.data.reply;
+    for(const field of ['evidence','limitations','grounding','claims','promptEvidence'])expect(Object.hasOwn(reply??{},field)).toBe(!hidden);
+  }
 });
 test('SSE: if pub/sub notices are lost, the periodic store re-check still delivers the end of the turn',async()=>{
   const {held,chat,release}=heldSplit();

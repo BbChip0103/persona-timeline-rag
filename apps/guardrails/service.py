@@ -78,6 +78,8 @@ class OutputMetadata(StrictModel):
     realPerson: bool
     language: str = Field(min_length=1, max_length=20)
     level: Literal["casual", "polite"] = "polite"
+    previousAssistantText: str = Field(default="", max_length=64000)
+    turnId: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class OutputRequest(StrictModel):

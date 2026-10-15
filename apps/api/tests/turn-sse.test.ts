@@ -53,7 +53,7 @@ test.each(['pending','completed'] as const)('maximum duration hard-stops an undr
   const turn:ChatTurn={id:'synthetic-turn',sessionId:'synthetic-session',ownerId:'synthetic-owner',clientRequestId:'synthetic-request',userText:'synthetic',sequence:1,state,createdAt:'2020-01-01T00:00:00Z'};
   const off=jest.fn();
   try {
-    await streamTurn({getTurn:async()=>turn},{subscribe:async()=>off},turn.ownerId,turn.id,{destroyed:false} as Request,response,{recheckMs:10,heartbeatMs:10,maxMs:30,subscribeTimeoutMs:10});
+    await streamTurn({getTurn:async()=>turn},{subscribe:async()=>off},turn.ownerId,turn.id,{destroyed:false} as Request,response,{recheckMs:10,heartbeatMs:10,maxMs:30,subscribeTimeoutMs:10},'web');
     await new Promise(resolve=>setTimeout(resolve,100));
     expect(off).toHaveBeenCalledTimes(1);
     expect(response.destroyed||response.writableEnded).toBe(true);

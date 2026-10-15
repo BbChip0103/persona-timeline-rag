@@ -16,18 +16,47 @@ def reply_text(key, language):
     return TEXTS[key]["ko" if is_korean(language) else "en"]
 
 
-def voice_text(key, language, level="polite"):
-    return voice(key, language, level)
+def voice_text(key, language, level="polite", previous="", seed=None):
+    return voice(key, language, level, previous, seed)
 
 
-def utterance_language(text, fallback):
+def _language_counts(text):
     words = regex.sub(r"\bhttps?://\S+|\bwww\.\S+|[@#][\p{L}\p{N}_.]+", " ", text).split()
     ko = sum(bool(js_search(r"[\uAC00-\uD7A3\u3131-\u318E]", w)) for w in words)
     en = sum(
         bool(js_search("[A-Za-z]", w)) and not bool(js_search(r"[\uAC00-\uD7A3\u3131-\u318E]", w))
         for w in words
+        if w.casefold().strip("!?.~, ") not in {"omg", "lol", "thanks"}
     )
-    return "ko" if ko and ko >= en else "en" if en else fallback
+    return ko, en, len(words)
+
+
+def utterance_language(text, fallback, history=()):
+    """Pin to the first substantive user turn; switch after two turns or 80% of one."""
+    language = fallback
+    consecutive = 0
+    prior = [m["content"] for m in history if m.get("role") == "user"]
+    for index, utterance in enumerate([*prior, text]):
+        ko, en, word_count = _language_counts(utterance)
+        if not ko and not en:
+            consecutive = 0
+            continue
+        candidate = "ko" if ko >= en else "en"
+        if index == 0:
+            language = candidate
+            consecutive = 0
+        elif (language.startswith("ko") and candidate == "ko") or (
+            language.startswith("en") and candidate == "en"
+        ):
+            consecutive = 0
+        else:
+            if word_count < 3:
+                continue
+            consecutive += 1
+            if max(ko, en) / (ko + en) >= 0.8 or consecutive >= 2:
+                language = candidate
+                consecutive = 0
+    return language
 
 
 def speech_level(persona):

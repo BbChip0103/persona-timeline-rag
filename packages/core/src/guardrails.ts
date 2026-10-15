@@ -4,7 +4,7 @@ import { SAFETY_CATEGORIES, type SafetyCategory, type SafetyProbabilities, type 
 import type { SpeechLevel } from './reply-texts';
 
 const categorySchema=z.enum(SAFETY_CATEGORIES);
-const revisionSchema=z.literal('reply-guard-v7');
+const revisionSchema=z.literal('reply-guard-v8');
 const intentSchema=z.object({label:z.enum(['timeline','small_talk']),confidence:z.number().min(0).max(1),
   probabilities:z.object({timeline:z.number().min(0).max(1),small_talk:z.number().min(0).max(1)}).strict()}).strict();
 const inputResponse=z.object({revision:revisionSchema,action:z.enum(['none','support','refuse','deflect']),
@@ -24,7 +24,7 @@ export type GuardrailsReplyResult=z.infer<typeof outputResponse>;
 export interface GuardrailsInput {
   classification?:'jev'|'rules-only';text:string;probabilities:SafetyProbabilities;thresholds:SafetyScores;categories:readonly SafetyCategory[];intent?:IntentClassification;
 }
-export interface GuardrailsReply {utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel}
+export interface GuardrailsReply {utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel;previousAssistantText?:string;turnId?:string}
 export interface GuardrailsOptions {baseUrl:string;apiKey:string;timeoutMs:number;fetch?:typeof globalThis.fetch}
 
 /** No request/response body, URL, provider error or token appears in this error. The caller must fail closed. */
@@ -57,7 +57,8 @@ export class GuardrailsClient {
   }
   async validateReply(input:GuardrailsReply,options:{signal:AbortSignal}):Promise<GuardrailsReplyResult> {
     return this.request('/validate/output',{text:input.reply,metadata:{utterance:input.utterance,realPerson:input.realPerson,
-      language:input.language,level:input.level??'polite'}},outputResponse,options.signal);
+      language:input.language,level:input.level??'polite',...(input.previousAssistantText?{previousAssistantText:input.previousAssistantText}:{}),
+      ...(input.turnId?{turnId:input.turnId}:{})}},outputResponse,options.signal);
   }
   private async request<T>(path:string,body:unknown,schema:z.ZodType<T>,signal:AbortSignal):Promise<T> {
     if(signal.aborted) throw new GuardrailsUnavailableError('aborted');

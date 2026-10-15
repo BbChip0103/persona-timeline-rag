@@ -1,4 +1,4 @@
-import { voiceText, type SpeechLevel } from './reply-texts';
+import { voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
 
 /**
  * Reply guard on the agent and experiment paths (S8 gates d/e), fail-closed: a model reply is replaced by a fixed
@@ -9,7 +9,8 @@ import { voiceText, type SpeechLevel } from './reply-texts';
  *  - for a real-person persona, touches private life (family, romance, residence/current location, health, friends,
  *    minors), or answers a second-person question about it (`private_life`), even when the detail is in the person's
  *    own posts.
- * Grammatical person is never checked: the persona speaks about its background and posts in the first person (* #216-217). Narrow Korean/English regexes; paraphrases and other languages can pass (the policy is the first control).
+ * The persona can speak about its public background and posts in the first person. The private-life exception checks
+ * user-directed sentences and bounded pronouns. Narrow Korean/English regexes still leave paraphrases to the policy.
  * v2 (S8 bundle review): an "AI" mention no longer counts as an acknowledgement when it is negated, denials are anchored
  * to the speaker, and the private-life patterns are narrowed (pinned false positives in reply-guard.test.ts).
  * v3 (review re-check): every negation stem (아니/아닙/아닌/아님/아녜/아냐/아녀) and an adverb before "not" count as denial;
@@ -42,8 +43,11 @@ import { voiceText, type SpeechLevel } from './reply-texts';
  * my data" constructions count; bare data words, perfume notes, notes apps, "on my feed" and questions back stay (pinned in
  * reply-guard.test.ts). The other checks then run on the edited text. Known limits (the policy is the first control): "My
  * bio doesn't say", "설정상 말 못 해", "공개 안 했어", and how-it-was-made talk on identity answers pass.
+ * v8 : private replies are trimmed at sentence and clause boundaries. Every private keyword in a
+ * reply triggers trimming, including user-directed questions and empathy. An emptied reply to a user's own story
+ * receives a neutral empathy prompt; other emptied replies receive the private decline.
  */
-export const REPLY_GUARD_REVISION='reply-guard-v7';
+export const REPLY_GUARD_REVISION='reply-guard-v8';
 export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk';
 // Only "not in my data" constructions (review HIGH: bare data words, perfume notes, notes apps, "on my feed" and questions back
 // to the user are ordinary chat); a sentence ending in a question mark is never meta talk.
@@ -63,8 +67,11 @@ const META_GAP:RegExp[]=[
  * The reply without its meta-talk sentences (split at line breaks and after terminal punctuation, a tilde or an emoji, with
  * or without a following space; trailing emoji and flags stay with their sentence), and whether any went.
  */
+export function splitSentences(reply:string):string[] {
+  return reply.trim().split(/\s*\n\s*|(?<=[.!?。！？~…]|\p{Extended_Pictographic}️?|\p{Regional_Indicator})(?:\s+|(?<=[!?~…])(?=[\p{L}\p{N}])|(?<=\.)(?=[가-힣]))(?![\p{Extended_Pictographic}\p{Regional_Indicator}])/u).filter(Boolean);
+}
 function withoutMetaTalk(reply:string):{text:string;removed:boolean} {
-  const sentences=reply.trim().split(/\s*\n\s*|(?<=[.!?。！？~…]|\p{Extended_Pictographic}️?|\p{Regional_Indicator})(?:\s+|(?<=[!?~…])(?=[\p{L}\p{N}])|(?<=\.)(?=[가-힣]))(?![\p{Extended_Pictographic}\p{Regional_Indicator}])/u).filter(Boolean);
+  const sentences=splitSentences(reply);
   const meta=(sentence:string)=>!/[?？]\s*\p{Extended_Pictographic}*️?\s*$/u.test(sentence)&&META_GAP.some(pattern=>pattern.test(sentence));
   const kept=sentences.filter(sentence=>!meta(sentence));
   return {text:kept.join(' ').trim(),removed:kept.length<sentences.length};
@@ -124,8 +131,8 @@ const AI_ACKNOWLEDGED:RegExp[]=[
 ];
 /** Real-person replies: family, romance, residence/current location, health, friends, minors (pinned false positives in tests). */
 const PRIVATE_REPLY:RegExp[]=[
-  /(?:우리|내|제|울)\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\s이가은는을를랑와과도한께의,.!?~]|$)|가족(?:들|이랑|하고|끼리|여행|모임)|가족과\s?(?:함께|같이)|큰\s?집(?:에서|에|이라)/,
-  /남자\s?친구|여자\s?친구|남친|여친|애인|열애|연애\s?(?:중|하고|했|해|를\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼/,
+  /(?:우리|내|제|울)\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\s이가은는을를랑와과도한께의,.!?~]|$)|가족\s?(?:들|이랑|하고|끼리|여행|모임)|가족과\s?(?:함께|같이)|큰\s?집(?:에서|에|이라)/,
+  /남자\s?친구|여자\s?친구|남친|여친|애인|신혼집|짝꿍|그이|예랑|열애|연애\s?(?:중|하고|했|해|를\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼/,
   /(?:우리|내|제)\s?집(?![밥필중착합])|사는\s?(?:곳|동네|집)|(?:에|에서)\s?살(?:아|고|았|아요)|이사(?:했|를|해|간|온|와)|거주|자택|(?<!(?:홈페이지|이메일|웹|사이트|링크|메일|URL)\s?)주소/,
   /아픈\s?데|아팠|아파서|아파요|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\s?먹|다쳤|부상(?:을\s?입|당했|당해|이\s?(?:있|심))|임신|출산|건강(?:해|하게\s?지내|은|이\s|상태|검진)/,
   /(?:내|제|우리)\s?친구|친구(?:들)?(?:이랑|랑|하고|들과|한테|를|들을)/,
@@ -133,7 +140,7 @@ const PRIVATE_REPLY:RegExp[]=[
   /\b(?:my|our)\s+(?:mom|mum|mother(?!\s+tongue)|dad|father|parents|family|brother|sister|siblings?|husband|wife|son|daughter|kids?|children|grand(?:ma|pa|mother|father|parents))\b|\b(?:husband|wife)\b/i,
   /\b(?:my\s+)?(?:boyfriend|girlfriend|fianc[eé]e?)\b|\b(?:I'm|I am|we're|we are)\s+dating\b|\b(?:I'm|I am|we're|we are|we got)\s+(?:married|engaged)\b/i,
   // Residence: a first-person living statement, or a move to a named place ("Moving to the next piece" stays).
-  /\b(?:I|we)\s+(?:live|lived|am living|are living)\s+in\b|\bhome\s+base\b|\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\s+move)\s+to\s+(?:[A-Z][a-z]|LA\b|NYC\b)|\bmy\s+(?:home|apartment|flat|house)\b(?!\s+(?:studio|office|gym))|\bmy\s+(?:address|neighbou?rhood)\b|\bI(?:'m| am)\s+(?:currently|now|right now)\s+(?:in|at)\s+[A-Z][a-z]/,
+  /\b(?:I|we)\s+(?:live|lived|am living|are living)\s+in\b|\bhome\s+base\b|\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\s+move)\s+to\s+(?:[A-Z][a-z]|LA\b|NYC\b)|\bmy\s+(?:own\s+)?(?:home|apartment|flat|house)\b(?!\s+(?:studio|office|gym))|\bmy\s+(?:address|neighbou?rhood)\b|\bI(?:'m| am)\s+(?:currently|now|right now)\s+(?:in|at)\s+[A-Z][a-z]/,
   /\bmy\s+health\b|\bI(?:'m| am)\s+(?:sick|ill|healthy|recovering)\b|\bhospital(?:s|i[sz]ed)?\b|\bsurgery\b|\bdiagnos\w*|\billness\b|\binjur(?:y|ed)\b|\bpregnan\w*/i,
   /\bmy\s+(?:best\s+|close\s+|old\s+)?friends?\b|\bclose\s+friends\b/i,
   /\b(?:underage|minors)\b/i,
@@ -143,6 +150,79 @@ const PRIVATE_QUESTION:RegExp[]=[
   /가족|부모|엄마|아빠|형제|자매|남매|결혼|애인|남자\s?친구|여자\s?친구|남친|여친|연애|사귀|어디\s?(?:살|사)|사는\s?(?:곳|동네)|(?:너|넌|네|니|당신)[^.?!\n]{0,12}(?:동네|건강)|어느\s?동네|집\s?(?:주소|어디)|지금\s?어디|건강은\s?(?:어때|괜찮)|아픈\s?(?:데|곳)|아파\?|병원|미성년/,
   /\byour\s+(?:family|parents?|mom|mum|dad|brother|sister|husband|wife|partner|boyfriend|girlfriend|kids?|children|son|daughter|health|neighbou?rhood|address)\b|\bare\s+you\s+(?:married|dating|single|sick|ill)\b|\bdo\s+you\s+have\s+a\s+(?:partner|boyfriend|girlfriend|husband|wife|family)\b|\bwhere\s+do\s+you\s+live\b|\bwhere\s+are\s+you\s+(?:right\s+)?now\b/i,
 ];
+// Korean markers require a token boundary on both sides: 내일, 나중에 and 제주도 are not self references.
+const SELF_MARKER=/(?:^|[^\p{L}\p{N}])(?:난|나|내|저|제|저희)(?:는|도|가|의|를|은|랑|와|과|에게|한테|에게는|한테는)?(?=$|[^\p{L}\p{N}])|\b(?:I|we|my|our)\b/iu;
+export const hasUserSelfMarker=(text:string):boolean=>SELF_MARKER.test(text);
+const USER_SUBJECT=/(?<![가-힣])(?:너|넌|네|니|당신)(?:는|도|가|랑|에게|한테|의|를|이)?(?![가-힣])|\b(?:you|your)\b/iu;
+const QUESTION_FORM=/[?？]|해\s?줘|말해|알려|얘기해|궁금해|tell me|(?<![A-Za-z])(?:언제|어디|뭐|누구|어떤|왜|how|when|where|what|who|which)(?![A-Za-z])|(?:니|냐|나요|습니까|세요)\s*$/iu;
+const OWN_NOUN=/(?<![가-힣])(?:내|제|우리|저희|나의)\s?(?:엄마|아빠|어머니|아버지|부모님|가족|오빠|언니|누나|형|동생|남편|아내|와이프|친구|병원|건강|남친|여친|애인|집|동네|학교|수술|결혼)|(?<![가-힣])나\s+(?:엄마|아빠|어머니|아버지|부모님|가족|오빠|언니|누나|형|동생|남편|아내|와이프|친구|병원|건강|남친|여친|애인|집|동네|학교|수술|결혼)(?:랑|하고|와|과|이|가|은|는|을|를|에게|한테|도|의)|\b(?:my|our)\s+(?:mom|mum|mother|dad|father|parents|family|brother|sister|husband|wife|friend|hospital|health|home)\b/iu;
+const SELF_SUBJECT=/(?<![가-힣])(?:나|난|나는|나도|내가|저|전|저는|저도|제가)(?![가-힣])|\b(?:i|we)\b/iu;
+const TOPIC_SHIFT=/궁금|물어|여쭤|생각|\b(?:wonder|ask)\b/iu;
+const PRIVATE_PREDICATE=/결혼(?:해|했|하고)|사귀|연애|유부|있어|없어|살아|살고|아프|다녀|갔|싸웠|싸우|만났|만나|걱정|그리워|보고\s?싶|여행|안\s?좋|\b(?:married|dating|newlywed|live|visited|went|ill|sick|fought|miss)\b/iu;
+const BARE_PRIVATE=/(?<![가-힣])(?:남자친구|여자친구|결혼|남친|여친|연애|이혼|임신|가족|엄마|아빠|병원|입원|아프|아팠|사귀|헤어|유부)|\b(?:boyfriend|girlfriend|married|marriage|divorce|pregnant|dating|hospital|hospitalized|newlywed)\b|\bmy\s+(?:mom|dad|family)\b/iu;
+const ADDITIONAL_PRIVATE=/신혼여행|신혼집|짝꿍|그이|예랑|식\s?올렸|웨딩|신랑|신부|어머님|아버님|할머니|할아버지|아기\s?낳|출산|썸|\b(?:wedding|partner\b(?!\s+(?:brands?|companies|agencies))|seeing\s+someone|had\s+a\s+baby)\b/iu;
+const PERSONA_SELF=/(?<![가-힣])(?:나는|나도|난|내가|나의|나|내|제가|저는|저도|저희|저|전|제|우리|울)(?:에게|한테|까지|부터|랑|하고|와|과|의|은|는|이|가|을|를|도|에|서|만|처럼|만큼|보다)?(?![가-힣])|\b(?:my|our|i|we|me|mine|us|ours)\b|\b(?:me\s+too|same\s+here|happened\s+to\s+me|i\s+did\s+too)\b/iu;
+const OWN_STORY_EMPATHY=/(?:겠다|겠어|길\s*바라|면\s*좋겠다|속상|축하해)[.!?~…]*$|^(?:i\s+hope|i(?:'m| am)\s+sorry|hope|sorry|congrats)\b/iu;
+const ALLOWED_EMPATHY_SELF_PREFIX=/^i(?:\s+hope|(?:'m| am)\s+sorry)\b/iu;
+const EXPERIENCE_MARKER=/로서|입장|겪어|해봐서|봐서|해봤|었던|았던|였던|던\s+거|생각나|것처럼|\b(?:as\s+a|myself|from\s+one)\b/iu;
+// Reuse the private-keyword sources; no parallel noun vocabulary is maintained.
+const PRIVATE_NOUNS=[BARE_PRIVATE,ADDITIONAL_PRIVATE,...PRIVATE_REPLY];
+const REPLY_PRIVATE_STEMS=/(?<![가-힣])(?:수술|입원|아프|아팠|임신|출산|이혼|결혼|사귀|연애|헤어)/gu;
+const USER_CARE=/아프지\s*(?:마|않게)|조심해|챙겨|푹\s*쉬어/u;
+const LEADING_CONNECTIVE=/^(?:(?:해서|고|는데|지만)(?=\s|$)\s*)+/u;
+const NOUN_SUFFIX=/^(?:한테도|에게도|이랑|랑|하고|와|과|은|는|이|가|을|를|에|에서|에게|한테|도|만|의|처럼|까지|부터|로|으로|께|께서|들|야|이에요|이야|해|했|하다|하는|한|할)?(?=$|[^\p{L}\p{N}])/u;
+const NOUN_PARTICLE=/(?:들이랑|들과|들을|한테도|에게도|이랑|랑|하고|와|과|은|는|이|가|을|를|에|에서|에게|한테|도|만|의|처럼|까지|부터|로|으로|께|께서)$/u;
+const canonicalPrivateNoun=(surface:string):string=>surface.toLowerCase().replace(/^(?:내|제|우리|울)\s?/u,'').trimEnd().replace(NOUN_PARTICLE,'');
+function privateNounMentions(text:string,reply=false):Set<string> {
+  const mentions=new Set<string>();
+  for(const pattern of PRIVATE_NOUNS) {
+    for(const match of text.matchAll(new RegExp(pattern.source,`${pattern.flags}g`))) {
+      if(/[^\p{L}\p{N}]$/u.test(match[0])||NOUN_SUFFIX.test(text.slice(match.index+match[0].length))) mentions.add(canonicalPrivateNoun(match[0]));
+    }
+  }
+  if(reply)for(const match of text.matchAll(REPLY_PRIVATE_STEMS))mentions.add(match[0]);
+  return mentions;
+}
+const QUESTION_PRIVATE=/아기|낳|출산|파트너|신혼|유부|\b(?:partner(?!\s+(?:brands?|companies|agencies))|baby|newlywed)\b/iu;
+const HEARSAY=/다며|다던데|했다는|줄\s?알았|소문|들었|\b(?:heard|rumor)\b/iu;
+function normalizePrivateText(text:string):string {
+  const stems=['결혼','남친','여친','연애','이혼','임신','가족','엄마','아빠','병원','입원','아프','사귀','헤어','신혼여행','웨딩','신랑','신부','어머님','아버님','할머니','할아버지','출산','식올렸','아기낳','wedding','partner','seeing','someone','baby','boyfriend','girlfriend','married','marriage','dating','hospital','유부','newlywed'];
+  return text.replace(/\p{Cf}/gu,'').replace(/\bseeing\r?\nsomeone\b/giu,'seeing someone').replace(/([\p{L}]+)\r?\n([\p{L}]+)/gu,(match,left:string,right:string)=>{
+    const combined=(left+right).toLowerCase();
+    const boundary=left.length;
+    return stems.some(stem=>{const start=combined.indexOf(stem);return start>=0&&start<boundary&&boundary<start+stem.length;})?left+right:match;
+  });
+}
+const CLAUSES=/\s*,\s*|(?<!에고)(?<=(?:는데|지만|다시피|잖아|고))(?=\s)/u;
+const DANGLING=/(?:는데|지만|다시피|잖아|고)$|^(?:응|네|예|맞아|맞아요|yeah|yes|right)[.!?~]*$/iu;
+function userOwnsPrivateStatement(sentence:string):boolean {
+  return !USER_SUBJECT.test(sentence)&&!HEARSAY.test(sentence)&&(OWN_NOUN.test(sentence)||SELF_SUBJECT.test(sentence)&&!TOPIC_SHIFT.test(sentence)&&PRIVATE_PREDICATE.test(sentence));
+}
+function allowedOwnStoryClause(clause:string,utterance:string):boolean {
+  if(userCareClause(clause))return true;
+  const empathy=OWN_STORY_EMPATHY.test(clause);
+  const markerText=empathy?clause.replace(ALLOWED_EMPATHY_SELF_PREFIX,''):clause;
+  const userNouns=privateNounMentions(utterance);
+  return (/[?？]\s*\p{Extended_Pictographic}*️?\s*$/u.test(clause)||empathy)
+    &&!PERSONA_SELF.test(markerText)&&!EXPERIENCE_MARKER.test(clause)
+    &&!(isPrivateClause(clause)&&[...privateNounMentions(clause,true)].some(noun=>!userNouns.has(noun)));
+}
+const isPrivateClause=(clause:string):boolean=>PRIVATE_REPLY.some(pattern=>pattern.test(clause))||BARE_PRIVATE.test(clause)||ADDITIONAL_PRIVATE.test(clause);
+const userCareClause=(clause:string):boolean=>USER_CARE.test(clause)&&!PERSONA_SELF.test(clause)&&[...privateNounMentions(clause,true)].every(noun=>noun==='아프'||noun==='건강');
+function withoutPrivateTalk(reply:string,ownStory:boolean,utterance:string):{text:string;removed:boolean} {
+  const clauses=splitSentences(reply).flatMap(sentence=>(userCareClause(sentence)?[sentence]:sentence.split(CLAUSES)).map(clause=>clause.trim()).filter(Boolean));
+  const removedPrivate=clauses.some(isPrivateClause);
+  const shouldRemove=(clause:string)=>ownStory?!allowedOwnStoryClause(clause,utterance):!userCareClause(clause)&&isPrivateClause(clause)||removedPrivate&&PERSONA_SELF.test(clause);
+  const removed=clauses.some(shouldRemove);
+  const kept=clauses.filter(clause=>!shouldRemove(clause)&&!(removed&&DANGLING.test(clause)))
+    .map(clause=>removed?clause.replace(LEADING_CONNECTIVE,'').trim():clause).filter(Boolean);
+  return {text:kept.join(' ').trim(),removed};
+}
+function privateQuestion(utterance:string):boolean {
+  return splitSentences(utterance).some(sentence=>
+    (PRIVATE_QUESTION.some(pattern=>pattern.test(sentence))||ADDITIONAL_PRIVATE.test(sentence)||QUESTION_PRIVATE.test(sentence)&&QUESTION_FORM.test(sentence)||HEARSAY.test(sentence)&&BARE_PRIVATE.test(sentence))
+    &&(QUESTION_FORM.test(sentence)||!userOwnsPrivateStatement(sentence)));
+}
 /** `language`: the reply language (the user's utterance language on the character paths); `level`: the persona's speech level (default polite). */
 /** "I don't have / eat …", "경력이 없어", "먹지 않아": a statement of not having something, read together with an AI mention. */
 const NOT_HAVING:RegExp[]=[
@@ -158,8 +238,10 @@ const BACKGROUND_DISOWNED:RegExp[]=[
   // Only the listed nouns, optionally paired ("고향이나 학교가"), then a clause-final 없어(요): "학교 숙제가 없어서" stays.
   /(?<![가-힣])(?:고향|출신|학교|경력|과거)(?:(?:이나|나|랑|이랑)\s?(?:고향|출신|학교|경력|과거))?(?:이|가|은|는|도)?\s?(?:없어요|없어|없거든요?|없답니다|없습니다)(?=$|[\s.!?~,ㅋㅎ^])/,
 ];
-export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel}):{reason:ReplyGuardReason;content:string;edited?:true}|undefined {
+export function guardReply(input:{utterance:string;reply:string;realPerson:boolean;language:string;level?:SpeechLevel;previousAssistantText?:string;seed?:string}):{reason:ReplyGuardReason;content:string;edited?:true}|undefined {
+  input={...input,utterance:normalizePrivateText(input.utterance),reply:normalizePrivateText(input.reply)};
   const level=input.level??'polite';
+  const voice=(key:VoiceTextKey)=>voiceText(key,input.language,level,input.previousAssistantText,input.seed);
   // "이 그림 AI야?" asks about an artwork, not the persona (unless it also addresses the persona).
   const identityQuestion=IDENTITY_QUESTION.some(pattern=>pattern.test(input.utterance))
     &&(!ART_UTTERANCE.test(input.utterance)||/(?:너|넌|당신|니가|네가)|\byou\b/i.test(input.utterance));
@@ -168,28 +250,32 @@ export function guardReply(input:{utterance:string;reply:string;realPerson:boole
     // The other checks see the edited reply. With nothing left: the identity line (identity question), the private-life
     // decline (a real person's private question), otherwise the fallback.
     if(/[\p{L}\p{N}]/u.test(meta.text)) return guardReply({...input,reply:meta.text})??{reason:'meta_talk',content:meta.text,edited:true};
-    if(identityQuestion) return {reason:'missing_ai_disclosure',content:voiceText('identity',input.language,level)};
-    if(input.realPerson&&PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))) return {reason:'private_life',content:voiceText('decline_private',input.language,level)};
-    return {reason:'meta_talk',content:voiceText('fallback',input.language,level)};
+    if(identityQuestion) return {reason:'missing_ai_disclosure',content:voice('identity')};
+    if(input.realPerson&&privateQuestion(input.utterance)) return {reason:'private_life',content:voice('decline_private')};
+    return {reason:'meta_talk',content:voice('service_retry')};
   }
   const artTalk=ART_UTTERANCE.test(input.utterance)||ART_REPLY.test(input.reply);
   // A human claim is never shown. The replacement says "I'm an AI" only when the user asked about identity or a human
   // pretence; otherwise it is the plain in-voice fallback (no unprompted AI mention).
   if(HUMAN_CLAIM.some(pattern=>pattern.test(input.reply))||!artTalk&&BARE_DENIAL.some(pattern=>pattern.test(input.reply)))
-    return {reason:'human_impersonation',content:voiceText(identityQuestion?'identity':'fallback',input.language,level)};
+    return {reason:'human_impersonation',content:voice(identityQuestion?'identity':'service_retry')};
   if(identityQuestion&&!AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply)))
-    return {reason:'missing_ai_disclosure',content:voiceText('identity',input.language,level)};
+    return {reason:'missing_ai_disclosure',content:voice('identity')};
   if(input.realPerson) {
     // On an identity question the replacement keeps the AI disclosure, whatever else the reply touched.
-    if(PRIVATE_QUESTION.some(pattern=>pattern.test(input.utterance))) return {reason:'private_life',content:voiceText(identityQuestion?'identity':'decline_private',input.language,level)};
+    if(privateQuestion(input.utterance)) return {reason:'private_life',content:voice(identityQuestion?'identity':'decline_private')};
     // Past-tense origin phrasing answering an origin question ("어릴 때 부산에서 살았어", "I grew up in …") is origin, not residence.
     const reply=ORIGIN_QUESTION.test(input.utterance)?input.reply.replace(PAST_HOME,' '):input.reply;
-    if(PRIVATE_REPLY.some(pattern=>pattern.test(reply))) return {reason:'private_life',content:voiceText(identityQuestion?'identity':'fallback',input.language,level)};
+    const ownStory=splitSentences(input.utterance).some(sentence=>userOwnsPrivateStatement(sentence)&&!QUESTION_FORM.test(sentence));
+    const privateEdit=withoutPrivateTalk(reply,ownStory,input.utterance);
+    if(privateEdit.removed) return /[\p{L}\p{N}]/u.test(privateEdit.text)
+      ?{reason:'private_life',content:privateEdit.text,edited:true}
+      :{reason:'private_life',content:voice(identityQuestion?'identity':ownStory?'empathy_ask':'decline_private')};
   }
   // Disowning the persona's own background, career or everyday likes "because I'm an AI" (every persona), or, for a real
   // person, plainly ("I don't have a hometown"): the in-voice fallback (gate e).
   if(!identityQuestion&&!artTalk&&(AI_ACKNOWLEDGED.some(pattern=>pattern.test(input.reply))&&NOT_HAVING.some(pattern=>pattern.test(input.reply))
     ||input.realPerson&&BACKGROUND_DISOWNED.some(pattern=>pattern.test(input.reply))))
-    return {reason:'background_denial',content:voiceText('fallback',input.language,level)};
+    return {reason:'background_denial',content:voice('service_retry')};
   return undefined;
 }

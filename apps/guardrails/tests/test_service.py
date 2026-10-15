@@ -24,7 +24,7 @@ THRESHOLDS = dict.fromkeys(CATEGORIES, 0.5) | {"self_harm": 0.2, "illegal_danger
 
 
 class DomainPolicyTests(unittest.TestCase):
-    def test_all_pinned_v7_synthetic_fixtures(self):
+    def test_all_pinned_synthetic_fixtures(self):
         fixtures = json.loads((ROOT / "tests/policy_fixtures.json").read_text())
         for fixture in fixtures:
             source = fixture["input"]
@@ -98,6 +98,32 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["reason"], "human_impersonation")
         self.assertIn("AI", response.json()["content"])
+
+    def test_output_accepts_bounded_previous_reply_and_turn_seed(self):
+        previous = "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"
+        metadata = {
+            "utterance": "가족 있어?",
+            "realPerson": True,
+            "language": "ko",
+            "previousAssistantText": previous,
+            "turnId": "synthetic-turn-42",
+        }
+        response = self.client.post(
+            "/validate/output",
+            headers=HEADERS,
+            json={"text": "글쎄", "metadata": metadata},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reason"], "private_life")
+        self.assertNotEqual(response.json()["content"], previous)
+        for key, value in (("previousAssistantText", "x" * 64001), ("turnId", "x" * 129)):
+            invalid = self.client.post(
+                "/validate/output",
+                headers=HEADERS,
+                json={"text": "글쎄", "metadata": {**metadata, key: value}},
+            )
+            self.assertEqual(invalid.status_code, 422)
+            self.assertNotIn(value, invalid.text)
 
     def test_input_contract_and_no_duplicate_jev_call(self):
         intent = {

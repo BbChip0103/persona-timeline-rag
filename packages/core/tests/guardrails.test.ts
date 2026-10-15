@@ -5,7 +5,7 @@ import { DEFAULT_SAFETY_THRESHOLDS } from '../src/input-safety';
 
 const token='synthetic-test-token-only';
 const reply={utterance:'Are you human?',reply:'I am a real person.',realPerson:true,language:'en'};
-const pass={revision:'reply-guard-v7',content:'Synthetic output.'};
+const pass={revision:'reply-guard-v8',content:'Synthetic output.'};
 const signal=()=>new AbortController().signal;
 const client=(fetch:typeof globalThis.fetch,timeoutMs=100)=>new GuardrailsClient({baseUrl:'http://guardrails.internal',apiKey:token,timeoutMs,fetch});
 
@@ -24,8 +24,14 @@ describe('Guardrails internal adapter',()=>{
     expect(JSON.parse(request.body as string)).toEqual({text:reply.reply,metadata:{utterance:reply.utterance,realPerson:true,language:'en',level:'polite'}});
     expect(request.body).not.toMatch(/PRIVATE_/u);
   });
+  test('output DTO forwards bounded prior assistant text and turn id for deterministic replacement',async()=>{
+    const fetch=fakeResponse(pass);
+    await client(fetch).validateReply({...reply,previousAssistantText:'Synthetic previous reply.',turnId:'synthetic-turn-1'},{signal:signal()});
+    const [,request]=(fetch as jest.Mock).mock.calls[0] as [string,RequestInit];
+    expect(JSON.parse(request.body as string).metadata).toMatchObject({previousAssistantText:'Synthetic previous reply.',turnId:'synthetic-turn-1'});
+  });
   test('Jev metadata forwards seven-category thresholds and only requested probabilities; no second classifier call',async()=>{
-    const result={revision:'reply-guard-v7',action:'support',category:'self_harm',fired:['self_harm']};
+    const result={revision:'reply-guard-v8',action:'support',category:'self_harm',fired:['self_harm']};
     const fetch=fakeResponse(result);
     expect(await client(fetch).validateInput({text:'synthetic',probabilities:{self_harm:0.8,prompt_injection:0.7},thresholds:DEFAULT_SAFETY_THRESHOLDS,
       categories:['self_harm']},{signal:signal()})).toEqual(result);
@@ -34,7 +40,7 @@ describe('Guardrails internal adapter',()=>{
     expect(fetch).toHaveBeenCalledTimes(1);
   });
   test('explicit rules-only metadata keeps empty probabilities without inventing Jev scores',async()=>{
-    const fetch=fakeResponse({revision:'reply-guard-v7',action:'none',fired:[]});
+    const fetch=fakeResponse({revision:'reply-guard-v8',action:'none',fired:[]});
     await client(fetch).validateInput({text:'hello',classification:'rules-only',probabilities:{},thresholds:DEFAULT_SAFETY_THRESHOLDS,
       categories:['prompt_injection','sexual','violence_gore','self_harm','hate_harassment','illegal_dangerous','private_info']},{signal:signal()});
     const [,request]=(fetch as jest.Mock).mock.calls[0] as [string,RequestInit];
@@ -55,7 +61,7 @@ describe('Guardrails internal adapter',()=>{
     await expect(client(fetch).validateReply(reply,{signal:signal()})).rejects.toMatchObject({code:'GUARDRAILS_UNAVAILABLE',reason:'http'});
     expect(fetch).toHaveBeenCalledTimes(1);
   });
-  test.each([{...pass,revision:'unknown'}, {...pass,reason:'unknown'}, {...pass,ragContext:'PRIVATE_SENTINEL'}, {revision:'reply-guard-v7',content:42}])(
+  test.each([{...pass,revision:'unknown'}, {...pass,reason:'unknown'}, {...pass,ragContext:'PRIVATE_SENTINEL'}, {revision:'reply-guard-v8',content:42}])(
     'malformed validator response fails closed: %j',async response=>{
       await expect(client(fakeResponse(response)).validateReply(reply,{signal:signal()})).rejects.toMatchObject({reason:'invalid_response'});
     });
@@ -92,7 +98,7 @@ describe('Guardrails internal adapter',()=>{
   test.each(['file:///tmp/test','http://user:secret@localhost','https://localhost?key=secret','http://localhost#secret'])(
     'unsafe URL fails configuration: %s',baseUrl=>expect(()=>new GuardrailsClient({baseUrl,apiKey:token,timeoutMs:100})).toThrow());
   test('invalid safety decision shape fails closed',async()=>{
-    const fetch=fakeResponse({revision:'reply-guard-v7',action:'support',category:'sexual',fired:['sexual']});
+    const fetch=fakeResponse({revision:'reply-guard-v8',action:'support',category:'sexual',fired:['sexual']});
     await expect(client(fetch).validateInput({text:'synthetic',probabilities:{sexual:0.8},thresholds:DEFAULT_SAFETY_THRESHOLDS,categories:['sexual']},{signal:signal()}))
       .rejects.toMatchObject({reason:'invalid_response'});
   });

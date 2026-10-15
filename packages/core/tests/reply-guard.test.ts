@@ -88,24 +88,31 @@ describe('private life (real-person personas only)',()=>{
     expect(reason('그때 얘기 더 해줘',reply)).toBe('private_life');
     expect(reason('그때 얘기 더 해줘',reply,synthetic)).toBeNull();
   });
-  test.each([['그 그림은 빛 번짐 표현이 포인트였어~'],['그 여행에서 기차로 해안선을 따라 쭉 돌았지'],['친구처럼 편하게 얘기해 줘~'],['건강한 피부 표현이 중요해요'],['We sailed along the coast in a small boat.'],
+  test.each([['그 그림은 빛 번짐 표현이 포인트였어~'],['그 여행에서 기차로 해안선을 따라 쭉 돌았지'],['We sailed along the coast in a small boat.'],
     // Pinned false positives from the review (MEDIUM 2).
     ['That chord is in a minor key.'],['Just a few minor changes to the palette.'],['The hospitality was amazing.'],['I\'m currently in the middle of a new series.'],
-    ['Moving to the next piece now!'],['It\'s more fun to paint with friends.'],['I set up a home studio for filming.'],['Our partner brand sent new brushes.'],
-    ['요즘 집필 중인 책이 있어'],['제 집중력이 좋아졌어요'],['부상으로 상금도 받았어!'],['홈페이지 주소는 프로필에 있어요'],['아동 그림책 일러스트를 그렸어'],['연애 감정을 담은 곡이야'],['명절 한정판 패키지 리뷰야']])(
+    ['Moving to the next piece now!'],['It\'s more fun to paint with friends.'],['Our partner brand sent new brushes.'],
+    ['요즘 집필 중인 책이 있어'],['제 집중력이 좋아졌어요'],['부상으로 상금도 받았어!'],['홈페이지 주소는 프로필에 있어요'],['아동 그림책 일러스트를 그렸어'],['명절 한정판 패키지 리뷰야']])(
     'public-work replies stay: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBeNull());
+  test.each(['친구처럼 편하게 얘기해 줘~','건강한 피부 표현이 중요해요','I set up a home studio for filming.','My mother tongue is Korean.'])(
+    '§14 excluded bare nouns preserve earlier allowed golden: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBeNull());
+  test.each(['연애 감정을 담은 곡이야','가족과 기억을 주제로 한 전시였어.'])(
+    '§14 listed bare nouns trim the whole clause: %s',reply=>expect(guardReply({...real,utterance:'그때 얘기 더 해줘',reply})).toEqual({reason:'private_life',content:voiceText('decline_private','ko','polite')}));
+  test('a fully trimmed family clause after an own story uses empathy',()=>expect(guardReply({...real,utterance:'우리 엄마랑 싸웠어',reply:'가족과 기억을 주제로 한 전시였어.'})).toEqual({reason:'private_life',content:voiceText('empathy_ask','ko','polite')}));
+  test.each([
+    '결혼','남친','여친','남자친구','여자친구','연애','이혼','임신','가족','엄마','아빠','병원','입원','아프','아팠','사귀','헤어',
+    'boyfriend','girlfriend','married','marriage','divorce','pregnant','dating','hospital','hospitalized','my mom','my dad','my family',
+  ])('§14 listed bare token is trimmed: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBe('private_life'));
 });
 
 describe('known behaviour (documented, review LOW)',()=>{
-  test('fixed cheaply: lowercase place after "I live in", "your kids", "mother tongue" and an exhibition theme',()=>{
+  test('fixed cheaply: lowercase place after "I live in" and "your kids"',()=>{
     expect(reason('그때 얘기 더 해줘','I live in seoul with my partner.')).toBe('private_life');
     expect(reason('Do your kids paint too?','Not much to say!',realEn)).toBe('private_life');
-    expect(reason('그때 얘기 더 해줘','My mother tongue is Korean.')).toBeNull();
-    expect(reason('그때 얘기 더 해줘','가족과 기억을 주제로 한 전시였어.')).toBeNull();
   });
-  test('known misses (left to the policy): a lowercase moved-to place and a partner without "my"',()=>{
+  test('a lowercase moved-to place remains outside scope; partner is now private',()=>{
     expect(reason('그때 얘기 더 해줘','after moving to seoul it was great')).toBeNull();
-    expect(reason('그때 얘기 더 해줘','living there with a partner is fun')).toBeNull();
+    expect(reason('그때 얘기 더 해줘','living there with a partner is fun')).toBe('private_life');
   });
 });
 
@@ -117,7 +124,7 @@ describe('replacement',()=>{
     const en=guardReply({utterance:'Tell me about your family.',reply:'Sure!',realPerson:true,language:'en'})!;
     expect(en).toEqual({reason:'private_life',content:voiceText('decline_private','en','polite')});
     expect(en.content).not.toMatch(/\bAI\b|simulation/);
-    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7');
+    expect(REPLY_GUARD_REVISION).toBe('reply-guard-v8');
   });
   test('impersonation outranks the other reasons',()=>{
     expect(reason('가족 얘기 해줘','나는 평범한 사람이야, 엄마랑 살아')).toBe('human_impersonation');
@@ -135,7 +142,7 @@ describe('localized deterministic texts',()=>{
 
 describe('guard v7: meta talk  — a sentence explaining a gap by the persona\'s data or system is removed (synthetic texts)',()=>{
   const g=(utterance:string,reply:string,o:{realPerson:boolean;language:string}=real)=>guardReply({utterance,reply,...o,level:'casual'});
-  test('revision',()=>expect(REPLY_GUARD_REVISION).toBe('reply-guard-v7'));
+  test('revision',()=>expect(REPLY_GUARD_REVISION).toBe('reply-guard-v8'));
   test.each([
     ['어디 출신이야?','나 바닷가 마을 출신이야! 학교 이름은 메모에 따로 없어서 모르겠어. 대신 도자기 얘기 하자~','나 바닷가 마을 출신이야! 대신 도자기 얘기 하자~'],
     ['학교 어디 나왔어?','그건 딱히 말해 줄 수 있는 정보가 없거든! 대신 요즘 빚는 그릇 얘기 해 줄까?','대신 요즘 빚는 그릇 얘기 해 줄까?'],
@@ -150,14 +157,14 @@ describe('guard v7: meta talk  — a sentence explaining a gap by the persona\'s
   test('a trailing emoji stays with the removed sentence',()=>
     expect(g('학교는?','학교는 내가 아는 정보가 하나도 없거든! 😅 대신 그릇 얘기 할래?')).toEqual({reason:'meta_talk',content:'대신 그릇 얘기 할래?',edited:true}));
   test('a reply that is only meta talk becomes the in-voice fallback; a private question keeps its decline',()=>{
-    expect(g('학교는?','그건 내가 가진 정보가 없네요.')).toEqual({reason:'meta_talk',content:voiceText('fallback','ko','casual')});
-    expect(g('Your school?','I don\'t have any info about that in my records!',realEn)).toEqual({reason:'meta_talk',content:voiceText('fallback','en','casual')});
+    expect(g('학교는?','그건 내가 가진 정보가 없네요.')).toEqual({reason:'meta_talk',content:voiceText('service_retry','ko','casual')});
+    expect(g('Your school?','I don\'t have any info about that in my records!',realEn)).toEqual({reason:'meta_talk',content:voiceText('service_retry','en','casual')});
     expect(g('가족 얘기 해줘','가족 얘기는 게시물에 안 올렸어~')).toEqual({reason:'private_life',content:voiceText('decline_private','ko','casual')});
   });
   test('on an identity question the AI line survives the edit; an emptied reply becomes the identity line, not on an artwork question',()=>{
     expect(g('너 AI야?','응, 나 AI야! 다른 건 프로필에 안 나와 있어~')).toEqual({reason:'meta_talk',content:'응, 나 AI야!',edited:true});
     expect(g('너 AI야?','그건 기록에 없어서 몰라~')).toEqual({reason:'missing_ai_disclosure',content:voiceText('identity','ko','casual')});
-    expect(g('이 그림 AI야?','그건 기록에 없어서 몰라~')).toEqual({reason:'meta_talk',content:voiceText('fallback','ko','casual')});
+    expect(g('이 그림 AI야?','그건 기록에 없어서 몰라~')).toEqual({reason:'meta_talk',content:voiceText('service_retry','ko','casual')});
   });
   test('synthetic personas are edited too',()=>expect(g('요즘 뭐 해?','요즘 바다 그려! 다른 건 설정에 없어서 몰라~',synthetic)).toEqual({reason:'meta_talk',content:'요즘 바다 그려!',edited:true}));
   // Ordinary chat (review HIGH): data words without a "not in my data" construction, questions back, notes apps, perfume notes.

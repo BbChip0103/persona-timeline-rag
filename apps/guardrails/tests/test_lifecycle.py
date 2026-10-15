@@ -86,7 +86,7 @@ class GuardLifecycleTests(unittest.TestCase):
         self.assertIsNot(_get_guard("rules"), guard)
         self.assertEqual(validate_input("hello", META)["action"], "none")
 
-    def test_parallel_threads_each_have_distinct_guards_and_all_315_results_match(self):
+    def test_parallel_threads_each_have_distinct_guards_and_all_results_match(self):
         fixtures = json.loads((ROOT / "tests/policy_fixtures.json").read_text())
         barrier = threading.Barrier(4)
 

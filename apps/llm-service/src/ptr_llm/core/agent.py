@@ -2,8 +2,10 @@
 
 import copy
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from operator import add
 from typing import Annotated, Any, TypedDict
+from zoneinfo import ZoneInfo
 
 import regex
 from langgraph.graph import END, START, StateGraph
@@ -18,7 +20,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v13-evidence-origin"
+AGENT_PROMPT_REVISION = "character-agent-context-v14-immersion"
 
 
 class AgentState(TypedDict, total=False):
@@ -111,6 +113,9 @@ async def run_character_agent(
     before_costly=None,
     telemetry=None,
     max_sources=EVIDENCE_POST_LIMIT,
+    created_at=None,
+    timezone_name="UTC",
+    reply_language=None,
 ):
     persona = copy.deepcopy(persona)
     history = copy.deepcopy(history)
@@ -118,8 +123,25 @@ async def run_character_agent(
     lore = copy.deepcopy(lore)
     if type(max_tool_rounds) is not int or not 0 <= max_tool_rounds <= 10:
         raise CoreError("INVALID_INPUT")
-    language = utterance_language(text, persona["language"])
+    language = reply_language or utterance_language(text, persona["language"], history)
     level = speech_level(persona)
+    previous = next((m["content"] for m in reversed(history) if m.get("role") == "assistant"), "")
+    instant = (
+        datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created_at
+        else datetime.now(UTC)
+    )
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    local_now = instant.astimezone(ZoneInfo(timezone_name))
+    last_user = next((m for m in reversed(history) if m.get("role") == "user"), None)
+    last_at = last_user.get("createdAt") if last_user else None
+    if last_at:
+        previous_at = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+        elapsed = max(0, (instant - previous_at).total_seconds())
+        since_last = "방금" if elapsed < 3600 else "몇 시간 전" if elapsed < 86400 else "며칠 전"
+    else:
+        since_last = "처음"
     language_name = (
         "Korean"
         if is_korean(language)
@@ -128,10 +150,10 @@ async def run_character_agent(
         else language
     )
 
-    def fallback():
+    def service_retry():
         return {
             "status": "insufficient_evidence",
-            "message": voice_text("fallback", language, level),
+            "message": voice_text("service_retry", language, level, previous, request_key),
             "evidenceRefs": [],
             "variableUpdates": {},
         }
@@ -167,6 +189,8 @@ async def run_character_agent(
                         run["variables"],
                         replyLanguage=language_name,
                         speechLevel="반말" if level == "casual" else "해요체",
+                        today=local_now.date().isoformat(),
+                        sinceLastUserMessage=since_last,
                     )
                 ),
             }
@@ -230,7 +254,7 @@ async def run_character_agent(
         try:
             response = parse_agent_response(raw)
         except CoreError:
-            response = fallback()
+            response = service_retry()
             limitation = "AGENT_REPLY_INVALID"
         if "function" not in response:
             response["message"] = trim_to_sentence(response["message"])
@@ -248,12 +272,14 @@ async def run_character_agent(
             if contains_credential(query) or contains_internal_path(query):
                 raise CoreError("TURN_FAILED", "TOOL_QUERY_REJECTED")
             if not search:
-                response = fallback()
+                response = service_retry()
                 limitation = "AGENT_TOOL_UNAVAILABLE"
             elif run["iteration"] >= max_tool_rounds:
-                raise CoreError("TURN_FAILED", "TOOL_LIMIT")
+                response = service_retry()
+                limitation = "TOOL_LIMIT"
             elif query in run["called"]:
-                raise CoreError("TURN_FAILED", "TOOL_REPEATED")
+                response = service_retry()
+                limitation = "TOOL_REPEATED"
         return {
             "response": response,
             "serviceLimitation": limitation,

@@ -20,7 +20,7 @@ jest.mock('node:fs/promises', () => {
 const S = {
   user: 'SENTINEL_USER_TEXT_q1', reply: 'SENTINEL_REPLY_TEXT_r1', owner: 'SENTINEL_OWNER_o1', person: 'SENTINEL_PERSON_p1',
   persona: 'SENTINEL_PERSONA_x1', turn: 'SENTINEL_TURN_t1', url: 'https://example.invalid/SENTINEL_URL_u1', s8Text: 'SENTINEL_S8_TEXT_s1',
-  s8Reply: 'SENTINEL_S8_REPLY_s2', error: 'SENTINEL_ERROR_e1',
+  s8Reply: 'SENTINEL_S8_REPLY_s2', error: 'SENTINEL_ERROR_e1', quote: 'SENTINEL_EVIDENCE_QUOTE_q2',
 };
 const OWNER = (n: number) => `local-${n.toString(16).padStart(40, '0')}`;
 const NOW = new Date('2026-10-10T03:00:00Z');
@@ -144,6 +144,21 @@ describe('review-sample run', () => {
     for (const hidden of [S.owner, 'local-0000', S.person, S.persona, S.turn, S.url, 'example.invalid', 'v99', 'run-disclosure']) expect(sheet).not.toContain(hidden);
     expect(sheet).toMatch(/id [0-9a-f]{10}\b/);
     expect(sheet).not.toMatch(/T\d{2}:\d{2}/);
+  });
+
+  it('puts bound evidence and exact quotes in the private operator sheet without exposing them on stdout', async () => {
+    const rows = dbRows(1, 20).map(row => ({ ...row, reply: reply(1, { grounding: 'source_bound_quotes', evidence: [
+      { sourceId: 'SENTINEL_SOURCE_id1', sourceUrl: S.url, origin: 'source_caption', postedAt: '2026-01-02', eventDate: null, quote: S.quote },
+    ] }) }));
+    const h = await harness(rows);
+    expect(await go(['--since', '7d', '--seed', '7'], h)).toBe(0);
+    const sheet = await readFile(sheetPath(h.root), 'utf8');
+    expect(sheet).toContain('**인용 근거**');
+    expect(sheet).toContain(`> ${S.quote}`);
+    expect(sheet).toContain('게시일 2026-01-02');
+    expect(sheet).not.toContain('SENTINEL_SOURCE_id1');
+    expect(sheet).not.toContain(S.url);
+    expect([...h.out, ...h.err].join('\n')).not.toContain(S.quote);
   });
 
   it('writes a 0600 trace sidecar with the salt and the masked id -> turn id map, matching the sheet', async () => {

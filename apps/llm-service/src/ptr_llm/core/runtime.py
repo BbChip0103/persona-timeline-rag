@@ -30,7 +30,7 @@ from .evidence import (
 )
 from .guardrails import validate_input, validate_output
 from .persona import dumps, match_lore, render_lore_message, serialized_bytes, validate_persona
-from .policy import REVISION
+from .policy import REVISION, SENTENCES, VOICES, has_user_self_marker
 from .prompts import EVIDENCE_POST_LIMIT, POLICY, build_experiment_context
 from .protocol import variables
 from .routing import (
@@ -44,6 +44,55 @@ from .routing import (
 )
 from .safety import contains_credential, contains_internal_path, contains_ungrounded_biography
 from .texts import reply_text, speech_level, utterance_language, voice_text
+
+
+def should_ask_back(intent, rag_condition, text, evidence):
+    """Only unsupported timeline questions may become a conversational ask-back."""
+    question = False
+    for sentence in SENTENCES.split(text):
+        # A preceding statement such as "난 몰라" does not own the following user question.
+        asked = regex.split(r"(?<=몰라)\s+(?=너|네가|니가|당신)", sentence)[-1]
+        if not (
+            regex.search(r"[?？]", asked)
+            or regex.search(
+                r"(?<![A-Za-z])(?:언제|어디|뭐|누구|어떤|왜|how|when|where|what|who|which)(?![A-Za-z])",
+                asked,
+                regex.I,
+            )
+            or regex.search(r"(?:니|냐|나요|지)\s*$", asked)
+        ):
+            continue
+        if regex.search(
+            r"(?:내일|모레|다음에|다음\s?(?:주|달|번)|앞으로|tomorrow|next\s+(?:week|month)"
+            r"|(?:할|갈)\s?거(?:야|예요)?|(?:할|갈)래|[가-힣]+(?:을|ㄹ)\s?거(?:야|예요)?|[가-힣]+(?:을|ㄹ)래)",
+            asked,
+            regex.I,
+        ):
+            continue
+        if not has_user_self_marker(asked):
+            question = True
+            break
+    return (
+        intent == "timeline"
+        and rag_condition not in (None, "off")
+        and question
+        and not evidence
+    )
+
+
+def _ask_back_streak(history):
+    asks = {variant for levels in VOICES["memory_ask_back"].values() for variant in levels}
+    streak = 0
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        if message["content"] not in asks:
+            break
+        streak += 1
+        if streak == 2:
+            break
+    return streak
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -352,10 +401,14 @@ class LLMEngine:
                 ),
                 "rule": rule,
                 "cardPath": card,
-                "replyLanguage": utterance_language(text, session["language"])
+                "replyLanguage": utterance_language(text, session["language"], prompt_history)
                 if card
                 else session["language"],
                 "level": speech_level(persona),
+                "previousAssistantText": next(
+                    (m["content"] for m in reversed(prompt_history) if m["role"] == "assistant"),
+                    "",
+                ),
             }
             return dict(
                 frame,
@@ -413,7 +466,13 @@ class LLMEngine:
                     combinedIntent=combined,
                     output={
                         "status": "insufficient_evidence",
-                        "content": voice_text("fallback", snap["replyLanguage"], snap["level"]),
+                        "content": voice_text(
+                            "service_retry",
+                            snap["replyLanguage"],
+                            snap["level"],
+                            snap["previousAssistantText"],
+                            turn["id"],
+                        ),
                         "claims": [],
                         "evidence": [],
                         "grounding": "unverified_model",
@@ -519,6 +578,8 @@ class LLMEngine:
                         }[key],
                         language,
                         level,
+                        snap["previousAssistantText"],
+                        turn["id"],
                     )
                     if snap["cardPath"]
                     else reply_text(key, session["language"])
@@ -745,6 +806,9 @@ class LLMEngine:
                     deadline_at=deadline,
                     before_costly=guarded,
                     telemetry=self.telemetry,
+                    created_at=turn.get("createdAt"),
+                    timezone_name=session["timezone"],
+                    reply_language=snap["replyLanguage"],
                 )
                 return dict(
                     frame,
@@ -809,6 +873,8 @@ class LLMEngine:
                     or ("off" if session["retrievalMode"] == "off" else "caption"),
                     snap["replyLanguage"],
                     snap["level"],
+                    snap["previousAssistantText"],
+                    turn["id"],
                 )
                 if not session.get("ragCondition") and frame["intent"] == "timeline":
                     output = validate_source_bound_reply(
@@ -831,7 +897,13 @@ class LLMEngine:
                     output["status"] == "answered"
                     or "INVALID_MODEL_EVIDENCE" in output["limitations"]
                     and output["content"]
-                    != voice_text("fallback", snap["replyLanguage"], snap["level"])
+                    != voice_text(
+                        "service_retry",
+                        snap["replyLanguage"],
+                        snap["level"],
+                        snap["previousAssistantText"],
+                        turn["id"],
+                    )
                 ):
                     if agent["toolCalls"]:
                         agent["validator"] = "skipped_tool_followup"
@@ -854,7 +926,11 @@ class LLMEngine:
                             output = {
                                 "status": "insufficient_evidence",
                                 "content": voice_text(
-                                    "fallback", snap["replyLanguage"], snap["level"]
+                                    "service_retry",
+                                    snap["replyLanguage"],
+                                    snap["level"],
+                                    snap["previousAssistantText"],
+                                    turn["id"],
                                 ),
                                 "claims": [],
                                 "evidence": [],
@@ -874,6 +950,8 @@ class LLMEngine:
                     session["ragCondition"],
                     snap["replyLanguage"],
                     snap["level"],
+                    snap["previousAssistantText"],
+                    turn["id"],
                 )
             elif frame["intent"] == "timeline":
                 output = validate_source_bound_reply(raw, frame["sources"], session["personId"])
@@ -912,6 +990,31 @@ class LLMEngine:
                 }
                 if ctx["omittedSourceIds"]:
                     prompt_evidence["omittedSourceIds"] = ctx["omittedSourceIds"]
+            if (
+                should_ask_back(
+                    frame["intent"], session.get("ragCondition"), text, output["evidence"]
+                )
+                and not (agent_run and agent_run.get("serviceLimitation"))
+                and output["content"]
+                not in {variant for level in VOICES["service_retry"].values() for variant in level}
+                and not any(code.startswith("AGENT_VALIDATOR_") for code in output["limitations"])
+            ):
+                broaden = _ask_back_streak(snap["promptHistory"]) >= 2
+                output = dict(
+                    output,
+                    status="needs_clarification",
+                    content=voice_text(
+                        "memory_topic_broaden" if broaden else "memory_ask_back",
+                        snap["replyLanguage"],
+                        snap["level"],
+                        snap["previousAssistantText"],
+                        turn["id"],
+                    ),
+                    claims=[],
+                    evidence=[],
+                    grounding="unverified_model",
+                    limitations=["MEMORY_TOPIC_BROADEN" if broaden else "MEMORY_ASK_BACK"],
+                )
             return dict(frame, output=output, agent=agent, promptEvidence=prompt_evidence)
 
         async def output_guard(frame):
@@ -927,6 +1030,8 @@ class LLMEngine:
                             "realPerson": snap["persona"]["reviewStatus"] != "synthetic",
                             "language": snap["replyLanguage"],
                             "level": snap["level"],
+                            "previousAssistantText": snap["previousAssistantText"],
+                            "turnId": turn["id"],
                         },
                     )
                     content = guarded_reply["content"]
@@ -966,7 +1071,13 @@ class LLMEngine:
                     check()
                     output = {
                         "status": "insufficient_evidence",
-                        "content": voice_text("fallback", snap["replyLanguage"], snap["level"]),
+                        "content": voice_text(
+                            "service_retry",
+                            snap["replyLanguage"],
+                            snap["level"],
+                            snap["previousAssistantText"],
+                            turn["id"],
+                        ),
                         "claims": [],
                         "evidence": [],
                         "grounding": "unverified_model",
@@ -1160,7 +1271,8 @@ class LLMEngine:
                 )
             except Exception:
                 return notice(
-                    voice_text("fallback", language, "polite"), ["GUARDRAILS_INPUT_UNAVAILABLE"]
+                    voice_text("service_retry", language, "polite", seed=key),
+                    ["GUARDRAILS_INPUT_UNAVAILABLE"],
                 )
             action = (safety or decision)["action"]
             category = (safety or decision).get("category")
@@ -1224,7 +1336,8 @@ class LLMEngine:
                     return notice(content, ["REPLY_GUARD_" + guarded["reason"].upper()])
             except Exception:
                 return notice(
-                    voice_text("fallback", language, "polite"), ["GUARDRAILS_OUTPUT_UNAVAILABLE"]
+                    voice_text("service_retry", language, "polite", seed=key),
+                    ["GUARDRAILS_OUTPUT_UNAVAILABLE"],
                 )
             await check()
             return {

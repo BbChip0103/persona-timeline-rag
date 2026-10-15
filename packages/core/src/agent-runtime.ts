@@ -29,13 +29,14 @@ export const AGENT_RUNTIME_REVISION='langgraph-json-action-v1';
  * is left for a prompt that does not fit without posts.
  * v13: explicitly bind caption quotes to sourceId only, and image quotes to the exact parent and annotation.
  */
-export const AGENT_PROMPT_REVISION='character-agent-context-v13-evidence-origin';
+export const AGENT_PROMPT_REVISION='character-agent-context-v14-immersion';
 export interface AgentValidator {
   /** Optional external judge. Its provider must use the same bounded ledger; core never auto-configures one. */
   validate(input:{question:string;answer:string;sources:SourcePost[];personId:string;signal:AbortSignal}):Promise<'accept'|'reject'>;
 }
 export interface AgentRunInput {
   provider:TextProvider;persona:Persona;history:ChatMessage[];text:string;sources:SourcePost[];
+  replyLanguage?:string;createdAt?:string;timezone?:string;
   variables?:AgentVariables;signal:AbortSignal;maxToolRounds?:number;
   search?:(query:string)=>Promise<SourcePost[]>;
   /** Per-turn safety note (input safety deflection): a system message right before the user utterance. */
@@ -79,7 +80,7 @@ type AgentRunResult={
   response:AgentResponse;rawReply:string;agent:AgentExecution;
   /** Successful model-task upstreams, including checkpoint replay (not another live call). */
   upstreams:string[];
-  context:ReturnType<typeof buildExperimentContext>;serviceLimitation?:'AGENT_TOOL_UNAVAILABLE'|'AGENT_REPLY_INVALID';
+  context:ReturnType<typeof buildExperimentContext>;serviceLimitation?:'AGENT_TOOL_UNAVAILABLE'|'AGENT_REPLY_INVALID'|'TOOL_LIMIT'|'TOOL_REPEATED';
 };
 interface RuntimeState {
   iteration:number;variables:AgentVariables;transcript:ProviderMessage[];called:string[];
@@ -104,9 +105,17 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<AgentRunRes
   // Only the ports/signal remain live; caller-owned prompt data cannot mutate between graph rounds.
   input={...input,persona:structuredClone(input.persona),history:structuredClone(input.history),sources:structuredClone(input.sources),
     ...(input.lore?{lore:structuredClone(input.lore)}:{})};
-  const replyLanguage=utteranceLanguage(input.text,input.persona.language);
+  const replyLanguage=input.replyLanguage??utteranceLanguage(input.text,input.persona.language,input.history);
   const level=speechLevel(input.persona);
-  const fallback=():AgentResponse=>({status:'insufficient_evidence',message:voiceText('fallback',replyLanguage,level),evidenceRefs:[],variableUpdates:{}});
+  const previousAssistantText=[...input.history].reverse().find(message=>message.role==='assistant')?.content;
+  const instant=new Date(input.createdAt??Date.now());
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:input.timezone??'UTC',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(instant);
+  const field=(kind:'year'|'month'|'day')=>parts.find(part=>part.type===kind)!.value;
+  const today=`${field('year')}-${field('month')}-${field('day')}`;
+  const previousUser=[...input.history].reverse().find(message=>message.role==='user');
+  const elapsed=previousUser?Math.max(0,instant.getTime()-new Date(previousUser.createdAt).getTime()):undefined;
+  const sinceLastUserMessage=elapsed===undefined?'처음':elapsed<3_600_000?'방금':elapsed<86_400_000?'몇 시간 전':'며칠 전';
+  const serviceRetry=():AgentResponse=>({status:'insufficient_evidence',message:voiceText('service_retry',replyLanguage,level,previousAssistantText,input.requestKey),evidenceRefs:[],variableUpdates:{}});
   const languageName=isKoreanLanguage(replyLanguage)?'Korean':/^en(?:$|[-_])/i.test(replyLanguage)?'English':replyLanguage;
   const max=input.maxToolRounds??2;
   if(!Number.isInteger(max)||max<0||max>10)throw new CoreError('INVALID_INPUT');
@@ -128,7 +137,7 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<AgentRunRes
       const safety=buildExperimentContext(input.persona,[],input.text,[]).messages[0]!.content.split('TIMELINE_JSON_REPLY:')[0];
       const context=buildExperimentContext(input.persona,input.history,input.text,run.sources,{
         policy:`${safety}${recollectionVoice}${protocol}`,...(input.policyNote?{policyNote:input.policyNote}:{}),
-        afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify({...run.variables,replyLanguage:languageName,speechLevel:level==='casual'?'반말':'해요체'})}`},...(input.lore?[input.lore]:[]),
+        afterHistory:[{role:'system',content:`AGENT_STATE_JSON_DATA ${JSON.stringify({...run.variables,replyLanguage:languageName,speechLevel:level==='casual'?'반말':'해요체',today,sinceLastUserMessage})}`},...(input.lore?[input.lore]:[]),
           {role:'system',content:`AGENT_TOOLS_JSON_DATA ${JSON.stringify(input.search&&run.iteration<max?['timeline_search']:[])}`}],
         afterUser:run.transcript,
       });
@@ -141,17 +150,17 @@ export async function runCharacterAgent(input:AgentRunInput):Promise<AgentRunRes
       const {raw,upstream}=await generate(run.context!.messages,run.iteration);
       checkedSignal(input.signal);
       let response:AgentResponse;let serviceLimitation:AgentRunResult['serviceLimitation'];
-      try {response=parseAgentResponse(withoutEchoedStateFields(raw));} catch {response=fallback();serviceLimitation='AGENT_REPLY_INVALID';}
+      try {response=parseAgentResponse(withoutEchoedStateFields(raw));} catch {response=serviceRetry();serviceLimitation='AGENT_REPLY_INVALID';}
       if(!response.function)response={...response,message:trimToSentence(response.message)};
       if(containsInternalPathPattern(response.message)||containsInternalPathPattern(response.reasoning??'')
         ||containsInternalPathPattern(response.variableUpdates.conversationTopic??''))throw new CoreError('TURN_FAILED','REPLY_REJECTED');
       if(response.function) {
         const query=response.function.arguments.query;
         if(containsCredentialPattern(query)||containsInternalPathPattern(query))throw new CoreError('TURN_FAILED','TOOL_QUERY_REJECTED');
-        if(!input.search){response=fallback();serviceLimitation='AGENT_TOOL_UNAVAILABLE';}
+        if(!input.search){response=serviceRetry();serviceLimitation='AGENT_TOOL_UNAVAILABLE';}
         else {
-          if(run.iteration>=max)throw new CoreError('TURN_FAILED','TOOL_LIMIT');
-          if(run.called.includes(query))throw new CoreError('TURN_FAILED','TOOL_REPEATED');
+          if(run.iteration>=max){response=serviceRetry();serviceLimitation='TOOL_LIMIT';}
+          else if(run.called.includes(query)){response=serviceRetry();serviceLimitation='TOOL_REPEATED';}
         }
       }
       return {run:{...run,response,serviceLimitation,upstreams:[...run.upstreams,upstream],modelCalls:run.modelCalls+1,steps:[...run.steps,{phase:'model' as const,iteration:run.iteration}]}};

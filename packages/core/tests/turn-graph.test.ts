@@ -14,8 +14,8 @@ const source:SourcePost={id:'graph-post',personId:persona.personId,caption:'합�
 const modelReply=JSON.stringify({status:'answered',message:'합성 숲 그렸었지!',evidenceRefs:[{sourceId:source.id,quote:source.caption}],variableUpdates:{tone:'warm'}});
 const zero=Object.fromEntries(SAFETY_CATEGORIES.map(key=>[key,0.01])) as typeof DEFAULT_SAFETY_THRESHOLDS;
 function guards():jest.Mocked<Pick<GuardrailsClient,'validateInput'|'validateReply'>> {
-  return {validateInput:jest.fn<ReturnType<GuardrailsClient['validateInput']>,Parameters<GuardrailsClient['validateInput']>>(async input=>({revision:'reply-guard-v7',...safetyAction(input.probabilities,input.thresholds)})),
-    validateReply:jest.fn<ReturnType<GuardrailsClient['validateReply']>,Parameters<GuardrailsClient['validateReply']>>(async input=>({revision:'reply-guard-v7',content:input.reply}))};
+  return {validateInput:jest.fn<ReturnType<GuardrailsClient['validateInput']>,Parameters<GuardrailsClient['validateInput']>>(async input=>({revision:'reply-guard-v8',...safetyAction(input.probabilities,input.thresholds)})),
+    validateReply:jest.fn<ReturnType<GuardrailsClient['validateReply']>,Parameters<GuardrailsClient['validateReply']>>(async input=>({revision:'reply-guard-v8',content:input.reply}))};
 }
 function options(guardrails=guards()) {
   return {store:new InMemoryConversationStore(),personas:new InMemoryPersonaRepository([persona]),
@@ -44,7 +44,7 @@ test('Jev disabled explicitly selects rules-only Guardrails without fabricated s
   expect(fixture.guardrails.validateInput.mock.calls[0][0]).toMatchObject({classification:'rules-only',probabilities:{}});
   expect(turn.reply?.inputSafety).toMatchObject({decidedBy:'rule',action:'none'});
   expect(turn.reply?.inputSafety).not.toHaveProperty('classifier');
-  fixture.guardrails.validateInput.mockResolvedValue({revision:'reply-guard-v7',action:'refuse',category:'private_info',fired:['private_info']});
+  fixture.guardrails.validateInput.mockResolvedValue({revision:'reply-guard-v8',action:'refuse',category:'private_info',fired:['private_info']});
   const screened=await chat.screenDraftBrief('합성 개인정보 요청','synthetic-rules-draft','ko',new AbortController().signal);
   expect(screened.trace).toMatchObject({decidedBy:'rule',action:'refuse',category:'private_info'});expect(screened.reply).toBeDefined();
   expect(fixture.guardrails.validateInput.mock.calls[1][0]).toMatchObject({classification:'rules-only',probabilities:{}});
@@ -55,7 +55,7 @@ test.each(['input','output'] as const)('configured Guardrails %s outage fails cl
   const fixture=options();fixture.guardrails[phase==='input'?'validateInput':'validateReply'].mockRejectedValue(new Error('private-token/private-path'));
   const chat=createLocalChat(fixture),session=await chat.createSession('owner',sessionInput);
   const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'one',text:'그 게시물 기억나?'});
-  expect(turn.state).toBe('completed');expect(turn.reply?.content).toBe(voiceText('fallback','ko','casual'));
+  expect(turn.state).toBe('completed');expect(turn.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,turn.id));
   expect(turn.reply?.limitations).toContain(`GUARDRAILS_${phase.toUpperCase()}_UNAVAILABLE`);
   expect(turn.reply?.agent?.variables.tone).toBe('neutral');expect(JSON.stringify(turn)).not.toContain('private-token');
   expect(fixture.provider.generate).toHaveBeenCalledTimes(phase==='input'?0:1);
@@ -171,13 +171,13 @@ test('creative draft safety uses the same configured Guardrails boundary and fai
   await expect(chat.screenDraftBrief('합성 그림', 'synthetic-draft','ko',new AbortController().signal)).resolves.toMatchObject({limitations:[],trace:{action:'none'}});
   fixture.guardrails.validateInput.mockRejectedValue(new Error('private failure'));
   const result=await chat.screenDraftBrief('합성 그림', 'synthetic-draft-two','ko',new AbortController().signal);
-  expect(result.reply).toBe(voiceText('fallback','ko','polite'));expect(result.limitations).toEqual(['GUARDRAILS_INPUT_UNAVAILABLE']);expect(JSON.stringify(result)).not.toContain('private failure');await chat.stop();
+  expect(result.reply).toBe(voiceText('service_retry','ko','polite',undefined,'synthetic-draft-two'));expect(result.limitations).toEqual(['GUARDRAILS_INPUT_UNAVAILABLE']);expect(JSON.stringify(result)).not.toContain('private failure');await chat.stop();
 });
 
 test('untrusted validator replacement cannot leak internal paths even with an otherwise valid response schema',async()=>{
-  const fixture=options();fixture.guardrails.validateReply.mockResolvedValue({revision:'reply-guard-v7',content:'see /home/agent/private-notes'});
+  const fixture=options();fixture.guardrails.validateReply.mockResolvedValue({revision:'reply-guard-v8',content:'see /home/agent/private-notes'});
   const chat=createLocalChat(fixture),session=await chat.createSession('owner',sessionInput);
   const turn=await chat.sendTurn('owner',{sessionId:session.id,clientRequestId:'bad-validator',text:'그 게시물 기억나?'});
-  expect(turn.reply?.content).toBe(voiceText('fallback','ko','casual'));expect(turn.reply?.limitations).toContain('GUARDRAILS_OUTPUT_UNAVAILABLE');
+  expect(turn.reply?.content).toBe(voiceText('service_retry','ko','casual',undefined,turn.id));expect(turn.reply?.limitations).toContain('GUARDRAILS_OUTPUT_UNAVAILABLE');
   expect(JSON.stringify(turn)).not.toContain('/home/agent');await chat.stop();
 });
