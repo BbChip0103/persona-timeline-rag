@@ -4,7 +4,7 @@ import {CoreError,type ConversationStore,type TurnDelivery,type TurnEvents} from
 import {containsCredentialPattern} from '../../../packages/core/src/safety';
 import {requestFingerprint} from '../../../packages/core/src/request-fingerprint';
 import {greetingIndexFor} from '../../../packages/core/src/persona-card';
-import type {PersonaProjection} from '../../../contracts/llm/v1/validate';
+import type {PersonaProjection} from '../../../contracts/llm/v2/validate';
 /** Backend domain operations only: no persona DB access, provider, safety model or graph composition. */
 export class SplitChatService {
   private depth?:{value:number;at:number};private refresh?:Promise<void>;

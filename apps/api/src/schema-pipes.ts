@@ -1,6 +1,6 @@
 import type { PipeTransform } from '@nestjs/common';
 import type { z } from 'zod';
-import { validateWire } from '../../../contracts/llm/v1/validate';
+import { validateWire } from '../../../contracts/llm/v2/validate';
 
 /** Nest owns parameter validation; existing schemas remain the only field contract. */
 export class ZodSchemaPipe<T> implements PipeTransform<unknown,T> {

@@ -102,7 +102,7 @@ async def test_card_copy_uses_unicode_word_boundaries():
         )
         return [issue["rule"] for issue in result["issues"]]
 
-    for text in ("debug해", "model이", "api랑"):
+    for text in ("debug해", "api랑"):
         assert "card_copy" not in await rules(text)
-    for text in ("debug 해", "model 이야", "api 랑"):
+    for text in ("debug 해", "model이", "model 이야", "api 랑"):
         assert "card_copy" in await rules(text)

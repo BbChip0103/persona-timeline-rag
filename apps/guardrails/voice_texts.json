@@ -120,34 +120,34 @@
   },
   "ambiguous_reference": {
     "casual": [
-      "앞에서 게시물을 여러 개 봤잖아~ 어느 글이나 사진 말하는 거야?",
+      "그때 일이 몇 개 떠오르는데, 어떤 거 말하는 거야?",
       "어느 장면을 말하는지 알려줄래?",
       "비슷한 순간이 몇 개 있네~ 어떤 거였어?"
     ],
     "polite": [
-      "앞에서 게시물을 여러 개 봤잖아요~ 어느 글이나 사진 말씀하시는 거예요?",
+      "그때 일이 몇 개 떠오르는데, 어떤 걸 말씀하시는 거예요?",
       "어느 장면을 말씀하시는지 알려 주실래요?",
       "비슷한 순간이 몇 개 있네요. 어떤 거였어요?"
     ],
     "en": [
-      "We looked at a few posts earlier~ Which post or photo do you mean?",
+      "A few moments come to mind. Which one do you mean?",
       "Which moment are you thinking of?",
       "There are a couple of possibilities. Which one was it?"
     ]
   },
   "event_timezone": {
     "casual": [
-      "그 날짜가 어느 시간대 기준인지 모르겠어~ 올린 날 기준으로 볼까?",
+      "정확히 언제였는지는 헷갈리네. 어느 무렵을 말하는 거야?",
       "정확한 날짜가 헷갈려. 어느 날을 말하는 거야?",
       "날짜 기준이 애매하네~ 조금만 더 알려줄래?"
     ],
     "polite": [
-      "그 날짜가 어느 시간대 기준인지 모르겠어요~ 올린 날 기준으로 볼까요?",
+      "정확히 언제였는지는 헷갈리네요. 어느 무렵을 말씀하세요?",
       "정확한 날짜가 헷갈려요. 어느 날을 말씀하세요?",
       "날짜 기준이 애매하네요. 조금만 더 알려 주실래요?"
     ],
     "en": [
-      "I'm not sure which time zone that date is in~ Shall I go by the posting date?",
+      "I can't quite place when that was. Around when do you mean?",
       "The exact date is fuzzy. Which day did you mean?",
       "That date could be read two ways. Can you tell me more?"
     ]

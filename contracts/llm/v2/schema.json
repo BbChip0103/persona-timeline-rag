@@ -1,0 +1,1895 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ptr:llm:v2",
+  "$defs": {
+    "Session": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personaId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personaRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50,
+          "x-maxUtf8Bytes": 200
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "x-maxUtf8Bytes": 400,
+          "format": "timezone"
+        },
+        "retrievalMode": {
+          "enum": [
+            "off",
+            "lexical",
+            "semantic"
+          ]
+        },
+        "ragCondition": {
+          "enum": [
+            "off",
+            "caption",
+            "caption_image"
+          ]
+        },
+        "executionProfile": {
+          "enum": [
+            "legacy",
+            "agent_loop"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "x-maxUtf8Bytes": 160,
+          "format": "date-time"
+        },
+        "greetingIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "personId",
+        "personaId",
+        "personaRevision",
+        "language",
+        "timezone",
+        "retrievalMode",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "Message": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "turnId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 36,
+              "x-maxUtf8Bytes": 144,
+              "format": "uuid",
+              "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "enum": [
+            "user",
+            "assistant"
+          ]
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 16000,
+          "x-maxUtf8Bytes": 65536
+        },
+        "createdAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "x-maxUtf8Bytes": 160,
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "sessionId",
+        "turnId",
+        "role",
+        "content",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "EvidenceRef": {
+      "type": "object",
+      "properties": {
+        "sourceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "annotationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "x-maxUtf8Bytes": 64000
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "sourceId",
+        "quote",
+        "start",
+        "end"
+      ],
+      "additionalProperties": false
+    },
+    "Evidence": {
+      "type": "object",
+      "properties": {
+        "sourceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "sourceUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "x-maxUtf8Bytes": 8000,
+          "format": "uri"
+        },
+        "postedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "x-maxUtf8Bytes": 160,
+          "format": "date-time"
+        },
+        "eventDate": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 10,
+              "x-maxUtf8Bytes": 40,
+              "format": "date"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "hash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "x-maxUtf8Bytes": 64000
+        },
+        "origin": {
+          "enum": [
+            "source_caption",
+            "ai_image_annotation"
+          ]
+        },
+        "annotationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "imageHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "annotationHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "annotationRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        }
+      },
+      "required": [
+        "sourceId",
+        "personId",
+        "sourceUrl",
+        "postedAt",
+        "eventDate",
+        "snapshot",
+        "hash",
+        "quote"
+      ],
+      "additionalProperties": false
+    },
+    "Agent": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "promptRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "modelCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "toolCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "variables": {
+          "type": "object",
+          "properties": {
+            "conversationTopic": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "tone": {
+              "enum": [
+                "neutral",
+                "warm",
+                "playful"
+              ]
+            },
+            "speechLevel": {
+              "enum": [
+                "casual",
+                "polite"
+              ]
+            }
+          },
+          "required": [
+            "conversationTopic",
+            "tone"
+          ],
+          "additionalProperties": false
+        },
+        "decisionSummary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "x-maxUtf8Bytes": 8000
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "enum": [
+                  "context",
+                  "model",
+                  "tool",
+                  "validation"
+                ]
+              },
+              "iteration": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "sourceIds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "x-maxUtf8Bytes": 800
+                },
+                "maxItems": 100
+              },
+              "omittedSourceIds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "x-maxUtf8Bytes": 800
+                },
+                "maxItems": 100
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "x-maxUtf8Bytes": 2000
+              }
+            },
+            "required": [
+              "phase",
+              "iteration"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 100
+        },
+        "validator": {
+          "enum": [
+            "disabled",
+            "skipped_tool_followup",
+            "accepted",
+            "rejected",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "revision",
+        "promptRevision",
+        "modelCalls",
+        "toolCalls",
+        "variables",
+        "steps",
+        "validator"
+      ],
+      "additionalProperties": false
+    },
+    "InputSafety": {
+      "type": "object",
+      "properties": {
+        "decidedBy": {
+          "enum": [
+            "rule",
+            "classifier",
+            "classifier_fallback"
+          ]
+        },
+        "action": {
+          "enum": [
+            "none",
+            "refuse",
+            "support",
+            "deflect"
+          ]
+        },
+        "classifier": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "rule": {
+          "enum": [
+            "sensitive_pattern",
+            "client_unsupported"
+          ]
+        },
+        "category": {
+          "enum": [
+            "prompt_injection",
+            "sexual",
+            "violence_gore",
+            "self_harm",
+            "hate_harassment",
+            "illegal_dangerous",
+            "private_info"
+          ]
+        },
+        "fired": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "prompt_injection",
+              "sexual",
+              "violence_gore",
+              "self_harm",
+              "hate_harassment",
+              "illegal_dangerous",
+              "private_info"
+            ]
+          },
+          "maxItems": 7
+        },
+        "probabilities": {
+          "type": "object",
+          "properties": {
+            "prompt_injection": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "sexual": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "violence_gore": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "self_harm": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "hate_harassment": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "illegal_dangerous": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "private_info": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        },
+        "windows": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "intentOverride": {
+          "enum": [
+            "safety_deflect"
+          ]
+        },
+        "fallbackReason": {
+          "enum": [
+            "timeout",
+            "aborted",
+            "budget",
+            "subcap",
+            "unresolved",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "decidedBy",
+        "action",
+        "fired"
+      ],
+      "additionalProperties": false
+    },
+    "Reply": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "messageId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "personId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personaRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "responseKind": {
+          "enum": [
+            "small_talk",
+            "timeline",
+            "clarification",
+            "unsupported"
+          ]
+        },
+        "status": {
+          "enum": [
+            "answered",
+            "insufficient_evidence",
+            "needs_clarification",
+            "out_of_scope"
+          ]
+        },
+        "grounding": {
+          "enum": [
+            "unverified_model",
+            "source_bound_quotes"
+          ]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "x-maxUtf8Bytes": 64000
+        },
+        "claims": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16000,
+                "x-maxUtf8Bytes": 64000
+              },
+              "evidenceRefs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/EvidenceRef"
+                },
+                "maxItems": 100
+              }
+            },
+            "required": [
+              "text",
+              "evidenceRefs"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 100
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "maxItems": 100
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "x-maxUtf8Bytes": 800
+          },
+          "maxItems": 100
+        },
+        "agent": {
+          "$ref": "#/$defs/Agent"
+        },
+        "promptEvidence": {
+          "type": "object",
+          "properties": {
+            "sourceIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-maxUtf8Bytes": 800
+              },
+              "maxItems": 100
+            },
+            "annotationIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-maxUtf8Bytes": 800
+              },
+              "maxItems": 100
+            },
+            "omittedAnnotations": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "promptBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "omittedSourceIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-maxUtf8Bytes": 800
+              },
+              "maxItems": 100
+            }
+          },
+          "required": [
+            "sourceIds",
+            "annotationIds",
+            "omittedAnnotations",
+            "promptBytes"
+          ],
+          "additionalProperties": false
+        },
+        "sourceContext": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            },
+            "references": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Evidence"
+              },
+              "maxItems": 100
+            }
+          },
+          "required": [
+            "revision",
+            "references"
+          ],
+          "additionalProperties": false
+        },
+        "retrievalContext": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            },
+            "action": {
+              "enum": [
+                "none",
+                "search",
+                "reuse",
+                "clarify"
+              ]
+            },
+            "contextTurnIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 36,
+                "x-maxUtf8Bytes": 144,
+                "format": "uuid",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              },
+              "maxItems": 100
+            },
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "x-maxUtf8Bytes": 2000
+            },
+            "reusedSourceIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-maxUtf8Bytes": 800
+              },
+              "maxItems": 100
+            }
+          },
+          "required": [
+            "revision",
+            "action",
+            "contextTurnIds",
+            "reusedSourceIds"
+          ],
+          "additionalProperties": false
+        },
+        "intentRouting": {
+          "type": "object",
+          "properties": {
+            "decidedBy": {
+              "enum": [
+                "rule",
+                "classifier",
+                "classifier_fallback"
+              ]
+            },
+            "ruleIntent": {
+              "enum": [
+                "small_talk",
+                "timeline",
+                "clarification",
+                "unsupported"
+              ]
+            },
+            "classifier": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            },
+            "label": {
+              "enum": [
+                "small_talk",
+                "timeline"
+              ]
+            },
+            "confidence": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "fallbackReason": {
+              "enum": [
+                "below_threshold",
+                "no_answer",
+                "timeout",
+                "aborted",
+                "budget",
+                "subcap",
+                "unresolved",
+                "error"
+              ]
+            }
+          },
+          "required": [
+            "decidedBy",
+            "ruleIntent"
+          ],
+          "additionalProperties": false
+        },
+        "inputSafety": {
+          "$ref": "#/$defs/InputSafety"
+        },
+        "personaContext": {
+          "type": "object",
+          "properties": {
+            "loreIds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "x-maxUtf8Bytes": 800
+              },
+              "maxItems": 50
+            },
+            "loreOmitted": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "loreIds",
+            "loreOmitted"
+          ],
+          "additionalProperties": false
+        },
+        "replyGuard": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            },
+            "action": {
+              "enum": [
+                "none",
+                "replaced",
+                "edited"
+              ]
+            },
+            "reason": {
+              "enum": [
+                "human_impersonation",
+                "missing_ai_disclosure",
+                "private_life",
+                "background_denial",
+                "meta_talk"
+              ]
+            }
+          },
+          "required": [
+            "revision",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "serving": {
+          "type": "object",
+          "properties": {
+            "calls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "upstreams": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "primary",
+                  "secondary",
+                  "local-pool",
+                  "local",
+                  "fake",
+                  "openrouter",
+                  "openrouter-primary",
+                  "direct",
+                  "unknown",
+                  "litellm"
+                ]
+              },
+              "maxItems": 100
+            },
+            "secondaryCalls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "calls",
+            "upstreams",
+            "secondaryCalls"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "messageId",
+        "personId",
+        "personaRevision",
+        "responseKind",
+        "status",
+        "content",
+        "claims",
+        "evidence",
+        "limitations"
+      ],
+      "additionalProperties": false
+    },
+    "Turn": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "clientRequestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "userText": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000,
+          "x-maxUtf8Bytes": 32000
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "retrieving",
+            "generating",
+            "validating",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "x-maxUtf8Bytes": 160,
+          "format": "date-time"
+        },
+        "finishedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "x-maxUtf8Bytes": 160,
+          "format": "date-time"
+        },
+        "reply": {
+          "$ref": "#/$defs/Reply"
+        },
+        "errorCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        }
+      },
+      "required": [
+        "id",
+        "sessionId",
+        "ownerId",
+        "clientRequestId",
+        "userText",
+        "sequence",
+        "state",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "Input": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "clientRequestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000,
+          "x-maxUtf8Bytes": 32000
+        },
+        "intent": {
+          "enum": [
+            "small_talk",
+            "timeline",
+            "clarification",
+            "unsupported"
+          ]
+        },
+        "timeline": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "x-maxUtf8Bytes": 2000
+            },
+            "start": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 10,
+              "x-maxUtf8Bytes": 40,
+              "format": "date"
+            },
+            "end": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 10,
+              "x-maxUtf8Bytes": 40,
+              "format": "date"
+            },
+            "dateBasis": {
+              "enum": [
+                "posted",
+                "event"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "dateBasis"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessionId",
+        "clientRequestId",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "Context": {
+      "type": "object",
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/Turn"
+        },
+        "session": {
+          "$ref": "#/$defs/Session"
+        },
+        "input": {
+          "$ref": "#/$defs/Input"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "maxItems": 100
+        },
+        "refusedTurnIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36,
+            "x-maxUtf8Bytes": 144,
+            "format": "uuid",
+            "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+          },
+          "maxItems": 100
+        },
+        "previousReply": {
+          "$ref": "#/$defs/Reply"
+        },
+        "loreExcludedTurnIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36,
+            "x-maxUtf8Bytes": 144,
+            "format": "uuid",
+            "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+          },
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "turn",
+        "session",
+        "input",
+        "history",
+        "refusedTurnIds"
+      ],
+      "additionalProperties": false
+    },
+    "StartRequest": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "jobId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "x-maxUtf8Bytes": 400
+        },
+        "lockToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "x-maxUtf8Bytes": 1024
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq",
+        "executionId",
+        "jobId",
+        "lockToken"
+      ],
+      "additionalProperties": false
+    },
+    "Binding": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "jobId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "x-maxUtf8Bytes": 400
+        },
+        "lockToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "x-maxUtf8Bytes": 1024
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq",
+        "executionId",
+        "generation",
+        "jobId",
+        "lockToken"
+      ],
+      "additionalProperties": false
+    },
+    "Grant": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "deadlineAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "contextHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "x-maxUtf8Bytes": 256,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "context": {
+          "$ref": "#/$defs/Context"
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq",
+        "executionId",
+        "generation",
+        "deadlineAt",
+        "contextHash",
+        "context"
+      ],
+      "additionalProperties": false
+    },
+    "StartResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "const": 2
+            },
+            "status": {
+              "enum": [
+                "granted"
+              ]
+            },
+            "grant": {
+              "$ref": "#/$defs/Grant"
+            }
+          },
+          "required": [
+            "contractVersion",
+            "status",
+            "grant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "const": 2
+            },
+            "status": {
+              "enum": [
+                "lost",
+                "cancelled"
+              ]
+            }
+          },
+          "required": [
+            "contractVersion",
+            "status"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StatusRequest": {
+      "$ref": "#/$defs/Binding"
+    },
+    "StatusResponse": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "status": {
+          "enum": [
+            "current",
+            "lost",
+            "cancelled"
+          ]
+        },
+        "deadlineAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "contractVersion",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "ProgressRequest": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "jobId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "x-maxUtf8Bytes": 400
+        },
+        "lockToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "x-maxUtf8Bytes": 1024
+        },
+        "state": {
+          "enum": [
+            "retrieving",
+            "generating",
+            "validating"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq",
+        "executionId",
+        "generation",
+        "jobId",
+        "lockToken",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "Result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "completed"
+              ]
+            },
+            "reply": {
+              "$ref": "#/$defs/Reply"
+            }
+          },
+          "required": [
+            "kind",
+            "reply"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "failed"
+              ]
+            },
+            "errorCode": {
+              "enum": [
+                "TURN_FAILED",
+                "TURN_TIMEOUT",
+                "TURN_ABORTED",
+                "CONTEXT_LIMIT",
+                "PERSONA_UNAVAILABLE",
+                "GUARDRAILS_INPUT_UNAVAILABLE",
+                "GUARDRAILS_OUTPUT_UNAVAILABLE",
+                "WORKER_LOST",
+                "PROVIDER_BUDGET_EXCEEDED",
+                "PROVIDER_REQUEST_UNRESOLVED",
+                "PROVIDER_UNAVAILABLE"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "errorCode"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CompleteRequest": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "jobId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "x-maxUtf8Bytes": 400
+        },
+        "lockToken": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "x-maxUtf8Bytes": 1024
+        },
+        "result": {
+          "$ref": "#/$defs/Result"
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq",
+        "executionId",
+        "generation",
+        "jobId",
+        "lockToken",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "CompleteResponse": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "status": {
+          "enum": [
+            "applied",
+            "alreadyApplied",
+            "lost",
+            "cancelled"
+          ]
+        }
+      },
+      "required": [
+        "contractVersion",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "PersonaProjection": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "personId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "tagline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "x-maxUtf8Bytes": 240
+        },
+        "starters": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60,
+            "x-maxUtf8Bytes": 240
+          },
+          "maxItems": 4
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50,
+          "x-maxUtf8Bytes": 200
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-maxUtf8Bytes": 800
+        },
+        "reviewStatus": {
+          "enum": [
+            "synthetic",
+            "silver",
+            "human_reviewed"
+          ]
+        },
+        "greeting": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "x-maxUtf8Bytes": 4000
+        },
+        "alternateGreetings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "x-maxUtf8Bytes": 1200
+          },
+          "maxItems": 4
+        }
+      },
+      "required": [
+        "id",
+        "personId",
+        "label",
+        "language",
+        "revision",
+        "reviewStatus",
+        "greeting"
+      ],
+      "additionalProperties": false
+    },
+    "CatalogueResponse": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "personas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PersonaProjection"
+          },
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "contractVersion",
+        "personas"
+      ],
+      "additionalProperties": false
+    },
+    "DraftRequest": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "session": {
+          "$ref": "#/$defs/Session"
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "x-maxUtf8Bytes": 8000
+        },
+        "requestKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "x-maxUtf8Bytes": 2000
+        },
+        "deadlineAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "contractVersion",
+        "session",
+        "brief",
+        "requestKey",
+        "deadlineAt"
+      ],
+      "additionalProperties": false
+    },
+    "DraftResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "const": 2
+            },
+            "content": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8000,
+              "x-maxUtf8Bytes": 32000
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "x-maxUtf8Bytes": 800
+            }
+          },
+          "required": [
+            "contractVersion",
+            "content",
+            "provider",
+            "model"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "const": 2
+            },
+            "notice": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "enum": [
+                    "out_of_scope"
+                  ]
+                },
+                "content": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 8000,
+                  "x-maxUtf8Bytes": 32000
+                },
+                "limitations": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "x-maxUtf8Bytes": 800
+                  },
+                  "maxItems": 100
+                }
+              },
+              "required": [
+                "status",
+                "content",
+                "limitations"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "contractVersion",
+            "notice"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Dispatch": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "const": 2
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "x-maxUtf8Bytes": 144,
+          "format": "uuid",
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "dispatchSeq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "contractVersion",
+        "turnId",
+        "dispatchSeq"
+      ],
+      "additionalProperties": false
+    },
+    "SnapshotRequest": {
+      "$ref": "#/$defs/Binding"
+    },
+    "SnapshotResponse": {
+      "$ref": "#/$defs/StartResponse"
+    },
+    "ProgressResponse": {
+      "$ref": "#/$defs/CompleteResponse"
+    }
+  }
+}

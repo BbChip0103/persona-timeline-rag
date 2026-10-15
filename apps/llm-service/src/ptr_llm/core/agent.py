@@ -20,7 +20,7 @@ from .texts import is_korean, speech_level, utterance_language, voice_text
 from .tools import timeline_tool
 
 AGENT_RUNTIME_REVISION = "langgraph-json-action-v1"
-AGENT_PROMPT_REVISION = "character-agent-context-v15-formatting"
+AGENT_PROMPT_REVISION = "character-agent-context-v16-natural-recall"
 
 
 class AgentState(TypedDict, total=False):
@@ -117,6 +117,7 @@ async def run_character_agent(
     created_at=None,
     timezone_name="UTC",
     reply_language=None,
+    level=None,
 ):
     persona = copy.deepcopy(persona)
     history = copy.deepcopy(history)
@@ -125,7 +126,8 @@ async def run_character_agent(
     if type(max_tool_rounds) is not int or not 0 <= max_tool_rounds <= 10:
         raise CoreError("INVALID_INPUT")
     language = reply_language or utterance_language(text, persona["language"], history)
-    level = speech_level(persona)
+    saved_level = variables(variables_state).get("speechLevel")
+    level = level or (saved_level if saved_level in {"casual", "polite"} else speech_level(persona))
     previous = next((m["content"] for m in reversed(history) if m.get("role") == "assistant"), "")
     instant = (
         datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -190,7 +192,7 @@ async def run_character_agent(
                         run["variables"],
                         replyLanguage=language_name,
                         speechLevel="반말" if level == "casual" else "해요체",
-                        today=local_now.date().isoformat(),
+                        today="오늘",
                         sinceLastUserMessage=since_last,
                     )
                 ),
@@ -217,6 +219,7 @@ async def run_character_agent(
             after_history=after,
             after_user=run["transcript"],
             max_sources=max_sources,
+            today=local_now.date().isoformat(),
         )
         if len(ctx["messages"]) > 64:
             raise CoreError("CONTEXT_LIMIT")

@@ -258,7 +258,7 @@ _FORBIDDEN = [(name, [compile_js(p) for p in patterns]) for name, patterns in _P
 _PRIVATE = [compile_js(p) for p in _POLICY["PRIVATE_LIFE"]]
 _DATE_PLACE = [compile_js(p) for p in _POLICY["DATE_PLACE"]]
 _CARD_COPY_FORBIDDEN = regex.compile(
-    r"(?:연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|\b(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)\b)",
+    r"(?:게시물|캡션|자료|연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|\bmodel(?=[가-힣])|\b(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)\b)",
     regex.I,
 )
 _CONFUSABLES = json.loads(Path(__file__).with_name("persona_confusables.json").read_text())

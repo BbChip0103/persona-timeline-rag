@@ -50,7 +50,7 @@ COPY --chmod=0755 packages/contracts/src/index.ts ./packages/contracts/src/
 COPY --chmod=0755 infra/backend/storage-package.json ./packages/storage/package.json
 COPY --chmod=0755 scripts/split-maintenance.py scripts/framework-retention.ts scripts/framework-evaluate.ts scripts/review-sample.ts scripts/production-review.ts ./scripts/
 COPY --chmod=0755 infra/backend/storage-index.ts ./packages/storage/src/index.ts
-COPY --chmod=0755 contracts/llm/v1 ./contracts/llm/v1
+COPY --chmod=0755 contracts/llm/v2 ./contracts/llm/v2
 RUN mkdir -p node_modules/@ptr && ln -s ../../packages/contracts node_modules/@ptr/contracts && ln -s ../../packages/ops node_modules/@ptr/ops && ln -s ../../packages/storage node_modules/@ptr/storage
 COPY --from=web-builder --chmod=0755 /app/apps/web/.next ./apps/web/.next
 COPY --chmod=0755 apps/web/package.json apps/web/next.config.mjs ./apps/web/

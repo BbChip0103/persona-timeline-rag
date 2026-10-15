@@ -17,7 +17,7 @@ const persona:Persona={id:'persona_synthetic_a',personId:'person_synthetic_a',la
 let app:INestApplication;let base:string;let runtime:SplitApiRuntime;let fixture:ReturnType<typeof splitRuntimeFixture>;let artifacts:CreativeArtifact[];
 async function call(path:string,options:{method?:string;body?:unknown;owner?:string;auth?:string}={}) {
   const response=await fetch(`${base}/api/${path}`,{method:options.method??'GET',headers:{Authorization:options.auth??`Bearer ${token}`,'X-PTR-Owner':options.owner??'owner_synthetic_a','Content-Type':'application/json'},...(options.body===undefined?{}:{body:JSON.stringify(options.body)})});
-  return {status:response.status,body:await response.json() as {session:ChatSession;turn:ChatTurn;personas:(Persona & {aiDisclosure:string})[];operatorMode:boolean;history:ChatMessage[];sessions:ChatSession[];artifact:CreativeArtifact;image:{code:string};cancelled:boolean}};
+  return {status:response.status,body:await response.json() as {session:ChatSession;turn:ChatTurn;personas:(Persona & {aiDisclosure:string})[];operatorMode:boolean;operatorOptionsAvailable?:boolean;history:ChatMessage[];sessions:ChatSession[];artifact:CreativeArtifact;image:{code:string};cancelled:boolean}};
 }
 async function waitTurn(id:string):Promise<ChatTurn> {
   for(let i=0;i<100;i++) {const result=await call(`turns/${id}`);if(['completed','cancelled','failed'].includes(result.body.turn.state)) return result.body.turn;await new Promise(resolve=>setTimeout(resolve,5));}
@@ -54,6 +54,7 @@ test('health safe; authentication required and invalid owner rejected',async()=>
 test('public catalogue carries approved card copy and operator mode is off by default',async()=>{
   const listed=(await call('personas')).body;
   expect(listed.operatorMode).toBe(false);
+  expect(listed.operatorOptionsAvailable).toBeUndefined();
   expect(listed.personas[0]).toMatchObject({label:persona.label,tagline:persona.tagline,starters:persona.starters});
   expect(listed.personas[0].reviewStatus).toBeUndefined();
 });
@@ -63,7 +64,12 @@ test('server-only operator flag enables the catalogue operator projection',async
   await app.listen(0,'127.0.0.1');base=await app.getUrl();
   const listed=(await call('personas')).body;
   expect(listed.operatorMode).toBe(true);
+  expect(listed.operatorOptionsAvailable).toBe(false);
   expect(listed.personas[0].reviewStatus).toBe('synthetic');
+  await app.close();
+  app=await createApiApplication(runtime,productionToken,{syntheticToken:token,operatorMode:true,operatorOptions:true});
+  await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  expect((await call('personas')).body.operatorOptionsAvailable).toBe(true);
 });
 test('production token cannot submit operator-only options unless the API flag is enabled',async()=>{
   const production=`Bearer ${productionToken}`;

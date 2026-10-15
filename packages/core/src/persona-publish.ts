@@ -102,7 +102,7 @@ const DATE_PLACE:RegExp[]=[
 ];
 type Group='label'|'card'|'core'|'greeting'|'personality'|'background'|'example'|'lore'|'meta';
 /** Card copy is public character-facing text, not an operator or research surface. */
-const CARD_COPY_FORBIDDEN=/(?:연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|(?<![\p{L}\p{N}_])(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)(?![\p{L}\p{N}_]))/iu;
+const CARD_COPY_FORBIDDEN=/(?:게시물|캡션|자료|연구|근거|출처|검수|리비전|검색|실험|평가|디버그|시스템|프롬프트|모델|운영자|데이터베이스|시뮬레이션|(?<![\p{L}\p{N}_])model(?=[가-힣])|(?<![\p{L}\p{N}_])(?:research|evidence|sources?|retrieval|revision|experiment|evaluation|debug|system|prompt|model|operator|database|simulation|rag|api)(?![\p{L}\p{N}_]))/iu;
 /** Every author-written string that is rendered (plus label and meta, shown in the UI), with its report path. */
 function authorFields(p:Persona):{path:string;text:string;group:Group}[] {
   const out:{path:string;text:string;group:Group}[]=[];

@@ -32,7 +32,7 @@ SOURCE_FILES = (
     "apps/llm-service/src/ptr_llm/providers/checkpoints.py",
     "apps/llm-service/src/ptr_llm/providers/local.py",
     "apps/llm-service/src/ptr_llm/core/runtime.py",
-    "contracts/llm/v1/models.py",
+    "contracts/llm/v2/models.py",
 )
 GATES: dict[str, Any] = {
     "jobs": 10000,

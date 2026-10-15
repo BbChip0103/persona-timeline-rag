@@ -1,12 +1,12 @@
 import type {Pool} from 'pg';
 import {PostgresLlmControl,canonicalHash} from '../src/llm-control';
-const request={contractVersion:1 as const,turnId:'00000000-0000-4000-8000-000000000001',dispatchSeq:0,jobId:'t-00000000-0000-4000-8000-000000000001-0',lockToken:'synthetic-lock',executionId:'00000000-0000-4000-8000-000000000002'};
+const request={contractVersion:2 as const,turnId:'00000000-0000-4000-8000-000000000001',dispatchSeq:0,jobId:'t-00000000-0000-4000-8000-000000000001-0',lockToken:'synthetic-lock',executionId:'00000000-0000-4000-8000-000000000002'};
 it('locks authoritative app row before consulting Redis, and cannot claim on failed token',async()=>{
   const order:string[]=[];
   const client={query:jest.fn(async(sql:string)=>{order.push(sql.includes('FOR UPDATE')?'row-lock':sql);if(sql.includes('FOR UPDATE'))return {rows:[{id:request.turnId,dispatch_seq:0,state:'pending'}]};return {rows:[]};}),release:jest.fn()};
   const pool={connect:jest.fn(async()=>client)} as unknown as Pool;
   const store=new PostgresLlmControl(pool,async()=>{order.push('redis-token');return false;});
-  expect(await store.start(request)).toEqual({contractVersion:1,status:'lost'});
+  expect(await store.start(request)).toEqual({contractVersion:2,status:'lost'});
   expect(order.indexOf('row-lock')).toBeLessThan(order.indexOf('redis-token'));
   expect(order.filter(x=>x.startsWith('UPDATE'))).toEqual([]);
   expect(order.at(-1)).toBe('COMMIT');
@@ -26,7 +26,7 @@ it('bounded LIMIT101 probes overflow and commits CONTEXT_LIMIT rather than silen
     return {rows:[]};
   }),release:jest.fn()};
   const control=new PostgresLlmControl({connect:async()=>client} as unknown as Pool,async()=>true);
-  expect(await control.start(request)).toEqual({contractVersion:1,status:'lost'});
+  expect(await control.start(request)).toEqual({contractVersion:2,status:'lost'});
   expect(client.query).toHaveBeenCalledWith(expect.stringContaining("state='failed'"),[request.turnId,'CONTEXT_LIMIT']);
   expect(client.query.mock.calls.some(([sql])=>sql.includes('INSERT INTO turn_execution_grants'))).toBe(false);
 });

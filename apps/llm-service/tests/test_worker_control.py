@@ -106,9 +106,9 @@ class ControlFake:
             self.start_failures -= 1
             raise ControlUnavailable()
         if self.denial:
-            return {"contractVersion": 1, "status": self.denial}
+            return {"contractVersion": 2, "status": self.denial}
         self.grant = {
-            "contractVersion": 1,
+            "contractVersion": 2,
             "turnId": body["turnId"],
             "dispatchSeq": body["dispatchSeq"],
             "executionId": body["executionId"],
@@ -117,12 +117,12 @@ class ControlFake:
             "contextHash": "a" * 64,
             "context": context(body["turnId"]),
         }
-        return {"contractVersion": 1, "status": "granted", "grant": self.grant}
+        return {"contractVersion": 2, "status": "granted", "grant": self.grant}
 
     async def status(self, _):
         if self.status_failure:
             raise ControlUnavailable()
-        return {"contractVersion": 1, "status": self.status_value}
+        return {"contractVersion": 2, "status": self.status_value}
 
     async def complete(self, binding, result):
         self.completions.append(copy.deepcopy({**binding, "result": result}))
@@ -130,7 +130,7 @@ class ControlFake:
             self.ack_failures -= 1
             raise ControlUnavailable()
         return {
-            "contractVersion": 1,
+            "contractVersion": 2,
             "status": "alreadyApplied" if len(self.completions) > 1 else "applied",
         }
 
@@ -152,7 +152,7 @@ class Engine:
 def setup():
     turn_id = str(uuid4())
     job = SimpleNamespace(
-        id=f"t-{turn_id}-0", data={"contractVersion": 1, "turnId": turn_id, "dispatchSeq": 0}
+        id=f"t-{turn_id}-0", data={"contractVersion": 2, "turnId": turn_id, "dispatchSeq": 0}
     )
     control, engine, store, redis = ControlFake(), Engine(), Store(), RedisFake()
     runner = WorkerRunner(settings(), control, engine, store, redis=redis)
@@ -518,7 +518,7 @@ async def test_control_transport_failure_does_not_echo_response_or_secret():
         with pytest.raises(ControlUnavailable, match="^CONTROL_UNAVAILABLE$"):
             await control.status(
                 {
-                    "contractVersion": 1,
+                    "contractVersion": 2,
                     "turnId": str(uuid4()),
                     "dispatchSeq": 0,
                     "executionId": str(uuid4()),
@@ -664,7 +664,7 @@ async def test_lost_status_crossing_deadline_timeout_only_for_actual_token_holde
         checked += 1
         if checked == 1:
             control.grant["deadlineAt"] = int((time.time() - 0.1) * 1000)
-            return {"contractVersion": 1, "status": "lost"}
+            return {"contractVersion": 2, "status": "lost"}
         return await original_status(binding)
 
     control.status = status
@@ -779,7 +779,7 @@ async def test_control_total_timeout_even_if_server_drips_chunks():
             "http://internal", "synthetic-control-token", timeout=0.05, client=client
         )
         binding = {
-            "contractVersion": 1,
+            "contractVersion": 2,
             "turnId": str(uuid4()),
             "dispatchSeq": 0,
             "executionId": str(uuid4()),
@@ -799,14 +799,20 @@ def test_installed_service_uses_explicit_shared_contract_directory(monkeypatch):
 
     from ptr_llm.control import _wire_module, validate_wire
 
-    directory = Path(__file__).resolve().parents[3] / "contracts/llm/v1"
+    directory = Path(__file__).resolve().parents[3] / "contracts/llm/v2"
     monkeypatch.setenv("PTR_LLM_CONTRACTS_DIR", str(directory))
     _wire_module.cache_clear()
     try:
         assert validate_wire(
-            "Dispatch", {"contractVersion": 1, "turnId": str(uuid4()), "dispatchSeq": 0}
+            "Dispatch", {"contractVersion": 2, "turnId": str(uuid4()), "dispatchSeq": 0}
         )
         corpus = json.loads((directory / "corpus.json").read_text())
+        for case in corpus:
+            if case["valid"]:
+                assert validate_wire(case["schema"], case["value"]) == case["value"]
+            else:
+                with pytest.raises(ControlRejected):
+                    validate_wire(case["schema"], case["value"])
         local_result = next(
             case["value"]
             for case in corpus
@@ -819,6 +825,33 @@ def test_installed_service_uses_explicit_shared_contract_directory(monkeypatch):
             validate_wire("Dispatch", {})
     finally:
         _wire_module.cache_clear()
+
+
+def test_v2_wire_rejects_v1_peer_with_clear_version_code():
+    from ptr_llm.control import ControlRejected, validate_wire
+
+    body = {"contractVersion": 2, "turnId": str(uuid4()), "dispatchSeq": 0}
+    assert validate_wire("Dispatch", body) == body
+    with pytest.raises(ControlRejected, match="WIRE_VERSION_MISMATCH"):
+        validate_wire("Dispatch", {**body, "contractVersion": 1})
+
+
+async def test_control_client_rejects_v1_response_with_clear_version_code():
+    async def responder(_):
+        return httpx.Response(200, json={"contractVersion": 1, "status": "lost"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(responder)) as client:
+        control = ControlClient("http://internal", "synthetic-control-token", client=client)
+        body = {
+            "contractVersion": 2,
+            "turnId": str(uuid4()),
+            "dispatchSeq": 0,
+            "executionId": str(uuid4()),
+            "jobId": "synthetic",
+            "lockToken": "synthetic",
+        }
+        with pytest.raises(ControlRejected, match="WIRE_VERSION_MISMATCH"):
+            await control.start(body)
 
 
 def test_module_cli_preserves_failed_evaluation_exit(monkeypatch):
@@ -898,7 +931,7 @@ async def test_post_receipt_expiry_backend_terminalizes_without_model_retry():
         # Backend transaction verifies fence+token, then atomically refuses
         # expired success, fails TURN_TIMEOUT and removes the outbox.
         terminal_state = "TURN_TIMEOUT"
-        return {"contractVersion": 1, "status": "lost"}
+        return {"contractVersion": 2, "status": "lost"}
 
     control.complete = complete
     assert await runner.process(job, "synthetic-token") == {"status": "obsolete"}
@@ -1076,7 +1109,7 @@ async def test_completed_result_cancellation_backend_cas_no_publication_or_model
     async def complete(binding, result):
         assert backend_cancelled
         control.completions.append(copy.deepcopy({**binding, "result": result}))
-        return {"contractVersion": 1, "status": "cancelled"}
+        return {"contractVersion": 2, "status": "cancelled"}
 
     control.complete = complete
     assert await runner.process(job, "synthetic-token") == {"status": "obsolete"}

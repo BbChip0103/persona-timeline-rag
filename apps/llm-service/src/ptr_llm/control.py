@@ -18,12 +18,12 @@ import httpx
 def _wire_module() -> Any:
     configured = os.environ.get("PTR_LLM_CONTRACTS_DIR")
     directory = (
-        Path(configured) if configured else Path(__file__).resolve().parents[4] / "contracts/llm/v1"
+        Path(configured) if configured else Path(__file__).resolve().parents[4] / "contracts/llm/v2"
     )
     path = directory / "models.py"
     if not path.is_file():
         raise ControlRejected()
-    spec = importlib.util.spec_from_file_location("ptr_llm_shared_wire_v1", path)
+    spec = importlib.util.spec_from_file_location("ptr_llm_shared_wire_v2", path)
     if spec is None or spec.loader is None:
         raise ControlRejected()
     module = importlib.util.module_from_spec(spec)
@@ -35,7 +35,14 @@ def _wire_module() -> Any:
 def validate_wire(name: str, value: Any) -> dict[str, Any]:
     try:
         return _wire_module().validate_wire(name, value)
-    except (ValueError, TypeError, KeyError):
+    except ValueError as error:
+        code = (
+            "WIRE_VERSION_MISMATCH"
+            if str(error) == "WIRE_VERSION_MISMATCH"
+            else "CONTROL_REJECTED"
+        )
+        raise ControlRejected(code) from None
+    except (TypeError, KeyError):
         raise ControlRejected() from None
 
 
@@ -45,8 +52,8 @@ class ControlUnavailable(RuntimeError):
 
 
 class ControlRejected(RuntimeError):
-    def __init__(self) -> None:
-        super().__init__("CONTROL_REJECTED")
+    def __init__(self, code: str = "CONTROL_REJECTED") -> None:
+        super().__init__(code)
 
 
 class ControlClient:
@@ -103,8 +110,10 @@ class ControlClient:
                         if len(raw) > 8 * 1024 * 1024:
                             raise ControlRejected()
                 decoded = json.loads(raw)
-                if not isinstance(decoded, dict) or decoded.get("contractVersion") != 1:
+                if not isinstance(decoded, dict):
                     raise ControlRejected()
+                if decoded.get("contractVersion") != 2:
+                    raise ControlRejected("WIRE_VERSION_MISMATCH")
                 return (
                     validate_wire(response_names[action], decoded)
                     if action in response_names

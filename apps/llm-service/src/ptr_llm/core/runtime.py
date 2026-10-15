@@ -94,6 +94,41 @@ def _ask_back_streak(history):
     return streak
 
 
+def requested_speech_level(text):
+    """Only a direct user request may change the session's Korean register."""
+    if regex.search(
+        r"\?|(?:지\s*마|don't|do\s+not|never)\b|\b(?:he|she|they)\s+told\s+me\b",
+        text,
+        regex.I,
+    ):
+        return None
+    if regex.search(r"[가-힣]+[가이]\s+나한테", text):
+        return None
+    ending = r"(?:해\s*(?:줘|주세요)?|하자|써\s*줘)[.!~]*$"
+    if regex.search(r"(?:존댓말|존대|해요체)(?:로)?\s*" + ending, text):
+        return "polite"
+    if regex.search(r"(?:말\s*편하게|반말)(?:로)?\s*" + ending, text):
+        return "casual"
+    english_request = (
+        r"\b(?:(?:speak|talk)\s+(?:{adverbs})|"
+        r"(?:use|speak(?:\s+in)?)\s+(?:{adjectives})"
+        r"(?:\s+(?:speech|language|tone))?)[.!~]*$"
+    )
+    if regex.search(
+        english_request.format(adverbs="politely|formally", adjectives="polite|formal|honorific"),
+        text,
+        regex.I,
+    ):
+        return "polite"
+    if regex.search(
+        english_request.format(adverbs="casually|informally", adjectives="casual|informal"),
+        text,
+        regex.I,
+    ):
+        return "casual"
+    return None
+
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -301,9 +336,9 @@ class LLMEngine:
                 {
                     "personId": session["personId"],
                     "dateBasis": "posted",
-                    "timezone": session["timezone"],
                     "limit": 20,
                     **value.get("timeline", {}),
+                    "timezone": session["timezone"],
                 },
                 session["personId"],
             )
@@ -317,6 +352,11 @@ class LLMEngine:
             ):
                 previous = None
             bound_previous = previous if rctx["followUp"] else None
+            previous_variables = variables((previous or {}).get("agent", {}).get("variables"))
+            requested_level = requested_speech_level(text)
+            level = (
+                requested_level or previous_variables.get("speechLevel") or speech_level(persona)
+            )
             references = []
             if (
                 bound_previous
@@ -341,6 +381,30 @@ class LLMEngine:
                         for c in bound_previous["evidence"]
                     )
                 ]
+            # Cited sources from the immediately preceding reply are extra search
+            # candidates when the user has not made an explicit reference. They
+            # never participate in the ambiguity check below.
+            carried = []
+            if (
+                previous
+                and not rctx["followUp"]
+                and not value.get("timeline")
+                and previous.get("grounding") == "source_bound_quotes"
+                and previous.get("responseKind") == "timeline"
+            ):
+                seen = set()
+                for ref in previous.get("evidence", []):
+                    if (
+                        ref.get("personId") == session["personId"]
+                        and ref.get("sourceId") not in seen
+                        and ref.get("hash")
+                        and ref.get("snapshot")
+                        and ref.get("quote")
+                    ):
+                        carried.append(ref)
+                        seen.add(ref["sourceId"])
+                        if len(carried) == 3:
+                            break
             ambiguous = (
                 len({r["sourceId"] for r in references}) > 1
                 or bool(regex.search(r"photo|picture|사진", text, regex.I))
@@ -389,6 +453,8 @@ class LLMEngine:
                 "query": query,
                 "ownedPrevious": previous,
                 "references": references,
+                "carriedReferences": carried,
+                "speechLevel": requested_level,
                 "ambiguous": ambiguous,
                 "signals": signals,
                 "recentUserTurns": recent,
@@ -404,7 +470,7 @@ class LLMEngine:
                 "replyLanguage": utterance_language(text, session["language"], prompt_history)
                 if card
                 else session["language"],
-                "level": speech_level(persona),
+                "level": level,
                 "previousAssistantText": next(
                     (m["content"] for m in reversed(prompt_history) if m["role"] == "assistant"),
                     "",
@@ -574,7 +640,6 @@ class LLMEngine:
                             "rule_refusal": "decline",
                             "clarification": "clarification",
                             "ambiguous_reference": "ambiguous_reference",
-                            "event_timezone": "event_timezone",
                         }[key],
                         language,
                         level,
@@ -618,21 +683,6 @@ class LLMEngine:
             q = dict(snap["query"], limit=min(EVIDENCE_POST_LIMIT, snap["query"]["limit"]))
             if (
                 intent == "timeline"
-                and session["retrievalMode"] != "off"
-                and q["dateBasis"] == "event"
-                and q.get("start")
-                and q["timezone"] != "UTC"
-            ):
-                return dict(
-                    frame,
-                    output=output(
-                        "needs_clarification",
-                        fixed("event_timezone"),
-                        ["EVENT_TIMEZONE_UNAVAILABLE"],
-                    ),
-                )
-            if (
-                intent == "timeline"
                 and session["retrievalMode"] == "off"
                 and not session.get("ragCondition")
             ):
@@ -646,7 +696,8 @@ class LLMEngine:
                 )
             if intent != "timeline" or session["retrievalMode"] == "off":
                 return frame
-            refs = snap["references"]
+            refs = snap["references"] or snap["carriedReferences"]
+            implicit_carry = bool(snap["carriedReferences"] and not snap["references"])
             sources = []
             trace = frame["memoryTrace"]
             if (
@@ -735,9 +786,27 @@ class LLMEngine:
                 sources = filter_evidence(pinned, q, session["personId"])
                 if sources:
                     trace = dict(trace, action="reuse", reusedSourceIds=[s["id"] for s in sources])
-            if not sources:
-                sources = await search(q)
-                trace = dict(trace, action="search", query=q.get("query", ""))
+            if implicit_carry or not sources:
+                searched = await search(q)
+                if implicit_carry:
+                    seen = {source["id"] for source in sources}
+                    reused_ids = set(seen)
+                    for source in searched:
+                        if source["id"] not in seen:
+                            sources.append(source)
+                            seen.add(source["id"])
+                    sources = sources[:EVIDENCE_POST_LIMIT]
+                    trace = dict(
+                        trace,
+                        action="search",
+                        query=q.get("query", ""),
+                        reusedSourceIds=[
+                            source["id"] for source in sources if source["id"] in reused_ids
+                        ],
+                    )
+                else:
+                    sources = searched
+                    trace = dict(trace, action="search", query=q.get("query", ""))
             if session.get("ragCondition") != "caption_image":
                 sources = [{k: v for k, v in s.items() if k != "imageAnnotations"} for s in sources]
             return dict(frame, sources=copy.deepcopy(sources), memoryTrace=trace)
@@ -791,7 +860,11 @@ class LLMEngine:
                     history=history,
                     text=text,
                     sources=frame["sources"],
-                    variables_state=previous.get("agent", {}).get("variables"),
+                    variables_state={
+                        **variables(previous.get("agent", {}).get("variables")),
+                        **({"speechLevel": snap["level"]} if snap["speechLevel"] else {}),
+                    },
+                    level=snap["level"],
                     cancelled=cancelled,
                     max_tool_rounds=self.max_tool_rounds,
                     search=tool_search
@@ -1090,6 +1163,10 @@ class LLMEngine:
                     agent["variables"] = variables(
                         dict(agent["variables"], **agent_run["response"]["variableUpdates"])
                     )
+                if snap["speechLevel"]:
+                    agent["variables"] = variables(
+                        dict(agent["variables"], speechLevel=snap["speechLevel"])
+                    )
                 if agent_run.get("serviceLimitation"):
                     output["limitations"].append(agent_run["serviceLimitation"])
             ctx = agent_run["context"] if agent_run else frame.get("experiment")
@@ -1104,7 +1181,12 @@ class LLMEngine:
                     "modelCalls": 0,
                     "toolCalls": 0,
                     "variables": variables(
-                        (snap.get("ownedPrevious") or {}).get("agent", {}).get("variables")
+                        {
+                            **(snap.get("ownedPrevious") or {})
+                            .get("agent", {})
+                            .get("variables", {}),
+                            **({"speechLevel": snap["speechLevel"]} if snap["speechLevel"] else {}),
+                        }
                     ),
                     "steps": [],
                     "validator": "disabled",
@@ -1230,7 +1312,7 @@ class LLMEngine:
 
         def notice(content, limitations):
             return {
-                "contractVersion": 1,
+                "contractVersion": 2,
                 "notice": {
                     "status": "out_of_scope",
                     "content": content,
@@ -1341,7 +1423,7 @@ class LLMEngine:
                 )
             await check()
             return {
-                "contractVersion": 1,
+                "contractVersion": 2,
                 "content": content,
                 "provider": getattr(self.provider, "provider_name", "configured"),
                 "model": getattr(self.provider, "model", "configured"),

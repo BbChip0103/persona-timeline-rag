@@ -11,6 +11,7 @@ from ptr_llm.core.prompts import build_experiment_context
 from ptr_llm.core.runtime import LLMEngine
 
 SEED = "12345678-1234-1234-1234-123456789abc"
+PROVENANCE_KEYS = ("personId", "sourceUrl", "postedAt", "eventDate", "snapshot", "hash")
 
 
 class Retrieval:
@@ -142,6 +143,84 @@ async def test_pinned_followup_keeps_reuse_or_ambiguity_without_judge(count):
     assert [post["sourceId"] for post in json.loads(evidence)] == [
         f"post-{i}" for i in range(min(count, 3))
     ]
+
+
+async def test_implicit_next_turn_unions_cited_sources_with_search_without_ambiguity():
+    retrieval = Retrieval(4)
+    cited = retrieval.sources[:2]
+    previous = {
+        "grounding": "source_bound_quotes",
+        "evidence": [
+            {
+                "sourceId": source["id"],
+                "quote": "I painted a blue sky.",
+                **{
+                    key: source[key]
+                    for key in PROVENANCE_KEYS
+                },
+            }
+            for source in cited
+        ],
+        "sessionId": "synthetic-session",
+        "personId": PERSONA["personId"],
+        "personaRevision": PERSONA["revision"],
+        "responseKind": "timeline",
+    }
+
+    def update(value):
+        value["context"]["previousReply"] = previous
+        value["context"]["history"] = [
+            {"role": "user", "content": "Tell me about dinner.", "turnId": "past"},
+            {"role": "assistant", "content": "That was delicious!", "turnId": "past"},
+        ]
+        value["context"]["input"]["intent"] = "timeline"
+
+    result, provider = await run(
+        retrieval, text="와 맛있었겠다! 뭐 먹었어?", mode="lexical", update=update
+    )
+    assert result["kind"] == "completed"
+    assert "AMBIGUOUS_SOURCE_REFERENCE" not in result["reply"]["limitations"]
+    assert retrieval.resolves and retrieval.searches
+    evidence = next(
+        json.loads(m["content"].split(" ", 1)[1])
+        for m in provider.messages[0]
+        if m["content"].startswith("UNTRUSTED_EVIDENCE_JSON_DATA ")
+    )
+    assert [post["sourceId"] for post in evidence] == ["post-0", "post-1", "post-2"]
+
+
+async def test_explicit_followup_still_reuses_without_search():
+    retrieval = Retrieval(1)
+    source = retrieval.sources[0]
+    previous = {
+        "grounding": "source_bound_quotes",
+        "evidence": [
+            {
+                "sourceId": source["id"],
+                "quote": "I painted a blue sky.",
+                **{
+                    key: source[key]
+                    for key in PROVENANCE_KEYS
+                },
+            }
+        ],
+        "sessionId": "synthetic-session",
+        "personId": PERSONA["personId"],
+        "personaRevision": PERSONA["revision"],
+        "responseKind": "timeline",
+    }
+
+    def update(value):
+        value["context"]["previousReply"] = previous
+        value["context"]["history"] = [
+            {"role": "user", "content": "Tell me about your sky post.", "turnId": "past"}
+        ]
+
+    result, _ = await run(
+        retrieval, text="Tell me more about that post.", mode="lexical", update=update
+    )
+    assert result["kind"] == "completed"
+    assert retrieval.resolves and not retrieval.searches
 
 
 async def test_date_only_query_real_adapter_never_embeds_empty_string(monkeypatch):

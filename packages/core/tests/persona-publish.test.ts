@@ -47,9 +47,9 @@ describe('validatePersonaForPublish',()=>{
     expect(await errors(real({...card,starters:['가족 이야기 해줘','요즘 뭐 그려?']}))).toContainEqual({path:'starters[0]',rule:'private_life',severity:'error'});
   });
   test('card copy uses Unicode word boundaries for English terms adjacent to Korean',async()=>{
-    for(const text of ['debug해','model이','api랑'])
+    for(const text of ['debug해','api랑'])
       expect((await rules({...cardPersona,tagline:text}))).not.toContain('card_copy');
-    for(const text of ['debug 해','model 이야','api 랑'])
+    for(const text of ['debug 해','model이','model 이야','api 랑'])
       expect((await rules({...cardPersona,tagline:text}))).toContain('card_copy');
   });
   test('public card copy length failures name the field and never echo text',async()=>{

@@ -24,6 +24,7 @@ from ptr_llm.core.persona import (
 )
 from ptr_llm.core.policy import VOICES
 from ptr_llm.core.prompts import build_experiment_context
+from ptr_llm.core.protocol import parse_agent_response, variables
 from ptr_llm.core.routing import safety_windows
 from ptr_llm.core.runtime import LLMEngine
 from ptr_llm.worker import ExecutionStopped
@@ -139,6 +140,81 @@ def grant(text="Hi!", **session_updates):
 
 async def noop():
     pass
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("말 편하게 해", "casual"),
+        ("반말해", "casual"),
+        ("존댓말 해 줘", "polite"),
+        ("Speak casually", "casual"),
+        ("Please speak informally", "casual"),
+        ("Please use polite speech", "polite"),
+        ("Please speak politely", "polite"),
+        ("반말해 줘", "casual"),
+        ("존댓말 해 주세요", "polite"),
+        ("please speak casually", "casual"),
+        ("걔가 나한테 반말해서 짜증나", None),
+        ("그 사람한테 존댓말 해요", None),
+        ("반말 해서 미안", None),
+        ("왜 존댓말 해요?", None),
+        ("don't speak casually", None),
+        ("I never use formal language", None),
+        ("he told me to speak casually", None),
+    ],
+)
+def test_speech_request_rule(text, expected):
+    from ptr_llm.core.runtime import requested_speech_level
+
+    assert requested_speech_level(text) == expected
+
+
+def test_only_runtime_can_set_speech_level():
+    assert variables({"speechLevel": "casual"})["speechLevel"] == "casual"
+    raw = response("응", updates={"speechLevel": "polite"})
+    assert "speechLevel" not in parse_agent_response(raw)["variableUpdates"]
+
+
+def test_persisted_speech_level_passes_strict_wire_contract():
+    from ptr_llm.control import validate_wire
+
+    agent = {
+        "revision": "synthetic",
+        "promptRevision": "synthetic",
+        "modelCalls": 1,
+        "toolCalls": 0,
+        "variables": {"conversationTopic": "", "tone": "neutral", "speechLevel": "casual"},
+        "steps": [],
+        "validator": "disabled",
+    }
+    assert validate_wire("Agent", agent) == agent
+
+
+async def test_speech_request_persists_on_non_answered_turn():
+    raw = json.dumps({
+        "message": "응, 편하게 얘기하자.",
+        "status": "needs_clarification",
+        "evidenceRefs": [],
+        "variableUpdates": {"speechLevel": "polite"},
+    })
+    provider = Provider([raw, response("응, 계속 얘기하자.")])
+    engine = LLMEngine(provider=provider, personas=Personas())
+    first = await engine.handle(
+        grant("말 편하게 해"), before_costly=noop, cancelled=asyncio.Event()
+    )
+    assert first["kind"] == "completed"
+    assert first["reply"]["agent"]["variables"]["speechLevel"] == "casual"
+    second_grant = grant("계속 이야기해")
+    second_grant["context"]["previousReply"] = first["reply"]
+    second = await engine.handle(second_grant, before_costly=noop, cancelled=asyncio.Event())
+    assert second["kind"] == "completed"
+    assert second["reply"]["agent"]["variables"]["speechLevel"] == "casual"
+    state = next(
+        m["content"] for m in provider.messages[1]
+        if m["content"].startswith("AGENT_STATE_JSON_DATA ")
+    )
+    assert json.loads(state.split(" ", 1)[1])["speechLevel"] == "반말"
 
 
 async def test_native_graph_tool_loop_state_and_fenced_each_call():
@@ -343,20 +419,25 @@ async def test_fence_failure_blocks_provider_submission():
     assert not provider.messages
 
 
-async def test_date_timezone_request_clarifies_without_model():
-    provider = Provider([])
-    g = grant("the event", retrievalMode="lexical", ragCondition="caption")
+async def test_event_date_query_uses_session_timezone_without_fixed_clarification():
+    provider = Provider([response("I'm not sure which day that was.")])
+    retrieval = Retrieval()
+    g = grant(
+        "the event", retrievalMode="lexical", ragCondition="caption", timezone="America/New_York"
+    )
     g["context"]["input"]["timeline"] = {
         "start": "2026-03-08",
         "end": "2026-03-09",
         "dateBasis": "event",
-        "timezone": "America/New_York",
+        "timezone": "UTC",
     }
-    result = await LLMEngine(provider=provider, personas=Personas(), retrieval=Retrieval()).handle(
+    result = await LLMEngine(provider=provider, personas=Personas(), retrieval=retrieval).handle(
         g, before_costly=noop, cancelled=asyncio.Event()
     )
-    assert result["reply"]["status"] == "needs_clarification"
-    assert not provider.messages
+    assert result["kind"] == "completed"
+    assert "EVENT_TIMEZONE_UNAVAILABLE" not in result["reply"]["limitations"]
+    assert retrieval.searches[0]["timezone"] == "America/New_York"
+    assert provider.messages
 
 
 def test_dst_calendar_filter_and_utf16_whitespace_binding():
@@ -416,7 +497,7 @@ def test_full_original_routing_matrix(case):
 async def test_draft_content_and_input_refusal_remain_backend_artifact_free():
     engine = LLMEngine(provider=Provider(["Fictional blue sky sketch."]), personas=Personas())
     request = {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "session": grant()["context"]["session"],
         "brief": "A fictional sky sketch",
         "requestKey": "draft:synthetic-key",

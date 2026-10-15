@@ -9,8 +9,8 @@ import type { ChatMessage, Persona } from '@ptr/contracts';
 const TEXTS={
   rule_refusal:{ko:'이 연구 자료 범위에서는 확인할 수 없어요.',en:'I can\'t check that within this research material.'},
   clarification:{ko:'어떤 날짜와 주제를 기준으로 볼까요?',en:'Which date and topic should I go by?'},
-  ambiguous_reference:{ko:'앞에서 여러 게시물을 봤어요. 어느 글이나 사진을 말하는 건가요?',en:'We looked at several posts earlier. Which post or photo do you mean?'},
-  event_timezone:{ko:'사건 날짜의 현지 시간대가 확인되지 않았어요. 게시일 기준으로 확인할까요?',en:'The local time zone of that event date is unknown. Shall I go by the posting date?'},
+  ambiguous_reference:{ko:'그때 일이 몇 개 떠오르는데, 어떤 걸 말씀하시는 거예요?',en:'A few moments come to mind. Which one do you mean?'},
+  event_timezone:{ko:'정확히 언제였는지는 헷갈리네요. 어느 무렵을 말씀하세요?',en:'I can\'t quite place when that was. Around when do you mean?'},
   retrieval_off:{ko:'검색을 끈 상태에서는 실제 활동 근거를 확인할 수 없어요.',en:'With search turned off I can\'t check evidence of actual activities.'},
   biography_guard:{ko:'실제 생애나 과거 활동에 대한 근거 없이 이야기할 수 없어요.',en:'I can\'t talk about real life events or past activities without evidence.'},
   claim_caption:{ko:'캡션 원문',en:'Caption'},
@@ -151,34 +151,34 @@ const VOICE_TEXTS={
   },
   "ambiguous_reference": {
     "casual": [
-      "앞에서 게시물을 여러 개 봤잖아~ 어느 글이나 사진 말하는 거야?",
+      "그때 일이 몇 개 떠오르는데, 어떤 거 말하는 거야?",
       "어느 장면을 말하는지 알려줄래?",
       "비슷한 순간이 몇 개 있네~ 어떤 거였어?"
     ],
     "polite": [
-      "앞에서 게시물을 여러 개 봤잖아요~ 어느 글이나 사진 말씀하시는 거예요?",
+      "그때 일이 몇 개 떠오르는데, 어떤 걸 말씀하시는 거예요?",
       "어느 장면을 말씀하시는지 알려 주실래요?",
       "비슷한 순간이 몇 개 있네요. 어떤 거였어요?"
     ],
     "en": [
-      "We looked at a few posts earlier~ Which post or photo do you mean?",
+      "A few moments come to mind. Which one do you mean?",
       "Which moment are you thinking of?",
       "There are a couple of possibilities. Which one was it?"
     ]
   },
   "event_timezone": {
     "casual": [
-      "그 날짜가 어느 시간대 기준인지 모르겠어~ 올린 날 기준으로 볼까?",
+      "정확히 언제였는지는 헷갈리네. 어느 무렵을 말하는 거야?",
       "정확한 날짜가 헷갈려. 어느 날을 말하는 거야?",
       "날짜 기준이 애매하네~ 조금만 더 알려줄래?"
     ],
     "polite": [
-      "그 날짜가 어느 시간대 기준인지 모르겠어요~ 올린 날 기준으로 볼까요?",
+      "정확히 언제였는지는 헷갈리네요. 어느 무렵을 말씀하세요?",
       "정확한 날짜가 헷갈려요. 어느 날을 말씀하세요?",
       "날짜 기준이 애매하네요. 조금만 더 알려 주실래요?"
     ],
     "en": [
-      "I'm not sure which time zone that date is in~ Shall I go by the posting date?",
+      "I can't quite place when that was. Around when do you mean?",
       "The exact date is fuzzy. Which day did you mean?",
       "That date could be read two ways. Can you tell me more?"
     ]

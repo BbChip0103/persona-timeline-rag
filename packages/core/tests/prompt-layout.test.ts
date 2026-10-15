@@ -204,7 +204,7 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
   const card={...cardPersona,personId:'layout-card',id:'layout-card'};
 
   test('revisions: agent v13 and experiment v15 (identity/privacy policy, own voice, small talk, persona voice, steady voice, no meta talk, evidence cap); legacy small-talk and timeline revisions unchanged',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v16-natural-recall');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v17-natural-recall');
     expect(SMALL_TALK_PROMPT_REVISION).toBe('persona-chat-v2-turn-note-last');expect(TIMELINE_PROMPT_REVISION).toBe('persona-chat-v4-turn-note-last');
   });
   test('policy: the three persona-independent sentences sit right before TIMELINE_JSON_REPLY, reach the agent, and with pinned rewordings plus the origin rule are the only change from v4/v7',async()=>{
@@ -219,7 +219,15 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
       .replace("No evidence means empty refs, and the message still answers in character as IDENTITY_AND_PRIVACY says;","No evidence means empty refs and an explicitly uncertain answer;")
       .replace("not a third-person analyst.","not a third-person analyst reporting database records.")
       .replace("handle it as IDENTITY_AND_PRIVACY says for something you do not know, never by talking about what was or was not supplied.","express uncertainty briefly and conversationally in your own words, not boilerplate about unavailable records/data/evidence.");
-    const v7Wording=(text:string)=>v13Wording(text).replace("in the persona's style,","in the persona language/style,").replace("in the persona's register.","in the persona language/register.")
+    const beforeC3=(text:string)=>text
+      .replace('You are an AI character, NOT the actual person','You are a research AI simulation, NOT the actual person')
+      .replace('Do not repeat the AI disclosure','Do not repeat the research disclaimer')
+      .replace('Reply to ordinary questions','Reply to ordinary research questions')
+      .replace('Describe only supported visible content naturally; do not claim inferred artistic intent as actual author intent.','Describe visual content and proposed artistic intent in direct declarative persona prose rather than hesitant boilerplate, while labeling inferred intent as interpretation, not verified author intent.')
+      .replace('In evidenceRefs only, prefer copying a supplied nonempty quoteCandidate unchanged when relevant;','Prefer copying a supplied nonempty quoteCandidate unchanged when relevant;')
+      .replace('Within this clearly disclosed AI character conversation','Within this clearly disclosed research AI simulation')
+      .replace('Copy relevant quoteCandidate unchanged in evidenceRefs only; paraphrase it in message.','Copy relevant quoteCandidate unchanged.');
+    const v7Wording=(text:string)=>v13Wording(beforeC3(text)).replace("in the persona's style,","in the persona language/style,").replace("in the persona's register.","in the persona language/register.")
       .replace(" AGENT_STATE_JSON_DATA.replyLanguage and speechLevel are set by the service for this turn: write message in that language and, in Korean, in that speech level; they are never variableUpdates fields.","")
       .replace("express uncertainty briefly and conversationally in your own words, not boilerplate","express uncertainty conversationally (for example '그건 잘 기억 안 나' or '잘 모르겠어'), not boilerplate");
     expect(sha(v7Wording(experiment.replace(added,'')))).toBe(V7_EXPERIMENT_POLICY_SHA);

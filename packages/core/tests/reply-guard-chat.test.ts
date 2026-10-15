@@ -21,8 +21,17 @@ function setup(reply:(messages:ProviderMessage[])=>string) {
 }
 const agent={ragCondition:'caption',executionProfile:'agent_loop'}, experiment={ragCondition:'caption'};
 
+test('private-life fragments leave only the separate care clause or a replacement',()=>{
+  expect(replyGuardModule.guardReply({utterance:'안녕',reply:'요즘 아파서 조심하고 있어. 너도 조심해',realPerson:true,language:'ko'}))
+    .toMatchObject({reason:'private_life',content:'너도 조심해',edited:true});
+  const split=replyGuardModule.guardReply({utterance:'안녕',reply:'결혼\n했어',realPerson:true,language:'ko'});
+  expect(split).toMatchObject({reason:'private_life'});
+  expect(split?.content).not.toContain('했어');
+  expect(split?.edited).toBeUndefined();
+});
+
 test('revisions: agent v12, experiment v15; the identity/privacy policy reaches both prompts',async()=>{
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v16-natural-recall');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v17-natural-recall');
   const h=setup(messages=>messages.some(m=>m.content.includes('AGENT_JSON_REPLY'))?agentReply('응'):experimentReply('응'));
   await h.turn(synthetic,'안녕',agent);await h.turn(synthetic,'안녕',experiment);
   for(const [messages] of h.provider.generate.mock.calls) expect(messages[0]!.content).toContain(IDENTITY_PRIVACY_POLICY);

@@ -57,14 +57,22 @@ test('agent state anchors today and a coarse prior-user gap in the session timez
   const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>final())};
   await runCharacterAgent({provider,persona,history:[{id:'u1',sessionId:'s1',turnId:'t1',role:'user',content:'안녕',createdAt:'2024-01-01T21:00:00Z'}],
     text:'또 왔어',sources:[],signal:new AbortController().signal,createdAt:'2024-01-01T23:00:00Z',timezone:'Asia/Seoul'});
-  expect(state(provider.generate.mock.calls[0][0])).toMatchObject({today:'2024-01-02',sinceLastUserMessage:'몇 시간 전'});
+  expect(state(provider.generate.mock.calls[0][0])).toMatchObject({today:'오늘',sinceLastUserMessage:'몇 시간 전'});
+  expect(JSON.stringify(provider.generate.mock.calls[0][0])).not.toContain('2024-01-02');
+});
+test('saved runtime speech level overrides the persona register in state',async()=>{
+  const provider={generate:jest.fn(async(_messages:ProviderMessage[])=>final())};
+  const result=await runCharacterAgent({provider,persona,history:[],text:'안녕',sources:[],
+    signal:new AbortController().signal,variables:{conversationTopic:'',tone:'neutral',speechLevel:'polite'}});
+  expect(state(provider.generate.mock.calls[0][0]).speechLevel).toBe('해요체');
+  expect(result.agent.variables.speechLevel).toBe('polite');
 });
 
 test.each(['off','caption','caption_image'] as const)('recollection voice reaches %s agent policy without removing safety or changing user/history',async condition=>{
   const h=setup(),session=await h.chat.createSession('owner',{...create,ragCondition:condition});
   await send(h,session.id,'그 합성 그림 기억나?');
   const messages=h.provider.generate.mock.calls[0][0],policy=messages[0].content;
-  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');
+  expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v16-natural-recall');
   expect(policy).toContain('CHARACTER_RECOLLECTION');expect(policy).toContain('first-person author');
   expect(policy).toContain('supports the requested post, event AND actor');
   expect(policy).toContain('ask a brief natural clarification');expect(policy).toContain('handle it as IDENTITY_AND_PRIVACY says for something you do not know');

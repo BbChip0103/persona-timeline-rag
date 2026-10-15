@@ -9,7 +9,7 @@ import { draftAttemptFor, type DraftAttempt } from '../lib/draft-attempt';
 import { splitReplyBubbles } from '../lib/reply-bubbles';
 import { friendlyError } from '../lib/friendly-error';
 import { voiceText } from '../../../packages/core/src/reply-texts';
-import { TimezoneSchema } from '../../../packages/contracts/src';
+import { browserTimezone } from '../lib/browser-timezone';
 
 type Mode='off'|'lexical'|'semantic';
 type RagCondition='off'|'caption'|'caption_image';
@@ -26,7 +26,6 @@ const canResend=(turn:Turn)=>turn.state==='failed'&&!['PROVIDER_REQUEST_UNRESOLV
 const canRefill=(turn:Turn)=>turn.state==='failed'&&turn.errorCode!=='PROVIDER_REQUEST_UNRESOLVED';
 const english=(language?:string)=>Boolean(language&&/^en(?:$|[-_])/i.test(language));
 const nameParticle=(name:string)=>{const last=[...name.trim()].at(-1)??'';const code=last.codePointAt(0)??0;return last&&/[0-9]/u.test(last)?(/[013678]/u.test(last)?'이':'가'):code>=0xac00&&code<=0xd7a3&&(code-0xac00)%28!==0?'이':'가';};
-const browserTimezone=()=>{try{const zone=Intl.DateTimeFormat().resolvedOptions().timeZone;return TimezoneSchema.safeParse(zone).success?zone:'UTC';}catch{return 'UTC';}};
 const oldGreetingPrefix=/^AI 연구용 시뮬레이션입니다\. |^AI research simulation\. /u;
 export default function Chat({ownerScope}:{ownerScope:string}) {
   const client=useQueryClient();
@@ -34,7 +33,7 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   const mounted=useRef(true);const sessionRef=useRef<string|undefined>(undefined);const streamController=useRef<AbortController|undefined>(undefined);
   const onUnauthorized=()=>{invalidateOwner();void clearOwnerQueries(client);window.location.assign('/login');};
   const api=<T,>(path:string,body?:unknown,signal?:AbortSignal)=>requestApi<T>(path,body,signal,onUnauthorized);
-  const people=useQuery({queryKey:['personas'],enabled:ownerActive,queryFn:({signal})=>api<{personas:Persona[];operatorMode:boolean}>('personas',undefined,signal)});
+  const people=useQuery({queryKey:['personas'],enabled:ownerActive,queryFn:({signal})=>api<{personas:Persona[];operatorMode:boolean;operatorNotice?:string}>('personas',undefined,signal)});
   const stored=useQuery({queryKey:['sessions'],enabled:ownerActive,queryFn:({signal})=>api<{sessions:Session[]}>('sessions',undefined,signal)});
   const personas=ownerActive?(people.data?.personas??[]):[];const sessions=ownerActive?(stored.data?.sessions??[]):[];const operatorMode=ownerActive&&people.data?.operatorMode===true;
   const [personId,setPersonId]=useState('');const [mode,setMode]=useState<Mode>('lexical');const [condition,setCondition]=useState<RagCondition>('caption');
@@ -135,7 +134,7 @@ export default function Chat({ownerScope}:{ownerScope:string}) {
   return <div className="workspace"><header className="topbar"><div><h1>{selected?.label??'대화 공간'}</h1></div><span className="ai-tag" data-testid="ai-marker">{selected?.aiDisclosure??'AI 캐릭터'}</span><button className="quiet" onClick={async()=>{invalidateOwner();await clearOwnerQueries(client);await fetch('/api/auth',{method:'DELETE'});window.location.assign('/login');}}>로그아웃</button></header>
     <div className="workspace-body"><aside className="sidebar"><h2>대화 공간</h2>
       <label htmlFor="persona">캐릭터</label><select id="persona" value={personId} onChange={event=>setPersonId(event.target.value)} disabled={busy||draftBusy||Boolean(active)}>{personas.map(persona=><option key={persona.id} value={persona.personId}>{persona.label}</option>)}</select>
-      {operatorMode&&<section className="operator-controls" aria-label="운영자 설정"><label htmlFor="rag-condition">새 세션의 RAG 조건</label><select id="rag-condition" value={condition} onChange={event=>setCondition(event.target.value as RagCondition)} disabled={busy||draftBusy||Boolean(active)}>{Object.entries(conditionLabel).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select>
+      {operatorMode&&<section className="operator-controls" aria-label="운영자 설정">{people.data?.operatorNotice&&<p role="status" data-testid="operator-notice">{people.data.operatorNotice}</p>}<label htmlFor="rag-condition">새 세션의 RAG 조건</label><select id="rag-condition" value={condition} onChange={event=>setCondition(event.target.value as RagCondition)} disabled={busy||draftBusy||Boolean(active)}>{Object.entries(conditionLabel).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select>
       {condition!=='off'&&<><label htmlFor="mode">검색 알고리즘</label><select id="mode" value={mode} onChange={event=>setMode(event.target.value as Mode)} disabled={busy||draftBusy||Boolean(active)}><option value="lexical">Lexical</option><option value="semantic">Semantic</option></select></>}</section>}
       <button disabled={!personId||busy||draftBusy||Boolean(active)} onClick={async()=>{const owner=ownerEpoch.current;const view=viewEpoch.current;setError('');try{const value=await sessionMutation.mutateAsync({personId,ragCondition:operatorMode?condition:'caption',retrievalMode:operatorMode?(condition==='off'?'off':mode):'lexical',timezone:browserTimezone()});if(!currentView(owner,view))return;client.setQueryData<{sessions:Session[]}>(['sessions'],previous=>({sessions:[value.session,...(previous?.sessions??[])]}));await selectSession(value.session.id,false);}catch(e){if(currentView(owner,view))setError((e as Error).message);}}}>새 대화 시작</button>
       <h3>저장된 대화</h3><nav aria-label="저장된 대화">{sessions.length===0&&<p className="muted">아직 저장된 대화가 없어요.</p>}{sessions.map(value=><button className={`session-button ${session?.id===value.id?'selected':''}`} key={value.id} disabled={busy||draftBusy||Boolean(active)} onClick={()=>{setPersonId(value.personId);setMode(value.retrievalMode==='off'?'lexical':value.retrievalMode);setCondition(value.ragCondition??'caption');void selectSession(value.id);}}><strong>{personas.find(persona=>persona.personId===value.personId)?.label??'캐릭터'}</strong><small>{operatorMode&&`${sessionLabel(value)} · `}{new Date(value.createdAt).toLocaleDateString('ko-KR')}</small></button>)}</nav></aside>

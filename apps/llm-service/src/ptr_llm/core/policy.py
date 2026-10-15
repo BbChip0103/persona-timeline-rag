@@ -92,8 +92,8 @@ _PERSONAL_NOUNS = (
     "home",
 )
 _BARE_PRIVATE = regex.compile(
-    r"(?<![가-힣])(?:남자친구|여자친구|결혼|남친|여친|연애|이혼|임신|가족|엄마|아빠|병원|입원|아프|아팠|사귀|헤어|유부)"
-    r"|\b(?:boyfriend|girlfriend|married|marriage|divorce|pregnant|dating|hospital|hospitalized|newlywed)\b"
+    r"(?<![가-힣])(?:남자친구|여자친구|결혼|남친|여친|연애|이혼|임신|가족|엄마|아빠|병원|입원|아프|아파|아팠|사귀|헤어|유부)"
+    r"|\b(?:boyfriend|girlfriend|married|marriage|divorce|pregnant|dating|hospital|hospitalized|newlywed)\b|\b(?:got|was|been)\s+(?:sick|ill)\b"
     r"|\bmy\s+(?:mom|dad|family)\b",
     regex.I,
 )
@@ -121,10 +121,10 @@ _EXPERIENCE_MARKER = regex.compile(
 # A private noun is recognized by the policy's existing private-keyword sources.
 _PRIVATE_NOUNS = (_BARE_PRIVATE, _ADDITIONAL_PRIVATE, *PATTERNS["PRIVATE_REPLY"])
 _REPLY_PRIVATE_STEMS = regex.compile(
-    r"(?<![가-힣])(?:수술|입원|아프|아팠|임신|출산|이혼|결혼|사귀|연애|헤어)"
+    r"(?<![가-힣])(?:수술|입원|아프|아파|아팠|임신|출산|이혼|결혼|사귀|연애|헤어)"
 )
 _USER_CARE = regex.compile(r"아프지\s*(?:마|않게)|조심해|챙겨|푹\s*쉬어")
-_LEADING_CONNECTIVE = regex.compile(r"^(?:(?:해서|고|는데|지만)(?=\s|$)\s*)+")
+_LEADING_CONNECTIVE = regex.compile(r"^(?:(?:해서|고|는데|지만)(?=[.!?~…\s]|$)[.!?~…\s]*)+")
 _NOUN_SUFFIX = regex.compile(
     r"(?:한테도|에게도|이랑|랑|하고|와|과|은|는|이|가|을|를|에|에서|에게|한테|도|만|의|처럼|까지|부터|로|으로|께|께서|들|야|이에요|이야|해|했|하다|하는|한|할)?"
     r"(?=$|[^\p{L}\p{N}])"
@@ -230,7 +230,7 @@ _PRIVATE_PREDICATE = regex.compile(
     regex.I,
 )
 _DANGLING = regex.compile(
-    r"(?:는데|지만|다시피|잖아|고)$|^(?:응|네|예|맞아|맞아요|yeah|yes|right)[.!?~]*$",
+    r"(?:는데|지만|다시피|잖아|고)$|^(?:응|네|예|맞아|맞아요|있어|있어요|했어|했어요|yeah|yes|right)[.!?~]*$",
     regex.I,
 )
 
@@ -331,7 +331,12 @@ def reply_decision(reply, metadata):
         plain = regex.sub(
             r"[ \t]*\n[ \t]*",
             lambda match: (
-                " " if regex.search(r"[.!?。！？~…]$", plain[:match.start()].rstrip()) else ". "
+                " "
+                if regex.search(
+                    r"[.!?。！？~…,]$|(?:은|는|이|가|을|를|도)$",
+                    plain[:match.start()].rstrip(),
+                )
+                else ". "
             ),
             plain,
         ).strip()

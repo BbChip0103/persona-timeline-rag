@@ -10,11 +10,11 @@ The Compose path here remains independent. The K6 fixes to the API `pg.Pool`
 idle-error listener, worker drain and K4 pass-through validation need an
 operational Compose redeploy before that deployment benefits from them; obtain
 user approval for that redeploy. Apply
-`supabase/split/0005_generated_artifacts.sql` before the API, and roll out the
-API reader before workers that emit the new receipt wire schema. Check durable
-ACKs and readiness after each role rollout. Ship the API and worker images from
-the same source revision; the API must understand every receipt label the worker
-can write.
+`supabase/split/0005_generated_artifacts.sql` before the service swap. Pause
+new intake, drain the queue and active turns, then replace API and worker as one
+maintenance operation. Ship both images from the same source revision and wire
+contract version; do not run a v1 peer against v2. Check durable ACKs and
+readiness before reopening intake. This creates a short maintenance window.
 
 ## Configuration and supervision
 
@@ -62,8 +62,8 @@ docker compose --env-file /private/compose.env \
   -f infra/compose.app.yml -f infra/split/compose.operational.yml config -q
 ```
 
-For an existing deployment, use the ordered redeploy procedure below; do not
-start the new worker before its migration and API reader are ready.
+For an existing deployment, use the coordinated redeploy procedure below. Both
+peers must start on the same wire version after the drain.
 
 Web receives only UI/session/API credentials and no corpus mount. Backend receives
 the app role/control credentials; Python receives the LLM role and local vLLM
@@ -334,6 +334,7 @@ PY
      test -s "${SNAPSHOT}/image-ids.txt"
      test -s "${SNAPSHOT}/rollback-images.yml"
      test -s "${SNAPSHOT}/images/operational-images.tar"
+     install -m 0600 scripts/rollback-v2-reply.sql "${SNAPSHOT}/tools/rollback-v2-reply.sql"
    )
    ```
 
@@ -487,24 +488,61 @@ PY
    The last command must show `ptr_split_research`, `ptr_split_owner`, `t` and
    `t`. Do not run it with runtime app or LLM credentials.
 
-5. Deploy the API only and wait for health and readiness.
+5. Begin a short maintenance window. At the host-owned client ingress, block
+   new session-turn and draft POST requests with HTTP 503 and `잠시 점검 중` while
+   leaving existing turn reads and worker control traffic available. Verify the
+   gate from every exposed client path before proceeding; the old C2 API does
+   not understand `PTR_API_INTAKE_PAUSED`. For later v2-only rollouts, an API
+   started with `PTR_API_INTAKE_PAUSED=1` returns HTTP 503 with code
+   `INTAKE_PAUSED` and that message on those POST routes. Changing that env flag
+   requires an API restart, so the ingress gate is the pause mechanism for this
+   C2-to-v2 swap. Keep the gate closed until step 6 is healthy.
+
+   Let the old worker finish all queued and in-flight turns. Confirm the queue
+   has no waiting or active jobs, `app.turns` has no `pending`, `retrieving`,
+   `generating` or `validating` rows, and `app.turn_outbox` has no pending rows.
+   Repeat the checks after a short interval while intake remains blocked. If
+   any count is nonzero, keep waiting and investigate; do not replace either
+   peer. Use the owned app connection and bound timeouts, without printing
+   reply content or private configuration.
+
+   Read only counts through the owned old API container, which already has the
+   app DB and Redis connections. Repeat until every count is zero twice. This
+   prints counts only; it never reads reply JSON or prints credentials.
 
    ```sh
-   docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
-     -f infra/compose.app.yml -f "${NEW_COMPOSE}" \
-     up -d --no-deps --no-build api
-   for attempt in $(seq 1 45); do
-     if curl --fail --silent --max-time 2 --output /dev/null "${APP_BASE}/api/readyz"; then break; fi
-     sleep 2
-   done
-   curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/health"
-   curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/readyz"
+   OLD_API_ID="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(next(row["id"] for row in m["services"] if row["service"] == "api"))' "${SNAPSHOT}/manifest.json")"
+   test "$(docker inspect "${OLD_API_ID}" --format \
+     '{{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{index .Config.Labels "ptr.operational.owner"}}')" \
+     = "${PROJECT} api ${OWNER_NONCE}"
+   timeout 20 docker exec -i "${OLD_API_ID}" node - <<'JS'
+   const {Queue}=require('bullmq');
+   const Redis=require('ioredis');
+   const {Client}=require('pg');
+   const redis=new Redis(process.env.PTR_REDIS_URL,{maxRetriesPerRequest:1,connectTimeout:5000});
+   const queue=new Queue(process.env.PTR_TURN_QUEUE||'turns',{connection:redis,prefix:'ptr'});
+   const db=new Client({connectionString:process.env.PTR_APP_DATABASE_URL||process.env.DATABASE_URL,connectionTimeoutMillis:5000});
+   (async()=>{
+     try {
+       await db.connect();
+       const [jobs,rows]=await Promise.all([
+         queue.getJobCounts('waiting','active','delayed','prioritized','waiting-children'),
+         db.query("SELECT (SELECT count(*)::int FROM app.turns WHERE state IN ('pending','retrieving','generating','validating')) AS turns, (SELECT count(*)::int FROM app.turn_outbox) AS outbox"),
+       ]);
+       const counts={...jobs,...rows.rows[0]};
+       console.log(JSON.stringify(counts));
+       if(Object.values(counts).some(n=>n!==0))process.exitCode=2;
+     } catch {console.error('drain check failed');process.exitCode=3;}
+     finally {await queue.close();await redis.quit();await db.end().catch(()=>undefined);}
+   })();
+   JS
    ```
 
-6. Drain the old worker, then deploy worker and web. The worker stop uses the
-   configured 90 second grace period so it stops accepting work before Compose
-   replaces it. Take its exact container ID from the snapshot and recheck its
-   project, service and owner labels immediately before stopping it.
+6. Stop the drained old worker and replace API, worker and web in one maintenance
+   operation. The worker stop uses the configured 90 second grace period. Take
+   its exact container ID from the snapshot and recheck its project, service
+   and owner labels immediately before stopping it. Keep the ingress gate
+   closed until both v2 services are ready.
 
    ```sh
    (
@@ -513,11 +551,17 @@ PY
      test "$(docker inspect "${OLD_WORKER_ID}" --format \
        '{{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}} {{index .Config.Labels "ptr.operational.owner"}}')" \
        = "${PROJECT} worker ${OWNER_NONCE}"
-     docker stop -t 90 "${OLD_WORKER_ID}" >/dev/null
+     timeout 100 docker stop -t 90 "${OLD_WORKER_ID}" >/dev/null
      docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
        -f infra/compose.app.yml -f "${NEW_COMPOSE}" \
-       up -d --no-deps --no-build worker web
+       up -d --no-deps --no-build api worker web
    )
+   for attempt in $(seq 1 45); do
+     if curl --fail --silent --max-time 2 --output /dev/null "${APP_BASE}/api/readyz"; then break; fi
+     sleep 2
+   done
+   curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/health"
+   curl --fail --silent --show-error --max-time 10 --output /dev/null "${APP_BASE}/api/readyz"
    for attempt in $(seq 1 45); do
      if curl --fail --silent --max-time 2 --output /dev/null "${WORKER_BASE}/health/ready"; then break; fi
      sleep 2
@@ -531,6 +575,9 @@ PY
    pnpm exec tsx scripts/operational-smoke.ts --env-file "${E2E_ENV}" \
      --execute --single-turn --owner-nonce "${OWNER_NONCE}"
    ```
+
+   Keep intake paused for readiness and wire-version checks. Run the synthetic
+   smoke through an operator-only local path, then reopen the client ingress.
 
    The smoke must be one synthetic RAG-off turn against local vLLM, with local
    chat cost `0`, no embedding rows and no paid provider rows. The one-turn
@@ -573,17 +620,41 @@ PY
    worker drain. Verify readiness, gauge 0 and a local-only smoke. Preserve all
    ledger rows, unknown reservations and receipts.
 
-   For a full rollback, roll back from the snapshot alone. Load the saved images, restore captured
+   For a full rollback, use the snapshot and the separately held owner DB env
+   file (needed for the v2 reply cleanup below). Load the saved images, restore captured
    config/code bind-mounted sources, private env/config files, Compose files and working
    directory paths for every group to their original absolute locations with the
    helper copied into the snapshot, then bring each group's services back under
    the one saved project name.
    Compose reads the restored files at their original paths so its relative bind
-   mounts resolve to the same host paths as before cutover. This step needs only
-   the private `SNAPSHOT` path; it reads every group's working directory, files,
-   env path and service list from the manifest, not the current checkout.
+   mounts resolve to the same host paths as before cutover. The restore helper
+   reads every group's working directory, files, env path and service list from
+   the private `SNAPSHOT` manifest, not the current checkout.
    The old gateway named volumes still exist because step 7 did not remove them.
-   Ledger, receipts and queue are not reset.
+   Ledger, receipts and queue are not reset. Keep intake paused, drain all v2
+   work as in step 5, stop the new API, worker and web with the same verified
+   project/owner identity, then run the snapshot's `rollback-v2-reply.sql` with the
+   verified `ptr_split_owner` connection before starting the old C2 worker. It
+   removes v2-only agent-variable keys from stored previous replies using
+   idempotent jsonb `#-` operations. The script leaves C4 summary and memory
+   tables alone; the old worker does not read them. Verify that no affected
+   reply remains before restoring old peers. Never apply it to an unrelated DB.
+
+   ```sh
+   (
+     set -euo pipefail
+     test -r "${OWNER_DB_ENV}"
+     test -s "${SNAPSHOT}/tools/rollback-v2-reply.sql"
+     PG_IMAGE='postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94'
+     timeout 100 docker compose --env-file "${NEW_OP_ENV}" -p "${PROJECT}" \
+       -f infra/compose.app.yml -f "${NEW_COMPOSE}" stop -t 90 api worker web
+     timeout 45 docker run --rm --network host \
+       --env-file "${OWNER_DB_ENV}" -e PGCONNECT_TIMEOUT=5 \
+       --mount "type=bind,src=${SNAPSHOT}/tools/rollback-v2-reply.sql,dst=/rollback.sql,readonly" \
+       --entrypoint sh "${PG_IMAGE}" -c \
+       'exec psql --no-psqlrc "$PTR_LLM_MAINTENANCE_DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f /rollback.sql'
+   )
+   ```
 
    ```sh
    (

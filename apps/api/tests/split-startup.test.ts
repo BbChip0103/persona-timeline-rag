@@ -100,7 +100,7 @@ test('split runtime routes generated artifacts to the Postgres store',async()=>{
 });
 test('PTR_LLM_SEMANTIC_SEARCH=0 accepts the public caption plus lexical session default',async()=>{
   const persona={id:'synthetic-persona',personId:'synthetic-person',label:'Synthetic Character',language:'ko',revision:'synthetic-v1',reviewStatus:'synthetic',greeting:'안녕!'};
-  const fetchCall=jest.spyOn(globalThis,'fetch').mockResolvedValue(Response.json({contractVersion:1,personas:[persona]}));
+  const fetchCall=jest.spyOn(globalThis,'fetch').mockResolvedValue(Response.json({contractVersion:2,personas:[persona]}));
   const save=jest.spyOn(PostgresConversationStore.prototype,'create').mockResolvedValue();
   const runtime=createSplitRuntime({PTR_APP_DATABASE_URL:'postgresql://ptr_split_app:synthetic@127.0.0.1:58432/ptr_split_test',
     PTR_REDIS_URL:'redis://:synthetic@127.0.0.1:58479/0',PTR_LLM_CONTROL_TOKEN:'synthetic-control-token-1234567890',

@@ -7,6 +7,7 @@ const tone = z.enum(['neutral', 'warm', 'playful']);
 export const AgentVariablesSchema = z.object({
   conversationTopic: z.string().max(200).default(''),
   tone: tone.default('neutral'),
+  speechLevel: z.enum(['casual','polite']).optional(),
 }).strict().default({});
 const variableUpdates = z.object({ conversationTopic: z.string().max(200).optional(), tone: tone.optional() }).strict();
 const reference = z.object({

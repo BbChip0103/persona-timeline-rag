@@ -104,7 +104,7 @@ def agent_response_schema(sources):
 
 def variables(value=None):
     value = {} if value is None else value
-    if not isinstance(value, dict) or set(value) - {"conversationTopic", "tone"}:
+    if not isinstance(value, dict) or set(value) - {"conversationTopic", "tone", "speechLevel"}:
         raise CoreError("INVALID_INPUT")
     topic = value.get("conversationTopic", "")
     tone = value.get("tone", "neutral")
@@ -112,9 +112,13 @@ def variables(value=None):
         not isinstance(topic, str)
         or utf16_length(topic) > 200
         or tone not in ("neutral", "warm", "playful")
+        or value.get("speechLevel", "polite") not in ("casual", "polite")
     ):
         raise CoreError("INVALID_INPUT")
-    return {"conversationTopic": topic, "tone": tone}
+    result = {"conversationTopic": topic, "tone": tone}
+    if "speechLevel" in value:
+        result["speechLevel"] = value["speechLevel"]
+    return result
 
 
 def _credential(value):

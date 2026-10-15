@@ -16,7 +16,7 @@ import { DEFAULT_SSE, streamTurn, type SseOptions } from './turn-sse';
 import type {CreativeArtifact} from './creative-artifact';
 import {createDraftLimiter} from './draft-limiter';
 import type {SplitApiRuntime} from './split-runtime';
-import {WireContractError,type StartRequest,type Binding,type CompleteRequest} from '../../../contracts/llm/v1/validate';
+import {WireContractError,type StartRequest,type Binding,type CompleteRequest} from '../../../contracts/llm/v2/validate';
 import { ZodSchemaPipe, WireSchemaPipe } from './schema-pipes';
 const RUNTIME=Symbol('API_RUNTIME');
 const SSE=Symbol('SSE_OPTIONS');
@@ -71,7 +71,7 @@ class SafeErrorFilter implements ExceptionFilter {
     if(error instanceof CoreError) {
       code=error.code;status=({NOT_FOUND:404,FORBIDDEN:403,TURN_ACTIVE:409,IDEMPOTENCY_CONFLICT:409,INVALID_INPUT:400,TURN_FAILED:502,CONTEXT_LIMIT:409,PERSONA_UNAVAILABLE:404,QUEUE_FULL:503,SEMANTIC_UNAVAILABLE:400} as const)[error.code];
       if(error.code==='QUEUE_FULL') response.setHeader('Retry-After','1');
-    } else if(error instanceof WireContractError) {status=400;code='INVALID_INPUT';}
+    } else if(error instanceof WireContractError) {status=400;code=error.message==='WIRE_VERSION_MISMATCH'?'WIRE_VERSION_MISMATCH':'INVALID_INPUT';}
     else if(error instanceof z.ZodError) {status=400;code='INVALID_INPUT';}
     else if(error instanceof HttpException) {
       status=error.getStatus();code=status===403?'UNAUTHORIZED':status===413?'BODY_TOO_LARGE':status===404?'NOT_FOUND':'INVALID_INPUT';
@@ -99,7 +99,7 @@ class ApiController {
   @Get('readyz') readyz(@Res({passthrough:true}) response:Response) {return this.health(response);}
   @Get('personas') async personas(@Req() request:Request) {
     owner(request);
-    return {operatorMode:this.operatorMode,personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,
+    return {operatorMode:this.operatorMode,...(this.operatorMode?{operatorOptionsAvailable:this.operatorOptions}:{}),personas:(await this.runtime.listPersonas()).map(p=>({id:p.id,personId:p.personId,label:p.label,language:p.language,revision:p.revision,
       ...(p.tagline?{tagline:p.tagline}:{}),...(p.starters?{starters:p.starters}:{}),
       ...(this.operatorMode?{reviewStatus:p.reviewStatus}:{}),aiDisclosure:/^en(?:$|[-_])/i.test(p.language)?`AI character · not the real ${p.label}`:`AI 캐릭터 · 실제 ${p.label} 아님`}))};
   }
@@ -174,12 +174,13 @@ class LlmControlController {
   @Post('complete') @HttpCode(200) async complete(@Body(new WireSchemaPipe<CompleteRequest>('CompleteRequest')) r:CompleteRequest) {const runtime=this.runtime;const ack=await runtime.control.complete(r);if(ack.status==='applied')void runtime.events.publish({turnId:r.turnId,state:r.result.kind==='completed'?'completed':'failed',...(r.result.kind==='failed'?{errorCode:r.result.errorCode}:{})}).catch(()=>undefined);return ack;}
 }
 /** `syntheticToken`: the harness token (PTR_API_SYNTHETIC_TOKEN, demo layer); it must differ from the production token. */
-export async function createApiApplication(runtime:SplitApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string;operatorMode?:boolean;operatorOptions?:boolean}={}):Promise<INestApplication> {
+export async function createApiApplication(runtime:SplitApiRuntime,token:string,options:{sse?:Partial<SseOptions>;draftsPerOwnerPerMinute?:number;syntheticToken?:string;operatorMode?:boolean;operatorOptions?:boolean;intakePaused?:boolean}={}):Promise<INestApplication> {
   const draftLimit=options.draftsPerOwnerPerMinute??DEFAULT_DRAFTS_PER_OWNER_PER_MINUTE;
   if(!Number.isInteger(draftLimit)||draftLimit<1) throw new CoreError('INVALID_INPUT');
   const validToken=(value:string)=>value.length>=24 && value.length<=512;
   if(!token || !validToken(token)) throw new CoreError('INVALID_INPUT');
   const synthetic=options.syntheticToken;
+  const intakePaused=options.intakePaused??process.env.PTR_API_INTAKE_PAUSED==='1';
   if(synthetic!==undefined && (!validToken(synthetic) || synthetic===token)) throw new CoreError('INVALID_INPUT');
   const metrics=new ApiMetrics();
   class RuntimeLifecycle implements OnApplicationShutdown {
@@ -213,6 +214,10 @@ export async function createApiApplication(runtime:SplitApiRuntime,token:string,
     if(hashed && timingSafeEqual(expected,hashed)) ownerSpace.set(request,'web');
     else if(hashed && expectedSynthetic && timingSafeEqual(expectedSynthetic,hashed)) ownerSpace.set(request,'harness');
     else return response.status(403).json({error:{code:'UNAUTHORIZED'}});
+    if(intakePaused&&request.method==='POST'&&/^\/api\/sessions\/[^/]+\/(?:turns|drafts)$/.test(request.path)) {
+      response.setHeader('Retry-After','30');
+      return response.status(503).json({error:{code:'INTAKE_PAUSED',message:'잠시 점검 중'}});
+    }
     return next();
   });
   const publicParser=json({limit:'16kb'}),internalParser=json({limit:'8mb'});

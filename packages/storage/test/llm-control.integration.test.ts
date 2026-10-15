@@ -1,11 +1,11 @@
 import {randomUUID} from 'node:crypto';
 import type {Pool} from 'pg';
 import type {ChatSession} from '@ptr/contracts';
-import type {Reply} from '../../../contracts/llm/v1/generated';
+import type {Reply} from '../../../contracts/llm/v2/generated';
 import {createLocalPool} from '../src/pool';
 import {PostgresConversationStore} from '../src/conversations';
 import {PostgresLlmControl} from '../src/llm-control';
-import type {Binding,CompleteRequest,StartRequest} from '../../../contracts/llm/v1/validate';
+import type {Binding,CompleteRequest,StartRequest} from '../../../contracts/llm/v2/validate';
 const raw=process.env.PTR_SPLIT_TEST_APP_DATABASE_URL;
 const safe=()=>{if(!raw)return false;const u=new URL(raw);return u.hostname==='127.0.0.1'&&u.port==='58432'&&u.pathname==='/ptr_split_test'&&u.username==='ptr_split_app';};
 const suite=safe()?describe:describe.skip;
@@ -18,27 +18,27 @@ suite('split app durable Start/Complete handshake synthetic PG',()=>{
     await store.create(session,{id:randomUUID(),sessionId:id,turnId:null,role:'assistant',content:'synthetic greeting',createdAt:session.createdAt});sessions.push(id);
     const input={sessionId:id,clientRequestId:randomUUID(),text:'synthetic hello'};
     const reserved=await store.reserveTurn(id,session.ownerId,input.clientRequestId,input.text,undefined,input);
-    lock='synthetic-current';const request:StartRequest={contractVersion:1,turnId:reserved.turn.id,dispatchSeq:0,jobId:`t-${reserved.turn.id}-0`,lockToken:lock,executionId:randomUUID()};
+    lock='synthetic-current';const request:StartRequest={contractVersion:2,turnId:reserved.turn.id,dispatchSeq:0,jobId:`t-${reserved.turn.id}-0`,lockToken:lock,executionId:randomUUID()};
     const reply:Reply={sessionId:id,turnId:reserved.turn.id,messageId:randomUUID(),personId:session.personId,personaRevision:session.personaRevision,responseKind:'small_talk',status:'answered',content:'synthetic reply',claims:[],evidence:[],limitations:[]};
     return {session,request,reply};
   }
   async function claimed() {const f=await fixture(),response=await control.start(f.request);if(response.status!=='granted')throw new Error('EXPECTED_GRANT');return {...f,grant:response.grant,binding:{...f.request,generation:response.grant.generation} as Binding};}
   test('lost Start ACK returns exact same durable snapshot/generation; no timed DB heartbeat',async()=>{
-    const f=await claimed();expect(await control.start(f.request)).toEqual({contractVersion:1,status:'granted',grant:f.grant});
-    expect(await control.snapshot(f.binding)).toEqual({contractVersion:1,status:'granted',grant:f.grant});expect(f.grant.context.history).toHaveLength(1);expect(f.grant.context.session.executionProfile).toBe('agent_loop');
+    const f=await claimed();expect(await control.start(f.request)).toEqual({contractVersion:2,status:'granted',grant:f.grant});
+    expect(await control.snapshot(f.binding)).toEqual({contractVersion:2,status:'granted',grant:f.grant});expect(f.grant.context.history).toHaveLength(1);expect(f.grant.context.session.executionProfile).toBe('agent_loop');
     expect((await pool.query('SELECT * FROM turn_leases WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);
     expect((await pool.query('SELECT * FROM turn_outbox WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(1);
   });
   test('reclaimed queue token issues fresh fencing generation; old result cannot publish',async()=>{
     const f=await claimed();lock='synthetic-reclaimed';const fresh={...f.request,executionId:randomUUID(),lockToken:lock};
     const response=await control.start(fresh);expect(response.status).toBe('granted');if(response.status!=='granted')return;
-    expect(response.grant.generation).toBe(2);expect(await control.status(f.binding)).toEqual({contractVersion:1,status:'lost'});
-    expect(await control.complete({...f.binding,result:{kind:'completed',reply:f.reply}})).toEqual({contractVersion:1,status:'lost'});
+    expect(response.grant.generation).toBe(2);expect(await control.status(f.binding)).toEqual({contractVersion:2,status:'lost'});
+    expect(await control.complete({...f.binding,result:{kind:'completed',reply:f.reply}})).toEqual({contractVersion:2,status:'lost'});
   });
   test('Complete commit ACK loss replays after lock expiry, result equality rejects mutations',async()=>{
     const f=await claimed(),request:CompleteRequest={...f.binding,result:{kind:'completed',reply:f.reply}};
-    expect(await control.complete(request)).toEqual({contractVersion:1,status:'applied'});lock='expired';
-    expect(await control.complete(request)).toEqual({contractVersion:1,status:'alreadyApplied'});
+    expect(await control.complete(request)).toEqual({contractVersion:2,status:'applied'});lock='expired';
+    expect(await control.complete(request)).toEqual({contractVersion:2,status:'alreadyApplied'});
     await expect(control.complete({...request,result:{kind:'completed',reply:{...f.reply,content:'changed synthetic'}}})).rejects.toMatchObject({code:'IDEMPOTENCY_CONFLICT'});
     expect((await store.history(f.session.id,f.session.ownerId)).map(m=>m.role)).toEqual(['assistant','user','assistant']);
     expect((await pool.query('SELECT * FROM turn_outbox WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);
@@ -84,7 +84,7 @@ suite('split app durable Start/Complete handshake synthetic PG',()=>{
       await pool.query("INSERT INTO messages(id,session_id,turn_id,role,content,created_at) VALUES($1,$2,$3,'user','synthetic prior user',now()),($4,$2,$3,'assistant','synthetic prior assistant',now())",[randomUUID(),f.session.id,id,randomUUID()]);
     }
     expect((await store.history(f.session.id,f.session.ownerId))).toHaveLength(101);
-    expect(await control.start(f.request)).toEqual({contractVersion:1,status:'lost'});
+    expect(await control.start(f.request)).toEqual({contractVersion:2,status:'lost'});
     expect(await store.getTurn(f.request.turnId,f.session.ownerId)).toMatchObject({state:'failed',errorCode:'CONTEXT_LIMIT'});
     expect((await pool.query('SELECT * FROM turn_execution_grants WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);
     expect((await pool.query('SELECT * FROM turn_outbox WHERE turn_id=$1',[f.request.turnId])).rowCount).toBe(0);

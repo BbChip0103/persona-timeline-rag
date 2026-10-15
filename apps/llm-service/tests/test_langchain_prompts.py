@@ -14,6 +14,7 @@ from ptr_llm.core.prompts import (
     POLICY,
     build_experiment_context,
     build_prompt,
+    relative_date,
     short_unique_quote,
     utf16_prefix,
 )
@@ -67,8 +68,8 @@ def reference_experiment_messages(
             "sourceId": item["id"],
             "personId": item["personId"],
             "caption": item["caption"],
-            "postedAt": item["postedAt"],
-            "eventDate": item["eventDate"],
+            "postedAt": relative_date(item["postedAt"]),
+            "eventDate": relative_date(item["eventDate"]),
             "quoteCandidate": short_unique_quote(item["caption"]),
         }
         if "imageAnnotations" in item:

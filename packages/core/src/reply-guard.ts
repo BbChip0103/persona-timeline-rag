@@ -52,9 +52,13 @@ export type ReplyGuardReason='human_impersonation'|'missing_ai_disclosure'|'priv
 /** Remove model-authored Markdown decoration, leaving its words for the safety checks below. */
 function withoutMarkdown(reply:string):string {
   const noLists=reply.replace(/^[ \t]{0,3}(?:[-*•][ \t]+|[0-9]+[.)][ \t]+)/gmu,'');
-  const noEmphasis=noLists.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<![\w^])_([^_\n]+)_(?![\w^])/gu,(_match,boldStar:string,boldUnderscore:string,italicStar:string,italicUnderscore:string)=>boldStar??boldUnderscore??italicStar??italicUnderscore);
-  return noEmphasis===reply?reply:noEmphasis.replace(/[ \t]*\n[ \t]*/gu,(_match,offset:number)=>
-    /[.!?。！？~…]$/u.test(noEmphasis.slice(0,offset).trimEnd())?' ':'. ').trim();
+  const noEmphasis=noLists.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__|\*([^*\n]+)\*|(?<![\p{L}\p{N}^])_([^_\n]+)_(?![\p{L}\p{N}^])/gu,(_match,boldStar:string,boldUnderscore:string,italicStar:string,italicUnderscore:string)=>boldStar??boldUnderscore??italicStar??italicUnderscore);
+  if(noEmphasis===reply)return reply;
+  const cleaned=noEmphasis.replace(/,[ \t]*\.(?=\s|$)/gu,',');
+  return cleaned.replace(/[ \t]*\r?\n[ \t]*/gu,(_match,offset:number)=>{
+    const before=cleaned.slice(0,offset).trimEnd();
+    return /[.!?。！？~…,]$|(?:은|는|이|가|을|를|도)$/.test(before)?' ':'. ';
+  }).trim();
 }
 // Only "not in my data" constructions (review HIGH: bare data words, perfume notes, notes apps, "on my feed" and questions back
 // to the user are ordinary chat); a sentence ending in a question mark is never meta talk.
@@ -141,14 +145,14 @@ const PRIVATE_REPLY:RegExp[]=[
   /(?:우리|내|제|울)\s?(?:가족|엄마|아빠|어머니|아버지|부모님|오빠|언니|누나|형|동생|남편|아내|와이프|딸|아들|할머니|할아버지)|(?<![가-힣])(?:엄마|아빠|어머니|아버지|부모님|남편|와이프|시댁|친정|남동생|여동생|남매)(?=[\s이가은는을를랑와과도한께의,.!?~]|$)|가족\s?(?:들|이랑|하고|끼리|여행|모임)|가족과\s?(?:함께|같이)|큰\s?집(?:에서|에|이라)/,
   /남자\s?친구|여자\s?친구|남친|여친|애인|신혼집|짝꿍|그이|예랑|열애|연애\s?(?:중|하고|했|해|를\s?하)|결혼(?:했|해|하고|생활|기념)|약혼|데이트(?:했|하|를)|이혼/,
   /(?:우리|내|제)\s?집(?![밥필중착합])|사는\s?(?:곳|동네|집)|(?:에|에서)\s?살(?:아|고|았|아요)|이사(?:했|를|해|간|온|와)|거주|자택|(?<!(?:홈페이지|이메일|웹|사이트|링크|메일|URL)\s?)주소/,
-  /아픈\s?데|아팠|아파서|아파요|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\s?먹|다쳤|부상(?:을\s?입|당했|당해|이\s?(?:있|심))|임신|출산|건강(?:해|하게\s?지내|은|이\s|상태|검진)/,
+  /아픈\s?데|아팠|아파|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\s?먹|다쳤|부상(?:을\s?입|당했|당해|이\s?(?:있|심))|임신|출산|건강(?:해|하게\s?지내|은|이\s|상태|검진)/,
   /(?:내|제|우리)\s?친구|친구(?:들)?(?:이랑|랑|하고|들과|한테|를|들을)/,
   /미성년|초등학생|중학생|고등학생/,
   /\b(?:my|our)\s+(?:mom|mum|mother(?!\s+tongue)|dad|father|parents|family|brother|sister|siblings?|husband|wife|son|daughter|kids?|children|grand(?:ma|pa|mother|father|parents))\b|\b(?:husband|wife)\b/i,
   /\b(?:my\s+)?(?:boyfriend|girlfriend|fianc[eé]e?)\b|\b(?:I'm|I am|we're|we are)\s+dating\b|\b(?:I'm|I am|we're|we are|we got)\s+(?:married|engaged)\b/i,
   // Residence: a first-person living statement, or a move to a named place ("Moving to the next piece" stays).
   /\b(?:I|we)\s+(?:live|lived|am living|are living)\s+in\b|\bhome\s+base\b|\b(?:mov(?:ed|ing)|relocat(?:ed|ing)|(?:the|that|my|our)\s+move)\s+to\s+(?:[A-Z][a-z]|LA\b|NYC\b)|\bmy\s+(?:own\s+)?(?:home|apartment|flat|house)\b(?!\s+(?:studio|office|gym))|\bmy\s+(?:address|neighbou?rhood)\b|\bI(?:'m| am)\s+(?:currently|now|right now)\s+(?:in|at)\s+[A-Z][a-z]/,
-  /\bmy\s+health\b|\bI(?:'m| am)\s+(?:sick|ill|healthy|recovering)\b|\bhospital(?:s|i[sz]ed)?\b|\bsurgery\b|\bdiagnos\w*|\billness\b|\binjur(?:y|ed)\b|\bpregnan\w*/i,
+  /\bmy\s+health\b|\bI(?:'m| am)\s+(?:sick|ill|healthy|recovering)\b|\b(?:got|was|been)\s+(?:sick|ill)\b|\bhospital(?:s|i[sz]ed)?\b|\bsurgery\b|\bdiagnos\w*|\billness\b|\binjur(?:y|ed)\b|\bpregnan\w*/i,
   /\bmy\s+(?:best\s+|close\s+|old\s+)?friends?\b|\bclose\s+friends\b/i,
   /\b(?:underage|minors)\b/i,
 ];
@@ -166,7 +170,7 @@ const OWN_NOUN=/(?<![가-힣])(?:내|제|우리|저희|나의)\s?(?:엄마|아�
 const SELF_SUBJECT=/(?<![가-힣])(?:나|난|나는|나도|내가|저|전|저는|저도|제가)(?![가-힣])|\b(?:i|we)\b/iu;
 const TOPIC_SHIFT=/궁금|물어|여쭤|생각|\b(?:wonder|ask)\b/iu;
 const PRIVATE_PREDICATE=/결혼(?:해|했|하고)|사귀|연애|유부|있어|없어|살아|살고|아프|다녀|갔|싸웠|싸우|만났|만나|걱정|그리워|보고\s?싶|여행|안\s?좋|\b(?:married|dating|newlywed|live|visited|went|ill|sick|fought|miss)\b/iu;
-const BARE_PRIVATE=/(?<![가-힣])(?:남자친구|여자친구|결혼|남친|여친|연애|이혼|임신|가족|엄마|아빠|병원|입원|아프|아팠|사귀|헤어|유부)|\b(?:boyfriend|girlfriend|married|marriage|divorce|pregnant|dating|hospital|hospitalized|newlywed)\b|\bmy\s+(?:mom|dad|family)\b/iu;
+const BARE_PRIVATE=/(?<![가-힣])(?:남자친구|여자친구|결혼|남친|여친|연애|이혼|임신|가족|엄마|아빠|병원|입원|아프|아파|아팠|사귀|헤어|유부)|\b(?:boyfriend|girlfriend|married|marriage|divorce|pregnant|dating|hospital|hospitalized|newlywed)\b|\b(?:got|was|been)\s+(?:sick|ill)\b|\bmy\s+(?:mom|dad|family)\b/iu;
 const ADDITIONAL_PRIVATE=/신혼여행|신혼집|짝꿍|그이|예랑|식\s?올렸|웨딩|신랑|신부|어머님|아버님|할머니|할아버지|아기\s?낳|출산|썸|\b(?:wedding|partner\b(?!\s+(?:brands?|companies|agencies))|seeing\s+someone|had\s+a\s+baby)\b/iu;
 const PERSONA_SELF=/(?<![가-힣])(?:나는|나도|난|내가|나의|나|내|제가|저는|저도|저희|저|전|제|우리|울)(?:에게|한테|까지|부터|랑|하고|와|과|의|은|는|이|가|을|를|도|에|서|만|처럼|만큼|보다)?(?![가-힣])|\b(?:my|our|i|we|me|mine|us|ours)\b|\b(?:me\s+too|same\s+here|happened\s+to\s+me|i\s+did\s+too)\b/iu;
 const OWN_STORY_EMPATHY=/(?:겠다|겠어|길\s*바라|면\s*좋겠다|속상|축하해)[.!?~…]*$|^(?:i\s+hope|i(?:'m| am)\s+sorry|hope|sorry|congrats)\b/iu;
@@ -174,9 +178,9 @@ const ALLOWED_EMPATHY_SELF_PREFIX=/^i(?:\s+hope|(?:'m| am)\s+sorry)\b/iu;
 const EXPERIENCE_MARKER=/로서|입장|겪어|해봐서|봐서|해봤|었던|았던|였던|던\s+거|생각나|것처럼|\b(?:as\s+a|myself|from\s+one)\b/iu;
 // Reuse the private-keyword sources; no parallel noun vocabulary is maintained.
 const PRIVATE_NOUNS=[BARE_PRIVATE,ADDITIONAL_PRIVATE,...PRIVATE_REPLY];
-const REPLY_PRIVATE_STEMS=/(?<![가-힣])(?:수술|입원|아프|아팠|임신|출산|이혼|결혼|사귀|연애|헤어)/gu;
+const REPLY_PRIVATE_STEMS=/(?<![가-힣])(?:수술|입원|아프|아파|아팠|임신|출산|이혼|결혼|사귀|연애|헤어)/gu;
 const USER_CARE=/아프지\s*(?:마|않게)|조심해|챙겨|푹\s*쉬어/u;
-const LEADING_CONNECTIVE=/^(?:(?:해서|고|는데|지만)(?=\s|$)\s*)+/u;
+const LEADING_CONNECTIVE=/^(?:(?:해서|고|는데|지만)(?=[.!?~…\s]|$)[.!?~…\s]*)+/u;
 const NOUN_SUFFIX=/^(?:한테도|에게도|이랑|랑|하고|와|과|은|는|이|가|을|를|에|에서|에게|한테|도|만|의|처럼|까지|부터|로|으로|께|께서|들|야|이에요|이야|해|했|하다|하는|한|할)?(?=$|[^\p{L}\p{N}])/u;
 const NOUN_PARTICLE=/(?:들이랑|들과|들을|한테도|에게도|이랑|랑|하고|와|과|은|는|이|가|을|를|에|에서|에게|한테|도|만|의|처럼|까지|부터|로|으로|께|께서)$/u;
 const canonicalPrivateNoun=(surface:string):string=>surface.toLowerCase().replace(/^(?:내|제|우리|울)\s?/u,'').trimEnd().replace(NOUN_PARTICLE,'');
@@ -201,7 +205,7 @@ function normalizePrivateText(text:string):string {
   });
 }
 const CLAUSES=/\s*,\s*|(?<!에고)(?<=(?:는데|지만|다시피|잖아|고))(?=\s)/u;
-const DANGLING=/(?:는데|지만|다시피|잖아|고)$|^(?:응|네|예|맞아|맞아요|yeah|yes|right)[.!?~]*$/iu;
+const DANGLING=/(?:는데|지만|다시피|잖아|고)$|^(?:응|네|예|맞아|맞아요|있어|있어요|했어|했어요|yeah|yes|right)[.!?~]*$/iu;
 function userOwnsPrivateStatement(sentence:string):boolean {
   return !USER_SUBJECT.test(sentence)&&!HEARSAY.test(sentence)&&(OWN_NOUN.test(sentence)||SELF_SUBJECT.test(sentence)&&!TOPIC_SHIFT.test(sentence)&&PRIVATE_PREDICATE.test(sentence));
 }

@@ -36,7 +36,7 @@ export class BullMqTurnDelivery implements TurnDelivery {
     // outbox entry is still pending: replace it, or the re-publish would be a silent no-op until retention expires.
     const state = await this.queue.getJobState(turnJobId(dispatch));
     if (state === 'completed' || state === 'failed') await this.queue.remove(turnJobId(dispatch)).catch(() => undefined);
-    await this.queue.add('turn', this.splitWire?{contractVersion:1,turnId:dispatch.turnId,dispatchSeq:dispatch.seq}:{turnId:dispatch.turnId,seq:dispatch.seq}, {
+    await this.queue.add('turn', this.splitWire?{contractVersion:2,turnId:dispatch.turnId,dispatchSeq:dispatch.seq}:{turnId:dispatch.turnId,seq:dispatch.seq}, {
       jobId: turnJobId(dispatch), attempts: 1,
       removeOnComplete: { age: 3600 }, removeOnFail: { age: 24 * 3600 },
     });

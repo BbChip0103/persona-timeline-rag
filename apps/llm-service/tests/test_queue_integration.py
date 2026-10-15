@@ -113,7 +113,7 @@ async def test_sigterm_drains_real_bullmq_job_before_ack(owned_redis, tmp_path):
     try:
         await queue.add(
             "turn",
-            {"contractVersion": 1, "turnId": turn_id, "dispatchSeq": 0},
+            {"contractVersion": 2, "turnId": turn_id, "dispatchSeq": 0},
             {"jobId": job_id, "attempts": 1},
         )
         process = await asyncio.create_subprocess_exec(
@@ -181,7 +181,7 @@ async def test_two_python_workers_saturation_drain_and_backpressure(owned_redis)
             ids.append(job_id)
             await queue.add(
                 "turn",
-                {"contractVersion": 1, "turnId": turn_id, "dispatchSeq": 0},
+                {"contractVersion": 2, "turnId": turn_id, "dispatchSeq": 0},
                 {"jobId": job_id, "attempts": 1},
             )
         await asyncio.wait_for(started.wait(), 5)
@@ -329,7 +329,7 @@ async def test_node_producer_python_consumer_cross_language_wire(owned_redis):
     node = """const {Queue}=require(process.argv[1]);const u=new URL(process.argv[2]);
 (async()=>{const connection={host:u.hostname,port:Number(u.port)};
 const q=new Queue('turns',{connection,prefix:process.argv[3]});
-const data={contractVersion:1,turnId:process.argv[4],dispatchSeq:0};
+const data={contractVersion:2,turnId:process.argv[4],dispatchSeq:0};
 await q.add('turn',data,{jobId:process.argv[5],attempts:1});await q.close()})();"""
     try:
         await runner.start()
@@ -391,7 +391,7 @@ async def test_real_lock_renewal_and_token_loss_stop_new_model_work(owned_redis)
         runner.worker.on("locksRenewed", lambda event: renewals.append(event))
         await queue.add(
             "turn",
-            {"contractVersion": 1, "turnId": turn_id, "dispatchSeq": 0},
+            {"contractVersion": 2, "turnId": turn_id, "dispatchSeq": 0},
             {"jobId": job_id, "attempts": 1},
         )
         await asyncio.wait_for(entered.wait(), 3)

@@ -2,6 +2,7 @@
 
 import copy
 import json
+from datetime import date
 from pathlib import Path
 
 import regex
@@ -15,6 +16,37 @@ from .persona import dumps, render_persona_block, serialized_bytes
 POLICY = json.loads(Path(__file__).with_name("prompt_policy.json").read_text())
 EXPERIMENT_PROMPT_BYTE_LIMIT = 30000
 EVIDENCE_POST_LIMIT = 3
+
+
+def relative_date(value, today=None):
+    """Prompt-only coarse date; missing turn clock never implies a date."""
+    if value is None:
+        return None
+    try:
+        target = date.fromisoformat(value[:10])
+        anchor = date.fromisoformat(today) if today else None
+    except (ValueError, TypeError):
+        return "그 무렵"
+    season = ("겨울", "봄", "여름", "가을")[(target.month % 12) // 3]
+    if anchor is None:
+        return season + " 무렵"
+    years = anchor.year - target.year
+    if years == 0:
+        return "올해 " + season
+    if years < 0:
+        return f"약 {-years}년 뒤 {season}"
+    return f"약 {years}년 전 {season}"
+
+
+def _turn_today(messages):
+    for message in messages:
+        content = message["content"]
+        if content.startswith("AGENT_STATE_JSON_DATA "):
+            try:
+                return json.loads(content.split(" ", 1)[1]).get("today")
+            except (ValueError, AttributeError):
+                pass
+    return None
 
 
 def _prompt_template(with_evidence):
@@ -99,6 +131,7 @@ def build_experiment_context(
     after_history=(),
     after_user=(),
     max_sources=EVIDENCE_POST_LIMIT,
+    today=None,
 ):
     if type(max_sources) is not int or not 1 <= max_sources <= 20:
         raise CoreError("INVALID_INPUT")
@@ -114,6 +147,7 @@ def build_experiment_context(
     persona_messages = render_persona_block(persona)
     history_messages = [{"role": m["role"], "content": m["content"]} for m in history]
     notes = [{"role": "system", "content": policy_note}] if policy_note else []
+    today = today or _turn_today(after_history)
 
     def render(*, final=False):
         cards = []
@@ -122,8 +156,8 @@ def build_experiment_context(
                 "sourceId": s["id"],
                 "personId": s["personId"],
                 "caption": s["caption"],
-                "postedAt": s["postedAt"],
-                "eventDate": s["eventDate"],
+                "postedAt": relative_date(s["postedAt"], today),
+                "eventDate": relative_date(s["eventDate"], today),
                 "quoteCandidate": short_unique_quote(s["caption"]),
             }
             if "imageAnnotations" in s:

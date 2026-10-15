@@ -10,7 +10,7 @@ import {BullMqTurnDelivery,turnJobId} from '../../../packages/messaging/src/bull
 import {RedisTurnEvents,RedisTurnEventSource} from '../../../packages/messaging/src/turn-events';
 import {createRedisConnection,REDIS_PREFIX} from '../../../packages/messaging/src/redis';
 import type {ChatSession} from '@ptr/contracts';
-import {validateWire,type PersonaProjection,type StartRequest} from '../../../contracts/llm/v1/validate';
+import {validateWire,WireContractError,type PersonaProjection,type StartRequest} from '../../../contracts/llm/v2/validate';
 import type {CreativeArtifact} from './creative-artifact';
 import {SplitChatService} from './split-chat';
 import {bounded} from '../../../packages/ops/src/bounded';
@@ -65,11 +65,14 @@ export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRu
   const rpc=async(name:string,path:string,body?:unknown,signal?:AbortSignal)=>{
     try {
       const response=await fetch(new URL(path,url),{method:body===undefined?'GET':'POST',redirect:'error',headers:{Authorization:`Bearer ${controlToken}`,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:signal??AbortSignal.timeout(3000)});
-      if(!response.ok||!response.body)throw new CoreError('TURN_FAILED');
+      if(!response.body)throw new CoreError('TURN_FAILED');
       const reader=response.body.getReader(),chunks:Uint8Array[]=[];let bytes=0;
       try {for(;;){const next=await reader.read();if(next.done)break;bytes+=next.value.byteLength;if(bytes>1024*1024){await reader.cancel();throw new CoreError('TURN_FAILED');}chunks.push(next.value);}}finally{reader.releaseLock();}
-      return validateWire(name,JSON.parse(Buffer.concat(chunks).toString('utf8')));
-    }catch{throw new CoreError('TURN_FAILED');}
+      const decoded=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if(response.status===400&&decoded?.detail==='WIRE_VERSION_MISMATCH')throw new WireContractError('WIRE_VERSION_MISMATCH');
+      if(!response.ok)throw new CoreError('TURN_FAILED');
+      return validateWire(name,decoded);
+    }catch(error){if(error instanceof WireContractError)throw error;throw new CoreError('TURN_FAILED');}
   };
   const listPersonas=async()=>{const response=await rpc('CatalogueResponse','/internal/llm/personas') as unknown as {personas:PersonaProjection[]};if(new Set(response.personas.map(p=>p.personId)).size!==response.personas.length)throw new CoreError('PERSONA_UNAVAILABLE');return response.personas;};
   const chat=new SplitChatService(store,listPersonas,delivery,events,integer(env,'PTR_QUEUE_MAX_DEPTH',256,1,100000),env.PTR_LLM_SEMANTIC_SEARCH==='1');
@@ -77,7 +80,7 @@ export function createSplitRuntime(env:NodeJS.ProcessEnv=process.env):SplitApiRu
   // API/backend owns outbox reconciliation even when Python/control service is down.
   if(env.PTR_BACKEND_MAINTENANCE!=='0')maintenance.start();
   return {kind:'split',chat,control,controlToken,executionStore:store,delivery,events,eventSource,providerName:env.PTR_CHAT_PROVIDER??'fake',model:env.PTR_MODEL??'synthetic/fake-text-v1',billable,draftLimiterClient:redis,listPersonas,
-    async draftRemote(session,brief,requestKey,deadlineAt,signal) {const payload=validateWire('DraftRequest',{contractVersion:1,session,brief,requestKey,deadlineAt});const result=await rpc('DraftResponse','/internal/llm/draft',payload,signal);const {contractVersion:_,...reply}=result;return reply as {content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}};},
+    async draftRemote(session,brief,requestKey,deadlineAt,signal) {const payload=validateWire('DraftRequest',{contractVersion:2,session,brief,requestKey,deadlineAt});const result=await rpc('DraftResponse','/internal/llm/draft',payload,signal);const {contractVersion:_,...reply}=result;return reply as {content:string;provider:string;model:string}|{notice:{status:'out_of_scope';content:string;limitations:string[]}};},
     saveArtifact:artifact=>artifacts.save(artifact),
     loadArtifact:(ownerId,id)=>artifacts.get<CreativeArtifact>(ownerId,id),
     async health() {const check=async(work:()=>Promise<unknown>)=>{try{await bounded(work,1000);return true;}catch{return false;}};const [database,redisOkay]=await Promise.all([check(()=>pool.query('SELECT 1')),check(()=>redis().ping())]);return {database,redis:redisOkay};},

@@ -355,7 +355,7 @@ def app_and_calls():
 
     async def draft(body):
         calls.append(body)
-        return {"contractVersion": 1, "content": "Synthetic", "provider": "fake", "model": "fake"}
+        return {"contractVersion": 2, "content": "Synthetic", "provider": "fake", "model": "fake"}
 
     return create_app(settings(), catalogue=catalogue, draft=draft), calls
 
@@ -441,7 +441,7 @@ async def test_authenticated_draft_uses_shared_wire_contracts_and_sanitizes_fail
         "createdAt": "2026-10-11T00:00:00Z",
     }
     body = {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "session": session,
         "brief": "Synthetic",
         "requestKey": "test",
@@ -458,6 +458,12 @@ async def test_authenticated_draft_uses_shared_wire_contracts_and_sanitizes_fail
             "/internal/llm/draft", json={**body, "extra": True}, headers=headers
         )
         assert invalid.status_code == 400 and invalid.json() == {"detail": "INVALID_DRAFT_REQUEST"}
+        assert calls == [body]
+        old_peer = await client.post(
+            "/internal/llm/draft", json={**body, "contractVersion": 1}, headers=headers
+        )
+        assert old_peer.status_code == 400
+        assert old_peer.json() == {"detail": "WIRE_VERSION_MISMATCH"}
         assert calls == [body]
 
 
@@ -500,7 +506,7 @@ async def test_native_auth_preserves_sanitized_draft_exception_codes(error, stat
 
     app = create_app(settings(), catalogue=catalogue, draft=draft)
     body = {
-        "contractVersion": 1,
+        "contractVersion": 2,
         "session": {
             "id": "00000000-0000-4000-8000-000000000001",
             "ownerId": "synthetic",
@@ -539,5 +545,5 @@ async def test_native_auth_keeps_health_public_and_catalogue_protected():
         reply = await client.get(
             "/internal/llm/personas", headers={"Authorization": "Bearer synthetic-control-token"}
         )
-    assert reply.status_code == 200 and reply.json() == {"contractVersion": 1, "personas": []}
+    assert reply.status_code == 200 and reply.json() == {"contractVersion": 2, "personas": []}
     assert calls == ["catalogue"]

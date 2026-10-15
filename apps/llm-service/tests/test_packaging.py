@@ -13,7 +13,7 @@ def test_worker_image_is_independent_and_private_data_not_copied():
         assert f"COPY {excluded}" not in dockerfile
     assert "USER 900:2000" in dockerfile
     assert "COPY --chmod=0755 contracts ./contracts" in dockerfile
-    assert "PTR_LLM_CONTRACTS_DIR=/app/contracts/llm/v1" in dockerfile
+    assert "PTR_LLM_CONTRACTS_DIR=/app/contracts/llm/v2" in dockerfile
     backend = (ROOT / "Dockerfile").read_text()
     assert "COPY . ." not in backend
     assert "COPY apps/llm-service" not in backend

@@ -25,7 +25,7 @@ test('final image copies the narrow split sources, never builder dependencies or
   expect(runtime).not.toMatch(/COPY[^\n]*(?:packages\s|packages\/providers|src\/runtime\.ts|src\/worker\.ts|scripts\s)/);
   expect(runtime).toContain('apps/api/src/packaged-main.ts');
   expect(runtime).toContain('USER 900:2000');
-  expect(runtime).toContain('contracts/llm/v1');
+  expect(runtime).toContain('contracts/llm/v2');
   expect(runtime).toContain('COPY --chmod=0755');
 });
 

@@ -134,7 +134,7 @@ async def test_agent_date_anchor_and_tool_limit_returns_retry():
         for m in provider.messages[0]
         if m["content"].startswith("AGENT_STATE_JSON_DATA")
     )
-    assert '"today":"2026-10-16"' in state
+    assert '"today":"오늘"' in state
     assert '"sinceLastUserMessage"' in state
 
 

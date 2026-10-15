@@ -9,22 +9,37 @@ import type {CreativeArtifact} from '../src/creative-artifact';
 const production='synthetic-production-token-1234567890',synthetic='synthetic-owner-token-1234567890123',controlToken='synthetic-control-token-12345678901';
 const persona={id:'synthetic-persona',personId:'synthetic-person',revision:'synthetic-v1',label:'Synthetic',language:'ko',reviewStatus:'synthetic' as const,greeting:'synthetic greeting'};
 let app:INestApplication,base:string,runtime:SplitApiRuntime;let artifacts:CreativeArtifact[],control:{start:jest.Mock;status:jest.Mock;progress:jest.Mock;complete:jest.Mock};
-const request={contractVersion:1,turnId:'00000000-0000-4000-8000-000000000001',dispatchSeq:0,jobId:'t-00000000-0000-4000-8000-000000000001-0',lockToken:'synthetic-lock',executionId:'00000000-0000-4000-8000-000000000002'};
+const request={contractVersion:2,turnId:'00000000-0000-4000-8000-000000000001',dispatchSeq:0,jobId:'t-00000000-0000-4000-8000-000000000001-0',lockToken:'synthetic-lock',executionId:'00000000-0000-4000-8000-000000000002'};
 async function call(path:string,body?:unknown,token=synthetic){const r=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json','X-PTR-Owner':'owner_synthetic_split'},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:r.status,body:await r.json()};}
 beforeEach(async()=>{
  const store=new InMemoryConversationStore(),events={publish:jest.fn(async()=>undefined)},delivery={backlog:async()=>0,publish:jest.fn(async()=>undefined)};
- control={start:jest.fn(async()=>({contractVersion:1,status:'lost'})),status:jest.fn(async()=>({contractVersion:1,status:'lost'})),progress:jest.fn(async()=>({contractVersion:1,status:'applied'})),complete:jest.fn(async()=>({contractVersion:1,status:'applied'}))};artifacts=[];
+ control={start:jest.fn(async()=>({contractVersion:2,status:'lost'})),status:jest.fn(async()=>({contractVersion:2,status:'lost'})),progress:jest.fn(async()=>({contractVersion:2,status:'applied'})),complete:jest.fn(async()=>({contractVersion:2,status:'applied'}))};artifacts=[];
  runtime={kind:'split',chat:new SplitChatService(store,async()=>[persona],delivery,events),control:control as unknown as PostgresLlmControl,controlToken,executionStore:store,delivery,events,eventSource:{subscribe:async()=>()=>undefined},providerName:'fake',model:'synthetic/fake',billable:false,listPersonas:async()=>[persona],draftRemote:jest.fn(async()=>({content:'synthetic draft',provider:'fake',model:'synthetic/fake'})),saveArtifact:async (a:CreativeArtifact)=>{artifacts.push(a);},health:async()=>({database:true,redis:true}),close:async()=>undefined} as unknown as SplitApiRuntime;
  app=await createApiApplication(runtime,production,{syntheticToken:synthetic});await app.listen(0,'127.0.0.1');base=await app.getUrl();
 });
 afterEach(async()=>{await app.close();});
 test('internal control auth never accepts public web/harness tokens or owner spoofing',async()=>{
  expect((await call('/internal/llm/start',request,synthetic)).status).toBe(403);expect((await call('/internal/llm/start',request,production)).status).toBe(403);
- expect(control.start).not.toHaveBeenCalled();expect((await call('/internal/llm/start',request,controlToken)).status).toBe(200);expect((await call('/internal/llm/start',request,controlToken)).body).toEqual({contractVersion:1,status:'lost'});expect(control.start).toHaveBeenCalledWith(request);
+ expect(control.start).not.toHaveBeenCalled();expect((await call('/internal/llm/start',request,controlToken)).status).toBe(200);expect((await call('/internal/llm/start',request,controlToken)).body).toEqual({contractVersion:2,status:'lost'});expect(control.start).toHaveBeenCalledWith(request);
  expect((await call('/api/personas',undefined,controlToken)).status).toBe(403);
 });
 test('unknown fields, versions, and raw provider strings reject with sanitized 400 and no store call',async()=>{
- for(const body of [{...request,contractVersion:2},{...request,unknown:'private upstream body'},{...request,dispatchSeq:'0'}])expect(await call('/internal/llm/start',body,controlToken)).toEqual({status:400,body:{error:{code:'INVALID_INPUT'}}});expect(control.start).not.toHaveBeenCalled();
+ for(const body of [{...request,unknown:'private upstream body'},{...request,dispatchSeq:'0'}])expect(await call('/internal/llm/start',body,controlToken)).toEqual({status:400,body:{error:{code:'INVALID_INPUT'}}});expect(control.start).not.toHaveBeenCalled();
+});
+test('v1 control peer gets a clear version mismatch before control validation',async()=>{
+  expect(await call('/internal/llm/start',{...request,contractVersion:1},controlToken)).toEqual({status:400,body:{error:{code:'WIRE_VERSION_MISMATCH'}}});
+  expect(control.start).not.toHaveBeenCalled();
+});
+test('paused intake returns a friendly maintenance error while reads and control stay available',async()=>{
+  await app.close();
+  app=await createApiApplication(runtime,production,{syntheticToken:synthetic,intakePaused:true});await app.listen(0,'127.0.0.1');base=await app.getUrl();
+  const session=await call('/api/sessions',{personId:persona.personId});expect(session.status).toBe(201);
+  for(const route of ['turns','drafts']){
+    const response=await call(`/api/sessions/${session.body.session.id}/${route}`,{clientRequestId:'synthetic',text:'synthetic',brief:'synthetic'});
+    expect(response).toEqual({status:503,body:{error:{code:'INTAKE_PAUSED',message:'잠시 점검 중'}}});
+  }
+  expect((await call('/api/personas')).status).toBe(200);
+  expect((await call('/internal/llm/start',{...request,contractVersion:2},controlToken)).status).toBe(200);
 });
 test('split public catalogue/session/reservation remain owner safe without LLM database/provider assembly',async()=>{
  const listed=await call('/api/personas');expect(listed.status).toBe(200);expect(listed.body.personas[0].greeting).toBeUndefined();

@@ -4,13 +4,13 @@ const password='synthetic-ui-password-only';
 type Session={id:string;personId:string;personaRevision:string;retrievalMode:string;ragCondition?:string;createdAt:string};
 type Message={id:string;turnId:string|null;role:string;content:string};
 type Turn={id:string;sessionId:string;clientRequestId:string;userText:string;state:string;errorCode?:string;reply?:Record<string,unknown>};
-async function fixtures(page:Page,options:{operatorMode?:boolean;replyContent?:string;holdTurn?:boolean;withoutCardCopy?:boolean;oldGreeting?:boolean;englishPersonas?:boolean;personasUnavailable?:boolean;initialState?:'pending'|'generating'}={}) {
+async function fixtures(page:Page,options:{operatorMode?:boolean;operatorNotice?:string;replyContent?:string;holdTurn?:boolean;withoutCardCopy?:boolean;oldGreeting?:boolean;englishPersonas?:boolean;personasUnavailable?:boolean;initialState?:'pending'|'generating'}={}) {
   const sessions:Session[]=[];const histories=new Map<string,Message[]>();const turns=new Map<string,Turn>();const polls=new Map<string,number>();const transport={streams:0,progressPolls:0};const requestIds=new Map<string,Turn>();let counter=0;let abortNext=false;let failNext:string|undefined;let failOnStream:string|undefined;const sentBodies:Record<string,unknown>[]=[];const sessionBodies:Record<string,unknown>[]=[];let holdTurn=options.holdTurn??false;let personasUnavailable=options.personasUnavailable??false;
   await page.route('**/api/proxy/**',async route=>{
     const path=new URL(route.request().url()).pathname.slice('/api/proxy/'.length);const body=route.request().method()==='POST'?route.request().postDataJSON() as Record<string,unknown>:undefined;
     let value:unknown;
     if(path==='personas'&&personasUnavailable){await route.fulfill({status:503,json:{error:{code:'API_UNAVAILABLE'}}});return;}
-    if(path==='personas')value={operatorMode:options.operatorMode??false,personas:['a','b','c','d'].map((id,index)=>({id:'synthetic-persona-'+id,personId:'synthetic-person-'+id,label:options.englishPersonas?`Synthetic Character ${index+1}`:`합성 캐릭터 ${index+1}`,...(options.withoutCardCopy?{}:{tagline:'오늘은 어떤 이야기를 해 볼까?',starters:['오늘 어땠어?','좋아하는 걸 이야기해 줘']}),language:options.englishPersonas?'en':'ko',revision:'synthetic-v1',reviewStatus:'synthetic',aiDisclosure:options.englishPersonas?`AI character · not the real Synthetic Character ${index+1}`:`AI 캐릭터 · 실제 합성 캐릭터 ${index+1} 아님`}))};
+    if(path==='personas')value={operatorMode:options.operatorMode??false,operatorNotice:options.operatorNotice,personas:['a','b','c','d'].map((id,index)=>({id:'synthetic-persona-'+id,personId:'synthetic-person-'+id,label:options.englishPersonas?`Synthetic Character ${index+1}`:`합성 캐릭터 ${index+1}`,...(options.withoutCardCopy?{}:{tagline:'오늘은 어떤 이야기를 해 볼까?',starters:['오늘 어땠어?','좋아하는 걸 이야기해 줘']}),language:options.englishPersonas?'en':'ko',revision:'synthetic-v1',reviewStatus:'synthetic',aiDisclosure:options.englishPersonas?`AI character · not the real Synthetic Character ${index+1}`:`AI 캐릭터 · 실제 합성 캐릭터 ${index+1} 아님`}))};
     else if(path==='sessions'&&!body)value={sessions};
     else if(path==='sessions'&&body){sessionBodies.push(body);const session={id:'synthetic-session-'+(++counter),personId:String(body.personId),personaRevision:'synthetic-v1',retrievalMode:String(body.retrievalMode??'lexical'),ragCondition:String(body.ragCondition??'caption'),createdAt:'2026-01-01T00:00:00Z'};sessions.unshift(session);histories.set(session.id,[{id:'synthetic-greeting-'+counter,turnId:null,role:'assistant',content:`${options.oldGreeting?'AI 연구용 시뮬레이션입니다. ':''}안녕, 편하게 이야기해 줘.`}]);value={session};}
     else if(/^sessions\/[^/]+$/.test(path)){const id=path.split('/')[1]!;value={session:sessions.find(session=>session.id===id),history:histories.get(id)??[]};}
@@ -284,4 +284,10 @@ test('SYNTHETIC ONLY: immediate terminal POST plus history failure offers GET re
   await expect(page.locator('.error')).toContainText('잠깐 문제가 생겼어');await expect(page.locator('.workspace')).not.toContainText('SYNTHETIC_HISTORY_UNAVAILABLE');await expect(page.getByRole('button',{name:'답장 확인하기'})).toHaveCount(0);await expect(page.getByLabel('메시지',{exact:true})).toHaveValue('');await expect(page.getByText('답장이 아직 확인되지 않았어.',{exact:false})).toBeVisible();
   await page.waitForTimeout(500);expect(state.sentBodies).toHaveLength(1);failed=false;await page.getByRole('button',{name:'대화 내역 다시 확인'}).click();await expect(page.getByLabel('대화 내역').getByText('합성 즉시 종료 요청',{exact:true})).toBeVisible();expect(historyReads).toBe(2);expect(state.sentBodies).toHaveLength(1);
   await page.getByLabel('메시지',{exact:true}).fill('새로운 합성 대화');await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.getByText('합성 응답입니다.',{exact:true})).toBeVisible();expect(state.sentBodies).toHaveLength(2);expect(state.sentBodies[0]!.clientRequestId).not.toBe(state.sentBodies[1]!.clientRequestId);
+});
+
+for(const operatorMode of [false,true])test(`SYNTHETIC ONLY: mismatch notice is single and operator-only (${operatorMode})`,async({page})=>{
+  await fixtures(page,{operatorMode,operatorNotice:'운영자 API 옵션이 꺼져 있어요. 설정을 확인해 주세요.'});await login(page);
+  await expect(page.getByTestId('operator-notice')).toHaveCount(operatorMode?1:0);
+  if(operatorMode){await newSession(page);await expect(page.getByTestId('operator-notice')).toHaveCount(1);}
 });

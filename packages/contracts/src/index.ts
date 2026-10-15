@@ -75,7 +75,7 @@ export interface EvidenceCard { sourceId:string; personId:string; sourceUrl:stri
 export interface FactualClaim { text:string; evidenceRefs:EvidenceRef[] }
 export interface AgentExecution {
   revision:string; promptRevision:string; modelCalls:number; toolCalls:number;
-  variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful'};
+  variables:{conversationTopic:string;tone:'neutral'|'warm'|'playful';speechLevel?:'casual'|'polite'};
   decisionSummary?:string;
   steps:Array<{phase:'context'|'model'|'tool'|'validation';iteration:number;sourceIds?:string[];omittedSourceIds?:string[];query?:string}>;
   validator:'disabled'|'skipped_tool_followup'|'accepted'|'rejected'|'error';

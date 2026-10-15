@@ -62,7 +62,7 @@ def create_app(
     @app.get("/internal/llm/personas", dependencies=[Depends(authenticate)])
     async def personas() -> dict[str, Any]:
         try:
-            result = {"contractVersion": 1, "personas": await catalogue()}
+            result = {"contractVersion": 2, "personas": await catalogue()}
             return validate_wire("CatalogueResponse", result)
         except Exception:
             raise HTTPException(status_code=503, detail="CATALOGUE_UNAVAILABLE") from None
@@ -83,7 +83,11 @@ def create_app(
             return validate_wire("DraftResponse", result)
         except TimeoutError:
             raise HTTPException(status_code=504, detail="DRAFT_TIMEOUT") from None
-        except (ValueError, ControlRejected):
+        except ControlRejected as error:
+            if str(error) == "WIRE_VERSION_MISMATCH":
+                raise HTTPException(status_code=400, detail="WIRE_VERSION_MISMATCH") from None
+            raise HTTPException(status_code=400, detail="INVALID_DRAFT_REQUEST") from None
+        except ValueError:
             raise HTTPException(status_code=400, detail="INVALID_DRAFT_REQUEST") from None
         except Exception:
             raise HTTPException(status_code=503, detail="DRAFT_UNAVAILABLE") from None

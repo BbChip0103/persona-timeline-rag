@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { localHost, sameOrigin, signedOwner } from '../../../../lib/auth';
+import { operatorAvailability } from '../../../../lib/operator-availability';
 import { apiUrl } from '../../../../lib/config';
 export const runtime='nodejs';
 const id='[a-zA-Z0-9_-]{1,200}';
@@ -27,7 +28,9 @@ async function proxy(request:Request,context:{params:Promise<{path:string[]}>}) 
       if(!result.body||!result.headers.get('content-type')?.startsWith('text/event-stream')) return NextResponse.json({error:{code:'API_ERROR'}},{status:502});
       return new Response(result.body,{headers:{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-store','X-Accel-Buffering':'no'}});
     }
-    return NextResponse.json(await result.json(),{headers:{'Cache-Control':'no-store'}});
+    const value=await result.json();
+    if(path==='personas'&&value.operatorMode===true)Object.assign(value,operatorAvailability(true,value.operatorOptionsAvailable===true,code=>console.warn(code)));
+    return NextResponse.json(value,{headers:{'Cache-Control':'no-store'}});
   } catch { return NextResponse.json({error:{code:'API_UNAVAILABLE'}},{status:503}); }
 }
 export const GET=proxy;

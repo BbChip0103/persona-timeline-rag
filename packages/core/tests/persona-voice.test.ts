@@ -314,7 +314,7 @@ describe('re-review (M1, M2, L4-L7)',()=>{
 describe('v10/v13 and guard v6 (light fictional likes allowed; no quotable policy lines; origin answered; one speech level)',()=>{
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v16-natural-recall');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v17-natural-recall');
     expect(REPLY_GUARD_REVISION).toBe('reply-guard-v8');
   });
   test('the policies describe behaviour and carry no quotable example lines (gate b overlap, copied lines)',async()=>{
@@ -383,7 +383,7 @@ describe('v11/v14 (no meta talk about the persona\'s data or system; unknown det
   const agentPolicy=async()=>{let policy='';await runCharacterAgent({provider:{generate:async messages=>{policy=messages[0]!.content;return agentReply('ok');}},persona:casualKo,history:[],text:'x',sources:[],signal:new AbortController().signal});return policy;};
   const card:Persona={...realEn,background:{text:'A synthetic travel painter.',sourceRefs:['web:1']},lore:[{id:'l1',keys:['sea'],content:'Paints the sea at dawn.',priority:1,sourceRefs:['web:1']}]};
   test('revisions',()=>{
-    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v15-formatting');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v16-formatting');
+    expect(AGENT_PROMPT_REVISION).toBe('character-agent-context-v16-natural-recall');expect(EXPERIMENT_PROMPT_REVISION).toBe('persona-chat-v17-natural-recall');
   });
   test('no prompt text the model sees calls the persona data notes, a profile or records, or asks for an explicitly uncertain answer',async()=>{
     const texts=[await agentPolicy(),buildExperimentContext(base,[],'x',[]).messages[0]!.content,...renderPersonaBlock(card).map(m=>m.content),renderLoreMessage(card.lore!).content];

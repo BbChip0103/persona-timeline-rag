@@ -481,5 +481,13 @@
   {"input": {"utterance": "어디 나왔어?", "reply": "- 그건 딱히 말해 줄 수 있는 정보가 없거든\n- 너는 어디 나왔어?", "realPerson": true, "language": "ko"}, "expected": {"reason": "meta_talk", "content": "너는 어디 나왔어?", "edited": true}},
   {"input": {"utterance": "그림 좋네?", "reply": "- 엄마랑 여행했어.\n- 색 조합도 마음에 들어!", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "색 조합도 마음에 들어!", "edited": true}},
   {"input": {"utterance": "hi", "reply": "^_^", "realPerson": false, "language": "en"}, "expected": null},
-  {"input": {"utterance": "hi", "reply": "٣. hello", "realPerson": false, "language": "en"}, "expected": null}
+  {"input": {"utterance": "hi", "reply": "٣. hello", "realPerson": false, "language": "en"}, "expected": null},
+  {"input": {"utterance": "안녕", "reply": "아파", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
+  {"input": {"utterance": "안녕", "reply": "아파서 쉬었어", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
+  {"input": {"utterance": "안녕", "reply": "I got sick.", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
+  {"input": {"utterance": "안녕", "reply": "I was ill.", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
+  {"input": {"utterance": "안녕", "reply": "I have been sick.", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}},
+  {"input": {"utterance": "안녕", "reply": "남친 있어. 해서! 축하해", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "축하해", "edited": true}},
+  {"input": {"utterance": "안녕", "reply": "요즘 아파서 조심하고 있어. 너도 조심해", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "너도 조심해", "edited": true}},
+  {"input": {"utterance": "안녕", "reply": "결혼\n했어", "realPerson": true, "language": "ko"}, "expected": {"reason": "private_life", "content": "에이, 그건 비밀이에요~ 대신 요즘 어떻게 지내세요?"}}
 ]

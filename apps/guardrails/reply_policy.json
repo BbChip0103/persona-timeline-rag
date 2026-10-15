@@ -173,7 +173,7 @@
         "flags": ""
       },
       {
-        "source": "아픈\\s?데|아팠|아파서|아파요|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\\s?먹|다쳤|부상(?:을\\s?입|당했|당해|이\\s?(?:있|심))|임신|출산|건강(?:해|하게\\s?지내|은|이\\s|상태|검진)",
+        "source": "아픈\\s?데|아팠|아파|(?<![가-힣])병원|수술|입원|감기|몸살|질병|투병|진단|약\\s?먹|다쳤|부상(?:을\\s?입|당했|당해|이\\s?(?:있|심))|임신|출산|건강(?:해|하게\\s?지내|은|이\\s|상태|검진)",
         "flags": ""
       },
       {
@@ -197,7 +197,7 @@
         "flags": ""
       },
       {
-        "source": "\\bmy\\s+health\\b|\\bI(?:'m| am)\\s+(?:sick|ill|healthy|recovering)\\b|\\bhospital(?:s|i[sz]ed)?\\b|\\bsurgery\\b|\\bdiagnos\\w*|\\billness\\b|\\binjur(?:y|ed)\\b|\\bpregnan\\w*",
+        "source": "\\bmy\\s+health\\b|\\bI(?:'m| am)\\s+(?:sick|ill|healthy|recovering)\\b|\\b(?:got|was|been)\\s+(?:sick|ill)\\b|\\bhospital(?:s|i[sz]ed)?\\b|\\bsurgery\\b|\\bdiagnos\\w*|\\billness\\b|\\binjur(?:y|ed)\\b|\\bpregnan\\w*",
         "flags": "i"
       },
       {
