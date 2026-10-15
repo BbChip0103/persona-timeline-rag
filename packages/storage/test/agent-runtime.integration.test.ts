@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import type { ChatSession, Persona, ProviderMessage } from '@ptr/contracts';
-import { type LocalChat, createLocalChat } from '@ptr/core';
+import { type LocalChat, createLocalChat, voiceText } from '@ptr/core';
 import { createLocalPool, PostgresConversationStore, PostgresPersonaRepository } from '../src';
 import { removeSyntheticConversations } from './synthetic-cleanup';
 
@@ -13,10 +13,12 @@ const visibleMessage = 'Hello from this fictional research fixture.';
 const finalResponse = (updates: Record<string, unknown> = {}): string => JSON.stringify({
   status: 'answered', message: visibleMessage, evidenceRefs: [], variableUpdates: updates, reasoning,
 });
-// The service adds the turn's replyLanguage (from the utterance; the fixtures are English) and the persona's speechLevel.
-// persona-voice fallback for an English utterance (reply-texts `fallback.en`)
-const FALLBACK_EN = 'Hmm, nothing comes to mind on that right now~ Shall we talk about something else?';
-const serviceFields = { replyLanguage: 'English', speechLevel: '해요체' };
+// Runtime-only prompt fields are reconstructed for each turn and never persisted as agent variables.
+const serviceFields = {
+  replyLanguage: 'English', speechLevel: '해요체',
+  registerInstruction: 'Use 해요체 throughout this reply.', registerExamples: ['~해요.', '~인가요?'],
+  registerRule: 'Never mix registers in one reply.', today: '오늘', sinceLastUserMessage: '방금',
+};
 function assertState(messages: ProviderMessage[], expected = variables): void {
   const blocks = messages.filter(message => message.role === 'system' && message.content.startsWith('AGENT_STATE_JSON_DATA'));
   expect(blocks).toHaveLength(1);
@@ -129,22 +131,23 @@ integration('dedicated loopback agent-loop agent persistence (synthetic provider
     expect(reloaded.retrieval.search).not.toHaveBeenCalled();
   });
 
-  it('an invalid reply answers once with the persona-voice fallback  without changing state or publishing its output', async () => {
+  it('an invalid reply answers once with service_retry without changing state or publishing its output', async () => {
     const original = await seeded();
     const malformed = JSON.stringify({ status: 'answered', message: 'SHOULD_NOT_PUBLISH', evidenceRefs: [],
       variableUpdates: { conversationTopic: 'SHOULD_NOT_PERSIST', tone: 'playful', forbidden: true } });
     const failing = fixture(malformed);
     const input = { sessionId: original.session.id, clientRequestId: 'malformed', text: 'Malformed synthetic turn.' };
     const failed = await failing.service.sendTurn(owner, input);
+    const retryText = voiceText('service_retry', 'en', 'polite', visibleMessage, failed.id);
     expect(failed.state).toBe('completed'); expect(failed.reply).toMatchObject({ status: 'insufficient_evidence', evidence: [], agent: { variables } });
-    expect(failed.reply?.limitations).toContain('AGENT_REPLY_INVALID'); expect(failed.reply?.content).toBe(FALLBACK_EN);
+    expect(failed.reply?.limitations).toContain('AGENT_REPLY_INVALID'); expect(failed.reply?.content).toBe(retryText);
     expect(failing.provider.generate).toHaveBeenCalledTimes(1);
     expect(failing.retrieval.search).not.toHaveBeenCalled();
     const replay = await failing.service.sendTurn(owner, input);
     expect(replay.id).toBe(failed.id); expect(failing.provider.generate).toHaveBeenCalledTimes(1);
     const history = await failing.service.history(owner, original.session.id);
     expect(history).toHaveLength(5); // the earlier exchange, then this user message and the fallback reply
-    expect(history[3]?.content).toBe(input.text); expect(history[4]?.content).toBe(FALLBACK_EN);
+    expect(history[3]?.content).toBe(input.text); expect(history[4]?.content).toBe(retryText);
     expect(JSON.stringify(history)).not.toContain('SHOULD_NOT_');
 
     const probe = fixture(finalResponse());
@@ -179,16 +182,17 @@ integration('dedicated loopback agent-loop agent persistence (synthetic provider
     expect(next.reply?.agent?.variables).toEqual(variables);
   });
 
-  it('RAG-off answers a tool request with the persona-voice fallback: no retrieval, model repair or variable persistence', async () => {
+  it('RAG-off answers a tool request with service_retry: no retrieval, model repair or variable persistence', async () => {
     const original = await seeded();
     const requesting = fixture(JSON.stringify({ status: 'answered', message: '', evidenceRefs: [], variableUpdates: {},
       function: { name: 'timeline_search', arguments: { query: 'Synthetic fictional timeline' } } }));
     const failed = await requesting.service.sendTurn(owner, { sessionId: original.session.id, clientRequestId: 'off-tool', text: 'Synthetic tool request.' });
+    const retryText = voiceText('service_retry', 'en', 'polite', visibleMessage, failed.id);
     expect(failed.state).toBe('completed'); expect(failed.reply).toMatchObject({ status: 'insufficient_evidence', evidence: [], agent: { variables } });
-    expect(failed.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE'); expect(failed.reply?.content).toBe(FALLBACK_EN);
+    expect(failed.reply?.limitations).toContain('AGENT_TOOL_UNAVAILABLE'); expect(failed.reply?.content).toBe(retryText);
     expect(requesting.provider.generate).toHaveBeenCalledTimes(1); expect(requesting.retrieval.search).not.toHaveBeenCalled();
     const offHistory = await requesting.service.history(owner, original.session.id);
-    expect(offHistory).toHaveLength(5); expect(offHistory[3]?.content).toBe('Synthetic tool request.'); expect(offHistory[4]?.content).toBe(FALLBACK_EN);
+    expect(offHistory).toHaveLength(5); expect(offHistory[3]?.content).toBe('Synthetic tool request.'); expect(offHistory[4]?.content).toBe(retryText);
     const probe = fixture(finalResponse());
     const next = await probe.service.sendTurn(owner, { sessionId: original.session.id, clientRequestId: 'after-off-tool', text: 'Resume fictional chat.' });
     expect(next.state).toBe('completed'); assertState(probe.provider.generate.mock.calls[0][0]);

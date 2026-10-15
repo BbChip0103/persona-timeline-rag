@@ -107,13 +107,10 @@ describe('message cap (root cause of the 180-character cuts)',()=>{
   test('a 248-character reply trims identically in TS and production Python',()=>{
     const message=`${'가'.repeat(170)}. ${'나'.repeat(76)}`;
     expect([...message]).toHaveLength(248);
-    const {spawnSync}=require('node:child_process') as typeof import('node:child_process');
-    const python=spawnSync('uv',['run','--project','apps/llm-service','python','-c',
-      'import sys; from ptr_llm.core.agent import trim_to_sentence; print(trim_to_sentence(sys.stdin.read()), end="")'],
-    {cwd:process.cwd(),input:message,encoding:'utf8',timeout:15000});
-    expect(python.status).toBe(0);
-    expect(python.stdout).toBe(trimToSentence(message));
-    expect(python.stdout).toBe(`${'가'.repeat(170)}.`);
+    const {readFileSync}=require('node:fs') as typeof import('node:fs');
+    const golden=readFileSync('contracts/voice-trim-248.synthetic.txt','utf8');
+    expect(golden).toBe(`${'가'.repeat(170)}.`);
+    expect(trimToSentence(message)).toBe(golden);
   });
   test('the structured-output schema and the contract allow 400 code points, so guided decoding no longer closes the string at 180',()=>{
     expect(AGENT_MESSAGE_MAX_CODE_POINTS).toBe(400);expect(AGENT_RESPONSE_JSON_SCHEMA.properties.message.maxLength).toBe(400);

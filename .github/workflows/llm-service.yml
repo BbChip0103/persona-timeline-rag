@@ -46,7 +46,7 @@ jobs:
       - name: Confirm no Node dependencies or private files in worker image
         run: |
           docker run --rm --entrypoint sh ptr-llm-ci:${{ github.sha }} -c 'test ! -d /app/node_modules && test ! -d /app/data && test ! -d /app/reports && ! command -v node'
-          docker run --rm --entrypoint python ptr-llm-ci:${{ github.sha }} -c 'from ptr_llm.control import validate_wire; from ptr_llm.runtime import build_runtime; assert validate_wire("Dispatch", {"contractVersion":1,"turnId":"00000000-0000-4000-8000-000000000001","dispatchSeq":1})'
+          docker run --rm --entrypoint python ptr-llm-ci:${{ github.sha }} -c 'from ptr_llm.control import validate_wire; from ptr_llm.runtime import build_runtime; assert validate_wire("Dispatch", {"contractVersion":2,"turnId":"00000000-0000-4000-8000-000000000001","dispatchSeq":1})'
 
   split-integration:
     # Explicit manual runs and main cutovers qualify the actual migrated topology.
