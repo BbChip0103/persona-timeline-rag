@@ -1,7 +1,7 @@
 import { z } from 'zod';
 const id = z.string().trim().min(1).max(200);
 export const ReviewStatusSchema = z.enum(['synthetic', 'silver', 'human_reviewed']);
-/** Trimmed, nonempty, at most `max` Unicode code points ( `text(n)`). */
+/** `text(n)` trims input and requires 1 to `n` Unicode code points. */
 const text = (max:number) => z.string().trim().min(1).refine(value => [...value].length <= max, `At most ${max} code points`);
 /** Lore keyword: 2–40 code points after trimming. */
 const loreKey = z.string().trim().refine(value => { const length=[...value].length; return length >= 2 && length <= 40; }, 'Lore keys have 2-40 code points');
@@ -95,7 +95,7 @@ export interface ChatReply {
   intentRouting?:IntentRouting;
   /** Internal: input safety filter outcome when one is configured. Never carries user text. */
   inputSafety?:InputSafetyTrace;
-  /** Internal : lore entries rendered this turn (ids only) and matched entries left out by the caps. */
+  /** Internal: lore entry IDs rendered this turn and matched entries left out by the caps. */
   personaContext?:{loreIds:string[];loreOmitted:number};
   /** Internal (S8 follow-up): reply guard outcome on the agent and experiment paths; a replaced reply carries the reason. */
   replyGuard?:{revision:string;action:'none'|'replaced'|'edited';reason?:'human_impersonation'|'missing_ai_disclosure'|'private_life'|'background_denial'|'meta_talk'|'formatting'};
@@ -104,7 +104,7 @@ export interface ChatReply {
   /** Operator-only reply origin and repeat-check outcome; fixed codes, never text. */
   operatorTrace?:{path:'model'|'fixed'|'ask_back'|'guard_replacement'|'guard_edit'|'fallback'|'regeneration'|'register_regeneration'|'identity_variant'|'voice_variant';code:string;repeatChecked:true;previousAvailable:boolean};
   /**
-   * Internal : which upstream answered each model call of the turn, in call order (`primary`, `secondary`,
+   * Internal: which upstream answered each model call of the turn, in call order (`primary`, `secondary`,
    * `fake`, `openrouter`, `direct`, else `unknown`); `calls` = upstreams.length. Absent when no model was called.
    */
   serving?:{calls:number;upstreams:string[];secondaryCalls:number};
@@ -132,7 +132,7 @@ export type TurnState = 'pending'|'retrieving'|'generating'|'validating'|'comple
 export interface ChatSession {
   id:string; ownerId:string; personId:string; personaId:string; personaRevision:string;
   language:string; timezone:string; retrievalMode:RetrievalMode; ragCondition?:RagCondition; executionProfile?:ExecutionProfile; createdAt:string;
-  /** Index into [greeting, ...alternateGreetings] ; absent means 0. */
+  /** Index into [greeting, ...alternateGreetings]; absent means 0. */
   greetingIndex?:number;
   userMemoryConsent?:boolean;
 }

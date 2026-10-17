@@ -12,7 +12,7 @@ async function proxy(request:Request,context:{params:Promise<{path:string[]}>}) 
   const path=(await context.params).path.join('/');
   if(!(request.method==='GET'?routes.GET:request.method==='DELETE'?routes.DELETE:routes.POST).test(path)||new URL(request.url).search) return NextResponse.json({error:{code:'NOT_FOUND'}},{status:404});
   try {
-    // Fixed loopback target : PTR_API_URL is no longer read; instrumentation.ts refuses a different value.
+    // Fixed loopback target: PTR_API_URL is no longer read; instrumentation.ts refuses a different value.
     const origin=apiUrl();
     const token=process.env.PTR_API_TOKEN??'';if(token.length<24) throw new Error('API_UNAVAILABLE');
     const body=request.method==='POST'?await request.text():undefined;

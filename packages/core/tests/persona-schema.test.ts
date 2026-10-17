@@ -1,7 +1,7 @@
 import { PersonaSchema, type Persona } from '@ptr/contracts';
 import { cardPersona, v1Persona } from './persona-fixtures';
 
-/** : optional fields only; structure is checked on every read, content at publish time. */
+/** Optional fields only; structure is checked on every read, content at publish time. */
 const parses=(patch:Record<string,unknown>)=>PersonaSchema.safeParse({...cardPersona,...patch}).success;
 const cp=(n:number,char='가')=>char.repeat(n);
 

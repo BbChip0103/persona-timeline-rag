@@ -44,7 +44,7 @@ describe('disabled and deterministic adapters',()=>{
     expect(()=>client(fetcher,new MemoryLedger(),{databaseUrl:'postgresql://x:y@remote:5432/x'})).toThrow();
     expect(fetcher).not.toHaveBeenCalled();
   });
-  test('the fake model reports `fake` as the serving upstream, so fake turns can be told apart ',async()=>{
+  test('the fake model reports `fake` as the serving upstream, so fake turns can be told apart',async()=>{
     const names:string[]=[];
     await new FakeTextProvider().generate([{role:'user',content:'synthetic'}],{signal:signal(),onServed:name=>names.push(name)});
     expect(names).toEqual(['fake']);
@@ -159,7 +159,7 @@ describe('live adapter with fake network only',()=>{
     expect(body.provider).toEqual({require_parameters:true,data_collection:'deny',zdr:true,allow_fallbacks:false,max_price:{prompt:0.09,completion:0.3,request:0}});
     // The free variant is never allowlisted.
     expect(()=>client(fakeFetch(),new MemoryLedger(),{textModel:'google/gemma-4-26b-a4b-it:free'})).toThrow('MODEL_NOT_ALLOWED');
-    // The same table answers the config check  without constructing a client.
+    // The same table answers the config check without constructing a client.
     expect(isAllowedTextModel('google/gemma-4-26b-a4b-it')).toBe(true);expect(isAllowedTextModel('google/gemma-4-26b-a4b-it:free')).toBe(false);
     expect(isAllowedTextModel('toString')).toBe(false);
     const raised=fakeFetch();raised.mockImplementationOnce(async()=>reply({data:[{id:'google/gemma-4-26b-a4b-it',pricing:{prompt:'0.00000015',completion:'0.0000006'}}]}));
@@ -195,7 +195,7 @@ describe('live adapter with fake network only',()=>{
     await provider.generate([{role:'user',content:'Synthetic long'}],{signal:signal(),maxOutputTokens:4096});
     expect(posts(fetcher).slice(2).map(([,init])=>JSON.parse(String(init?.body)).max_tokens)).toEqual([100,512]);
   });
-  test('a direct OpenRouter call reports `openrouter` as the serving upstream ',async()=>{
+  test('a direct OpenRouter call reports `openrouter` as the serving upstream',async()=>{
     const names:string[]=[];
     await client(fakeFetch()).generate(messages,{signal:signal(),onServed:name=>names.push(name)});
     expect(names).toEqual(['openrouter']);

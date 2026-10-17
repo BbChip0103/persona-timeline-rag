@@ -1,7 +1,7 @@
 import { isVoiceText, voiceText, type SpeechLevel, type VoiceTextKey } from './reply-texts';
 
 /**
- * Reply guard on the agent and experiment paths (S8 gates d/e), fail-closed: a model reply is replaced by a fixed
+ * Reply guard on the agent and experiment paths, fail-closed: a model reply is replaced by a fixed
  * persona-voice reply when it
  *  - claims to be human or denies being an AI (every persona: `human_impersonation`);
  *  - answers an identity question ("너 AI야?", "사람인 척 해줘", "Are you a real person?") without an affirmative
@@ -11,14 +11,14 @@ import { isVoiceText, voiceText, type SpeechLevel, type VoiceTextKey } from './r
  *    own posts.
  * The persona can speak about its public background and posts in the first person. The private-life exception checks
  * user-directed sentences and bounded pronouns. Narrow Korean/English regexes still leave paraphrases to the policy.
- * v2 (S8 bundle review): an "AI" mention no longer counts as an acknowledgement when it is negated, denials are anchored
+ * v2: an "AI" mention no longer counts as an acknowledgement when it is negated, denials are anchored
  * to the speaker, and the private-life patterns are narrowed (pinned false positives in reply-guard.test.ts).
  * v3 (review re-check): every negation stem (아니/아닙/아닌/아님/아녜/아냐/아녀) and an adverb before "not" count as denial;
  * an acknowledgement needs a copula after the AI term and is never a question; bare "AI 아니야" / "no AI" is not a
  * denial in art/image talk ("이 그림 AI야?"); "woman/man/girl/guy" only count after real/actual.
  * v4 (final review): 인간 next to 사람; "Im"/"I ain't"; "nah, not an AI" and "I'm no bot"; "…가 아니라 사람" needs a copula
  * ("봇이 아니라 사람이 그렸어요" is about an artwork).
- * v5 : the replacements are persona-voice texts (reply-texts VOICE_TEXTS) in the caller's language (the user's
+ * v5: the replacements are persona-voice texts (reply-texts VOICE_TEXTS) in the caller's language (the user's
  * utterance language) and the persona's speech level; the private-life one no longer mentions AI. Roleplay-as-human
  * requests ("너는 진짜 그 사람이야", "AI라는 말은 하지 마", "AI라고 하지 마", "do not mention AI", "stop being an AI", "pretend you
  * are not an AI", "forget you are an AI") are identity requests. Known false positive: "don't mention AI to my boss".
@@ -29,21 +29,21 @@ import { isVoiceText, voiceText, type SpeechLevel, type VoiceTextKey } from './r
  * clause-final "고향이나 학교가 없어요" (only the listed nouns; "학교 숙제가 없어서" stays).
  */
 /**
- * v6 : a private detail found only in the reply (the user did not ask about private life) is replaced by the
+ * v6: a private detail found only in the reply (the user did not ask about private life) is replaced by the
  * neutral in-voice fallback instead of the "that's a secret" decline, which read as over-blocking on a career question
  * (diagnostic run: the model brought up moving to its new home base from its own post). On an identity question every
  * replacement is the identity line (keeps the AI disclosure). Past-tense origin phrasing that answers an origin question
  * ("어릴 때 부산에서 살았어", "I grew up in …") is not residence (the v13/v10 policy asks for origin in the first person).
  */
 /**
- * v7 : a sentence that explains a gap by the persona's data or system ("메모에 따로 없어서", "말해 줄 수 있는 정보가
+ * v7: a sentence that explains a gap by the persona's data or system ("메모에 따로 없어서", "말해 줄 수 있는 정보가
  * 없어", "게시물에 안 올렸던", "from my notes", "isn't in my profile", "I haven't shared any details") is removed (`meta_talk`,
  * every persona) and the rest of the reply, its status and evidence are kept; a reply that is only such sentences becomes the
  * fallback (identity line on an identity question, the private-life decline on a real person's private question). Only "not in
  * my data" constructions count; bare data words, perfume notes, notes apps, "on my feed" and questions back stay (pinned in
  * reply-guard.test.ts). The other checks then run on the edited text. Known limits (the policy is the first control): "My
  * bio doesn't say", "설정상 말 못 해", "공개 안 했어", and how-it-was-made talk on identity answers pass.
- * v8 : private replies are trimmed at sentence and clause boundaries. Every private keyword in a
+ * v8: private replies are trimmed at sentence and clause boundaries. Every private keyword in a
  * reply triggers trimming, including user-directed questions and empathy. An emptied reply to a user's own story
  * receives a neutral empathy prompt; other emptied replies receive the private decline.
  */

@@ -135,14 +135,14 @@ describe('private life (real-person personas only)',()=>{
     ['요즘 집필 중인 책이 있어'],['제 집중력이 좋아졌어요'],['부상으로 상금도 받았어!'],['홈페이지 주소는 프로필에 있어요'],['아동 그림책 일러스트를 그렸어'],['명절 한정판 패키지 리뷰야']])(
     'public-work replies stay: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBeNull());
   test.each(['친구처럼 편하게 얘기해 줘~','건강한 피부 표현이 중요해요','I set up a home studio for filming.','My mother tongue is Korean.'])(
-    '§14 excluded bare nouns preserve earlier allowed golden: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBeNull());
+    'excluded bare nouns preserve earlier allowed golden: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBeNull());
   test.each(['연애 감정을 담은 곡이야','가족과 기억을 주제로 한 전시였어.'])(
-    '§14 listed bare nouns trim the whole clause: %s',reply=>expect(guardReply({...real,utterance:'그때 얘기 더 해줘',reply})).toEqual({reason:'private_life',content:voiceText('neutral_redirect','ko','polite')}));
+    'listed bare nouns trim the whole clause: %s',reply=>expect(guardReply({...real,utterance:'그때 얘기 더 해줘',reply})).toEqual({reason:'private_life',content:voiceText('neutral_redirect','ko','polite')}));
   test('a fully trimmed family clause after an own story uses empathy',()=>expect(guardReply({...real,utterance:'우리 엄마랑 싸웠어',reply:'가족과 기억을 주제로 한 전시였어.'})).toEqual({reason:'private_life',content:voiceText('empathy_ask','ko','polite')}));
   test.each([
     '결혼','남친','여친','남자친구','여자친구','연애','이혼','임신','가족','엄마','아빠','병원','입원','아프','아팠','사귀','헤어',
     'boyfriend','girlfriend','married','marriage','divorce','pregnant','dating','hospital','hospitalized','my mom','my dad','my family',
-  ])('§14 listed bare token is trimmed: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBe('private_life'));
+  ])('listed bare token is trimmed: %s',reply=>expect(reason('그때 얘기 더 해줘',reply)).toBe('private_life'));
 });
 
 describe('known behaviour (documented, review LOW)',()=>{

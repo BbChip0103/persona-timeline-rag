@@ -223,7 +223,7 @@ describe('review-sample run', () => {
   });
 
   it('excludes turns served by the fake model (reply.serving), synthetic personas, non-local owners and empty replies', async () => {
-    // reply.serving : real upstreams are kept; turns stored before O4 have no serving and stay eligible.
+    // Real upstreams in reply.serving are kept; older turns without serving stay eligible.
     const servings = [{ calls: 1, upstreams: ['primary'], secondaryCalls: 0 }, { calls: 2, upstreams: ['primary', 'secondary'], secondaryCalls: 1 },
       { calls: 1, upstreams: ['openrouter'], secondaryCalls: 0 }, undefined];
     const rows = dbRows(1, 25).map((row, i) => ({ ...row, user_text: `keep-${i}`, reply: reply(i, servings[i % 4] ? { serving: servings[i % 4] } : {}) }));
@@ -234,7 +234,7 @@ describe('review-sample run', () => {
       // Any call answered by the fake model (in-process, or the gateway's fake upstream) drops the turn.
       { ...rows[0]!, id: 'b4', reply: reply(1, { serving: { calls: 1, upstreams: ['fake'], secondaryCalls: 0 } }), user_text: 'DROP-serving-fake' },
       { ...rows[0]!, id: 'b5', reply: reply(1, { serving: { calls: 2, upstreams: ['primary', 'fake'], secondaryCalls: 0 } }), user_text: 'DROP-serving-mixed' },
-      // A serving record that does not have the D21 shape fails closed.
+      // A serving record with an invalid shape fails closed.
       { ...rows[0]!, id: 'b8', reply: reply(1, { serving: { calls: 1 } }), user_text: 'DROP-serving-shape' },
       { ...rows[0]!, id: 'b9', reply: reply(1, { serving: 'primary' }), user_text: 'DROP-serving-string' },
       { ...rows[0]!, id: 'b10', reply: reply(1, { serving: { calls: 1, upstreams: [7], secondaryCalls: 0 } }), user_text: 'DROP-serving-number' },

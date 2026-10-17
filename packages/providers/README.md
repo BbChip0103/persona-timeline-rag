@@ -42,9 +42,7 @@ prices. Unsupported combinations fail rather than weaken restrictions.
 
 A generation with a known id may be explicitly reconciled using GET-only
 `reconcile(requestKey, signal)`. Missing ids need manual accounting; no restart or
-retry recovers them through a new POST. This text/embedding package has no paid image adapter. The separate
-`packages/images` module contains the narrowly authorized free-only account experiment;
-it is not a supported general production integration and never switches to credit mode.
+retry recovers them through a new POST. This text/embedding package has no image adapter. Image generation is disabled in the public build.
 
 `decide(request, {signal, idempotencyKey})` calls the Decisions API (`POST /api/alpha/decisions`)
 for pinned decision models only (`typesafe/jev-1.13`). It verifies only that model's public endpoint

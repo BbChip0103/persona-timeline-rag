@@ -59,24 +59,20 @@ Next.js 채팅 → NestJS turn API (예약 + outbox → Redis/BullMQ) → turn w
 | timeline core | 원본·사건·관찰·임베딩, 인물/기간 검색과4상태, 게시일≠사건일 |
 | conversation core | owner/person/revision 고정, 메시지·후속 reference·turn idempotency·tool trace |
 | model/provider | intent/답변 생성 경계. 권한/DB/현실 이력 결정자 아님 |
-| creative/provider | 가상포스트/이미지 job·External image·생성물 origin·비용. 원본사건과분리 |
+| creative/provider | 가상 포스트 초안과 생성물 origin을 원본 사건과 분리. 이미지 생성 비활성화 |
 | API/UI | 검증된 코어 호출, 인물 선택·채팅·근거 카드·재접속 |
 | evaluation | 추출50게시물/질문50개/대화12개, 사실·표현·미답·비용 분리 |
 
 서비스/코어는 TypeScript/Node.js·pnpm, API는 NestJS, 필수 최소 화면은 Next.js/React다. 전용 로컬 Supabase/PostgreSQL·pgvector와 SQL migrations를 사용하고 Python ingestion은 유지한다. 모델은 provider/worker 경계로 분리하며 필요한 경우 GPU worker만 Python을 고려한다.
 
-
-DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard로 격리한다. 다른 프로젝트 stage/prod/공유 DB나 Cloud 연결/remote migration은 하지 않는다. 현재 전용 DB-only local Supabase와 연결 guard/limited app role가 구현돼 있다. Auth/Storage/Studio 전체 스택은 아니다.
+DB는 전용 project_id·포트·Docker 자원·credentials 및 loopback guard로 격리한다. 다른 프로젝트의 DB나 Cloud 연결/remote migration은 사용하지 않는다. 현재 전용 DB-only local Supabase와 연결 guard/limited app role가 구현돼 있다.
 
 ### 구현 게이트 — 세 단계
 
 1. **채팅 환경:** TS/contracts·NestJS/Next.js·전용 local DB의세션/메시지·provider로 합성캐릭터 일반대화/reload/owner와person격리를 검증한다. source corpus/검색/embedding은 아직 요구하지 않는다.
-2. **persona 표현 기준선:**4명 검수/버전persona의 실제대화와Instagram 가상포스트초안·External image GPT Image2 medium 이미지생성을 RAG off로 검증한다. 생성물은별도CreativeArtifact/job/provider이며실제SourcePost/Event로유입시키지않는다. 실제provider조건은호출전확정한다.
+2. **persona 표현 기준선:** 채팅과 가상 포스트 초안을 RAG off로 검증한다. 생성물은 실제 SourcePost/Event로 유입시키지 않는다. 공개 빌드의 이미지 생성은 비활성화돼 있다.
 3. **RAG:**1,189건source import→lexical→semantic과사건추출표본/질문/대화평가. 같은persona/model/prefix의 off/lexical/semantic과각자누적history를구분해비교한다. 원본사진VLM 근거보강은그뒤선택이다.
-
-[PRD](prd.md) · [페르소나·채팅](persona-chat.md) · [창작물](creative-artifacts.md) · [근거 계약](evidence-schema.md) · [평가](evaluation.md). 실제 대상/다른 프로젝트참고경로는비공개명세에 둔다.
-
 
 ### 캐릭터 에이전트 실행 profile
 
-새 API 세션은 `agent_loop` 독립 structured-response/state/readonly-tool loop를 사용한다. 옛 세션과 저수준 core 기본값은 호환성을 유지하고, 향후 자연대화 평가는 `agent_loop`로 고정해 RAG 3조건만 비교한다. 전체 다른 프로젝트 engine/운영 설정 재현이 아니며, 범위·비용·남은 차이·검증은 [character-agent.md](character-agent.md)를 따른다.
+새 API 세션은 독립된 structured-response/state/읽기 전용 도구 루프를 사용한다. 모델 호출과 도구 호출의 상한, 재시도 금지 조건, 평가 범위는 [캐릭터 에이전트 계약](character-agent.md)을 따른다.

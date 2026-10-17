@@ -116,7 +116,7 @@ lines and `pnpm ops:status` are described in [observability.md](observability.md
 
 ## Deploy with Compose (production profile)
 
- (D22–D24). `infra/compose.app.yml` (project `ptr_app`) runs the roles from one image (`Dockerfile`,
+`infra/compose.app.yml` (project `ptr_app`) runs the roles from one image (`Dockerfile`,
 `ptr_app:local`): api, worker, dispatcher, web, and the gateway behind the `gateway` profile (only for
 `PTR_CHAT_PROVIDER=gateway`; with `openrouter` it is not started). Postgres and Redis stay in `compose.db.yml` and
 `compose.redis.yml`, both `restart: unless-stopped`. Every app service has the same settings:
@@ -130,11 +130,11 @@ lines and `pnpm ops:status` are described in [observability.md](observability.md
   `PTR_UID`/`PTR_GID` in `.env.local` to the account that owns `data/generated` and can read `data/`.
 - `env_file: ../.env.local` (`required: false`; a missing file shows up as `config_invalid` at startup), `restart:
   unless-stopped`, json-file logs rotated at 10 MB × 5 files per container. Every role receives the whole file (one env
-  file, D22), including infra keys such as `PTR_DB_PASSWORD`, visible in `docker inspect`. Keep infra-only passwords in
+  file), including infra keys such as `PTR_DB_PASSWORD`, visible in `docker inspect`. Keep infra-only passwords in
   `infra/.env.db` ([DB setup](../infra/README.md)) when that matters.
 - Mounts: `data/` read-only and `data/generated` read-write on api and worker; the upstreams file read-only on the gateway.
   Nothing else from the host. The image contains no `.env*`, `data/`, `reports/` or `accounts/` (`.dockerignore`).
-- Healthchecks (`node -e fetch`, no curl): api `/api/health` (database `SELECT 1` and Redis `PING`, D23), worker
+- Healthchecks (`node -e fetch`, no curl): api `/api/health` (database `SELECT 1` and Redis `PING`), worker
   `:56442/healthz`, dispatcher `:56443/healthz`, gateway `/healthz`, web `/login`.
 - `stop_grace_period: 35s` on worker and gateway: a turn has a 30 s deadline; SIGTERM lets the worker finish its turns
   and the gateway drain (`gateway_draining` / `gateway_drained` log lines). Both exit 0 after a clean stop.
@@ -223,7 +223,7 @@ The upstreams file is mounted as a single file. Edit it in place: the gateway re
 
 ## Authentication and owner spaces
 
-Threat model : single-user research serving; every process binds 127.0.0.1 only (code guards). The
+Threat model: single-user research serving; every process binds 127.0.0.1 only (code guards). The
 browser authenticates to the web with the login password and a signed HttpOnly cookie; the web proxy authenticates to
 the API with the Bearer `PTR_API_TOKEN` and names the owner in `X-PTR-Owner`. The remaining risks are a local process
 holding a token (the load harness included) claiming an arbitrary owner, and harness owners mixing with the real web
@@ -241,7 +241,7 @@ that; with `PTR_DEMO_SCALING=1` only the login route refuses it (503 `AUTH_UNAVA
 
 ## Redis ACL migration and rollback
 
-`infra/compose.redis.yml` runs Redis with an ACL (–D13): the app user `ptr` (password
+`infra/compose.redis.yml` runs Redis with an ACL: the app user `ptr` (password
 `PTR_REDIS_PASSWORD`), the `default` user off, no `requirepass`, no admin user. Moving an existing `requirepass`
 container keeps the volume and the AOF. Redis is not a source of truth; a lost job is re-published from the outbox.
 Values are never printed; only key names and counts.

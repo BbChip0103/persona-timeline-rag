@@ -14,7 +14,7 @@ async function call(e:FakeEngine,messages:{role:string;content:string}[],output=
 }
 const msgs=(user:string,policyBytes=44500)=>[{role:'system',content:'P'.repeat(policyBytes)},{role:'user',content:user}];
 
-describe('FakeEngineUpstream (§9.1)',()=>{
+describe('FakeEngineUpstream',()=>{
   test('streams SSE ending in [DONE]; prefill time follows uncached tokens; a cached prefix skips it',async()=>{
     const e=await engine({prefillTokensPerSec:20000}); // 44500 B / 4.45 = 10000 tokens → 500 ms cold
     const cold=await call(e,msgs('a'));

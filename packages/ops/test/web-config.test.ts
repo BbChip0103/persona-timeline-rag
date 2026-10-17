@@ -1,7 +1,7 @@
 import { register } from '../../../apps/web/instrumentation';
 import { apiUrl, checkWebConfig, registerWebConfig } from '../../../apps/web/lib/config';
 
-// : the web validates its keys in instrumentation.ts register(), except during `next build`.
+// The web validates its keys in instrumentation.ts register(), except during `next build`.
 const valid={PTR_API_TOKEN:'synthetic-api-token-at-least-24-characters',PTR_SESSION_SECRET:'synthetic-session-secret-at-least-32-characters',PTR_UI_PASSWORD:'synthetic-ui-pass'};
 const SENTINEL='SENTINEL-web-value-0123456789';
 

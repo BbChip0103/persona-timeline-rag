@@ -163,9 +163,9 @@ Dry-run is the default; apply requires the exact connected isolated database nam
 Only >=90-day raw receipts belonging to >=90-day terminal chat/Jev turns without
 outbox work, plus expired standalone drafts, are scrubbed. Active, resumable and
 recent turns are excluded; concurrent terminal row locks are skipped. Receipt JSON
-is nulled and its irreversible scrub marker set, but idempotency records
-state, actual/reserved cost and generation IDs remain as accounting/idempotency
-**tombstones**. The adapter continues refusing a second billable submission after
+is nulled and its irreversible scrub marker set. Request identifiers,
+submitted or unknown status, task state, actual/reserved cost, and generation IDs
+remain as accounting and idempotency tombstones. The adapter continues refusing a second billable submission after
 the replay payload expires. Unknown receipts cannot be restored by later finish or
 reconciliation calls once scrubbed.
 

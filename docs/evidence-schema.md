@@ -5,7 +5,7 @@
 
 최소 `SourcePost`/`Persona` Zod 계약, 불변 importer·scoped검색·인용검증·1536dim embedding/DBguard는 구현됐다. 기존 Python ingestion/`Post` 정규화도 유지한다. 아래 상세 Event/Observation·사건 병합·사람 검수 truth 모델 전체가 구현된 것은 아니다.
 
-구현 코어는 독립 TypeScript이며 Zod·NestJS adapter·프로젝트 전용 DB-only 로컬 Supabase/PostgreSQL·pgvector를 사용한다. reference agent loop와의 접합은 일반 JSON 계약/adapter로 제한하고 다른 프로젝트 코드·패키지·credentials를 import하지 않는다. 이 명세 작성은 설치·서비스 시작·DB 생성·migration·외부 모델 전송을 승인하거나 수행하는 단계가 아니다.
+구현 코어는 독립 TypeScript이며 Zod·NestJS adapter·프로젝트 전용 DB-only 로컬 Supabase/PostgreSQL·pgvector를 사용한다. reference agent loop(비교 대상으로 삼는 일반적인 plan→tool→reply 실행 흐름)와의 접합은 일반 JSON 계약/adapter로 제한하고 다른 프로젝트 코드·패키지·credentials를 import하지 않는다. 이 명세 작성은 설치·서비스 시작·DB 생성·migration·외부 모델 전송을 승인하거나 수행하는 단계가 아니다.
 
 - 제품 범위: [prd.md](./prd.md).
 - 최종 페르소나 채팅/세션·tool wrapper: [persona-chat.md](./persona-chat.md). 이 문서는 검색/근거 코어 계약이며 단독으로 최종 PoC를 완료하지 않는다.
@@ -180,7 +180,7 @@ ID 존재, 파일 존재, JPEG 시그니처, 높은 검색 점수만으로 `supp
 - 접속 host는 검증된 loopback(`127.0.0.1`, `::1`, `localhost`)만 허용한다. hostname은 해석된 모든 주소가 loopback인지 확인한다. 원격 IP, LAN 주소, 공유 DB host와 Supabase Cloud URL을 거부한다.
 - URL 정규화·실제 접속 대상 확인으로 위장 host/우회 redirect를 거부한다. localhost proxy를 통한 원격 DB 연결도 허용하지 않는다. Docker 서비스 이름/내부 IP를 자동 예외로 추가하지 않고 host의 loopback 포트를 사용한다.
 - 연결 거부 시 네트워크 호출·migration은 0건이다. 사용자 query·원문 캡션·모델 출력으로 접속 URL을 변경할 수 없다.
-- guard와 권한 필터는 서로 대체하지 않는다. 다른 프로젝트/타 프로젝트 자원 연결·수정·정지·삭제는 이 작업 범위 밖이다.
+- guard와 권한 필터는 서로 대체하지 않는다. 다른 프로젝트 자원 연결·수정·정지·삭제는 이 작업 범위 밖이다.
 
 ## 9. 합성 JSON 예제
 

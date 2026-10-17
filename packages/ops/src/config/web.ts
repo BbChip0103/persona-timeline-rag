@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Web configuration , imported by the web as `@ptr/ops/web` and validated once by
+ * Web configuration, imported by the web as `@ptr/ops/web` and validated once by
  * apps/web/instrumentation.ts `register()`; `pnpm ops:check-env --roles web` runs the same rules. Dependency-free (zod
  * only) so the Next.js bundle does not pull in the database, Redis or provider packages. Problems name the key and a
  * rule id, never a value.
@@ -42,7 +42,7 @@ export function webSchemaProblems(env:NodeJS.ProcessEnv):ConfigProblem[] {
   const result=schema.safeParse(env);
   return result.success?[]:result.error.issues.map(issue=>({key:String(issue.path[0]),rule:issue.message}));
 }
-/** PTR_API_URL is no longer read: the constant is used. The same value is a warning, a different one an error (D7). */
+/** PTR_API_URL is no longer read: the constant is used. The same value is a warning, a different one an error. */
 export function apiUrlProblem(env:NodeJS.ProcessEnv):{level:'error'|'warning';problem:ConfigProblem}|undefined {
   if(env.PTR_API_URL===undefined) return;
   return env.PTR_API_URL===(clusterMode(env)?clusterApiUrl(env):apiUrl(env))?{level:'warning',problem:{key:'PTR_API_URL',rule:'constant_ignored'}}

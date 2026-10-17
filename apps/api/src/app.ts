@@ -31,9 +31,9 @@ const sendBodySchema=SendTurnSchema.omit({sessionId:true});
 const memoryConsentSchema=z.object({enabled:z.boolean()}).strict();
 const cancelBodySchema=z.preprocess(value=>!value||typeof value==='object'&&Object.keys(value).length===0?{}:value,z.object({}).strict());
 const forbiddenSecret=/\bsk-[A-Za-z0-9_-]{8,}|Bearer\s+\S+|(?:api[_-]?key|password)\s*[:=]/i;
-const imageUnavailable={status:'separate_runner',code:'IMAGE_RUNNER_ONLY',reason:'이 포스트 초안 요청은 이미지를 제출하지 않습니다. 무료 이미지 생성은 자격을 검증하는 별도 private runner에서 실행하며 완료 결과와 작업 상태를 별도로 기록합니다.'};
+const imageUnavailable={status:'disabled',code:'IMAGE_GENERATION_DISABLED',reason:'이미지 생성은 이 공개 빌드에서 제공하지 않습니다.'};
 /**
- * Owner spaces . The production token (the web proxy) may only name the owner the web derives
+ * Owner spaces. The production token (the web proxy) may only name the owner the web derives
  * (apps/web/lib/auth.ts: `local-<40 hex>`); the harness token (PTR_API_SYNTHETIC_TOKEN) only synthetic owners, so
  * load tests and fixtures never share an owner with the web. The token middleware records which space a request has.
  */
@@ -45,7 +45,7 @@ const requestMetrics=new WeakMap<Request,ApiMetrics>();
 function owner(request:Request):string {
   const value=request.header('X-PTR-Owner');const space=ownerSpace.get(request);
   if(!value || !space || !(space==='web'?WEB_OWNER:SYNTHETIC_OWNER).test(value)) {
-    // `space`: a valid owner of the other token's space ; `format`: no valid owner at all.
+    // `space`: a valid owner of the other token's space; `format`: no valid owner at all.
     const reason=!value?'missing':WEB_OWNER.test(value)||SYNTHETIC_OWNER.test(value)?'space':'format';
     requestMetrics.get(request)?.ownerRejected.inc({reason});
     throw new HttpException({error:{code:'UNAUTHORIZED'}},403);
@@ -89,7 +89,7 @@ class ApiController {
     @Inject(OPERATOR_MODE) private readonly operatorMode:boolean,
     @Inject(OPERATOR_OPTIONS) private readonly operatorOptions:boolean,
     @Inject(METRICS) private readonly metrics:ApiMetrics) {this.admitDraft=createDraftLimiter(draftLimit,runtime.draftLimiterClient?.());}
-  /** D23: with a runtime that checks its dependencies, a failed database `SELECT 1` or Redis `PING` (1 s each) answers 503. */
+  /** A failed database `SELECT 1` or Redis `PING` (1 s each) answers 503 when the runtime checks its dependencies. */
   @Get('health') async health(@Res({passthrough:true}) response:Response) {
     const body={ok:true,service:'persona-timeline-rag',liveEnabled:this.runtime.billable};
     const {database,redis}=await this.runtime.health();
@@ -213,11 +213,11 @@ export async function createApiApplication(runtime:SplitApiRuntime,token:string,
   const expected=digest(token), expectedSynthetic=synthetic===undefined?undefined:digest(synthetic);
   app.use((request:Request,response:Response,next:NextFunction)=>{
     response.setHeader('Cache-Control','no-store');response.setHeader('X-Content-Type-Options','nosniff');
-    // Requests by route label and status class ; counted when the response ends, any outcome.
+    // Requests by route label and status class; counted when the response ends, any outcome.
     requestMetrics.set(request,metrics);
     const route=routeLabel(request.path);
     response.once('finish',()=>metrics.requests.inc({route,status_class:`${Math.floor(response.statusCode/100)}xx`}));
-    // Prometheus text (D18): no token, like /api/health (loopback bind, aggregates only).
+    // Prometheus text: no token, like /api/health (loopback bind, aggregates only).
     if(request.path==='/metrics/prom') return void servePrometheus(request.method,()=>metrics.render())
       .then(({status,headers,body})=>{response.writeHead(status,headers);response.end(body);});
     if(request.method==='GET' && ['/api/health','/api/livez','/api/readyz'].includes(request.path)) return next();

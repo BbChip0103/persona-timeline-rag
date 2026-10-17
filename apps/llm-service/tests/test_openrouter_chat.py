@@ -528,10 +528,10 @@ async def test_paid_http_503_keeps_unknown_no_resubmit_and_hides_private_error(c
     messages = [{"role": "user", "content": "synthetic"}]
     try:
         with pytest.raises(ProviderError) as first:
-            await client.generate(messages, request_key="synthetic-503")
+            await client.generate(messages, request_key="synthetic-503")  # gitleaks:allow
         assert first.value.code == "PROVIDER_HTTP_503"
         with pytest.raises(ProviderError) as second:
-            await client.generate(messages, request_key="synthetic-503")
+            await client.generate(messages, request_key="synthetic-503")  # gitleaks:allow
         assert second.value.code == "REQUEST_UNRESOLVED_NO_RESUBMIT"
         assert len(calls) == 1
         receipt = next(iter(client.ledger.requests.values()))

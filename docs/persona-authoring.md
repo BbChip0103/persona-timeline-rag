@@ -275,7 +275,7 @@ policy · persona definition · [examples] · history (greeting first) · [state
     agent's policy split carries it.
   - It names the definition (background included), examples and lore `PERSONA_BLOCKS`: who the persona is and how it
     talks, spoken from as itself, never citable. v5 also said "never real memories"; v7/v10 replaced that with "you may
-    speak about them as yourself" ; v11/v14 dropped "author-set notes", "public profile" and "do not extend
+    speak about them as yourself"; v11/v14 dropped "author-set notes", "public profile" and "do not extend
     them" (replies echoed them).
   - It is the only policy change from v4/v7 (pinned by hash in `prompt-layout.test.ts`), but it re-baselines every
     persona: v4 and v5 numbers are not compared.

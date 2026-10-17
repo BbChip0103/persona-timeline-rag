@@ -18,8 +18,7 @@ cost is uncertain: retain the receipt and do not resubmit.
 
 ## Why no LLM gateway
 
- (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
-removes the gateway from the current serving path. The durable provider ledger
+The active serving path has no LLM gateway. The durable provider ledger
 and, by default, the provider key credit limit enforce paid budget, the EPP owns local routing and
 admission, and the paid OpenRouter key is present only in the Kubernetes worker.
 Rollback restores the old gateway from the private operational snapshot, not
@@ -118,7 +117,5 @@ recovers.
 
 ## Sources
 
--  (LiteLLM removal) §1, §4 row L4 and §6.4, `private design notes` repo
-  `<private-design-notes>`.
 - Prometheus text exposition format: https://prometheus.io/docs/instrumenting/exposition_formats/
 - Prometheus metric and label naming: https://prometheus.io/docs/practices/naming/

@@ -1,14 +1,13 @@
 # Historical Goal2 serving: queued execution, SSE, LLM gateway, load harness and engine benchmarks
 
-> Historical reference only. Current serving removes the LLM gateway per design
-> 63 and uses the split Python worker with direct local vLLM/OpenRouter providers;
+> Historical reference only. Current serving uses the split Python worker with
+> direct local vLLM/OpenRouter providers instead of an LLM gateway;
 > Kubernetes local routing/admission is handled by EPP/InferencePool. Use
 > [kubernetes.md](kubernetes.md), [configuration.md](configuration.md) and
 > [operational-deployment.md](operational-deployment.md) for current operation.
 
-Archived contract and reproduction steps for the Goal2 (LLMOps) work, including the large-scale rework. Measured
-results and the decision history live in the issue repository; this file only says how the system behaves and how
-to rerun it.
+This archived Goal2 serving contract describes the system's behavior and
+reproduction steps. Measured results are kept in private reports.
 
 ## Topology
 
@@ -28,7 +27,7 @@ Every turn runs queued; there is no inline mode (`PTR_EXECUTION` is rejected at 
 `pnpm dev:api`, `pnpm dev:worker`, `pnpm dev:dispatcher`, `pnpm dev:gateway`.
 All need `PTR_REDIS_URL` (`infra/compose.redis.yml`) and migrations through `0008_turn_leases.sql`.
 
-Configuration : production is one process per role with 19 variables, checked at startup
+Configuration: production is one process per role with 19 variables, checked at startup
 ([configuration.md](configuration.md), `pnpm ops:check-env`). The scaling features below that are not part of that
 profile (several workers or gateways, the registries, routing policies other than `least_inflight`, telemetry, affinity)
 need `PTR_DEMO_SCALING=1`: see [demo-mode.md](demo-mode.md).
@@ -142,7 +141,7 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
 | --- | --- | --- | --- |
 | connection refused (`ECONNREFUSED`): nothing was sent | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_TRANSPORT` at once | yes | none before an untried URL; `min(100·2^n, 1000)` ms once every URL was tried |
 | 429/503 marked `X-PTR-Gateway: rejected`, reason `queue_full` / `queue_timeout` | yes, while the wait + `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` still fits before the deadline; else `PROVIDER_HTTP_429` / `PROVIDER_HTTP_503` at once | no | `min(Retry-After, 5 s) × U(0.5, 1.5)` (250 ms base without a header); the cap comes before the jitter so long waits still spread over 2.5–7.5 s |
-| the same, reason `draining` (a gateway draining on SIGTERM, S6) | yes (same time rule) | yes | none before an untried URL, else as above |
+| the same, reason `draining` (a gateway draining on SIGTERM) | yes (same time rule) | yes | none before an untried URL, else as above |
 | 503 marked, reason `deadline`, or an unmarked 504 with `X-PTR-Gateway-Reason: deadline` (see "Turn deadline" below) | never: `PROVIDER_DEADLINE` at once | — | — |
 | reset or close before the response headers, or a failed connect: a fetch `TypeError` whose cause code is `ECONNRESET`, `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET` ("other side closed"), `UND_ERR_CLOSED`, `UND_ERR_CONNECT_TIMEOUT`, `EHOSTUNREACH` or `ENETUNREACH` | only with a request key, at most `PTR_GATEWAY_RESET_RETRIES` in total, only with ≥ `PTR_GATEWAY_RETRY_MIN_REMAINING_MS` left | yes | full jitter `U(0, min(2000, 200·2^k))` ms |
 | reset while reading the SSE body after a 200 (same codes), or a stream that ends cleanly without `[DONE]` or a `finish_reason` | as above; the partial text and its usage are discarded (only a complete answer is returned) | yes | as above |
@@ -195,8 +194,8 @@ provider's own 60 s timeout only matters for callers without a turn. Duplicate U
 
 ### Capacity controller (demo mode)
 
-Moved to [demo-mode.md](demo-mode.md#capacity-controller-design-38-135-stage-s2b): production runs one worker
-(`PTR_WORKER_CONCURRENCY`, 32) against one gateway and has no controller .
+Moved to [demo-mode.md](demo-mode.md#capacity-controller): production runs one worker
+(`PTR_WORKER_CONCURRENCY`, 32) against one gateway and has no controller.
 
 ### Failover to OpenRouter (optional, default off)
 
@@ -290,7 +289,7 @@ Response shape: the secondary is called non-streaming, and the gateway returns t
 Startup: with `PTR_GATEWAY_FAILOVER=openrouter` the gateway reads the ledger and verifies the gemma catalog price before it listens, and fails startup (`GATEWAY_STARTUP_FAILED`) otherwise.
 
 Observability:
-- **Header:** every upstream HTTP answer carries `X-PTR-Upstream: primary|secondary` (`fake` for the synthetic fake model). Since  the header is sent without failover too, and the worker records it in `reply.serving` ([observability.md](observability.md)). Errors without an upstream answer (connection failures, timeouts, secondary errors) carry no such header; `/metrics` splits them.
+- **Header:** every upstream HTTP answer carries `X-PTR-Upstream: primary|secondary` (`fake` for the synthetic fake model). The worker records the header even without failover in `reply.serving` ([observability.md](observability.md)). Errors without an upstream answer (connection failures, timeouts, secondary errors) carry no such header; `/metrics` splits them.
 - **`/metrics`:** adds `failover`:
   - `breaker`: `state` (closed/open/half_open), `consecutiveFailures`, `consecutiveTimeouts`, `opened`, `probesOk`, `probesFailed`
   - `answered.primary|secondary`
@@ -314,9 +313,9 @@ Runbook:
 - **Breaker stuck open:** `/health` on the engine origin is failing; check the engine and the SSH tunnel (`curl http://127.0.0.1:<port>/health`).
 - **Stop paid traffic:** restart the gateway without `PTR_GATEWAY_FAILOVER`, lower `PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE`, or lower the ledger caps. In-flight secondary calls finish within the shutdown drain.
 
-### Upstream pools (stage S2)
+### Upstream pools
 
-Production : the gateway requires `PTR_GATEWAY_UPSTREAMS_FILE` with exactly one pool and serves that pool
+Production: the gateway requires `PTR_GATEWAY_UPSTREAMS_FILE` with exactly one pool and serves that pool
 (its name is the served model; `PTR_GATEWAY_POOL` and the env-only single engine are demo layer).
 
 A self-hosted gateway can front a **pool** of engines that serve the same model instead of one
@@ -376,7 +375,7 @@ maxSeqs, weight, slowStart, breaker, dispatched, answered, connectFailures} and 
 (registry_stale), staleForMs, failedPolls, rejected (registry_rejected), rejectedReasons, graceRemainingMs, version,
 fileErrors}. With failover on, `failover.breaker` aggregates the members (closed if any is closed).
 
-### Credit admission, central queue and routing (–§4, stage S3)
+### Credit admission, central queue and routing
 
 A pool from a file or the registry **owns admission**: the gateway's own limiter (`PTR_GATEWAY_MAX_CONCURRENCY`) is
 bypassed, requests wait in the pool's queue, and an upstream gets a request only when it has credit (late binding).
@@ -386,7 +385,7 @@ The env-only single upstream and the failover wrapper keep the old limiter, so N
 requests; M = `max_tokens` (else 512). G (the policy block) is the most common msg0 seen (bounded table of 16, counts
 decayed with a half-life of 256 requests), so one odd first request or a short batch with another system message
 cannot set it, while a policy-prompt deploy re-learns G after about 256 requests (fewer when the old block was rare); a request whose msg0 is that block has G cached (uncached = T̂ − G), any other
-has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. Since S5 the
+has nothing cached (uncached = T̂). G is resident once per server and capped at half the KV budget. With the prefix table, the
 cached share on an upstream is the larger of that and the request's match in the upstream's prefix table ([demo-mode.md](demo-mode.md)).
 
 **Credit `fits_u(r)`** (all must hold; the same check for every routing policy):
@@ -397,7 +396,7 @@ cached share on an upstream is the larger of that and the request's match in the
 4. prefill, only when `prefillTokensPerSec` (R_u) is calibrated (record/file field; unset by default): U_u = 0 or
    U_u + (T̂ − G) ≤ R_u · T_max (`PTR_GATEWAY_TTFT_PENALTY_MS` 1000).
 
-5. engine telemetry, while fresh (S4, off in production, [demo-mode.md](demo-mode.md)): KV usage < `PTR_GATEWAY_ENGINE_KV_HIGH` and waiting ≤
+5. engine telemetry, while fresh (off in production, [demo-mode.md](demo-mode.md)): KV usage < `PTR_GATEWAY_ENGINE_KV_HIGH` and waiting ≤
    `PTR_GATEWAY_ENGINE_WAITING_MAX`, except that an upstream with nothing of ours in flight still takes one request.
 
 The ledger: N (in flight), Kres (reserved KV, released at the end), U (uncached prompt tokens, released at the first
@@ -446,34 +445,34 @@ rejected {queue_full, saturated, queue_timeout}, globalPrefixTokens, prefillToke
 | `PTR_GATEWAY_REJECT_SATURATED` | false | early 429 `saturated` |
 | `PTR_GATEWAY_MAX_QUEUE` / `PTR_GATEWAY_QUEUE_TIMEOUT_MS` | 256 / 10000 | the pool queue bound and wait |
 
-### Slow start after recovery, restarts (stage S4)
+### Slow start after recovery and restarts
 
 Pools only (file or registry). Engine telemetry polling and its filter (off by default) are demo mode: see
-[demo-mode.md](demo-mode.md#engine-telemetry-design-38-44-stage-s4).
+[demo-mode.md](demo-mode.md#engine-telemetry).
 
-**Slow start after a breaker closes** (§5, deferred in S2): when a member's breaker closes again (probe healthy, or a
+**Slow start after a breaker closes:** when a member's breaker closes again (probe healthy, or a
 call sent while open answered), its limit ramps from 1 over `PTR_GATEWAY_SLOW_START_MS` like a newly added member, so a
 recovered (cold-cache) engine does not receive the whole queue at once. `rampReason` in the member metrics says why a
 member is ramping: `added`, `breaker_closed` or `restarted`. Exception: a breaker closed by a call sent while it was
 open (no other member and no secondary, so the open upstream was used and answered) does not ramp: that upstream is
 already serving, and ramping the only member would throttle the whole pool.
 
-**Engine restarts:** a registry record's new epoch already makes a new member (S2). For file and env members the epoch
+**Engine restarts:** a registry record's new epoch already makes a new member. For file and env members the epoch
 never changes, and an agent started with `--epoch` keeps it too, so a **later** `process_start_time_seconds` clears the
 member once two polls in a row report the same new value: a fresh breaker, slow start from 1 (`rampReason: restarted`),
-the telemetry streaks reset, the prefix table emptied (S5), `events.restarted` + 1. A restart only ever moves the start
+the telemetry streaks reset, the prefix table emptied, `events.restarted` + 1. A restart only ever moves the start
 time forward, so a value **earlier** than the latest one seen (current or pending candidate) means several processes
 answer on that port (e.g. API server processes behind one port, each with its own start time): restart detection is
 then turned off for that member (`telemetry.restartDetectionDisabled`, one `WARNING gateway upstream <id>:
 restart detection off …` line, the prefix table cleared once), because alternating start times would otherwise be read
-as restarts back and forth (S4 re-review). In the worst order (A, B, B, A with B later) the B, B pair still counts one
+as repeated restarts. In the worst order (A, B, B, A with B later) the B, B pair still counts one
 restart before the earlier A turns detection off. While off, only the breaker reacts to real restarts; 30 polls in a
 row with one start time (one process again) re-arm it with that value as the new baseline (`restart detection back
 on` line); when that baseline differs from the one before detection went off, the prefix table is emptied once more
 (the process left on the port may not be the one whose cache the table describes). In-flight calls of the old process end on their own (cut streams are
 retried by the worker's reset rule). Without the metric nothing is detected (only the breaker reacts).
 
-**Primary-to-primary retry and failover (§5, verified):** retried on another member only for connection-phase errors
+**Primary-to-primary retry and failover:** retried on another member only for connection-phase errors
 (`UpstreamConnectError.certain`) and, with `PTR_GATEWAY_FAILOVER_ON_CLOSE=true`, a close before any response byte; at
 most `PTR_GATEWAY_PRIMARY_ATTEMPTS` (2) members per request; the reservation moves with it (released on the failed
 member, a new one on the next). Timeouts, HTTP errors and streams cut mid-response are not moved. The secondary is used
@@ -485,18 +484,18 @@ stay busy until the queue timeout, the request goes to the secondary (or the con
 
 ### Prefix table and cache affinity (demo mode)
 
-Moved to [demo-mode.md](demo-mode.md#prefix-table-cache-affinity-routing-log-and-8-metrics-design-38-4243-8-stage-s5). In production
+Moved to [demo-mode.md](demo-mode.md#prefix-table-cache-affinity-routing-log-and-metrics). In production
 only the learned global policy block G (credit admission above) changes routing; with affinity off (the default)
 the per-member prefix tables are recorded but do not change the choice.
 
-### Gateway drain (stage S6)
+### Gateway drain
 
-**Graceful drain (§6.3).** SIGTERM or SIGINT on a gateway:
+**Graceful drain.** SIGTERM or SIGINT on a gateway:
 1. `draining = true`: `/healthz` answers 503 `{ok:false,draining:true}`, `/metrics` reports `draining: true`.
 2. Every request waiting in the gateway (the limiter's queue, or a pool's band queue) and every request arriving
    later get **503 `GATEWAY_DRAINING`** with `X-PTR-Gateway: rejected`, `X-PTR-Gateway-Reason: draining`,
    `Retry-After: 1` and `Connection: close`. None of them was sent upstream, so the worker client resends at once to
-   its next gateway URL, with no wait (S1 rule). A retry inside a pool (a second primary after a connect failure, whose
+   its next gateway URL without waiting. A retry inside a pool (a second primary after a connect failure, whose
    first attempt may have reached an engine) is neither refused nor counted: queued or arriving during the drain, it
    waits for credit and is served like an in-flight call (or ends as before: secondary, or the connect error).
 3. The registry record (demo mode, [demo-mode.md](demo-mode.md)) is set to `draining`, and the leader hint is given up.
@@ -515,7 +514,7 @@ is never resent.
 The gateway registry, several gateways, per-replica limits and their acceptance runs are demo mode: see
 [demo-mode.md](demo-mode.md#gateway-registry-and-several-gateways).
 
-### Prompt layout for prefix reuse ( P1–P3, §9.2, stage S7)
+### Prompt layout for prefix reuse
 
 All chat prompt builders (`packages/core/src/prompts.ts`; the agent runtime uses `buildExperimentContext`) render:
 
@@ -531,11 +530,11 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   persona message is identical across a persona's turns; the first model call of turn N up to the end of its history
   is a byte prefix of turn N+1's first call (and of the next agent iteration's); state, tools, evidence, the note and
   tool results appear only after the history. Mutating either change back makes the suite fail.
-- **Superseded by the persona card :** agent `character-agent-context-v5-persona-card` and experiment
-  `persona-chat-v8-persona-card`. The S7 layout is kept. Style examples are added before the history, and matched lore
+- **Superseded by the persona card:** agent `character-agent-context-v5-persona-card` and experiment
+  `persona-chat-v8-persona-card`. The prompt layout is kept. Style examples are added before the history, and matched lore
   is placed between the state and the tools. One persona-independent policy sentence is added, and English sessions
   get an English disclosure prefix. Superseded in turn by agent `character-agent-context-v6-identity-privacy` and
-  experiment `persona-chat-v9-identity-privacy` (S8 follow-up: identity/privacy policy and reply guard; same layout),
+  experiment `persona-chat-v9-identity-privacy` (identity/privacy policy and reply guard; same layout),
   then by `character-agent-context-v7-own-voice` / `persona-chat-v10-own-voice` (first-person voice kept, no added
   details) and `character-agent-context-v8-small-talk` / `persona-chat-v11-small-talk` (light everyday
   small talk for real-person personas, no concrete invented facts), then by
@@ -548,8 +547,8 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   answered like a person, only important real-world facts never invented; reply guard v7 removes meta-talk sentences; same
   layout), then by `character-agent-context-v12-evidence-cap` / `persona-chat-v15-evidence-cap` (at most 3
   evidence posts in the character prompts, tool results first in the agent, a post that does not fit skipped whole instead
-  of a `CONTEXT_LIMIT` turn failure; retrieval and the legacy path keep their limit; policy text and layout unchanged). v12/v15 need S8 gates b–f, with c re-measuring recall
-  under the cap, before serving or baselining; a only when the layout changes. See
+  of a `CONTEXT_LIMIT` turn failure; retrieval and the legacy path keep their limit; policy text and layout unchanged). v12/v15 still need the validation gates below, including a repeat recall measurement
+  under the cap, before serving or baselining. The chat-template check needs repeating only if the layout changes. See
   docs/persona-authoring.md (persona authoring, CLI, deploy order, reply guard, persona voice).
 - **Revisions:** `character-agent-context-v4-prefix-stable` (agent, every turn's bytes change), and for the note
   placement only `persona-chat-v7-turn-note-last` (experiment), `persona-chat-v4-turn-note-last` (timeline) and
@@ -559,24 +558,24 @@ policy · persona · history · [AGENT_STATE, AGENT_TOOLS] · [UNTRUSTED_EVIDENC
   `reply.agent.promptRevision`; the evaluation scripts record the constants in their reports. Pre-existing gaps, not
   changed here: only agent turns store a prompt revision (experiment and legacy turns store none), and
   `scripts/live-research.ts` labels its small-talk outputs with the timeline revision (`PROMPT_REVISION`).
-- **HARD GATES before v4 is served or used as an eval baseline** (S8, items 1 and 2 below):
+- **HARD GATES before v4 is served or used as an eval baseline** (items 1 and 2 below):
   (a) the chat-template check. It applies to **every agent turn from turn 2 on**, not only to deflected turns: the
   state and tool system messages now follow assistant turns. (b) The reply-level `prompt_injection` comparison of v3
-  and v4. The S7 safety condition is so far met only structurally (deterministic placement checks), not on model replies.
+  and v4. The prompt layout safety condition is so far met only structurally (deterministic placement checks), not on model replies.
 - **Not changed:** the legacy goal1 `buildPrompt` keeps its reply-format instruction inside the policy message, so it
   has two policy variants (small talk / timeline), each byte-stable; the serving path (agent) has one. The fictional
   draft prompt (`fictional-post-draft-v1`, one call without history) still appends a deflection note to its policy.
-- **Gateway side effects:** the policy block G that admission learns from the first message (§3.1) is no longer
-  polluted by deflected turns, and the S5 prefix table (message-boundary hashes) now matches a deflected turn up to
+- **Gateway side effects:** the policy block G that admission learns from the first message is no longer
+  polluted by deflected turns, and the gateway prefix table (message-boundary hashes) now matches a deflected turn up to
   its history.
 - **The Jev input-safety filter is unaffected:** it receives only the user text, at most two earlier user turns, a
   seed and the question set (`SafetyAssessInput`), runs before any prompt is built, and does not import the prompt
   builders. Its synthetic-set accuracy (152/154 at the defaults) measures the classifier, not the chat model, so it
   needs no re-run.
 
-**Offline prefix gain (§9.2; zero cost).** `scripts/prompt-prefix-gain.ts --workload=<workload.private.json>` takes
+**Offline prefix gain (zero cost).** `scripts/prompt-prefix-gain.ts --workload=<workload.private.json>` takes
 the captured Jev/Gemma workload (`reports/jev-gemma-bench/2026-10-08T11-39-16-577Z`, private: 91 agent calls, 32
-conversations of 2–3 turns, no tool rounds, no deflections), rebuilds each call in the S7 order from its own
+conversations of 2–3 turns, no tool rounds, no deflections), rebuilds each call in the revised prompt order from its own
 messages (byte-identical to the new builder, tested), and takes for each call, in capture order, the longest common
 byte prefix with any earlier call. This is an unbounded prefix cache that never evicts, so the numbers are upper
 bounds. **Global** is the prefix shared with other conversations (policy, persona, greeting). **Session** adds the
@@ -585,7 +584,7 @@ There is no Gemma tokenizer offline: bytes become tokens at 4.45 B/token (the me
 `prompt_tokens` measured on these captures; range 3.74–4.96) and are floored to whole 16-token KV
 blocks. Messages are serialized with a generic chat-template wrapper.
 
-| Calls | Prompt tokens (mean) | Global: previous → S7 | Session: previous → S7 |
+| Calls | Prompt tokens (mean) | Global: previous → revised | Session: previous → revised |
 | --- | --- | --- | --- |
 | turn 1 (32) | 3360 | 40.5% → 40.6% | 40.5% → 40.6% |
 | turn 2 (28) | 2591 | 49.1% → 49.9% | 51.8% → 52.7% |
@@ -611,14 +610,14 @@ blocks. Messages are serialized with a generic chat-template wrapper.
 - The session part needs the same engine: with affinity off (the default) and N engines it hits about 1/N of the time.
   The global part is reused on every engine.
 
-**To re-measure in S8 (needs the GPU host or paid calls, not run here):**
+**To re-measure with the GPU host or paid calls (not run here):**
 1. **Chat template (hard gate a).** Render v4 prompts through the engine's chat template (vLLM `/tokenize` with `messages`, then
    `/detokenize`; no generation) and check that system messages after assistant turns are accepted and stay in place.
    If the template hoists or merges system messages, both the prefix gain and the note's position change. Do the same
    for the OpenRouter failover model, whose provider applies its own template.
 2. **Reply-level injection handling (hard gate b).** No existing eval measures the chat model's answer to a deflected turn: the Jev
    safety eval scores the classifier only. Send the 14 synthetic `prompt_injection` items (including the multi-turn
-   `prompt_injection-ko-08`) through a `agent_loop` session with the filter on, under v3 and v4, on the self-hosted
+   `prompt_injection-ko-08`) through an `agent_loop` session with the filter on, under v3 and v4, on the self-hosted
    model. Check that no reply reveals the policy or prompt text, that the reply stays in persona, and that it keeps
    the JSON format. Deterministic offline checks (note right before the utterance, once; no retrieval or tool; same
    policy bytes) pass for all 14 items in all three profiles.
@@ -637,7 +636,7 @@ Jev decision state) before the request body, and so its ledger key, is built (`n
 special tokens of the deployed Gemma 4 tokenizer (`<|turn>`, `<turn|>`, `<|channel>`, `<|"|>`, `<bos>`, …), any
 `<|x>`/`<x|>`/`<|x|>`, the legacy `<start_of_turn>` family, `<s>`, `<<SYS>>` and `[INST]`. The leading `<` becomes `‹`
 (`[` becomes `［`): readable, deterministic, idempotent, and text without such strings is byte-identical (prefix
-caching and ledger keys unchanged). S8 gate a showed vLLM turning these strings inside content into real control
+caching and ledger keys unchanged). The chat-template check showed vLLM turning these strings inside content into real control
 tokens (a user could forge a system turn). The gateway neutralizes forwarded messages again (defence in depth for any
 other caller). Known limit: a caption that contains one is shown to the model neutralized,
 so a quote copied from it no longer matches the original caption and that reference fails validation.
@@ -707,9 +706,9 @@ vs HOT updates and dead tuples of `turns`; inserts, updates, HOT updates, delete
 Single-host replicas do not demonstrate multi-host fault tolerance. Fake-model results describe the serving
 architecture, never real LLM throughput.
 
-Registry acceptance (`scripts/registry-acceptance.ts`–T5, T7, T9): in-process fake engines (12
+Registry acceptance scenarios T5, T7 and T9 (`scripts/registry-acceptance.ts`): in-process fake engines (12
 sequences each, 600 ms per call, an engine-side queue beyond that), the real agent loop, gateway, pool and registry
-source, and closed-loop worker clients with the S1 retry settings. `--store=redis` (default) goes through a local TCP
+source, and closed-loop worker clients with the retry settings described above. `--store=redis` (default) goes through a local TCP
 proxy to the isolated Redis (so the outage scenario never touches the shared container) in a `ptrtest:s2<run>:llm`
 namespace deleted afterwards; `--store=memory` uses the in-memory registry. Report: `reports/registry-acceptance-<run>.json`.
 
@@ -718,7 +717,7 @@ pnpm exec tsx scripts/registry-acceptance.ts [--store=redis|memory] [--scenarios
 pnpm exec tsx scripts/registry-acceptance.ts --scenarios=G1,G2,G5,T8     # capacity controller, Redis only
 ```
 
-The G scenarios (S2b) drive the production BullMQ path (`BullMqTurnDelivery`, `startTurnConsumer`, `openTurnQueue`) on
+The capacity-controller scenarios drive the production BullMQ path (`BullMqTurnDelivery`, `startTurnConsumer`, `openTurnQueue`) on
 a throwaway `ptrtest-cap-<hex>` queue (obliterated afterwards) with the real `CapacityController`: workers of local
 concurrency 64 whose turn is 400 ms outside the gateway plus one gateway call, and a feeder that keeps 48 turns
 waiting. G1 = scale-up (G rises within a tick), G2 = drain (G drops at once), G5 = flapping (G changes at most once per

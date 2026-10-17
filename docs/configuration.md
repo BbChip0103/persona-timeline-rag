@@ -25,8 +25,7 @@ classified `PROVIDER_REQUEST_UNRESOLVED` and must not be retried.
 
 ### Why no LLM gateway
 
- (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
-removes the gateway from the current configuration surface. The paid budget is
+The active configuration has no LLM gateway. The paid budget is
 enforced by the durable provider ledger plus the paid provider key's credit
 limit. The EPP owns local routing/admission, and the paid OpenRouter key lives
 only in the Kubernetes worker Secret. Operational rollback restores the old
@@ -53,7 +52,6 @@ the role-specific variables in the Helm chart.
 Historical production was one process per role with **19 environment
 variables**. Every other knob was a constant; the scaling features measured in
 goal2 stayed in the code behind `PTR_DEMO_SCALING=1` ([demo-mode.md](demo-mode.md)).
-Design:  (decisions D3-D9).
 
 ## Startup check
 
@@ -152,9 +150,5 @@ I (Compose, psql and redis-cli: database and Redis passwords, `PTR_UID`/`PTR_GID
 
 ## Sources
 
--  (operations round 2) §3 and decisions D3–D9, `private design notes` repo
-  `<private-design-notes>`.
--  (LiteLLM removal) §1, §4 row L4 and §6.4, `private design notes` repo
-  `<private-design-notes>`.
 - Node.js `util.parseEnv` (the `--env-file` parser): https://nodejs.org/api/util.html#utilparseenvcontent
 - Next.js `instrumentation.ts` `register()`: https://nextjs.org/docs/app/guides/instrumentation

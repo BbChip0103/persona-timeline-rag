@@ -126,7 +126,7 @@ test('over-budget base history is rejected instead of slicing captions or user i
   expect(()=>buildExperimentPrompt(persona,[{id:'h',sessionId:'s',turnId:null,role:'user',content:'😀'.repeat(12000),createdAt:'2020-01-01T00:00:00Z'}],'user input',[source])).toThrow(expect.objectContaining({code:'CONTEXT_LIMIT'}));
 });
 
-test('service omits an oversize caption  and exposes a safe context limit only when no evidence fits, without invoking provider',async()=>{
+test('service omits an oversize caption and exposes a safe context limit only when no evidence fits, without invoking provider',async()=>{
   const h=setup();h.retrieval.search.mockResolvedValue([{...source,caption:'😀'.repeat(10000)}]);
   const session=await h.service.createSession('synthetic-owner',{...query,ragCondition:'caption'});
   const omitted=await h.service.sendTurn('synthetic-owner',{sessionId:session.id,clientRequestId:'oversize',text:'이미지 설명'});

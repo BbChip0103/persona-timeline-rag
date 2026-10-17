@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     environment:
       PTR_REDIS_PASSWORD: ${PTR_REDIS_PASSWORD:?Set PTR_REDIS_PASSWORD in the private .env.local}
-    # ACL : one app user `ptr` limited to the ptr:* / ptrtest:* keys and channels, every command but the
+    # ACL: one app user `ptr` limited to the ptr:* / ptrtest:* keys and channels, every command but the
     # @dangerous ones (KEYS, CONFIG, FLUSHALL, ...) plus INFO, which BullMQ reads. The default user is off and there is
     # no admin user: break-glass is the rollback in docs/runbook.md. PTR_REDIS_PASSWORD is the ptr password; only its
     # SHA-256 is written to a container-local config file, and it is never passed as an argument.

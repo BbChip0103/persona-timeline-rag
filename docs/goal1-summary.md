@@ -1,15 +1,15 @@
 # 목표1: 캐릭터 채팅·RAG 평가/관측 요약
 
-이 문서는 **현재 구현 계약과 보존된 측정 결과**의 공개 요약이다. 과정/대화 일지는 비공개 설계 노트에 둔다. 원자료, 실제 대상 이름/계정, 실채팅, 평가 reference와 private 보고서는 공개하지 않는다. 아래 예시 대화는 모두 합성이다.
+이 문서는 **현재 구현 계약과 보존된 측정 결과**의 공개 요약이다. 비공개 설계 노트는 이 저장소에 포함되지 않는다. 원자료, 실제 대상 이름/계정, 실채팅, 평가 reference와 private 보고서는 공개하지 않는다. 아래 예시 대화는 모두 합성이다.
 
 ## 1. 구현 범위
 
-- NestJS API + Next.js 채팅 + 전용 DB-only 로컬 PostgreSQL/pgvector. owner/person/persona revision/실행 profile/RAG 조건을 세션에 고정하고 재접속·history·취소·idempotency를 처리한다. 다른 프로젝트·stage/prod DB나 운영 앱을 사용하지 않는다.
+- NestJS API + Next.js 채팅 + 전용 DB-only 로컬 PostgreSQL/pgvector. owner/person/persona revision/실행 profile/RAG 조건을 세션에 고정하고 재접속·history·취소·idempotency를 처리한다. 다른 프로젝트의 DB나 운영 앱을 사용하지 않는다.
 - 새 세션은 [agent-loop](character-agent.md) 구조: persona + 완료된 실제 대화 + 최소 topic/tone 상태 + 원근거 → 구조화된 모델 출력 → 필요 시 제한된 읽기 전용 검색 → 자연어 캐릭터 메시지. 기본 도구 최대2회/모델 최대3회, 도구 없는 답변은1회다. 상세 사고과정은 요구/표시하지 않으며 짧은 결정 요약/상태/도구 trace는 비공개다.
 - 검색은 최근 사용자 발화 최대5턴/500문자 규칙 기반 맥락과 직전 답변이 인용한 원게시물의 고정 revision을 사용한다. 별도 rewrite/planner LLM 호출은 없다. 영구 사용자 기억이나 완전한 대명사 해석은 아니다.
 - 이미지 설명 생성·[별도 색인](image-rag.md)·채팅 연결까지 실행했다. `gpt-6-luna`/`medium`의 시각 관찰·중요한 강조·의도 해석과 본문 맥락을 구분한다. 본문에는 해시태그를 포함했지만 이것이 얼굴 신원 확인이나 시각 사실의 증거가 되지는 않는다. 의도 문장은 완결형이어도 AI 해석이며 `humanReviewed=false`다.
 - 인물 범위/허용된 출처/annotation revision/인용 결합을 검증한다. **정확한 인용과 자연어 답변 전체의 의미적 지원은 별개**다. 선택적 validator hook은 기본 비활성이며 아래 실험도 disabled였다. legacy 인용 renderer 결과를 현재 자유 발화 경로의 성능으로 읽지 않는다.
-- 합성 fixture 기반 계약 테스트, private 실행 보고서·provider ledger/cache·비용·실행 시간·독립 SQL 감사를 갖췄다. 전체 reference agent loop 엔진, streaming/native tool calls, 분산 queue, 자체 모델 서빙을 구현했다고 주장하지 않는다.
+- 합성 fixture 기반 계약 테스트와 private 실행 보고서·provider ledger/cache·비용·실행 시간·독립 SQL 감사를 갖췄다. 완전한 범용 에이전트 엔진, streaming/native tool calls, 분산 queue, 자체 모델 서빙까지 구현했다고 주장하지 않는다.
 
 ## 2. 비교하는3조건
 
@@ -99,7 +99,8 @@ Runtime revision은 `agent-loop-json-action-v1`이다. 한국어 baseline과 회
 1. **자료 정합성:** 확정 핵심 사건/주체/인용, 정정 후 모순을 본다.
 2. **캐릭터 경험:** 자연스러운 회상·가벼운 각색·개성·정정 수용·맥락 연결·재미를 별도로 본다.
 
-전체3조건 재생성/전량 재채점은 현재 보류다. 코드 변경의 합성·필요한 로컬 표적 검증과 실제 모델 품질 평가를 구분한다. 사람 원자료/설명/페르소나 의미 검수, 실인물 말투 충실도, 정정 후 복구, unseen 일반화, 주장별 의미 검증은 남은 한계다. 목표2 LLMOps·Kubernetes·다른 프로젝트 병합/배포·추가 유료 실험은 이 마감의 완료 항목이 아니다.
+
+전체 3조건 재생성/전량 재채점은 현재 보류다. 합성·로컬 회귀 검증과 실제 모델 품질 평가를 구분한다. 사람 원자료·페르소나 의미 검수, 실인물 말투 충실도, 정정 후 복구, unseen 일반화, 주장별 의미 검증은 남은 한계다. 추가 유료 실험과 운영 배포는 이 마감의 완료 항목이 아니다.
 
 ### 새 페르소나의 차별화/검수 범위
 

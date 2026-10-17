@@ -16,7 +16,7 @@ function setup(provider:TextProvider,hooks:Partial<ConstructorParameters<typeof 
   return {chat,store,delivery,events,run};
 }
 
-describe('reply.serving : which upstream answered each model call',()=>{
+describe('reply.serving records which upstream answered each model call',()=>{
   test('the upstream each call reports is recorded per call; secondary calls are counted',async()=>{
     const answers=['primary','secondary'];
     const provider:TextProvider={generate:jest.fn(async(_messages,options)=>{options.onServed?.(answers.shift()!);return '반가워요.';})};

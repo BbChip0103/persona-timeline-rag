@@ -1,6 +1,6 @@
 # persona-timeline-rag
 
-승인받은 Instagram 자료를 바탕으로 **인플루언서 AI 페르소나와 채팅하면서 과거 활동 타임라인 근거를 활용하는** 독립 개인 연구 프로젝트입니다. 목표1은 4명 페르소나 채팅에 RAG를 연결하고 평가·관측하는 것, 이후 목표2는 LLM 서빙 구조·부하·복구 실험입니다. 실제 본인/공식 계정이 아닌 연구용 AI 시뮬레이션으로 표시합니다.
+허가된 Instagram 연구 데이터셋을 바탕으로 **AI 페르소나와 채팅하면서 과거 활동 타임라인 근거를 활용하는** 독립 개인 연구 프로젝트입니다. 목표1은 4명 페르소나 채팅에 RAG를 연결하고 평가·관측하는 것, 이후 목표2는 LLM 서빙 구조·부하·복구 실험입니다. 실제 본인/공식 계정이 아닌 연구용 AI 시뮬레이션으로 표시합니다.
 
 ## 현재 구현 범위
 
@@ -9,11 +9,8 @@
 - 전용 **DB-only 로컬 Supabase PostgreSQL15 + pgvector**: Auth/Storage/Studio 전체 배포가 아니다. owner/person/revision 고정 세션, history/reload, idempotency/cancel, lexical substring baseline 및1536dim exact cosine 검색.
 - 명시적 fake/local/OpenRouter provider와 durable shared ledger, provider key credit limit, 알려진 응답 cache·불명확 제출 재전송 금지, private traces/보고서.
 - 공개 fixture는 합성이다. 실제 persona는 개발 캡션 통계 기반 **silver**이며 사람 검수 완료/본인 복제 정확도를 주장하지 않는다. 근거 없는 사건 날짜를 게시일로 대체하지 않는다.
-- 새 API 세션은 **agent-loop 캐릭터 에이전트**다. 페르소나·실제 누적 대화·최소 대화 변수와 근거를 받아 자연어 답변을 만들고, 선택적 읽기 전용 검색 도구를 제한된 루프로 실행한다. 과거 legacy 원문 인용 renderer와 구분하며 다른 프로젝트 reference agent loop 전체 엔진의 동등성을 주장하지 않는다.
 - **RAG 없음 / 본문만 / 본문+이미지 설명**을 세션에 고정한다. 이미지 설명은 `gpt-6-luna`/`medium`으로 생성한 관찰·강조·의도 해석을 별도 출처로 색인하며, 원사진을 매 채팅 요청에 직접 넣는 방식은 아니다. 의도 해석은 단정형 어미여도 실제 작성자의 확정 의도가 아니다.
 - 최근 사용자 대화를 활용한 검색과 직전 답변의 원근거 재사용은 별도 rewrite LLM 호출 없이 처리한다. 인용 검증은 출처·범위·문자열 결합을 확인하지만, 자연어 답변의 모든 주장을 의미적으로 검증하지는 않는다.
-
-**[목표1 구현·결과 요약](docs/goal1-summary.md)**에서 최신 한국어 3조건 비교, 합성 대화 예시, 관측·비용과 잔여 한계를 확인한다. 실제 모델/이미지/평가 자료는 ignored `reports/`에만 둔다. 결과는 AI-assisted silver 개발 회귀이며 사람 gold·실인물 개성 복제·새 질문 일반화 성능을 입증하지 않는다. 실자료·실모델 전체 재측정은 보류 상태다. 프레임워크 전환의 오프라인 전체 회귀와 신규 합성 통합 검증은 별도로 수행했다. 독립 OCR/ASR, 사람 검수된 사건 추출/병합, 웹검색 및 목표2 서빙·부하 실험은 완료 항목이 아니다. 다른 프로젝트 코드·DB·운영 설정은 변경하지 않는다.
 
 ## 현재 프레임워크 실행 경로
 
@@ -23,7 +20,7 @@ Web → **Nest 서비스 backend → BullMQ → 독립 Python RAG·agent worker 
 
 ### Why no LLM gateway
 
- (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4) removes the LLM gateway from the current architecture. Budget enforcement lives in the durable provider ledger plus the paid provider key's credit limit, routing/admission for local serving lives in the EPP, and the paid OpenRouter key exists only in the Kubernetes worker Secret. Rollback restores the old gateway from the private operational snapshot rather than from this repository.
+The current architecture has no LLM gateway. Budget enforcement lives in the durable provider ledger plus the paid provider key's credit limit, routing/admission for local serving lives in the EPP, and the paid OpenRouter key exists only in the Kubernetes worker Secret. Rollback restores the old gateway from the private operational snapshot rather than from this repository.
 
 ## Kubernetes
 
@@ -33,7 +30,6 @@ known acceptance limits are documented in [Kubernetes deployment](docs/kubernete
 ## 실행
 
 새 채팅/DB 구성은 [Python 분리 실행 계약](docs/python-llm-split.md)을 따른다. Python 검증은 `pnpm llm:check`와 기존 ingestion `make check`이며, 실제 DB/Redis·메모리/부하는 별도 opt-in proof다. [기존 서비스 runbook](docs/runbook.md)은 이전 버전 재현 기록이다. 기본 합성 검증은 `pnpm install && pnpm check`, 웹 빌드는 `pnpm build:web`다. 실제 자료 없이 합성 테스트를 실행할 수 있다.
-
 
 ```bash
 # 승인 데이터 없이 실행 가능한 합성 fixture 테스트
@@ -68,7 +64,7 @@ PYTHONPATH=src python -m persona_timeline_rag audit
 ```text
 apps/api/       # NestJS local API
 apps/web/       # Next.js local chat + authenticated BFF
-packages/       # shared contracts/core/storage/providers/images
+packages/       # shared contracts/core/storage/providers
 supabase/       # immutable SQL migrations
 infra/          # isolated DB-only compose/bootstrap
 scripts/        # preparation/live/evaluation/effort harness
@@ -88,7 +84,7 @@ reports/        # 실제 계정·다운로드·평가 보고서: Git 제외
 ## 연구 원칙
 
 - **게시일 ≠ 사건일.** 원본 게시 시각은 `posted_at`; 근거가 없으면 `event_date`는 비워 둡니다.
-- 현재 캐릭터 채팅 비교는 같은 agent-loop 구조·모델에서 RAG 없음/본문/본문+이미지 설명의3조건을 사용합니다. lexical/semantic은 검색 알고리즘이며 이3조건과 별개입니다. 웹 검색은 미구현 선택 실험이고 로컬 RAG가 더 낫다는 결론을 미리 가정하지 않습니다.
+- 현재 캐릭터 채팅 비교는 같은 agent-loop 구조·모델에서 RAG 없음/본문/본문+이미지 설명의3조건을 사용합니다. 여기서 `agent_loop`는 구조화된 응답을 만들고 필요할 때 읽기 전용 타임라인 검색을 호출하는 실행 프로필입니다. lexical/semantic은 검색 알고리즘이며 이3조건과 별개입니다. 웹 검색은 미구현 선택 실험이고 로컬 RAG가 더 낫다는 결론을 미리 가정하지 않습니다.
 - 반응·유머·분위기·가벼운 살붙이기는 캐릭터 대화의 일부입니다. 확인된 핵심 사건/주체의 모순, 사용자 정정 무시, 허위 원문 인용과 구분합니다. 기존 엄격한 사실성 진단 점수는 캐릭터 대화 전체의 성공 점수가 아닙니다.
 - 미성년자는 대상에서 제외하고 댓글·사용자 태그 구조는 정규화하지 않습니다. 사진·캡션에 등장하는 제3자를 자동 익명화하는 기능은 아직 없으므로 별도 검수가 필요합니다.
 - 승인 원본과 인물별 결과는 비공개입니다. 공개 저장소는 코드·문서·합성 테스트를 대상으로 합니다.
@@ -99,12 +95,10 @@ reports/        # 실제 계정·다운로드·평가 보고서: Git 제외
 
 ## 라이선스와 한계
 
-코드 라이선스와 데이터 사용 조건은 별개입니다. 현재 별도 코드 `LICENSE`는 지정하지 않았습니다. 향후 코드에 라이선스를 붙여도 승인 데이터·사진·캡션의 재배포 권한이 생기지 않습니다. 원본 제공자의 승인 조건과 원저작자의 권리를 따릅니다.
+**All rights reserved.** 이 저장소에는 코드 LICENSE가 없으며 공개 열람이 재사용 허가를 뜻하지 않습니다. 데이터셋은 코드에 포함되지 않고, 승인 데이터·사진·캡션의 권리는 별도입니다. 원본 제공자의 승인 조건과 원저작자의 권리를 따릅니다. Vendored llm-d Router standalone Helm chart v0.11.0은 [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router/tree/v0.11.0)의 Apache-2.0 구성요소입니다. [제3자 고지](deploy/helm/ptr-router/THIRD_PARTY_NOTICE.md)를 참조하세요.
 
 이 프로젝트는 과거 공개 활동에 대한 근거 검증 실험이며, 개인 추적·실시간 위치 추론·무근거 사생활 재구성을 목적으로 하지 않습니다. 원본의 과거 snapshot은 최신 활동 기록이 아닙니다.
 
 ## 완료 범위와 남은 gate
 
-로컬 DB/API/UI, 버전 페르소나, 원본문·이미지 설명 RAG, 멀티턴 맥락 연결과3조건 실행·기록은 구현/실행됐습니다. 가상 포스트·이미지 표현도 기준선 검증을 했으며 생성물은 실제 게시물/활동 근거로 재유입하지 않습니다.
-
-**실행 완료와 품질 목표 달성은 다릅니다.** 인용 공백 차이의 제한적 원문 복원·미허용 도구의 서비스 안내·미확정 외부 요청 안내를 보완했고, DEV 자료 기반 4종 페르소나를 새 버전으로 분리했습니다. 이 변경은 합성/로컬 계약 검증이며 새로운 실제 모델 품질 결과가 아닙니다. 사람 의미 검수·고유 말투 충실도·정정 후 다른 기억으로 복구·새 질문 일반화는 별도 잔여 gate입니다. 최초 검수/평가 목표 수량을 충족했다고 소급 주장하지 않습니다. 최신 측정 결과와 이후 미평가 변경은 [요약](docs/goal1-summary.md)에서 구분합니다. 목표2·Kubernetes·다른 프로젝트 병합/배포·추가 과금 실험으로 자동 확대하지 않습니다.
+로컬 DB/API/UI, 버전 페르소나, 원본문·이미지 설명 RAG, 멀티턴 맥락 연결과3조건 실행·기록은 구현/실행됐습니다. 가상 포스트 초안은 공개 빌드에서 제공하며 이미지 생성은 비활성화돼 있습니다. 생성물은 실제 게시물/활동 근거로 재유입하지 않습니다.

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { LoreEntry, Persona, ProviderMessage } from '@ptr/contracts';
 
 /**
- * Persona card rendering : allowlist only. `meta`, `label`, `sourceRefs` and lore/greeting text are never
+ * Persona card rendering: allowlist only. `meta`, `label`, `sourceRefs` and lore/greeting text are never
  * part of the persona block. Without the v2 fields the definition bytes equal the v4 (pre-card) definition, because
  * JSON.stringify drops the absent keys.
  */
@@ -11,7 +11,7 @@ export const LORE_BYTE_LIMIT=2048;
 export const LORE_MAX_ENTRIES=3;
 export const PERSONA_STYLE_EXAMPLES_MARKER='PERSONA_STYLE_EXAMPLES_JSON_DATA';
 export const PERSONA_LORE_MARKER='UNTRUSTED_PERSONA_LORE_JSON_DATA';
-// : no "notes"/"profile" wording (not even as a key) the model can echo; the block name is the only label.
+// Do not use "notes"/"profile" wording (not even as a key) the model can echo; the block name is the only label.
 const BACKGROUND_LABEL='part of PERSONA_BLOCKS; NOT citable';
 
 /** Persona definition (system) and, when the persona has example dialogues, the style examples (system). */
@@ -28,7 +28,7 @@ export function renderPersonaBlock(persona:Persona):ProviderMessage[] {
 /** Budget unit: UTF-8 bytes of the serialized messages (the request body's escaping included), as in agent-runtime. */
 export const serializedBytes=(messages:readonly ProviderMessage[])=>Buffer.byteLength(JSON.stringify(messages),'utf8');
 export const personaBlockBytes=(persona:Persona)=>serializedBytes(renderPersonaBlock(persona));
-/** Matched lore as untrusted user-role data after the history ; entries keep document order. */
+/** Matched lore as untrusted user-role data after the history; entries keep document order. */
 export function renderLoreMessage(entries:readonly Pick<LoreEntry,'id'|'content'>[]):ProviderMessage {
   return {role:'user',content:`${PERSONA_LORE_MARKER} (part of PERSONA_BLOCKS; NOT citable) ${JSON.stringify(entries.map(entry=>({loreId:entry.id,content:entry.content})))}`};
 }
@@ -39,7 +39,7 @@ export const loreBytes=(entries:readonly Pick<LoreEntry,'id'|'content'>[])=>Buff
 export const LORE_SCAN_CODE_POINTS=1000;
 const loreForm=(text:string)=>[...text].slice(0,LORE_SCAN_CODE_POINTS).join('').normalize('NFKC').toLowerCase();
 /**
- * Deterministic lore selection . Callers pass the current utterance and up to two previous user messages,
+ * Deterministic lore selection. Callers pass the current utterance and up to two previous user messages,
  * leaving out turns the input-safety filter acted on, and skip matching entirely on a deflected turn. Keys match as
  * NFKC + lower-case substrings (no word boundaries, because of Korean particles; no regex). Ranking: matched in the
  * current utterance, then priority, then document order; up to three entries within LORE_BYTE_LIMIT, skipping an entry

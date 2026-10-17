@@ -1,18 +1,18 @@
 /**
- * Offline prefix-gain estimate for the S7 prompt layout (zero cost, no model or tokenizer calls).
+ * Offline prefix-gain estimate for the cache-friendly prompt layout (stable prefix first; zero cost, no model or tokenizer calls).
  *
  *   pnpm exec tsx scripts/prompt-prefix-gain.ts --workload=reports/jev-gemma-bench/<run>/workload.private.json [--bytes-per-token=4.45] [--block-tokens=16]
  *
  * Input: a captured chat workload (`chat[]` of {conversationId, turnIndex, iteration, messages}) in the previous layout
- * (policy[+note] · persona · state · tools · history · evidence · user · transcript). Each call is rebuilt in the S7
- * layout by moving its own messages (policy · persona · history · state · tools · evidence · [note] · user ·
+ * (policy[+note] · persona · state · tools · history · evidence · user · transcript). Each call is rebuilt in the cache-friendly
+ * layout (stable prefix first) by moving its own messages (policy · persona · history · state · tools · evidence · [note] · user ·
  * transcript), which is byte-identical to what buildExperimentContext now renders for the same inputs.
  *
  * For each call in capture order, the cacheable prefix is the longest common byte prefix with any EARLIER call (an
  * unbounded prefix cache that never evicts: an upper bound), split into the part shared with other conversations
  * (global: policy, persona, greeting) and the extra part only the same conversation provides (session history, which
  * only hits when the call lands on the engine that served that conversation before). Bytes become tokens at
- * `bytesPerToken` (the measured workload: median UTF-8 bytes / vLLM prompt_tokens = 4.45 on these captures, Gemma tokenizer), floored to
+ * `bytesPerToken` (median UTF-8 bytes / vLLM prompt_tokens = 4.45 on these captures, Gemma tokenizer), floored to
  * whole KV blocks (`blockTokens`, vLLM's default 16) because only full blocks are reused. Messages are serialized with a
  * generic chat-template wrapper; the real template adds a few constant bytes per message. Output: aggregates only (no
  * prompt text).
@@ -26,7 +26,7 @@ export type Layout='previous'|'s7';
 const tagged=(message:ProviderMessage,tag:string)=>message.content.startsWith(tag);
 const isAgentBlock=(message:ProviderMessage)=>message.role==='system'&&(tagged(message,'AGENT_STATE_JSON_DATA ')||tagged(message,'AGENT_TOOLS_JSON_DATA '));
 
-/** Previous-layout call → the same messages in the S7 order (a note appended to the policy becomes its own message). */
+/** Previous-layout call → the same messages in the cache-friendly order (stable prefix first; a note appended to the policy becomes its own message). */
 export function toS7Layout(messages:readonly ProviderMessage[]):ProviderMessage[] {
   const [policy,persona,...rest]=messages;
   if(!policy||!persona) throw new Error('CALL_TOO_SHORT');

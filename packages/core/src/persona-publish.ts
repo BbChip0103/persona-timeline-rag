@@ -5,9 +5,9 @@ import { LORE_BYTE_LIMIT, PERSONA_BLOCK_BYTE_LIMIT, loreBytes, personaBlockBytes
 import { containsCredentialPattern, containsInternalPathPattern, containsUngroundedBiography } from './safety';
 
 /**
- * Publish-time persona checks , fail-closed. Run only when a revision is published, so the rules may
+ * Publish-time persona checks, fail-closed. Run only when a revision is published, so the rules may
  * narrow without breaking stored revisions. These are narrow regex gates, not a semantic review: for real-person
- * personas the user's confirmation of the publish summary  stays the main control. The private-life
+ * personas the user's confirmation of the publish summary stays the main control. The private-life
  * patterns are broad on purpose (N5): a harmless phrase that matches must be reworded, there is no exception list.
  * Bump the revision whenever a pattern or limit changes.
  */
@@ -22,7 +22,7 @@ export interface PersonaPublishContext {
   /**
    * The persona prepare-research generated for the same person, when there is one. Author texts left exactly as
    * generated (the existing style/boundaries sentences, built from development captions only) skip the leak check:
-   * common phrases such as "conversational responses" otherwise collide with captions .
+   * common phrases such as "conversational responses" otherwise collide with captions.
    */
   generated?:Persona;
   /**
@@ -41,7 +41,7 @@ export const EXAMPLE_DIALOGUE_CODE_POINT_LIMIT=800;
 export const TEST_CAPTION_OVERLAP_CODE_POINTS=12;
 
 const codePoints=(text:string)=>[...text].length;
-/** Our prompt block markers ; an author field must never forge one. */
+/** Our prompt block markers; an author field must never forge one. */
 const BLOCK_MARKERS=['UNTRUSTED_EVIDENCE_JSON_DATA','AGENT_STATE_JSON_DATA','AGENT_TOOLS_JSON_DATA','TOOL_RESULT_JSON_DATA','SAFETY_NOTE_FOR_THIS_TURN',
   'TIMELINE_JSON_REPLY','AGENT_JSON_REPLY','SMALL_TALK_REPLY','CHARACTER_RECOLLECTION','PERSONA_STYLE_EXAMPLES_JSON_DATA','UNTRUSTED_PERSONA_LORE_JSON_DATA','Persona definition'];
 const AI_WORDS='AI|A\\.I\\.|에이아이|인공지능|챗봇|봇|로봇|시뮬레이션';
@@ -76,12 +76,12 @@ const FORBIDDEN:[string,RegExp[]][]=[
   ['block_marker',[new RegExp(BLOCK_MARKERS.join('|'),'i')]],
   ['reply_json',[/"(?:evidenceRefs|variableUpdates)"|"(?:status|function)"\s*:/i]],
   // `<|x>` / `<x|>`: Gemma 4's asymmetric control tokens (<|turn>, <turn|>, <|channel>, <tool_call|>, …), parsed as real
-  // control tokens when they appear in message content (S8 gate a, vLLM /tokenize).
+  // control tokens when they appear in message content (verified with vLLM /tokenize).
   ['special_token',[/<\/?(?:start_of_turn|end_of_turn|bos|eos|pad|start_of_image|end_of_image)>|<\|[^|<>\s]{1,40}\|>|<\|[^|<>\s]{1,40}>|<[^|<>\s]{1,40}\|>|\[\/?INST\]|<<\/?SYS>>|<\/?s>/i]],
-  // CBS / V1 macros are nondeterministic or substituted ; any double brace is refused.
+  // CBS / V1 macros are nondeterministic or substituted; any double brace is refused.
   ['macro',[/\{\{|\}\}|<\s*\/?\s*(?:BOT|USER|CHAR)\s*>/i]],
 ];
-/** Real-person personas only : family, romance, address, health, real-time location, minors. */
+/** Real-person personas only: family, romance, address, health, real-time location, minors. */
 const PRIVATE_LIFE:RegExp[]=[
   /가족|부모|엄마|아빠|어머니|아버지|어머님|아버님|형제|자매|남매|오빠|언니|누나|남편|아내|와이프|배우자|자녀|아들|딸(?!기)|손자|손녀|결혼|이혼|임신|출산|시댁|처가|친정/,
   /연애|남자\s*친구|여자\s*친구|남친|여친|애인|열애|연인|썸(?:남|녀|타)|데이트|헤어졌|이별/,
@@ -227,7 +227,7 @@ export async function validatePersonaForPublish(input:unknown,context:PersonaPub
     if(group!=='label'&&group!=='meta'&&leaks.size&&!exempt&&windows(text,TEST_CAPTION_OVERLAP_CODE_POINTS).some(window=>leaks.has(window))) report(path,'test_caption_overlap');
     if(realPerson&&['card','greeting','personality','background','example','lore'].includes(group)&&PRIVATE_LIFE.some(matches)) report(path,'private_life');
     // Background text is stored as a third-person character sheet (a storage format; the model speaks about it in the
-    // first person): it gets the private-life check instead of the biography check .
+    // first person): it gets the private-life check instead of the biography check.
     if(['card','greeting','personality','example'].includes(group)&&(containsUngroundedBiography(text)||containsUngroundedBiography(folded))) report(path,'biography',realPerson?'error':'warn');
     if(group!=='label'&&group!=='meta'&&DATE_PLACE.some(pattern=>pattern.test(text))) report(path,'date_place','warn');
   }

@@ -8,20 +8,20 @@ import { isKoreanLanguage, speechLevel, utteranceLanguage, voiceText } from './r
 
 export const AGENT_RUNTIME_REVISION='langgraph-json-action-v1';
 /**
- * v4 (S7): agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout).
- * v5 : persona card (examples before the history, matched lore between state and tools) and the
+ * v4: agent state/tools after the history, the safety note right before the user utterance (prompts.ts layout).
+ * v5: persona card (examples before the history, matched lore between state and tools) and the
  * PERSONA_CARD_POLICY sentence, which the policy split below carries over from the experiment policy.
- * v6 (S8 follow-up): IDENTITY_PRIVACY_POLICY, carried the same way; the service notice follows the persona language.
- * v7 : that policy keeps the first-person voice (no third-person rule) and forbids added details.
- * v8 : light fictional everyday small talk allowed for real-person personas, no concrete invented facts.
- * v9 : IDENTITY_PRIVACY_POLICY discloses the AI only when asked, never disowns the background and declines in
+ * v6: IDENTITY_PRIVACY_POLICY, carried the same way; the service notice follows the persona language.
+ * v7: that policy keeps the first-person voice (no third-person rule) and forbids added details.
+ * v8: light fictional everyday small talk allowed for real-person personas, no concrete invented facts.
+ * v9: IDENTITY_PRIVACY_POLICY discloses the AI only when asked, never disowns the background and declines in
  * the persona voice; REPLY_VOICE_POLICY (user's language, short complete sentences). An invalid reply format or an
  * unavailable tool answers with a persona-voice fallback (reason in metadata), never a service notice. The state message
  * carries the turn's replyLanguage (from the utterance), and the recollection voice says "register" instead of
  * "persona language/register" (the first v9 GPU run answered 15% of replies in the persona's language instead).
- * v10 : the state message also carries the persona's Korean speechLevel (반말/해요체, one per persona); the
+ * v10: the state message also carries the persona's Korean speechLevel (반말/해요체, one per persona); the
  * recollection voice has no quotable example lines.
- * v11 : no evidence means an in-character answer (IDENTITY_AND_PRIVACY), not an "explicitly uncertain" one; the
+ * v11: no evidence means an in-character answer (IDENTITY_AND_PRIVACY), not an "explicitly uncertain" one; the
  * recollection voice no longer speaks of database records or unavailable records/data/evidence (the model echoed them).
  * v12 (user decision): at most EVIDENCE_POST_LIMIT (3) posts in the prompt. A tool search puts its results first
  * (the model chose that query for this turn), then the earlier candidates, each group in retrieval order; posts are added

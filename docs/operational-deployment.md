@@ -91,8 +91,7 @@ network availability or multi-engine performance.
 
 ### Why no LLM gateway
 
- (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
-removes the gateway from the active operational path. The durable provider
+The active operational path has no LLM gateway. The durable provider
 ledger and, by default, the provider key's credit limit enforce paid budget, the EPP owns
 local routing/admission in Kubernetes, and the paid key lives only in the
 worker. Compose uses Redis shared slots for admission; Kubernetes uses EPP. Rollback restores the old gateway from

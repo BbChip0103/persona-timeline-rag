@@ -92,7 +92,7 @@ test('PTR_SAFETY_FILTER=jev is off by default, separate from the intent classifi
   const write=jest.spyOn(process.stderr,'write').mockImplementation(()=>true);
   const log=(safety.chat as unknown as {options:{onSafetyFallback:(event:{scope:string;reason:string})=>void}}).options.onSafetyFallback;
   log({scope:'turn',reason:'budget'});log({scope:'turn',reason:'budget'});
-  // One JSON event per fallback , with the running count.
+  // One JSON event per fallback, with the running count.
   expect(write.mock.calls.map(([line])=>JSON.parse(String(line))).map(({role,event,scope,reason,count})=>({role,event,scope,reason,count}))).toEqual([
     {role:'api',event:'input_safety_fallback',scope:'turn',reason:'budget',count:1},{role:'api',event:'input_safety_fallback',scope:'turn',reason:'budget',count:2}]);
   write.mockRestore();await safety.close?.();
@@ -103,7 +103,7 @@ test('PTR_SAFETY_FILTER=jev is off by default, separate from the intent classifi
     expect(()=>createRuntime({...live,...env})).toThrow();
 });
 
-describe('persona catalogue: generated list + authored list ',()=>{
+describe('persona catalogue: generated list + authored list',()=>{
   const p=(personId:string,revision:string):Persona=>({id:`persona:${personId}`,personId,label:'Synthetic',language:'ko',revision,reviewStatus:'synthetic',identity:'Fictional',concept:'test',style:[],boundaries:['AI'],sourceRefs:[],greeting:'안녕'});
   test('the authored entry wins for its personId; other generated entries stay; personIds are unique',()=>{
     const merged=mergePersonaLists([p('a','gen-1'),p('b','gen-1')],[p('b','auth-1'),p('c','auth-1')]);

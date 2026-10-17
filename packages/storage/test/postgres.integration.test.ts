@@ -44,7 +44,7 @@ integration('dedicated loopback Postgres storage (synthetic fixtures only)', () 
     expect((await personas.get(persona.id))?.revision).toBe('synthetic-v2');
     expect((await personas.get(persona.id, persona.revision))?.greeting).toBe(persona.greeting);
     expect((await conversations.getOwnedSession(session.id, session.ownerId))?.personaRevision).toBe(persona.revision);
-    // The publish CLI sets the pointer explicitly, even for an existing revision ( ②).
+    // The publish CLI sets the pointer explicitly, even for an existing revision.
     expect(await personas.importPersona(persona, { setCurrent: true })).toEqual({ inserted: false, previousRevision: 'synthetic-v2' });
     expect((await personas.get(persona.id))?.revision).toBe(persona.revision);
   });

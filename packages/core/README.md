@@ -1,7 +1,7 @@
 # Chat core quote-selection contract
 
 The timeline model contract introduced in `persona-chat-v3-offsetless-quotes` (current revision
-`persona-chat-v4-turn-note-last`: same bytes without a safety note, see the S7 layout below) requests strict
+`persona-chat-v4-turn-note-last`: same bytes without a safety note, see the cache-friendly prompt layout below) requests strict
 JSON with `status`, `answer`, and `evidenceRefs`. Model prose in `answer` is never
 used to render factual claims. New model selections contain only:
 
@@ -34,7 +34,7 @@ bytes and `persona-chat-v1-source-quotes` revision were unchanged by it. The v3 
 prompt is an explicit variant; earlier study results must not be relabeled as if
 they used it. `PROMPT_REVISION` currently denotes the timeline revision.
 
-**Prompt layout (S7).** Every builder renders
+**Cache-friendly prompt layout (stable prefix first).** Every builder renders
 `policy · persona · history · [agent state/tools] · [evidence] · [safety note] · user · [tool transcript]`,
 so policy → persona → history is a prefix that only grows from turn to turn. The input-safety deflection note is
 its own system message right before the user utterance (it was appended to the policy message). Revisions:
@@ -57,7 +57,7 @@ prompt `persona-chat-v8-persona-card`. Their layout is
 
 ## agent-loop conversational voice and service boundaries
 
-`character-agent-context-v5-persona-card` (v3 wording, S7 layout, persona card) uses first-person author-role
+`character-agent-context-v5-persona-card` (v3 wording, cache-friendly prompt layout, persona card) uses first-person author-role
 narration in the disclosed research simulation. Light reactions, humour,
 atmosphere and minor scene embellishment are allowed, but are not verified
 source facts. Established core events/actors, exact quotations and important

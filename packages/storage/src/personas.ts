@@ -13,7 +13,7 @@ export class PostgresPersonaRepository implements PersonaRepository {
   }
   /**
    * Same revision + same content is idempotent; revision content cannot be replaced. A first-seen revision becomes
-   * current; an existing one moves the pointer only with `setCurrent` (the persona publish CLI ②).
+   * current; an existing one moves the pointer only with `setCurrent` when the persona publish CLI explicitly sets it.
    */
   async importPersona(input: Persona, options: { setCurrent?: boolean } = {}): Promise<{ inserted: boolean; previousRevision: string | null }> {
     const persona = PersonaSchema.parse(input);

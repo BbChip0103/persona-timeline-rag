@@ -1,11 +1,11 @@
-# licensed-dataset persona research Chat PoC — 제품 명세
+# Persona Timeline RAG — character chat PoC on a licensed research dataset
 
 > 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
 상태: 최소 TS채팅/DB/API/UI와 silver페르소나·RAG·자동평가 하네스가 구현됐다. 아래 전체 수용 기준은 자동 달성 결과가 아니다. 사람검수·독립 사건 truth·semantic entailment와 Goal2는 별도 잔여 gate다.
 
 ## 1. 목적과 완료 단위
 
-**선택한 인플루언서의 연구용 AI 클론과 멀티턴으로 채팅하고, 그 대화가 해당 인물의 과거 SNS 근거를 활용하도록 만든다.** 검색 후 질의응답은 기반 기능/중간 검증이지 PoC 완료가 아니다.
+**선택한 인플루언서의 연구용 AI 페르소나와 멀티턴으로 채팅하고, 그 대화가 해당 인물의 과거 SNS 근거를 활용하도록 만든다.** 검색 후 질의응답은 기반 기능/중간 검증이지 PoC 완료가 아니다.
 
 - 공개 활동·텍스트 표현을 바탕으로 정의한 페르소나가 일반 대화와 활동 질문에서 일관적인가?
 - 같은 페르소나/모델에서 timeline RAG가 무검색 대화보다 과거 활동 답변을 정확하게 만드는가?
@@ -37,11 +37,10 @@
 - 합성 캐릭터로 일반 대화·history·재접속·AI 표시·owner/person 격리·턴 상태를 검증한다. 같은 모델을 연결할 구조를 먼저 만들며 실제 모델 조건은 별도 확정한다.
 - 아직 corpus import/검색/임베딩을 선행조건으로 두지 않는다. `retrieval_mode=off`로 검색이 실제0회인지 테스트한다.
 
-### 2단계:4명 persona와 채팅·포스트/이미지 검증 — RAG off
+### 2단계:4명 persona와 채팅·포스트 초안 검증 — RAG off
 
-- reference persona authoring의 authoring 차원을 참고하되 다른 프로젝트 코드/문구를 복사하지 않고4명 각각 persona를 작성/검수한다. 정체성/분야·concept·behavior·speech·합성예시·greeting·boundary와 관찰/설계/미상 provenance를 구분한다.
-- 실제 모델로 일반 대화/후속 질문, Instagram 형식의 **AI 가상 포스트 초안**과 이미지 생성을 검증한다. 원본게시물/실제활동 회상과 창작brief는 구분하며 실제Instagram 게시/계정연결은 하지 않는다.
-- 이미지 provider는 External image GPT Image 2 `medium`. 공식API 독립adapter의 job/상태/다운로드/비용을 검증한다. [창작물 계약](creative-artifacts.md).
+- 실제 모델로 일반 대화/후속 질문과 Instagram 형식의 **AI 가상 포스트 초안**을 검증한다. 원본게시물/실제활동 회상과 창작brief는 구분하며 실제Instagram 게시/계정연결은 하지 않는다.
+- 공개 빌드의 이미지 생성은 비활성화한다. 포스트 초안만 제공하며 생성물은 실제 근거로 재사용하지 않는다. [창작물 계약](creative-artifacts.md).
 - 기존 Python 데이터는 persona 스타일/정적profile provenance 검수에 활용하되 runtime timeline RAG는 끈다. 검수된 정적사실 밖의 구체적인 과거활동은 미답으로 처리한다.
 - persona/model/settings와 채팅/창작 baseline을 고정한다. 생성된포스트/이미지/대화를 실제SourcePost/사건/gold로 재사용하지 않는다.
 
@@ -64,14 +63,11 @@
 ## 5. 기술·환경 제약
 
 - TypeScript/Node.js·pnpm·NestJS·Next.js/React, 로컬 Supabase/PostgreSQL·pgvector, SQL migrations·Zod 계열의 독립 프로젝트. 필요한 경우 기존 계열 pg-boss와 독립 GPU worker를 고려한다.
-- reference agent loop와는 의미적 데이터/adapter 경계를 맞춘다. 실제 reference agent loop 배포·등록·소스 직접 import는 이번 PoC에 포함하지 않는다.
-- 전용 project_id·포트·Docker 자원·credentials와 loopback guard를 요구한다. 다른 프로젝트 stage/prod/공유 DB 및 Supabase Cloud에 접속하거나 변경하지 않는다.
-- 모델·외부 전송 조건·비용·개인 credentials는 별도 확정 후 실행한다. 다른 프로젝트 키를 재사용하지 않는다.
 - 실제 persona 정의·채팅 내용·원본·평가 자료는 비공개, 공개 fixture는 합성. [데이터 정책](data-policy.md).
 
 ## 6. 비목표
 
-신규 SNS 수집/최신 위치 추론, 영상/음성·보이스 클론, 파인튜닝, 실제 본인 사칭, 공개 실존인물 챗봇 배포, 다른 프로젝트 서비스 변경/운영 병합, LP 전체 세계관·관계/보상 시스템, 인물간 비교·그룹 채팅. 공개/상업 사용과 향후 다른 프로젝트 통합은 별도 권한·효과 검토다.
+신규 SNS 수집, 최신 위치 추론, 영상·음성 생성과 보이스 클론, 파인튜닝, 실제 본인 사칭, 공개 실존인물 챗봇 배포, 인물 간 비교와 그룹 채팅은 범위 밖이다. 공개·상업적 사용은 데이터와 인물 권리 및 안전성을 별도로 검토해야 한다.
 
 ## 7. PoC 수용 기준
 
@@ -81,11 +77,10 @@
 4. 활동 질문의 요청/도구 결과/최종 답변을 추적할 수 있고, 답변 근거 카드가 실제 같은 인물의 출처를 가리킨다. 표현 후 무근거 사실 추가0건, 게시일/사건일 혼동0건을 목표로 검수한다.
 5. 인물 혼합·세션간 history 유출0건. 인물 변경은 새 세션이며 다른 인물 tool 요청, prompt injection, invalid/미답, 중단/재시도 중복 방지 회귀를 통과한다.
 6. 50게시물 추출 검수와50질문 평가에 더해4명×3개×5user turns=12개 대화 시나리오를 검수한다. 실제 같은 persona/model/history에서 RAG on/off의 사실성·말투 일관성·미답·지연·비용을 보고한다. recall@5≥90% 등은 제안 목표이며 성능 향상을 완료의 전제로 꾸미지 않는다.
-7. RAG off 상태의4명 채팅/포스트초안·External image 이미지 검증과 그 baseline 버전/비용을 기록한다. 실제호출 미수행/fake를 구분하고 생성물이 실제SourcePost로 들어가지 않는지 확인한다. 원본사진 VLM 근거보강은 선택확장이다.
-8. 최종완료는1~3단계 필수흐름/검수/비교보고서이며 다른 프로젝트통합은 이후 별도판단이다.
+7. RAG off 상태의 채팅/포스트 초안을 검증하고 생성물이 실제 SourcePost로 들어가지 않는지 확인한다. 이미지 생성은 공개 빌드에서 비활성화한다.
 
 ## 관련 계약
 
 [페르소나·채팅](persona-chat.md) · [창작물](creative-artifacts.md) · [근거 스키마](evidence-schema.md) · [평가](evaluation.md) · [아키텍처](architecture.md) · 현재 [`Post`](../src/persona_timeline_rag/schemas.py)
 
-기술 선택·논의 과정의 기준 이력은 코드 프로젝트 밖 작업 이슈 문서에서 관리한다. 이 문서는 현재 제품 계약이다.
+기술 선택과 논의 기록은 이 저장소에 포함되지 않은 비공개 설계 노트로 관리한다. 이 문서는 현재 제품 계약이다.

@@ -1,6 +1,6 @@
 # K6 final fix round — kind acceptance, 2026-10-14
 
-Scope: `kind-ptr-k8s`, synthetic data, local simulator, fake OpenRouter, and no paid calls. The acceptance bars are design §7, including its K6 V3 interpretation. The original round ran V1, V2, V3, V7, V8, V9, V11, V13, then V4, V5, V6, V10, V12. The follow-up reran only V2 worker deletion. An initial V2 setup attempt stopped before any subcase because of a Helm field ownership conflict; an initial V7 setup attempt stopped before its first saturation check because EPP could not reach the Kubernetes API. Both setup faults were repaired before the measured runs. A FAIL means a clause failed or its evidence was not obtained.
+Scope: `kind-ptr-k8s`, synthetic data, local simulator, fake OpenRouter, and no paid calls. The acceptance bars cover the Kubernetes tests summarized below, including the K6 V3 interpretation. The original round ran V1, V2, V3, V7, V8, V9, V11, V13, then V4, V5, V6, V10, V12. The follow-up reran only V2 worker deletion. An initial V2 setup attempt stopped before any subcase because of a Helm field ownership conflict; an initial V7 setup attempt stopped before its first saturation check because EPP could not reach the Kubernetes API. Both setup faults were repaired before the measured runs. A FAIL means a clause failed or its evidence was not obtained.
 
 **Result: 5 PASS, 1 PARTIAL, 7 FAIL.** No bar was relaxed.
 
@@ -149,7 +149,7 @@ were in fallback and held workers and engines at 1/1; fallback cleared at
 outbox residue on the final profile. One saturation check passed: 32 requests,
 2 successes, 22 `rejected-saturated`, and 8 `rejected-ttl-expired` drops.
 
-## Stage S3: worker spill headroom, 2026-10-15
+## Worker spill headroom acceptance, 2026-10-15
 
 Fresh `ptr-k8s` on kind used only the simulator, synthetic database and fake
 OpenRouter. No paid or external model calls were made. The first `up.sh` attempt
@@ -205,4 +205,4 @@ restored to 1,000,000 microUSD; all four kind nodes remained Ready. The final
 V2 run also verified the control-plane CIDRs persisted through both its setup
 and cleanup upgrades.
 
-Note on K3: the design describes K3 as "the gauge is still 1 when the budget runs out". This run instead started with spill already unavailable (budget exhausted, gauge 0). In cluster mode, a capacity 429 takes the same local-retry branch whether or not a spill was attempted first (`providers/local.py`). The one extra step in the stale-gauge window is the refusal before submission. The S1 unit tests cover it: `test_first_epp_capacity_refusal_retries_local_without_second_spill` and `test_chat_pre_submit_budget_refusal_has_special_type_and_no_submission`.
+K3 tested the exhausted-budget path with the gauge at 0. It did not exercise the brief stale-gauge window, when the gauge can still read 1 after the budget runs out. In cluster mode, a capacity 429 takes the same local-retry branch whether or not a spill was attempted first (`providers/local.py`). The one extra step in the stale-gauge window is the refusal before submission. The S1 unit tests cover it: `test_first_epp_capacity_refusal_retries_local_without_second_spill` and `test_chat_pre_submit_budget_refusal_has_special_type_and_no_submission`.

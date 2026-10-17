@@ -27,7 +27,8 @@ The UI distinguishes selected settings for a **new** session from the current
 session's pinned persona revision / retrieval mode. Timeline filters are explicit
 UTC `[start,end)` values, never guessed from prose. Sources render plain text,
 separate posted and event dates, and link only HTTP(S) URLs without credentials.
-shown rather than paid or web-cookie execution.
+Image generation is disabled in this public build. The UI shows the draft caption
+without paid or web-cookie execution.
 
 Verification:
 

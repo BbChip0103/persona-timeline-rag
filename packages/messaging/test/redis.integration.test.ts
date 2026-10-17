@@ -4,7 +4,7 @@ import { createRedisConnection } from '../src/redis';
 const url = process.env.PTR_REDIS_URL ?? '';
 const run = process.env.RUN_REDIS_TESTS === '1' ? describe : describe.skip;
 
-// Redis ACL : the app user `ptr` (keys and channels `ptr:*` / `ptrtest:*`, every command but the
+// Redis ACL: the app user `ptr` (keys and channels `ptr:*` / `ptrtest:*`, every command but the
 // @dangerous ones, plus INFO for BullMQ); the default user is off and there is no admin user.
 run('isolated Redis (opt-in RUN_REDIS_TESTS=1)', () => {
   it('connects as ptr and is configured for BullMQ (noeviction, read through INFO)', async () => {

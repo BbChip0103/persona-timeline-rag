@@ -10,7 +10,7 @@ import { loadInputs, parseCliArgs, publishDocuments, resolvePaths, restoreDocume
 import { prepare } from '../prepare-research';
 
 const withoutUndefined=(value:Persona):Persona=>JSON.parse(JSON.stringify(value)) as Persona;
-/**  (§5): synthetic personas, temp files and an in-memory store only — no database, no research data. */
+/** Synthetic personas, temp files and an in-memory store only; no database or research data. */
 const persona=(personId:string,patch:Partial<Persona>={}):Persona=>withoutUndefined({id:`persona:${personId}`,personId,label:'Synthetic',language:'en',revision:'draft',reviewStatus:'silver',
   identity:'Fictional research AI. Not a real person.',concept:'Synthetic style simulation.',style:['Prefer concise conversational responses.'],
   boundaries:['No real identity claim or endorsement.'],sourceRefs:[`${personId}:post-1`],greeting:'Hi! I am a research AI.',
@@ -106,7 +106,7 @@ describe('arguments and private paths (N3: named flags, env fallback, no default
   test('missing input files fail closed',async()=>{
     for(const key of ['sourcesDoc','splitFile','captionsFile'] as const) await expect(loadInputs({...paths,[key]:join(dir,'missing.json')})).rejects.toThrow();
   });
-  test('the private source document: §5.1 keys validated, extra keys ignored; errors name index and key only',async()=>{
+  test('the private source document validates its keys, extra keys ignored; errors name index and key only',async()=>{
     expect((await loadInputs(paths)).sources).toHaveLength(2);
     for(const bad of [{id:'note:1'},{paraphrase:'x'.repeat(301)},{retrievedAt:undefined},{url:'ftp://example.invalid'},{kind:'fan_wiki'},{personId:''}]) {
       await writeFile(paths.sourcesDoc,JSON.stringify([sourceEntry('syn-a'),{...sourceEntry('syn-b'),...bad}]));
@@ -180,7 +180,7 @@ describe('publish',()=>{
     expect(lines).toEqual([{personaId:'persona:syn-a',personId:'syn-a',revision,previousRevision:null,inserted:true,currentRevisionSet:true,publisher:'tester/synthetic',
       publishedAt:'2026-10-09T00:00:00.000Z',lintRevision:PERSONA_LINT_REVISION,sourceDocSha256,target:'loadtest_db',database:'ptr_loadtest'}]);
   });
-  test('same file → same revision; republishing is idempotent and restores current_revision (N6 ②)',async()=>{
+  test('same file → same revision; republishing is idempotent and restores current_revision',async()=>{
     const store=new MemoryStore();
     await publish([persona('syn-a')],{store});
     const listBefore=await readFile(paths.authoredList!,'utf8');
@@ -218,7 +218,7 @@ describe('publish',()=>{
   });
 });
 
-test('§5.3 deploy order: a reader on the old .strict() schema rejects a v2 document',()=>{
+test('deploy order: a reader on the old .strict() schema rejects a v2 document',()=>{
   const id=z.string().trim().min(1).max(200);
   const OldPersonaSchema=z.object({id,personId:id,label:z.string().min(1),language:z.string().min(1),revision:id,reviewStatus:z.enum(['synthetic','silver','human_reviewed']),
     identity:z.string(),concept:z.string(),style:z.array(z.string()),boundaries:z.array(z.string()),sourceRefs:z.array(id),greeting:z.string().min(1)}).strict();

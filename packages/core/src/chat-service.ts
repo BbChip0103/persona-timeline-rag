@@ -130,7 +130,7 @@ export class ChatService {
     if(!result.success) throw new CoreError('PERSONA_UNAVAILABLE');
     const persona=result.data;
     if(persona.id !== value.personaId || persona.revision !== value.personaRevision || persona.personId !== value.personId) throw new CoreError('FORBIDDEN');
-    // Greeting : an explicit index (evaluations pin 0) or one derived from the session id. The index is
+    // Greeting: an explicit index (evaluations pin 0) or one derived from the session id. The index is
     // stored only when it was given or there is a choice, so v1 personas keep their session shape.
     const greetings=greetingsOf(persona);
     if(value.greetingIndex!==undefined&&value.greetingIndex>=greetings.length) throw new CoreError('INVALID_INPUT');
@@ -266,7 +266,7 @@ export class ChatService {
       // provider error code are logged only when they look like a constant, otherwise as UNSPECIFIED, so free text
       // can never reach the log.
       const constant=(value:string)=>/^[A-Z_]{1,40}$/.test(value)?value:'UNSPECIFIED';
-      // The gateway refused or cut a model call at the turn deadline: a turn timeout, reported like the timer's own (§4.7).
+      // The gateway refused or cut a model call at the turn deadline; report the same timeout as the turn timer.
       const message=providerCode===PROVIDER_DEADLINE?'TURN_TIMEOUT'
         :error instanceof CoreError&&error.code==='TURN_FAILED'&&error.message!==error.code?error.message:undefined;
       this.options.onTurnFailure?.({turnId:turn.id,code:message!==undefined?constant(message):typeof providerCode==='string'?constant(providerCode)

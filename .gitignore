@@ -41,3 +41,19 @@ test-results/
 
 # Isolated framework verification environments
 .venv-guardrails/
+
+# Public checkout private material and local tool state
+*.private.*
+*.env
+!*.env.example
+*.log
+accounts/
+output/
+state/
+.omc/
+.claude/
+.codex/
+*.key
+*.pem
+*.ipynb
+infra/split/*.env

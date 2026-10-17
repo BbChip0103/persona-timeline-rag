@@ -95,7 +95,7 @@ function formattedQuote(text:string,quote:string):{start:number;end:number;quote
 /**
  * Experimental natural prose is explicitly unverified; quotes are validated independently. `language` is the reply
  * language and `level` the persona's speech level for the persona-voice fallback.
- * : a validation failure never shows a system text. Invalid evidence keeps the model's own answer, unverified
+ * A validation failure never shows a system text. Invalid evidence keeps the model's own answer, unverified
  * and without citations (the reply guard still runs on it in the chat service); an unparseable reply or an empty answer
  * gets the persona-voice fallback, also when its citations are valid (they stay in `evidence`/`claims`). INVALID_MODEL_EVIDENCE
  * stays in the limitations (metadata).

@@ -2,7 +2,7 @@ import type { Pool } from 'pg';
 import type { Persona } from '@ptr/contracts';
 import { PostgresPersonaRepository } from '../src/personas';
 
-/** Mocked client (no database): the SQL decisions of importPersona, including the publish CLI's setCurrent ( ②). */
+/** Mocked client (no database): the SQL decisions of importPersona, including the publish CLI's setCurrent behavior. */
 const persona:Persona={id:'persona-synthetic',personId:'synthetic',label:'Synthetic',language:'ko',revision:'synthetic-v2',reviewStatus:'synthetic',
   identity:'Fictional',concept:'test',style:[],boundaries:[],sourceRefs:[],greeting:'안녕'};
 function setup(state:{current?:string;existingHash?:'same'|'other'}) {

@@ -3,7 +3,7 @@ import type { Persona } from '@ptr/contracts';
 import { PERSONA_BLOCK_BYTE_LIMIT, PERSONA_LINT_REVISION, personaBlockBytes, personaRevision, renderPersonaBlock, validatePersonaForPublish, type PersonaPublishContext } from '../src';
 import { cardPersona, v1Persona } from './persona-fixtures';
 
-/** : fail-closed publish checks over every rendered field. Synthetic text only. */
+/** Fail-closed publish checks over every rendered field. Synthetic text only. */
 const known=new Set(['web:1','web:2','synthetic-a:post-1']);
 /** A real-person publish needs test captions to run the leak check; this unrelated synthetic one never overlaps. */
 const ctx=(patch:Partial<PersonaPublishContext>={}):PersonaPublishContext=>({testCaptions:['qqqq zzzz 합성 캡션'],sourceRefExists:ref=>known.has(ref),...patch});

@@ -19,7 +19,7 @@ describe('private research preparation',()=>{
     expect(()=>prepare([...rows,rows[0]!],targets)).toThrow('Duplicate');
     expect(()=>prepare([...rows,{...rows[0]!,person_id:'other'}],targets)).toThrow('outside');
   });
-  it('skips the DB import of personIds that have an authored persona ( ①) but still lists them',()=>{
+  it('skips the DB import of personIds that have an authored persona but still lists them',()=>{
     const personas=prepare(rows,targets).personas;
     const two=[personas[0]!,{...personas[0]!,id:'persona:synthetic-other',personId:'synthetic-other'}];
     expect(importablePersonas(two,[])).toEqual({importable:two,skipped:[]});

@@ -22,7 +22,7 @@ export interface ApiRuntime {
   saveArtifact(artifact:CreativeArtifact,requestKey:string):Promise<void>;
   guardrails?:GuardrailsClient;telemetry?:FrameworkTelemetry;billable?:boolean;
   providerName:string;model:string;close?():Promise<void>;
-  /** Dependency checks for /api/health (D23): database `SELECT 1` and Redis `PING`, 1 s each. */
+  /** Dependency checks for /api/health: database `SELECT 1` and Redis `PING`, 1 s each. */
   health?():Promise<{database:boolean;redis:boolean}>;
 
 }
@@ -116,7 +116,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
   const sources=new PostgresSourceRepository(pool);
   // SQL tests may retain immutable synthetic rows: only the private approved registry is a UI catalogue.
   // Authored personas (scripts/persona.ts publish) live in their own list so prepare-research cannot overwrite them;
-  // read once per process, so a publish needs an API restart .
+  // Read once per process, so a publish needs an API restart.
   const authoredFile=env.PTR_AUTHORED_PERSONAS_FILE;
   if(authoredFile&&!existsSync(authoredFile)) throw new CoreError('INVALID_INPUT','PTR_AUTHORED_PERSONAS_FILE is set but the file does not exist');
   let approved:Promise<Persona[]>|undefined;
@@ -193,7 +193,7 @@ export function createRuntime(env:NodeJS.ProcessEnv=process.env,hooks:{onTurnFai
     }
   }
   const store=new PostgresConversationStore(pool);
-  // Health (D23): its own Redis connection, opened on the first check (composing a runtime opens none).
+  // Health: its own Redis connection, opened on the first check (composing a runtime opens none).
   let pingConnection:ReturnType<typeof createRedisConnection>|undefined;
   const ping=()=>{if(!pingConnection) {pingConnection=createRedisConnection(redisUrl);pingConnection.on('error',()=>undefined);}return pingConnection.ping();};
   const delivery=new BullMqTurnDelivery(redisUrl,{queueName});

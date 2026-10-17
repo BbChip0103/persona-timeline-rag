@@ -63,7 +63,7 @@ test('malformed JSON, fenced output, nonobjects and oversized raw bytes fail wit
   expect(() => parseAgentResponse(undefined as unknown as string)).toThrow(CoreError);
 });
 test('credential patterns anywhere are rejected including escaped decoded strings', () => {
-  const secret = 'synthetic-credential';
+  const secret = 'sk-' + 'synthetic-credential';
   for (const value of [{ ...final, message: secret }, { ...final, reasoning: 'Bearer synthetic-token' },
     { ...final, variableUpdates: { conversationTopic: 'password=synthetic' } },
     { ...final, evidenceRefs: [{ sourceId: secret, quote: 'Synthetic' }] },

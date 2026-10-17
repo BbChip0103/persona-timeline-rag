@@ -1,6 +1,6 @@
 # Historical framework migration: obsolete gateway/fleet retirement
 
-This is a historical deletion record for the earlier framework migration. The current implementation removes the LiteLLM proxy path; current serving uses direct
+This is a historical deletion record for the earlier framework migration. The LiteLLM proxy path is retired; active serving uses direct
 local vLLM through Compose or Kubernetes EPP/InferencePool, with optional
 worker-only direct OpenRouter spillover in Kubernetes.
 

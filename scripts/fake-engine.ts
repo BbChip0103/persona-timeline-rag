@@ -1,5 +1,5 @@
 /**
- * FakeEngineUpstream (routing ): an OpenAI-compatible streaming engine for zero-cost routing comparisons.
+ * FakeEngineUpstream: an OpenAI-compatible streaming engine for zero-cost routing comparisons.
  *
  * - `slots` sequences run at once; more wait inside the engine (vLLM `num_requests_waiting`).
  * - KV (like vLLM V1): a running request needs (prompt − the prefix it shares with other RUNNING requests + output)
@@ -10,7 +10,7 @@
  * - Prefix cache: an LRU of message-boundary chain hashes H_k = sha256(H_{k−1} ‖ role ‖ content_k) with cumulative
  *   tokens; a hit skips that many prompt tokens. The engine counts tokens as bytes / `bytesPerToken` (4.45, the measured
  *   median; the gateway estimates with 3.9, so it over-reserves like in production). Like vLLM's, the cache lives in the
- *   free part of the KV pool (S5): the own tokens of cached entries not held by a running request stay within
+ *   free part of the KV pool: the own tokens of cached entries not held by a running request stay within
  *   `prefixCacheTokens` (default kvCapacityTokens) − KV in use, so load evicts them; a request's chain is touched tail
  *   first so its longest prefixes are evicted first. `stats.cachedTokens / stats.promptTokens` is the token-level hit
  *   rate (vLLM's prefix_cache_hits / queries are tokens too). The cache has the gateway prefix table's message-boundary
@@ -21,7 +21,7 @@
  * - `/health` 200; `/metrics` with the vLLM v1 names the gateway reads (vllm:num_requests_running / _waiting,
  *   vllm:kv_cache_usage_perc, vllm:prefix_cache_queries_total / _hits_total, vllm:cache_config_info{num_gpu_blocks,
  *   block_size}) and process_start_time_seconds. Checked against vLLM's docs/source upstream, not against the deployed
- *   build (). The prefix counters count requests here; vLLM counts tokens.
+ *   build. The prefix counters count requests here; vLLM counts tokens.
  * - Telemetry controls for acceptance runs: `report()` forces the reported KV usage / waiting, `hangMetrics()` leaves
  *   /metrics unanswered (stale telemetry), `restart()` restarts on the same port with a new start time and empty state.
  */

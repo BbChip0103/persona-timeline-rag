@@ -107,7 +107,7 @@ test.each(['caption','image','caption_with_image_id'] as const)('reference agent
     expect(turn.reply?.claims[0].evidenceRefs[0].annotationId).toBe(origin==='image'?annotation.id:undefined);
   }
 });
-test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs keep the model text unverified, without citations ',async()=>{
+test('unsupported detail remains natural uncertainty with no accepted evidence; bad refs keep the model text unverified, without citations',async()=>{
   const h=setup([final({status:'insufficient_evidence',message:'그건 잘 기억 안 나. 어느 그림 말하는 거야?'}),final({message:'아 기억나!',evidenceRefs:[{sourceId:'invented',quote:'invented'}]})]);
   const session=await h.chat.createSession('owner',{...create,ragCondition:'off'});
   const first=await send(h,session.id);expect(first.reply?.content).toBe('그건 잘 기억 안 나. 어느 그림 말하는 거야?');expect(first.reply?.evidence).toEqual([]);

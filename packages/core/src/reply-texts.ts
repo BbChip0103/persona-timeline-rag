@@ -1,9 +1,9 @@
 import type { ChatMessage, Persona } from '@ptr/contracts';
 
 /**
- * Deterministic texts in a given language: Korean for `ko`, `ko-…`, `ko_…`, English otherwise (S8: rule refusals were
+ * Deterministic texts in a given language: Korean for `ko`, `ko-…`, `ko_…`, English otherwise (rule refusals were
  * Korean in English sessions). The Korean strings are the previous fixed texts, unchanged. User-visible texts here are
- * for the legacy path; the agent and experiment paths show VOICE_TEXTS instead . Limitations and claim prefixes
+ * for the legacy path; the agent and experiment paths show VOICE_TEXTS instead. Limitations and claim prefixes
  * are metadata.
  */
 const TEXTS={
@@ -294,7 +294,7 @@ export function isVoiceText(key:VoiceTextKey,text:string):boolean {
   return Object.values(VOICE_TEXTS[key]).some(variants=>(variants as readonly string[]).includes(text));
 }
 /**
- * Language of the user's utterance for the reply , counted in words after links, @handles and #tags are removed:
+ * Language of the user's utterance for the reply, counted in words after links, @handles and #tags are removed:
  * Korean when words with Hangul are at least as many as Latin-only words ("AI 맞아?", "Procreate으로 그린 illustration
  * 어때?"), English when there are Latin words, otherwise the given fallback (the persona language).
  */

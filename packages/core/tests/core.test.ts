@@ -109,7 +109,7 @@ describe('session and turn lifecycle',()=>{
     const t=await service.sendTurn('owner_synthetic_a',{sessionId:s.id,clientRequestId:'r1',text:'안녕'});expect(t.state).toBe('failed');resolve('late');await tick();expect(await service.history('owner_synthetic_a',s.id)).toHaveLength(1);
   });
   test('credentials-like provider text is not exposed',async()=>{
-    const h=harness({generate:async()=> 'api_key=synthetic-credential'});const s=await h.create();
+    const h=harness({generate:async()=> 'api_key=' + 'synthetic-credential'});const s=await h.create();
     const t=await h.service.sendTurn('owner_synthetic_a',{sessionId:s.id,clientRequestId:'r1',text:'안녕'});expect(t.state).toBe('failed');expect(t.reply).toBeUndefined();
   });
   test('history context limit fails explicitly instead of truncating',async()=>{

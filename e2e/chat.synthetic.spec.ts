@@ -29,7 +29,7 @@ async function fixtures(page:Page,options:{operatorMode?:boolean;operatorNotice?
       if(path.endsWith('/events')){await route.fulfill({status:200,headers:{'content-type':'text/event-stream; charset=utf-8'},body:`event: turn\ndata: ${JSON.stringify(turn)}\n\n`});return;}
       value={turn};
     }
-    else if(/^sessions\/[^/]+\/drafts$/.test(path))value={artifact:{content:'[가상 포스트 초안 · AI 생성]\n합성 창작 초안입니다.'},image:{code:'IMAGE_RUNNER_ONLY'}};
+    else if(/^sessions\/[^/]+\/drafts$/.test(path))value={artifact:{content:'[가상 포스트 초안 · AI 생성]\n합성 창작 초안입니다.'},image:{code:'IMAGE_GENERATION_DISABLED'}};
     else {await route.fulfill({status:404,json:{error:{code:'NOT_FOUND'}}});return;}
     await route.fulfill({json:value});
   });
@@ -157,7 +157,7 @@ test('SYNTHETIC ONLY: explicit UTC filters hide evidence cards and preserve fict
   await page.getByLabel('대화 종류').selectOption('timeline');await page.getByLabel('타임라인 검색어').fill('합성');await page.getByLabel('날짜 기준',{exact:true}).selectOption('posted');await page.getByLabel('시작일 포함',{exact:true}).fill('2026-01-01');await page.getByLabel('종료일 제외',{exact:true}).fill('2026-02-01');
   await page.getByLabel('메시지',{exact:true}).fill('합성 캡션 근거를 보여 주세요.');await page.getByRole('button',{name:'보내기',exact:true}).click();await expect(page.getByText('그때 이야기를 들려줄게.',{exact:true})).toBeVisible();
   expect(state.sentBodies[0]!.timeline).toEqual({query:'합성',start:'2026-01-01',end:'2026-02-01',dateBasis:'posted',limit:5});await expect(page.locator('.source-card')).toHaveCount(0);await expect(page.getByRole('link',{name:'원본 링크 ↗'})).toHaveCount(0);
-  await page.getByText('가상 포스트 초안 · 실제 활동 근거 아님',{exact:true}).click();await page.getByLabel('창작 브리프').fill('합성 창작 브리프');await page.getByRole('button',{name:'가상 초안 만들기',exact:true}).click();await expect(page.getByText('[가상 포스트 초안 · AI 생성]',{exact:false})).toBeVisible();await expect(page.getByText('External image 이미지: 별도 무료 runner',{exact:false})).toBeVisible();
+  await page.getByText('가상 포스트 초안 · 실제 활동 근거 아님',{exact:true}).click();await page.getByLabel('창작 브리프').fill('합성 창작 브리프');await page.getByRole('button',{name:'가상 초안 만들기',exact:true}).click();await expect(page.getByText('[가상 포스트 초안 · AI 생성]',{exact:false})).toBeVisible();await expect(page.getByText('이미지 생성은 이 공개 빌드에서 제공하지 않습니다.',{exact:false})).toBeVisible();
 });
 test('real BFF boundary: HttpOnly signed cookie, origin restriction and fixed routes',async({page,request})=>{
   expect((await request.get('/api/proxy/personas',{headers:{'X-PTR-Owner':'forged-owner'}})).status()).toBe(403);
@@ -260,7 +260,7 @@ for(const kind of ['session','draft'] as const)for(const status of [200,503]) {
     let releaseWrite!:()=>void;let releaseLogout!:()=>void;const writeGate=new Promise<void>(resolve=>{releaseWrite=resolve;});const logoutGate=new Promise<void>(resolve=>{releaseLogout=resolve;});let writes=0;let staleHistoryReads=0;
     page.on('request',request=>{if(request.method()==='GET'&&new URL(request.url()).pathname.includes('synthetic-stale-session'))staleHistoryReads++;});
     const pattern=kind==='session'?'**/api/proxy/sessions':'**/api/proxy/sessions/*/drafts';
-    await page.route(pattern,async route=>{if(route.request().method()!=='POST'){await route.fallback();return;}writes++;await writeGate;await route.fulfill({status,json:status===503?{error:{code:'SYNTHETIC_LATE_ERROR'}}:kind==='session'?{session:{id:'synthetic-stale-session',personId:'synthetic-person-a',personaRevision:'synthetic-v1',retrievalMode:'off',ragCondition:'off',createdAt:'2026-01-01T00:00:00Z'}}:{artifact:{content:'synthetic stale draft must not render'},image:{code:'IMAGE_RUNNER_ONLY'}}});});
+    await page.route(pattern,async route=>{if(route.request().method()!=='POST'){await route.fallback();return;}writes++;await writeGate;await route.fulfill({status,json:status===503?{error:{code:'SYNTHETIC_LATE_ERROR'}}:kind==='session'?{session:{id:'synthetic-stale-session',personId:'synthetic-person-a',personaRevision:'synthetic-v1',retrievalMode:'off',ragCondition:'off',createdAt:'2026-01-01T00:00:00Z'}}:{artifact:{content:'synthetic stale draft must not render'},image:{code:'IMAGE_GENERATION_DISABLED'}}});});
     // Hold logout's transport response so the real component remains mounted after owner invalidation.
     await page.route('**/api/auth',async route=>{if(route.request().method()!=='DELETE'){await route.fallback();return;}await logoutGate;await route.fulfill({json:{ok:true}});});
     const writeStarted=page.waitForRequest(request=>request.method()==='POST'&&(kind==='session'?new URL(request.url()).pathname==='/api/proxy/sessions':new URL(request.url()).pathname.endsWith('/drafts')));

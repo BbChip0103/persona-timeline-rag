@@ -1,4 +1,4 @@
-#  (D24).
+# See docs/runbook.md and docs/architecture.md for the validation scope.
 # - check: every push and pull request. No secrets, and the checkout has no data/ and no .env* (the clean-clone
 #   acceptance), so a test that depends on a private local file fails here.
 # - integration: historical scientific Postgres and Redis regression suites, on main/manual runs, against throwaway containers on the

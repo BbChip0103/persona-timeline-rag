@@ -1,7 +1,7 @@
 # Historical LiteLLM engine routing
 
-> Historical reference only. The current implementation removes the LiteLLM proxy and
-> retired proxy implementation from the active repository. Do not run these
+> Historical reference only. The LiteLLM proxy and retired proxy implementation are absent
+> from the active repository. Do not run these
 > commands against the current checkout; rollback restores this path from the
 > private operational snapshot captured before cutover.
 

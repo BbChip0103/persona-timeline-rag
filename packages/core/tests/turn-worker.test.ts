@@ -273,7 +273,7 @@ describe('queued turn execution (outbox → delivery → leased worker)',()=>{
   test('a provider call refused or cut at the turn deadline (gateway `deadline`) ends the turn as TURN_TIMEOUT, like the turn timer',async()=>{
     const failures:{turnId:string;code:string}[]=[];
     const store=new InMemoryConversationStore();const delivery=new InMemoryTurnDelivery();const events=new InMemoryTurnEvents();
-    // What the gateway client throws for a marked 503 `deadline` or a 504 cut at X-PTR-Deadline .
+    // What the gateway client throws for a marked 503 `deadline` or a 504 cut at X-PTR-Deadline.
     const chat=new ChatService({store,personas:new InMemoryPersonaRepository([persona]),timeoutMs:5000,leases:store,delivery,events,maxQueueDepth:10,
       provider:{generate:async()=>{throw Object.assign(new Error(PROVIDER_DEADLINE),{code:PROVIDER_DEADLINE});}},onTurnFailure:failure=>failures.push(failure)});
     const s=await chat.createSession('owner_q',{personaId:persona.id,personId:persona.personId,personaRevision:persona.revision,retrievalMode:'off',timezone:'UTC'});

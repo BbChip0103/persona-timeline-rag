@@ -8,7 +8,7 @@ import type {CreativeArtifact} from '../src/creative-artifact';
 import {splitRuntimeFixture} from './split-runtime-fixture';
 import {ZodSchemaPipe} from '../src/schema-pipes';
 const ChatServiceGetTurn=SplitChatService.prototype.getTurn;
-// Two owner spaces : the web's production token sends `local-<40 hex>` owners only; this harness token
+// Two owner spaces: the web's production token sends `local-<40 hex>` owners only; this harness token
 // (PTR_API_SYNTHETIC_TOKEN) sends synthetic owners only. Most tests use the harness token.
 const token='synthetic_api_token_abcdefghijklmnop';
 const productionToken='production_api_token_abcdefghijklmnop';
@@ -99,7 +99,7 @@ test('authentication runs before malformed or oversized JSON parsing',async()=>{
   }
   expect(fixture.dispatches).toHaveLength(0);expect(runtime.draftRemote).not.toHaveBeenCalled();
 });
-test('owner spaces: the production token takes only web owners, the harness token only synthetic owners ',async()=>{
+test('owner spaces: the production token takes only web owners, the harness token only synthetic owners',async()=>{
   const production=`Bearer ${productionToken}`;
   expect((await call('personas',{auth:production,owner:webOwner})).status).toBe(200);
   for(const owner of ['lt-x','owner_synthetic_a','local-'+'0'.repeat(39),'local-'+'A'.repeat(40),'local-'+'0'.repeat(41),'../unsafe'])
@@ -167,7 +167,7 @@ test('fictional draft saved outside source corpus, private owner omitted; no ima
   const created=await call('sessions',{method:'POST',body:{personId:persona.personId}});const id=created.body.session.id;
   const drafted=await call(`sessions/${id}/drafts`,{method:'POST',body:{brief:'합성 그림 전시 소개'}});
   expect(drafted.status).toBe(201);expect(drafted.body.artifact.origin).toBe('generated');expect(drafted.body.artifact.fictional).toBe(true);expect(drafted.body.artifact.content).toContain('가상 포스트');expect(drafted.body.artifact.ownerId).toBeUndefined();
-  expect(artifacts).toHaveLength(1);expect(artifacts[0].ownerId).toBe('owner_synthetic_a');expect(drafted.body.image.code).toBe('IMAGE_RUNNER_ONLY');
+  expect(artifacts).toHaveLength(1);expect(artifacts[0].ownerId).toBe('owner_synthetic_a');expect(drafted.body.image.code).toBe('IMAGE_GENERATION_DISABLED');
   expect((await call(`sessions/${id}`)).body.history).toHaveLength(1);
   expect((await call(`sessions/${id}/drafts`,{method:'POST',owner:'owner_synthetic_b',body:{brief:'hi'}})).status).toBe(404);
 });

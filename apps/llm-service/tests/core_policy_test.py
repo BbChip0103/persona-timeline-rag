@@ -126,7 +126,7 @@ def test_own_story_experience_markers_are_blocked(reply):
 
 
 def test_head_policy_matrix_has_no_reply_disclosure_regression():
-    """Compare the frozen pre-C1 head with the pre-§18 synthetic fixture set."""
+    """Compare the frozen pre-C1 head with the earlier synthetic fixture set."""
     from ptr_llm.core.policy import reply_decision
 
     matrix = json.loads(Path(__file__).with_name("head_b008a3c_policy_matrix.json").read_text())

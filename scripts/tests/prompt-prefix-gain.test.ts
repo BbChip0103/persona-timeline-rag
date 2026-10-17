@@ -7,14 +7,14 @@ const message=(role:'user'|'assistant',content:string):ChatMessage=>({id:`m-${co
 const history=[message('assistant','안녕'),message('user','숲 그렸어?'),message('assistant','응')];
 const state:ProviderMessage={role:'system',content:'AGENT_STATE_JSON_DATA {"tone":"warm"}'},tools:ProviderMessage={role:'system',content:'AGENT_TOOLS_JSON_DATA []'};
 const transcript:ProviderMessage[]=[{role:'assistant',content:'{"function":{}}'},{role:'user',content:'TOOL_RESULT_JSON_DATA {}'}];
-/** What the previous layout (before S7) rendered for the same inputs. */
+/** What the previous layout (before the cache-friendly prompt layout) rendered for the same inputs. */
 function previousLayout(note:boolean):ProviderMessage[] {
   const s7=buildExperimentContext(persona,history,'언제?',[],{afterHistory:[state,tools],afterUser:transcript}).messages;
   const [policy,definition,...rest]=s7;
   return [{role:'system',content:note?`${policy!.content} ${SAFETY_DEFLECTION_NOTE}`:policy!.content},definition!,state,tools,...rest.filter(m=>m!==state&&m!==tools)];
 }
 
-describe('offline prefix-gain estimate ',()=>{
+describe('offline prefix-gain estimate',()=>{
   test('rebuilding a previous-layout call gives exactly what buildExperimentContext now renders (with and without a note)',()=>{
     for(const note of [false,true]) {
       const now=buildExperimentContext(persona,history,'언제?',[],{afterHistory:[state,tools],afterUser:transcript,...(note?{policyNote:SAFETY_DEFLECTION_NOTE}:{})}).messages;

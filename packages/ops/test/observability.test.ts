@@ -50,7 +50,7 @@ describe('standard Prometheus collectors',()=>{
   });
 });
 
-describe('JSON line log (D20)',()=>{
+describe('JSON line log',()=>{
   test('one JSON object per line with ts, role, event and constant-like fields only',()=>{
     const lines:string[]=[];const log=createLog('worker',line=>lines.push(line));
     log('turn_finished',{turnId:'3f1c2a9e-0000-4000-8000-000000000001',outcome:'failed',code:'TURN_TIMEOUT',durationMs:31000.4,ok:false,none:null});
@@ -74,7 +74,7 @@ describe('JSON line log (D20)',()=>{
 
 /** A port the OS just handed out and released (the listener under test binds it next). */
 const freePort=()=>new Promise<number>(resolve=>{const probe=createServer();probe.listen(0,'127.0.0.1',()=>{const {port}=probe.address() as {port:number};probe.close(()=>resolve(port));});});
-describe('metrics listener (D18)',()=>{
+describe('metrics listener',()=>{
   const events:{event:string;fields:Record<string,unknown>}[]=[];
   const onEvent=(event:string,fields:Record<string,unknown>={})=>{events.push({event,fields});};
   beforeEach(()=>{events.length=0;});

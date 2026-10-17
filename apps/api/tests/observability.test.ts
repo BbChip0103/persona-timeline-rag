@@ -11,7 +11,7 @@ import { publicTurn } from '../src/public-turn';
 import type {SplitApiRuntime} from '../src/split-runtime';
 import {splitRuntimeFixture} from './split-runtime-fixture';
 
-// : exact /metrics/prom names per role (plus the common pair).
+// Check exact /metrics/prom names per role (plus the common pair).
 const COMMON=['ptr_build_info','process_start_time_seconds'];
 const API_NAMES=[...COMMON,'ptr_http_requests_total','ptr_turns_created_total','ptr_sse_streams_open','ptr_owner_rejected_total'];
 const WORKER_NAMES=[...COMMON,'ptr_turns_finished_total','ptr_turn_duration_seconds','ptr_turn_queue_wait_seconds','ptr_turns_inflight',
@@ -27,7 +27,7 @@ const value=(text:string,name:string,labels:Record<string,string>={})=>parseExpo
   .find(sample=>sample.name===name&&Object.entries(labels).every(([key,v])=>sample.labels[key]===v))?.value;
 const until=async(check:()=>boolean|Promise<boolean>,ms=3000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,5));}throw new Error('condition not met');};
 
-describe('api /metrics/prom and health ',()=>{
+describe('api /metrics/prom and health',()=>{
   let app:INestApplication;let base:string;let runtime:SplitApiRuntime;let health:{database:boolean;redis:boolean};let fixture:ReturnType<typeof splitRuntimeFixture>;
   beforeEach(async()=>{
     fixture=splitRuntimeFixture(persona);runtime=fixture.runtime;health={database:true,redis:true};runtime.health=async()=>health;
@@ -69,7 +69,7 @@ describe('api /metrics/prom and health ',()=>{
     await until(async()=>value(await scrape(),'ptr_sse_streams_open')===0);
     await call(`turns/${sent.turn.id}/cancel`,{method:'POST',body:{}});
   });
-  test('/api/health is 503 when the database or Redis check fails (D23); the body names which',async()=>{
+  test('/api/health is 503 when the database or Redis check fails; the body names which',async()=>{
     expect((await call('health')).status).toBe(200);
     health={database:false,redis:true};
     const down=await call('health');expect(down.status).toBe(503);

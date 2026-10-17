@@ -8,7 +8,7 @@ import { AGENT_PROMPT_REVISION, CoreError, DEFAULT_SAFETY_THRESHOLDS, EXPERIMENT
 import { cardPersona, v1Persona } from './persona-fixtures';
 
 /**
- * Prompt layout byte stability : policy → persona → history is a prefix that only grows from
+ * Prompt layout byte stability: policy → persona → history is a prefix that only grows from
  * turn to turn; agent state/tools, evidence, the safety note and tool transcripts come after the history.
  */
 const persona:Persona={id:'layout-a',personId:'layout-person-a',label:'A',language:'ko',revision:'v1',reviewStatus:'synthetic',identity:'Fictional painter',concept:'Research',style:['brief'],boundaries:['AI simulation'],sourceRefs:[],greeting:'안녕'};
@@ -145,7 +145,7 @@ describe('experiment and legacy paths',()=>{
       expect(turn2.at(-2)).toEqual({role:'system',content:SAFETY_DEFLECTION_NOTE});expect(turn2.at(-1)).toEqual({role:'user',content:'숲?'});
       expect(turn2[0]!.content).not.toContain(SAFETY_DEFLECTION_NOTE);
     }
-    // Known limit (not changed in S7): the reply-format instruction is part of this path's policy message, so a switch
+    // Known limit (unchanged by the cache-friendly prompt layout): the reply-format instruction is part of this path's policy message, so a switch
     // between small-talk and timeline turns changes it. The goal2 serving path (agent) has one policy for every turn.
     expect(buildPrompt(persona,[],'a',[],true)[0]).not.toEqual(buildPrompt(persona,[],'a',[],false)[0]);
   });
@@ -211,9 +211,9 @@ describe('persona card layout (S8 follow-up: agent v10, experiment v13)',()=>{
     const added=`${PERSONA_CARD_POLICY} ${IDENTITY_PRIVACY_POLICY} ${REPLY_VOICE_POLICY} `;
     const experiment=buildExperimentContext(v1Persona,[],'x',[]).messages[0]!.content;
     expect(experiment).toContain(`${added}TIMELINE_JSON_REPLY:`);
-    // v12/v9  also reworded three phrases on purpose; undoing exactly those gives the v4/v7 bytes back.
-    // v13/v10  also removed the recollection voice's quotable example lines.
-    // v14/v11  reworded five phrases that asked for explicitly uncertain answers or named records/data; undone first.
+    // v12/v9 also reworded three phrases on purpose; undoing exactly those gives the v4/v7 bytes back.
+    // v13/v10 also removed the recollection voice's quotable example lines.
+    // v14/v11 reworded five phrases that asked for explicitly uncertain answers or named records/data; undone first.
     const v13Wording=(text:string)=>text.replace("and never present an unsupported statement as source-supported.","but clearly distinguish uncertain model-generated responses from source-supported statements.")
       .replace("answer naturally in character as IDENTITY_AND_PRIVACY says and","answer naturally with uncertainty and")
       .replace("No evidence means empty refs, and the message still answers in character as IDENTITY_AND_PRIVACY says;","No evidence means empty refs and an explicitly uncertain answer;")

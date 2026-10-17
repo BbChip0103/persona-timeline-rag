@@ -35,7 +35,7 @@ From "Worker gateway client" in goal2-serving.md (the retry table stays there).
   All URLs must be loopback, so a standby gateway is another port on the same host (it covers a process crash or a
   deploy, not a host failure). With `PTR_GATEWAY_DISCOVERY=redis` the list comes from the gateway registry and these
   URLs become its seed and fallback (see "Gateway registry and several gateways" below); with Kubernetes a single Service address in
-  `PTR_GATEWAY_URLS` and `static` discovery replace both (in the cluster profile).
+  `PTR_GATEWAY_URLS` and `static` discovery replace both.
 - Every gateway in `PTR_GATEWAY_URLS` must use the **same Postgres ledger database** (`GOAL1_DATABASE_URL`) when a
   billable secondary (`PTR_GATEWAY_FAILOVER=openrouter`) is on. A reset retry that lands on another gateway is safe
   only because both see the same ledger entry for the turn key; with separate ledgers the second gateway could pay for
@@ -58,14 +58,14 @@ BullMQ. Example: gateway defaults 32 + 256 = 288;
 4 workers × 32 = 128 is fine, 4 × 128 = 512 warns:
 `WARNING gateway capacity: worker concurrency 128 x replicas 4 = 512 > gateway capacity 288 (upstream caps 32 + queue 256); calls above it are refused with 429 and wait in client retries ...`.
 The load harness prints the same check (`report.capacityCheck`). Its fake-model defaults (gateway 1024 + 4096) are
-sized so the gateway is never the bottleneck. The S9 setting of 4 workers × 512 broke the rule; it measured fake
+sized so the gateway is never the bottleneck. An earlier setting of 4 workers × 512 broke the rule; it measured fake
 throughput only.
 
 With an upstream pool (below) each upstream also has its own cap `maxSeqs` (default 12), and the rule becomes
 Σ worker concurrency ≤ min(`PTR_GATEWAY_MAX_CONCURRENCY`, Σ_u maxSeqs_u) + max queue. `/metrics` `capacity` still
 reports the gateway-wide numbers only; the capacity controller (next section) enforces the rule from the registry.
 
-## Capacity controller (stage S2b)
+## Capacity controller
 
 The dispatcher keeps BullMQ's **global concurrency G** of the turn queue (`ptr:<PTR_TURN_QUEUE>:meta` field
 `concurrency`) at
@@ -73,7 +73,7 @@ The dispatcher keeps BullMQ's **global concurrency G** of the turn queue (`ptr:<
 ```text
 S_live = Σ maxSeqs of the pool's active, unexpired registry records that pass the gateway's record policy
          (allowlist, loopback, one id per origin; draining excluded; slow start ignored: the gateway absorbs the ramp)
-Q      = Σ maxQueue of the active gateways in the gateway registry that pass PTR_GATEWAY_ALLOW (S6),
+Q      = Σ maxQueue of the active gateways in the gateway registry that pass PTR_GATEWAY_ALLOW,
          else PTR_GATEWAY_MAX_QUEUE (256) when none is registered or the registry cannot be read
 G*     = max(PTR_CAPACITY_FLOOR (1), min(ceil(S_live × (1 + PTR_CAPACITY_HEADROOM (0.25))), S_live + Q))
 ```
@@ -91,7 +91,7 @@ value); in-flight turns = min(Σ local caps, G).
   never moves G. A newly **draining** upstream (planned shrink) lowers G at once. Lowering G never interrupts active
   turns: BullMQ only stops handing out new jobs (verified by the opt-in BullMQ test), so `active` may exceed G briefly
   and converges as turns finish.
-- **Registry unreachable:** G is held and those ticks never count toward a decrease (§13.2 freeze); BullMQ is down
+- **Registry unreachable:** G is held and those ticks never count toward a decrease during a registry outage; BullMQ is down
   with it anyway. A readable but empty registry goes to FLOOR (1) through the hysteresis: never 0, which would stop
   every worker silently. With failover on, OpenRouter's 120/min ceiling is the minimum path; turns beyond G wait in
   BullMQ, durably.
@@ -120,11 +120,11 @@ value); in-flight turns = min(Σ local caps, G).
 - **Known limits:** a crashed worker's job holds its active slot until BullMQ's stall check (about 30–60 s); one queue
   = one pool (several pools need one turn queue each).
 - **Headroom:** part of a turn runs outside the gateway (Jev intent p50 0.39 s × 0.594 calls/turn, the safety filter
-  about 0.4 s when on; the measured workload), so the GPUs stay busy only if G ≥ S_live / share, i.e. headroom ≈ 1/share − 1, where
+  about 0.4 s when on), so the GPUs stay busy only if G ≥ S_live / share, i.e. headroom ≈ 1/share − 1, where
   share = time in gateway calls / turn time. From the measured parts: share ≈ 1.0 with both Jev features off (the
   fake-model path's turn e2e p50 1.94 s vs gateway call p50 1.99 s), ≈ 0.86 with intent only and ≈ 0.69 with intent +
-  safety at an E4B call of 1.4 s (the measured safety step), so headroom 0 – 0.45. The default 0.25 stays; set 0.5 with both Jev features
-  on, and re-measure with real engines (S8). Too much headroom only lengthens gateway waits (bounded by Q); too little
+  safety at an E4B call of 1.4 s, so headroom 0 – 0.45. The default 0.25 stays; set 0.5 with both Jev features
+  on, and re-measure with real engines. Too much headroom only lengthens gateway waits (bounded by Q); too little
   leaves GPU slots idle (the acceptance harness shows it: share 0.6, G = 15 keeps about 9 of 12 slots busy).
 
 | Variable | Default | Meaning |
@@ -143,10 +143,10 @@ warning stays the guard.
 
 **Workers** read G and whether a controller leader is alive (`ptr:llm:cap:leader`) once at startup. On a worker only an
 explicit `PTR_CAPACITY_CONTROLLER` counts. Workers now often set `PTR_GATEWAY_DISCOVERY=redis` to read the gateway
-registry (S6), which derives `on`, but that says nothing about a controller. So without an explicit setting the line
+registry, which derives `on`, but that says nothing about a controller. So without an explicit setting the line
 follows the leader lock and never warns: a running leader is reported as `capacity controller running elsewhere: G=…`,
 a set G without a leader as an info line. Warnings come only from an explicit setting that disagrees:
-`PTR_CAPACITY_CONTROLLER=off|keep` while a leader runs (mixed modes), or `off` while a G is still set. The S1
+`PTR_CAPACITY_CONTROLLER=off|keep` while a leader runs (mixed modes), or `off` while a G is still set. The initial
 Σ-concurrency check against the gateways' `/metrics` runs unless `PTR_CAPACITY_CONTROLLER=on` is set here or a leader
 is running.
 
@@ -182,7 +182,7 @@ ptr:llm:ups:<pool>       ZSET member=<id> score=expiresAtMs   (read with ZRANGEB
 ptr:llm:reg:ver          INCR on every new record, field change, drain or removal
 ptr:llm:reg              PUB/SUB, empty message = "poll now"
 ptr:llm:drain:<pool>:<id> STRING epoch, PX the record's drainMaxMs + TTL: the drain tombstone
-ptr:llm:cap / :cap:leader HASH status / leader lock of the capacity controller (S2b)
+ptr:llm:cap / :cap:leader HASH status / leader lock of the capacity controller
 ```
 
 Expiry scores and the live listing use the Redis server clock (`TIME` inside the scripts). Pool names and ids are
@@ -250,7 +250,7 @@ pnpm exec tsx scripts/upstream-agent.ts list [--pool=gemma-4-e4b-fp8]
   `vllm:cache_config_info` (`num_gpu_blocks × block_size`, else `--kv-capacity-tokens`, else null) and
   `process_start_time_seconds` for the epoch (a hash of id, URL and start time: a restarted agent keeps the epoch, a
   restarted engine gets a new one; `--epoch` overrides; without either the epoch is random). Both metric names are
-  unverified against the deployed vLLM (); the fallbacks keep the agent working either way.
+  unverified against the deployed vLLM version; the fallbacks keep the agent working either way.
   It then heartbeats; three failed `/health` checks in a row deregister the engine until it is healthy again.
 - Drain (`SIGTERM`/`SIGINT` to the agent, or `drain` from anywhere): the agent heartbeats `state=draining` (every
   tick until a write succeeds), waits `PTR_UPSTREAM_DRAIN_SETTLE_MS` counted from that confirmed write, then until `vllm:num_requests_running + vllm:num_requests_waiting = 0` on two checks in a
@@ -278,19 +278,19 @@ From "Credit admission, central queue and routing" in goal2-serving.md.
 
 **Selection** (`PTR_GATEWAY_ROUTING`) among the fitting upstreams:
 - `round_robin`: rotate;
-- `least_inflight`: fewest in flight, ties rotate (the S2 rule);
-- `scored` (§4.3): least cost (U + (1 − h_u)·T̂) / (R_u · T_max) + (N + 1) / S_eff (h_u·T̂ = G, or the prefix-table
-  match when longer, S5), with R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of
-  hash(policy ‖ persona). Cache affinity (`PTR_GATEWAY_AFFINITY`, S5) can come before any of the three.
+- `least_inflight`: fewest in flight, ties rotate;
+- `scored`: least cost (U + (1 − h_u)·T̂) / (R_u · T_max) + (N + 1) / S_eff (h_u·T̂ = G, or the prefix-table
+  match when longer), with R_u = weight × 10000 until calibrated; ties go to the rendezvous-hash order of
+  hash(policy ‖ persona). Cache affinity (`PTR_GATEWAY_AFFINITY`) can come before any of the three.
 
-The default is `least_inflight`; `scored` stays selectable. It has not met the §9.1 acceptance bar (fixed before the
+The default is `least_inflight`; `scored` stays selectable. It has not met the acceptance bar (fixed before the
 first run: heterogeneous W2 and W3, one of {max throughput with TTFT p95 ≤ 2 s, TTFT p95 at the knee} ≥ 10% better and
 the other ≤ 5% worse; homogeneous W1 both ≤ 5% worse), so there is no evidence to change the default:
 
-- **S3 run** (single seed, fixed rate grid, partly overloaded): heterogeneous W2 had no rate meeting the 2 s TTFT p95
+- **Initial run** (single seed, fixed rate grid, partly overloaded): heterogeneous W2 had no rate meeting the 2 s TTFT p95
   for either policy, so that half of the bar could not be evaluated and the other did not reach 10%; in heterogeneous
   W3 `scored` was worse (TTFT p95 894 vs 667 ms at the nominal rate, throughput −2.3%). Homogeneous W1 within 5%.
-- **S4 re-run with the revised method** (below; `reports/routing-compare-muzx6c629836.json`, merged from three runs
+- **Re-run with the revised method** (below; `reports/routing-compare-muzx6c629836.json`, merged from three runs
   made in parallel as three processes on one 12-core host, so they shared CPU; knees 7.5 / 6 / 9 req/s for homogeneous
   W1 / heterogeneous W2 / W3, each from a single seed-0 sweep (the script now takes the median over 3 seeds); 3 seeds;
   means with 95% t intervals, descriptive only (3 seeds, no significance test); paired = per-seed relative
@@ -310,10 +310,10 @@ the other ≤ 5% worse; homogeneous W1 both ≤ 5% worse), so there is no eviden
   1531 ms). Every interval includes 0, so the data show no reliable difference in either direction on the
   heterogeneous configs. The one consistent signal is homogeneous W1, where `scored` had the lower TTFT p95 in 11 of
   15 seed × rate cells (it also counts uncached prefill tokens, which least in-flight ignores), not part of the bar.
-  Re-run after the prefix table and affinity (S5) and real-engine R_u / S_u calibration (S8), with longer windows or
+  Re-run after the prefix table and affinity and real-engine R_u / S_u calibration, with longer windows or
   more seeds, before revisiting the default.
 
-**Comparison method** (`scripts/routing-compare.ts`, revised in S4): per (config, workload) a knee sweep with
+**Comparison method** (`scripts/routing-compare.ts`, revised after the initial run): per (config, workload) a knee sweep with
 `least_inflight` on `--knee-seeds` seeds (default 3; per seed the highest rate of the monotone prefix with TTFT p95
 ≤ 2 s; the grid uses their median); a grid of knee ×
 0.8/0.9/1/1.1/1.2; 3 seeds per point, every random choice (arrival times, token lengths, outputs, flows) from the
@@ -326,7 +326,7 @@ are written as the strings "Infinity" / "-Infinity" in the JSON. `--merge=a.json
 parallel into one verdict; the same point twice is an error (`MERGE_DUPLICATE_POINT`), and so are runs whose stored
 `method` differs in anything that shapes points or knees — grid, seeds, `kneeSeeds`, windows, drain, arrivals, SLO, knee
 sweep, prompt layout (`MERGE_METHOD_MISMATCH`; reports written before `kneeSeeds` was stored never merge with new ones).
-`--policies` also takes `<policy>+affinity` variants (S5).
+`--policies` also takes `<policy>+affinity` variants.
 
 Limits: `drr` needs `X-PTR-Flow` (the worker does not send one yet, so all traffic is one flow = FIFO with LOOKAHEAD);
 for non-streaming requests the first chunk is the whole reply, so U stays reserved to the end; requests waiting on a
@@ -338,7 +338,7 @@ TPOT, KV capacity, prefix LRU over message-chain hashes, vLLM-named `/metrics`, 
 `scripts/routing-compare.ts` (W1–W4 × homogeneous / heterogeneous × the three policies, method above, report in
 `reports/routing-compare-<run>.json`).
 
-## Engine telemetry (stage S4)
+## Engine telemetry
 
 From "Engine telemetry, slow start after recovery, restarts" in goal2-serving.md (slow start after recovery,
 restarts and the primary-to-primary retry stay there).
@@ -346,7 +346,7 @@ restarts and the primary-to-primary retry stay there).
 Pools only (file or registry; the env-only single upstream and the failover wrapper are unchanged).
 
 **Telemetry polling (off by default):** `PTR_GATEWAY_METRICS_INTERVAL_MS` defaults to 0 until the metric names and
-meanings are verified on the real engines (S8); with e.g. 1000 the gateway reads each member's `GET {origin}/metrics`
+meanings are verified on the real engines; with e.g. 1000 the gateway reads each member's `GET {origin}/metrics`
 at that interval (one poll times out after `PTR_GATEWAY_METRICS_TIMEOUT_MS`, default min(500 ms, interval), overlapping polls collapse, a body over 1 MiB is
 dropped as a failed poll). Parsed (vLLM v1 names,
 checked against vLLM's metrics docs and `v1/metrics/loggers.py` upstream, **not against the deployed build**; design
@@ -363,7 +363,7 @@ Parsing skips comments, NaN and ±Inf, takes the first value token (a timestamp 
 ignored) and reads label values containing `}` or escaped quotes. Impossible values (KV usage outside [0, 1], negative
 counts) are treated as unknown, never as a block, and counted (`telemetry.implausible`).
 
-**Filter only, never a score input** (§4.4: delayed telemetry in a closed loop oscillates). While the last good poll is
+**Filter only, never a score input.** Delayed telemetry in a closed loop can oscillate. While the last good poll is
 at most 3 × the interval old, a member whose engine reports KV usage ≥ `PTR_GATEWAY_ENGINE_KV_HIGH` (0.95) or waiting >
 `PTR_GATEWAY_ENGINE_WAITING_MAX` (2) gets no new request: the request is treated like "no credit" and waits in the
 queue (no failover, no spillover); it is re-dispatched as soon as a poll clears the condition. **Fallback (agent
@@ -393,8 +393,8 @@ id), which is harmless for routing because the API server processes share one en
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PTR_GATEWAY_METRICS_INTERVAL_MS` | 0 = off (else 100–60000, e.g. 1000) | telemetry poll interval; stale after 3 ×; off until verified on real engines (S8) |
-| `PTR_GATEWAY_METRICS_TIMEOUT_MS` | 500 (the interval when shorter; 50–60000, at most 3 × the interval when telemetry is on) | one poll's timeout. Use 2000 for engines behind an SSH tunnel: S8 measured 0.6–1.2 s for `/metrics` on a new tunnel connection (3 ms on the host), so 500 ms polls failed and the member went stale; with 2000 the real-engine acceptance passed |
+| `PTR_GATEWAY_METRICS_INTERVAL_MS` | 0 = off (else 100–60000, e.g. 1000) | telemetry poll interval; stale after 3 ×; off until verified on real engines |
+| `PTR_GATEWAY_METRICS_TIMEOUT_MS` | 500 (the interval when shorter; 50–60000, at most 3 × the interval when telemetry is on) | one poll's timeout. Use 2000 for engines behind an SSH tunnel: a real-engine run measured 0.6–1.2 s for `/metrics` on a new tunnel connection (3 ms on the host), so 500 ms polls failed and the member went stale; with 2000 the real-engine acceptance passed |
 | `PTR_GATEWAY_ENGINE_KV_HIGH` | 0.95 (0.1–1) | KV usage at or above it filters a member out |
 | `PTR_GATEWAY_ENGINE_WAITING_MAX` | 2 (0–100000) | engine waiting above it filters a member out |
 
@@ -415,7 +415,7 @@ null.
 | A3 b's engine down 2–5 s (telemetry off) | breaker open at 2.2 s, closed at 5.2 s (3 s cooldown), b's limit 1 → 2 → 5 → 8 → 12 at +0/2.5/5/7.5/10 s (10 s ramp), at most 2 in flight in the first 2 s; 5 failed = the streams on b cut when it stopped (the worker retries those) |
 | A4 b's engine restarts at 5 s (same port and epoch) | restart confirmed at 6.8 s (two polls), b's limit 1 then 5 after 5 s, breaker closed, `events.restarted` 1; 4 failed = streams cut by the restart |
 
-## Prefix table, cache affinity, routing log and §8 metrics (–4.3, §8, stage S5)
+## Prefix table, cache affinity, routing log and metrics
 
 Pools only (file or registry).
 
@@ -436,11 +436,11 @@ off (several processes on the port, one may be a fresh engine); a new member (ne
 
 **What the table changes (only with affinity on):** the cached share of a request on upstream u becomes
 max(policy-block share G, its table match on u) for **prefill only**: the prefill ledger U, the calibrated prefill gate
-and the §4.3 cost (and so `scored`'s choice) use (1 − h_u)·T̂. The **KV reservation stays (T̂ − G) + M**: a prefix hit
+and the routing cost formula above (and so `scored`'s choice) use (1 − h_u)·T̂. The **KV reservation stays (T̂ − G) + M**: a prefix hit
 saves prefill compute, but KV only for blocks that a *running* request holds, and a session's history is held by none
 (one turn per session at a time), so vLLM allocates those blocks again (its free cached blocks move into use). The
 policy block is the one prefix that running requests always share. With affinity off the table is not consulted at all
-(matched = 0), so credit, `scored` cost and selection are exactly as in S4; the table is still kept, but only its
+(matched = 0), so credit, `scored` cost and selection are exactly as without affinity; the table is still kept, but only its
 size metrics fill in (`prefix.entries`, `prefix.tokens`, `prefix.cleared`): `extraHits` and the `affinity` outcome
 counters need a lookup and stay 0, so with affinity off the metrics do not show what affinity would have picked.
 
@@ -449,7 +449,7 @@ g_u = matched_u − G (cached tokens beyond the policy block, which every warm s
 g (the cheapest of those, then the rendezvous order) is picked if g ≥ `PTR_GATEWAY_AFFINITY_MIN_TOKENS` (256) and its
 cost_u ≤ min cost + `PTR_GATEWAY_AFFINITY_SLACK` (0.5), with cost_u = (U_u + (1 − h_u)·T̂) / (R_u·T_max) + (N_u + 1) /
 S_eff (R_u = weight × 10000 until calibrated). Otherwise the configured `PTR_GATEWAY_ROUTING` decides. **Composition
-(agent decision):** the slack is measured with the §4.3 cost whatever the routing policy, so its meaning ("at most
+(agent decision):** the slack is measured with the routing cost formula above whatever the routing policy, so its meaning ("at most
 0.5 more occupancy / prefill pressure than the least loaded candidate") is the same for every policy; the fallback is
 the policy itself — `least_inflight` (fewest in flight; with affinity on its ties go to the rendezvous order of
 hash(policy ‖ persona) instead of rotating, so a persona's cold-start requests gather on one server), `scored` (least
@@ -468,13 +468,13 @@ route rk=3f2a9c0d1b7e pool=gemma-4-e4b-fp8 band=0 est=1912 h={a:0.71,b:0.59} cos
 connection failure), `failover` (`pick=secondary`, h and cost empty); `affinity=` (picked | brokenBySlack | none) only
 when affinity is on; h and cost list the candidates that fit.
 
-**Metrics (§8)** added to `pool` in `/metrics`: per upstream `ttftMs` and `e2eMs` {p50, p95} (2xx calls, from dispatch
+**Metrics** added to `pool` in `/metrics`: per upstream `ttftMs` and `e2eMs` {p50, p95} (2xx calls, from dispatch
 to the first body chunk / to the end of a completed stream; a stream the caller closed early counts for TTFT only), `estOverActualTokens` {p50, p95, n} (T̂ / `usage.prompt_tokens` read from the
 end of the answer; the worker asks for usage with `stream_options.include_usage`), `prefix` {entries, tokens, cleared,
 extraHits (affinity on: dispatches whose table match exceeded G)}; per pool `latency` {ttftMs, e2eMs} (from arrival at the pool,
 queue wait included), `affinity` {mode, minTokens, slack, picked, brokenBySlack, none} (counted only when on),
-`prefixTtlMs`. Already present and named differently from §8: `retriedOnOtherPrimary` (= primaryRetries),
-`failover.failovers` by reason, `queue.queued` by band, `queue.rejected` by reason (`draining` since S6),
+`prefixTtlMs`. Already present and named differently from the metrics listed above: `retriedOnOtherPrimary` (= primaryRetries),
+`failover.failovers` by reason, `queue.queued` by band, `queue.rejected` by reason (`draining` after gateway drain was added),
 `seqUtil`, `kvUtil`, `telemetry`.
 
 | Variable | Default | Meaning |
@@ -487,31 +487,31 @@ queue wait included), `affinity` {mode, minTokens, slack, picked, brokenBySlack,
 
 **Affinity evaluation — pre-registered before the first run** (`scripts/routing-compare.ts`, `affinityAcceptance`):
 `least_inflight+affinity` (256 / 0.5) against `least_inflight` (the default), homogeneous and heterogeneous configs,
-W3 and W1, the S4 method (median knee of `least_inflight` over 3 knee seeds, grid 0.8–1.2 × knee, open loop, 15 s
+W3 and W1, the revised comparison method (median knee of `least_inflight` over 3 knee seeds, grid 0.8–1.2 × knee, open loop, 15 s
 windows, failures = ∞) with **5 seeds**. Affinity becomes the default only if **all** hold, on seed means:
 W3 on both configs — TTFT p95 at the knee ≥ 10% better and max throughput with TTFT p95 ≤ 2 s ≤ 5% worse; W1 on both
 configs — both ≤ 5% worse. Reported next to it, not part of the bar: TTFT p50, engine prefix hit rate (requests and
 tokens), dispatch imbalance (max / mean per upstream), affinity outcomes. Workload change for this run: W3 requests put
-the agent state after the history (the approved S7 P2 layout), so a session's turns share a prefix that grows with
-its history; with the layout of that time (state before the history) the shared prefix stopped at the persona and
-affinity had nothing to act on. S7 (below) made the app use that layout. The fake engine now models vLLM's KV: a request holds prompt − (prefix shared with running
-requests) + output, so a cached history saves prefill but not KV, and cached prefixes live in the free KV (capacity −
-KV in use, so load evicts them; the old model was 2000 entries and subtracted every cached token from KV). It counts
-hit tokens. **Fixed after the runs below (S6, Part A):** the shared blocks were charged to the request that allocated
+the agent state after the history, as described in [prompt layout for prefix reuse](goal2-serving.md#prompt-layout-for-prefix-reuse),
+so a session's turns share a prefix that grows with its history. Earlier runs placed state before history, stopping the
+shared prefix at the persona and leaving affinity little to act on. The fake engine now models vLLM's KV: a request holds
+prompt − (prefix shared with running requests) + output, so a cached history saves prefill but not KV. Cached prefixes
+live in the free KV (capacity − KV in use), so load evicts them; the old model used 2000 entries and subtracted every cached token from KV. It counts
+hit tokens. **Fixed after the runs below:** the shared blocks were charged to the request that allocated
 them only, so when that request ended first its sharer's history dropped out of the KV in use (under-counted KV:
 the fake engine admitted somewhat more than vLLM would under sharing). Shared blocks are now counted once and freed by
 their last running holder. Every run below was affected (all requests share at least the policy block), both arms
 alike: the fake engine's own KV limit was looser than intended, which matters only where that limit binds (KV-bound
 configs near the knee). The runs were not repeated: the bar failed by a wide margin, and the fix tightens the engine
 for both arms, not one. The fake cache has the gateway table's message-boundary granularity and sees exactly the gateway's
-requests, so these runs do not exercise table staleness (other clients, engine eviction policy, real tokenization). Expectation from the design (§0, §1.2): small, because the
+requests, so these runs do not exercise table staleness (other clients, engine eviction policy, real tokenization). The expected gain is small because the
 policy block (~60% of a prompt) is cached on every server whatever the routing.
 
 **Result.** Two runs; the second is the one that counts for W3. Both: 5 seeds per point, knees from 3 seeds, seed
 means with 95% t intervals, gains positive = affinity better, paired = mean of the per-seed relative differences,
 runs made in parallel (one process per config × workload, one 12-core host, shared CPU).
 
-1. `reports/routing-compare-muzzck15899f.json` (all four combinations) used the first S5 code: the KV reservation
+1. `reports/routing-compare-muzzck15899f.json` (all four combinations) used the initial prefix-table code: the KV reservation
    subtracted the table match and the fake engine subtracted every cached token from KV. Both overstated what a
    history hit saves (review finding; fixed above).
 2. `reports/routing-compare-mv00vpea57e4.json` (W3 only, after the fix: KV = (T̂ − G) + M, table off when affinity is
@@ -539,17 +539,17 @@ default.** Supporting numbers (run 2, at the knee unless noted; not part of the 
   1.51 vs 1.54: affinity did not concentrate load.
 - Over the 25 seed × rate cells affinity had the lower TTFT p95 in 12 (homogeneous) and 12 (heterogeneous), median
   paired gain 0.0% in both: run 1's heterogeneous lean (19 of 25) did not survive the KV fix. The seed spread is far
-  larger than the difference; as in S4, throughput in an open loop equals the offered rate unless a policy crosses
+  larger than the difference; as in the earlier runs, throughput in an open loop equals the offered rate unless a policy crosses
   2 s somewhere on the grid, so that half of the bar barely moves.
 
-Revisit only with a reason to expect more: the approved S7 prompt reordering in the app (this run assumed it), longer
-histories (more prefill saved per sticky turn), or real-engine calibration (S8). Reusing history never saves KV.
+Revisit only with a reason to expect more: the prompt reordering in the app (this run assumed it), longer
+histories (more prefill saved per sticky turn), or real-engine calibration. Reusing history never saves KV.
 
 ## Gateway registry and several gateways
 
 From "Gateway HA" in goal2-serving.md (the graceful drain stays there).
 
-**Gateway registry (§13.6, G2).** `PTR_GATEWAY_REGISTRY=on|off` (default `on` with `PTR_GATEWAY_DISCOVERY=redis`,
+**Gateway registry.** `PTR_GATEWAY_REGISTRY=on|off` (default `on` with `PTR_GATEWAY_DISCOVERY=redis`,
 else `off`) publishes, under the registry prefix (`PTR_REGISTRY_PREFIX`, default `ptr:llm`):
 
 ```text
@@ -594,7 +594,7 @@ be on a port in `PTR_GATEWAY_ALLOW` (default 56460–56469). A gateway on anothe
 - A failed read keeps the last list (Redis outage fallback), so the list is never empty.
 - Registry URLs must be `http://127.0.0.1:<port>/v1` with no credentials, query or fragment, on a port in
   `PTR_GATEWAY_ALLOW` (default `127.0.0.1:56460-56469`; same syntax as `PTR_GATEWAY_UPSTREAM_ALLOW`). This is the same
-  §13.4 guard as for engines: anyone with the Redis password can register, and a prompt must never go to an
+  record guard as for engines: anyone with the Redis password can register, and a prompt must never go to an
   unlisted port.
 - If two ids share a URL, the later start wins.
 - Ignored records are logged once per record version, with the reason only and no URLs: `WARNING gateway registry: N
@@ -606,7 +606,7 @@ be on a port in `PTR_GATEWAY_ALLOW` (default 56460–56469). A gateway on anothe
 standby's queue is counted although only the active one queues in steady state. Q only binds when S_live × headroom
 exceeds it (S_live 24 at headroom 0.25 adds 6, far below 256), so this over-count does not matter in practice.
 
-**Per-replica limits (§6.2 amendment):**
+**Per-replica limits:**
 - **Failover per-minute ceiling:** each gateway uses floor(`PTR_GATEWAY_FAILOVER_MAX_PER_MINUTE` / k), at least 1.
   k = the active gateways in the registry that pass `PTR_GATEWAY_ALLOW` at its last successful read, itself always
   included (also while draining). In H1 this halves the active gateway's own share while a standby is registered
@@ -618,9 +618,9 @@ exceeds it (S_live 24 at headroom 0.25 adds 6, far below 256), so this over-coun
     last k.
   - **k is unknown until the first successful registry read**, for example on a cold start during a Redis outage.
     Until then the ceiling is 1 per minute, the most conservative value. BullMQ shares that Redis, so no new turns
-    run then anyway (§13.2).
-  - A global per-minute check in the Postgres ledger (design S9) would remove both limits.
-  - **Registry heartbeat failures are visible (S7 Part A).** A wrong `PTR_REDIS_URL` or password on a gateway used
+    run then anyway.
+  - A global per-minute check in the Postgres ledger would remove both limits.
+  - **Registry heartbeat failures are visible.** A wrong `PTR_REDIS_URL` or password on a gateway used
     to leave k unknown, so the ceiling stayed at 1 per minute without any sign. The gateway now writes one line to
     stderr on the first failed heartbeat and then at most one a minute while failures go on (a flapping Redis is
     limited the same way): `WARNING gateway registry heartbeat failed (<code or error class>): N in a row, M in total; k
@@ -650,7 +650,7 @@ exceeds it (S_live 24 at headroom 0.25 adds 6, far below 256), so this over-coun
 
 `scripts/gateway-ha-acceptance.ts` runs real gateway processes (pool mode, registry on) in front of in-process fake
 engines (2 × 12 slots, about 1.5 s per call). It runs closed-loop worker clients, one client per user, with request
-keys and the S1 retry settings, and two `GatewayDirectory`s over the real Redis registry in a `ptrtest:s6<run>:llm`
+keys and the retry settings in [goal2-serving.md](goal2-serving.md#worker-gateway-client-retries), and two `GatewayDirectory`s over the real Redis registry in a `ptrtest:s6<run>:llm`
 namespace, deleted afterwards. Each scenario runs for 30 s, and the leader is killed at 10 s.
 
 For D, the gateways run `PTR_GATEWAY_FAILOVER=openrouter` with the real `OpenRouterClient` and Postgres ledger
@@ -674,12 +674,6 @@ Report: `reports/gateway-ha-acceptance-be804406.json` and `reports/loadtest/…-
 
 Notes:
 - Before the registry record expires, the killed gateway stays at the head of the list. Each call pays one refused
-  connect (S1: no wait before an untried URL; 48 of 96 calls in the C kill window show 2 attempts).
+  connect (no wait before an untried URL; 48 of 96 calls in the C kill window show 2 attempts).
 - After a drain the deleted record's URL can reappear at the end of the list as a seed URL, which is harmless.
 - One run per scenario on one host. These results describe the failover mechanics, not multi-host fault tolerance.
-
-## Sources
-
--  (operations round 2, §2 demo-mode freeze) and the measurements behind each feature:  (scale
-  architecture plan), 35 (scale results), 37 (request routing survey), 38 (multi-server routing design) and 39
-  (multi-server routing results), all in the `private design notes` repo under `<private-design-notes>/`.

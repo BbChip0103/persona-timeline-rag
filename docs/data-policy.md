@@ -22,7 +22,6 @@
 
 연구용 AI 페르소나는 실제 본인/공식 계정이 아닌 시뮬레이션임을 표시합니다. 실제 인물의 비공개 관계·감정·의도·사적 기억을 설계로 채워 사실처럼 말하지 않습니다. 사용자와의 채팅도 실제 인물의 현실 이력이나 관계로 기록하지 않습니다. 승인된 로컬 연구용 채팅과 공개/상업용 실존인물 챗봇 배포는 구분합니다.
 
-포스트/이미지는 AI 가상 초안으로 표시하고 실제Instagram에 업로드하지 않습니다. 생성물을 실제 게시물/사건/평가정답으로 재유입하지 않습니다. External image는 외부 API이므로 모델 선택과 별개로 개인 자격·비용·원본/사진 reference 전송 조건을 확인합니다. 다른 프로젝트 cookie/API key는 사용하지 않습니다. [창작물 계약](creative-artifacts.md).
 
 ## 외부 전송
 
@@ -40,7 +39,7 @@
 - Paid spillover는 턴 id를 원장 멱등 키로 씁니다. 같은 턴의 재시도는 끝난 응답을 재사용하거나, 결과가 미확정이면 다시 보내지 않습니다(이중 과금 없음). 예산은 durable ledger로 제한하고, 기본 모드에서는 worker-only provider key credit limit도 적용합니다.
 - Jev 호출이 실패하거나 시간을 넘기면 규칙만으로 처리합니다(fail-open). 페르소나 카드·캡션·모델 응답은 Jev로 보내지 않습니다.
 - RunPod 호스트는 이 저장소 밖의 제3자 장비입니다. 프롬프트는 그 호스트의 엔진 프로세스가 처리하며, 호스트의 디스크·로그 보존과 접근 통제는 이 코드가 관리하지 않습니다. 접속 정보와 호스트 정보는 저장소에 두지 않습니다.
-- 이 표 밖의 직접 OpenRouter 연구 실행(채팅과 질의 임베딩)도 같은 live 조건과 원장으로 OpenRouter에 보냅니다. External image는 위 창작물 계약을 따릅니다.
+- 외부 모델 전송은 개인 자격, 비용 한도, 원본 전송 조건을 확인한 실행에서만 허용합니다. 공개 빌드의 이미지 생성은 비활성화돼 있습니다.
 - 연구·평가 스크립트(운영자가 live 조건을 켜고 직접 실행할 때만): `scripts/live-research.ts`는 라이선스 원본 캡션을, `scripts/import-image-annotations.ts`는 AI 이미지 설명 텍스트를 임베딩용으로 OpenRouter(`openai/text-embedding-3-small`)에 보냅니다. `scripts/evaluate.ts`, `scripts/evaluate-memory-context.ts`, `scripts/provider-bench.ts`, `scripts/bench-jev-gemma.ts`, `scripts/evaluate-jev-*.ts`, `scripts/s8-gates.ts`는 평가용 대화 프롬프트나 사용자 발화를 위 표와 같은 방식(OpenRouter 채팅·Jev, 또는 RunPod 엔진)으로 보냅니다.
 - 자체 엔진 local 경로에는 실제 질의 임베딩이 없습니다. semantic 세션은 만들 수 없고(`SEMANTIC_UNAVAILABLE`), 임베딩을 위한 새 외부 전송은 연결하지 않았습니다.
 

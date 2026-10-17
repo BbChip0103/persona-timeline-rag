@@ -834,8 +834,9 @@ class InferenceChartContractTest(unittest.TestCase):
         self.assertIn("ptr.io/namespace=inference", up_script)
         self.assertIn("policy.apiServerCIDRs[1]=$control_plane_ip/32", up_script)
 
+        # RFC 5737 TEST-NET-1 address: chart pass-through fixture, not a kind node IP.
         rendered = helm_template(
-            "kind", "--set-string", "policy.apiServerCIDRs[1]=172.29.0.3/32",
+            "kind", "--set-string", "policy.apiServerCIDRs[1]=192.0.2.3/32",
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         prometheus_policy = parsed_document(
@@ -847,7 +848,7 @@ class InferenceChartContractTest(unittest.TestCase):
             for target in rule.get("to", [])
             if "ipBlock" in target
         ]
-        self.assertEqual(api_cidrs, ["10.96.0.1/32", "172.29.0.3/32"])
+        self.assertEqual(api_cidrs, ["10.96.0.1/32", "192.0.2.3/32"])
         ksm_policy = parsed_document(
             rendered.stdout, "NetworkPolicy", "ptr-kube-state-metrics-egress",
         )

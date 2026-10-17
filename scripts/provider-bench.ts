@@ -1,5 +1,5 @@
 /**
- * Goal2 D2-b/D2-c: provider-call latency for the same app-shaped synthetic prompt across
+ * Provider-call latency for the same app-shaped synthetic prompt across
  * OpenRouter (API baseline) and self-hosted engines reached through an SSH tunnel.
  *
  *   pnpm exec tsx scripts/provider-bench.ts openrouter --levels=1,4,8 --requests=12 --max-usd=0.25

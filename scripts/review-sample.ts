@@ -120,7 +120,7 @@ function reviewEvidence(value: unknown): ReviewEvidence[] {
 /** Upstreams that serve real model replies (docs/observability.md); `fake` and `unknown` are not among them. */
 const REAL_UPSTREAMS = new Set(['primary', 'secondary', 'openrouter', 'direct']);
 /**
- * reply.serving : `{calls, upstreams[], secondaryCalls}`, one upstream name per model call. Fail-closed: a
+ * reply.serving: `{calls, upstreams[], secondaryCalls}`, one upstream name per model call. Fail-closed: a
  * turn any call of which was not answered by a known real upstream (the fake model, `unknown`), or a record without that
  * shape, is left out. Turns stored before O4 have no record and stay eligible.
  */
@@ -130,7 +130,7 @@ function fakeServing(serving: unknown): boolean {
   return typeof serving !== 'object' || !Array.isArray(upstreams) || !upstreams.every(name => typeof name === 'string' && REAL_UPSTREAMS.has(name));
 }
 
-/** Population : local owners, real-person personas, a real reply, not served by a fake or synthetic engine. */
+/** Population: local owners, real-person personas, a real reply, not served by a fake or synthetic engine. */
 function eligible(row: Record<string, unknown>): boolean {
   const reply = row.reply as ReplyLike | null;
   return /^local-/.test(text(row.owner_id)) && row.review_status !== 'synthetic' && !!reply && typeof reply === 'object'

@@ -3,14 +3,9 @@
 > 현재 실행 계약은 [runbook](runbook.md)을 따른다. 아래는 전체 설계/수용 기준이다. 구현·합성 회귀 및 실제 silver 실행과 사람검수 완료를 구분한다. 아직 달성하지 않은 human-gold/사건병합/semantic entailment/배포 기준을 구현 성공으로 해석하지 않는다.
 상태: 최소 persona/sessions/turns와 TS core·DB/API/UI·모델 경계가 구현됐다. 실제 persona는 **silver 초안, 사람검수 pending**이다. 개발 캡션의 관찰 통계와 독립 작성한 대화 설계를 분리하는 offline refinement가 구현됐으며, 새 revision의 모델 성능이나 실존 인물 말투 충실도가 검증됐다는 뜻은 아니다. 아래 풍부한 authoring/reference 설계 전체가 구현된 것은 아니다. [PRD](prd.md)의 필수 PoC 완료 단위이며 [근거 계약](evidence-schema.md)을 사용한다.
 
-## 1. 호환 범위
+## 1. 단계와 retrieval mode
 
-
-개인 PoC의 `person_id`, `persona_id`, `persona_revision`, `session_id`는 서로 다른 식별자다. 추후 다른 프로젝트 bot/template/room ID 대응은 adapter의 별도 매핑이며 지금 다른 프로젝트 ID를 발급하거나 사용하지 않는다.
-
-### 단계와 retrieval mode
-
-먼저 합성캐릭터 채팅 환경을 만들고4명 persona로 채팅/포스트초안/이미지 표현을 검증한 뒤 timeline RAG를 추가한다. 세션/run은 `retrieval_mode: off | lexical | semantic`을 기록한다. `off`는 tool/embedding 호출0회이고, 구체적인 실제활동은 검수된 정적profile 근거 밖이면 미답이다. 같은 persona revision/model/history를 고정한 후 RAG를 켠다. [창작물 계약](creative-artifacts.md).
+먼저 합성캐릭터 채팅 환경을 만들고4명 persona로 채팅/포스트초안을 검증한 뒤 timeline RAG를 추가한다. 세션/run은 `retrieval_mode: off | lexical | semantic`을 기록한다. `off`는 tool/embedding 호출0회이고, 구체적인 실제활동은 검수된 정적profile 근거 밖이면 미답이다. 같은 persona revision/model/history를 고정한 후 RAG를 켠다. [창작물 계약](creative-artifacts.md).
 
 ## 2. 공개 프로필과 비공개 정의
 
@@ -129,11 +124,9 @@ owner 확인 후 owned session 응답 projection이며 구현된 API가 아니�
 5. concurrent sends, idempotent retry, tool/provider timeout, cancel/늦은 결과, stream 단절/reload, 미검증 claim 비공개.
 6. [평가 명세](evaluation.md)의12시나리오를 같은 persona/model/history에서 비교하고 사실·표현·미답을 따로 보고한다. 기반 unit test 통과를 실제4명 model 성능과 혼동하지 않는다.
 
-
 ## 실행 profile
 
 새 API 세션의 `agent_loop` 응답은 사용자 message와 비공개 결정 요약/대화 변수/action을 분리한다. 기존 세션과 저수준 core 기본값은 호환성을 유지하며, 향후 자연대화 평가는 `agent_loop`를 고정하고 RAG 3조건만 비교한다. 상세 [character-agent.md](character-agent.md). persona 및 대화 변수는 실제 활동 근거나 인물 정체성 인증이 아니다.
-
 
 ## 개발 캡션 기반 대화 설계 refinement
 
@@ -166,7 +159,6 @@ ID/person ID, 원래 언어, AI 공개 identity/greeting, 기존 boundaries를 �
 생성 명령은 활성화하지 않는다. 검토 후 **독립 로컬 DB의 loopback 자격**을 확인한 활성화 작업에서 `PostgresPersonaRepository.importPersona()`에 versioned 파일을 전달할 수 있다. 저장소는 새 version을 보존하고 현재 revision만 바꾸며 기존 세션은 저장된 `personaRevision`으로 이전 정의를 계속 조회한다. 같은 revision의 내용 변경 및 다른 person에 대한 ID 재사용은 거부된다. 실제 DB 활성화의 성공/원본 보존은 별도 SQL 검증이 필요하다. API 프로세스나 UI의 새 세션 선택 상태도 확인해야 하며 offline 파일 생성만으로 실제 채팅에 적용됐다고 주장하지 않는다.
 
 평가는 **핵심 기억 일치·정정 후 복구**와 **말투·설계 일관성·재미**를 분리한다. 이 버전 생성과 합성 회귀 통과는 실제 모델 비교나 사람검수 결과가 아니며 이전 엄격한 사실 점수를 새 기준으로 조용히 변경하지 않는다. 가상 반응/분위기는 허용되지만 생성물은 원본 이력이나 RAG 근거로 재유입하지 않는다.
-
 
 ### Atomic isolated-local activation
 

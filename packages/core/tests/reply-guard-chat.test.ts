@@ -75,24 +75,24 @@ test('rule refusals on the character paths are persona-voice declines in the use
   expect((await h.turn(realKo,'집 주소 알려줘',{})).reply).toMatchObject({status:'out_of_scope',content:replyText('rule_refusal','ko')});
   expect(h.provider.generate).not.toHaveBeenCalled();
 });
-test('invalid evidence keeps the model text, unverified, with the reason only in the metadata ',async()=>{
+test('invalid evidence keeps the model text, unverified, with the reason only in the metadata',async()=>{
   const h=setup(()=>agentReply('Remember!',{evidenceRefs:[{sourceId:'invented',quote:'invented'}]}));
   expect((await h.turn(realEn,'Tell me about the forest painting',agent)).reply).toMatchObject({content:'Remember!',grounding:'unverified_model',evidence:[],limitations:expect.arrayContaining(['INVALID_MODEL_EVIDENCE'])});
 });
 
-test('policy keeps the first-person voice : no third-person rule; facts only from background, lore or evidence',()=>{
+test('policy keeps the first-person voice: no third-person rule; facts only from background, lore or evidence',()=>{
   for(const policy of [IDENTITY_PRIVACY_POLICY,PERSONA_CARD_POLICY]) {
     expect(policy).not.toMatch(/third[- ]person|never retell|first-person memor|never real memories/i);
   }
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/own voice/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/first person/);
-  // v14/v11 : small everyday colour may be filled in; important real-world facts are never invented.
+  // v14/v11: small everyday colour may be filled in; important real-world facts are never invented.
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/never invent important real-world facts/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/Small everyday colour/);
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/never deny being an AI/);expect(IDENTITY_PRIVACY_POLICY).toMatch(/family/);
   // Review MEDIUM 4: the private-life rule is scoped to real-person personas, in one static string (policy bytes stay persona-independent).
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/reviewStatus is silver or human_reviewed/);
-  // : light fictional everyday small talk is allowed for real-person personas, concrete facts are not.
+  // Light fictional everyday small talk is allowed for real-person personas, concrete facts are not.
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/light everyday small talk/);
-  // : light fictional likes too, still without named brands, shops, people, places, dates or events.
+  // Light fictional likes too, still without named brands, shops, people, places, dates or events.
   expect(IDENTITY_PRIVACY_POLICY).toMatch(/never name brands, shops or people, specific places, dates or events/);
 });
 test('the guard never penalizes first-person voice about the background or a source-supported post',async()=>{
@@ -142,7 +142,7 @@ test('limitation notes and claim prefixes follow the session language; Korean se
   expect(fallback.limitations).toEqual(['INVALID_MODEL_EVIDENCE','UNVERIFIED_MODEL_RESPONSE',replyText('limitation_unverified_model','en'),replyText('limitation_semantic_unchecked','en')]);
 });
 
-test('guard v7 : a meta-talk sentence is removed in place; status and evidence stay, recorded as edited',async()=>{
+test('guard v7 removes a meta-talk sentence in place; status and evidence stay, recorded as edited',async()=>{
   const h=setup(messages=>{
     const evidence=messages.find(m=>m.content.startsWith('UNTRUSTED_EVIDENCE_JSON_DATA'))!.content;
     const sourceId=(JSON.parse(evidence.slice('UNTRUSTED_EVIDENCE_JSON_DATA '.length)) as {sourceId:string}[])[0]!.sourceId;

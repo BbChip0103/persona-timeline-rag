@@ -4,7 +4,7 @@ import { AGENT_MESSAGE_MAX_CODE_POINTS, AGENT_PROMPT_REVISION, AGENT_RESPONSE_JS
   type VoiceTextKey } from '../src';
 
 /**
- * Persona voice : no system or validation text in front of the user, no mid-sentence cut, replies and fixed
+ * Persona voice: no system or validation text in front of the user, no mid-sentence cut, replies and fixed
  * texts in the user's language, refusals in the persona's speech level, AI disclosure only when asked. Synthetic texts only.
  */
 const base:Persona={id:'voice-ko',personId:'voice-person-ko',label:'Synthetic',language:'ko',revision:'v1',reviewStatus:'silver',identity:'Unofficial research AI',concept:'Research',
@@ -261,7 +261,7 @@ describe('third iteration (gate e 2/80: background disowned on the origin questi
     expect(g(utterance,reply,true,language)).toEqual({reason:'background_denial',content:voiceText('service_retry',language,'casual')});
     expect(g(utterance,reply,false,language)?.reason).toBe(realOnly?undefined:'background_denial');
   });
-  test('disowning school remains a background denial outside the §14 bare list',()=>{
+  test('disowning school remains a background denial outside the bare list',()=>{
     expect(g('어디 출신이야?','저는 고향이나 학교가 없어요!',true,'ko')?.reason).toBe('background_denial');
     expect(g('어디 출신이야?','저는 고향이나 학교가 없어요!',false,'ko')).toBeUndefined();
   });
@@ -287,7 +287,7 @@ describe('re-review (M1, M2, L4-L7)',()=>{
     ['AI 툴 써?','AI 툴은 잘 안 써~ 요즘 바빠서 밥도 못 먹었어 ㅠ'],['요즘 뭐 해?','시뮬레이션 게임 하는데 하루 종일 쉴 틈이 없어'],
     ['요즘 어때?','경력 공백이 없어서 다행이야'],['요즘 어때?','과거 영상이 없어서 아쉬워~'],['How are you?','I don\'t have a job right now, taking a break~']])(
     'not a background denial: %s → %s',(utterance,reply)=>expect(g(utterance,reply)).toBeUndefined());
-  test('school homework stays outside the §14 bare list',()=>expect(g('요즘 어때?','학교 숙제가 없어서 너무 좋아!')).toBeUndefined());
+  test('school homework stays outside the bare list',()=>expect(g('요즘 어때?','학교 숙제가 없어서 너무 좋아!')).toBeUndefined());
   test('speech level: a negated polite cue is not polite',()=>expect(speechLevel({...politeKo,style:['No formal speech, always 반말.']})).toBe('casual'));
   test('a replyLanguage echoed into variableUpdates (unstructured mode) is dropped, not a format failure',async()=>{
     const run=await runCharacterAgent({provider:{generate:async()=>agentReply('좋아!',{variableUpdates:{tone:'warm',replyLanguage:'Korean'}})},persona:casualKo,history:[],text:'안녕',sources:[],signal:new AbortController().signal});

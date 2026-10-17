@@ -1,6 +1,5 @@
 # Independent agent-loop character agent
 
-
 ## Profiles
 
 - `legacy`: existing server-routed RAG → `answer/evidenceRefs` generation. Existing sessions without `executionProfile`, and direct core calls without an explicit profile, remain legacy. Historical baseline runners retain this profile explicitly; they are not the forward evaluation path.
@@ -39,6 +38,7 @@ No extra planner/rewrite call. A no-tool answer uses1 text call; a tool-requesti
 
 - Total prompt≤30,000 UTF8 bytes and64 messages, including state and action transcript. Over the byte budget, evidence parents are skipped first (whole, in relevance order); the message count does not depend on evidence, so over64 messages is always `CONTEXT_LIMIT`.
 - Message≤180 Unicode codepoints; optional summary≤160 UTF16 units; topic≤200; at most2 quotes≤96 UTF16 units. Existing provider output cap512 tokens is unchanged, and does not guarantee JSON completion.
+- Optional `AgentValidator` is server-injected and **disabled by default**. Its implementation must account for external calls in the same budget. Tool-followup responses skip it; otherwise accept/reject/error outcomes are recorded. Reject/error returns a safe final with unchanged variables and no rewrite or retry.
 - Exact quotes prove text binding, **not semantic entailment or truth**. No new factual-quality or cost-equivalence claim follows from fake tests.
 
 ## Verification and remaining differences
@@ -53,6 +53,7 @@ RUN_STORAGE_DB_TESTS=1 pnpm exec jest --runInBand packages/storage/test/agent-ru
 
 Synthetic regressions cover multi-search evidence retention, state restart, scope isolation, malformed/repeated actions, cancellation, idempotency, off zero retrieval, validator outcomes and HTTP redaction. They are control-flow tests, not a real-person chat-quality benchmark.
 
+Still not reproduced: streaming transport, native provider `tool_calls`, a distributed queue/dispatcher, or a full game/reward/plugin framework. This JSON-action protocol uses the independently implemented provider port. Control-flow verification does not establish answer quality or parity with any production system. Reports must identify their execution profile; historical legacy results cannot be relabeled as agent-loop results.
 
 ## Forward three-condition evaluation
 
@@ -77,10 +78,9 @@ rows. Actual private replies/accounting go under `reports/agent-reevaluation/`;
 previous evaluation pointers are not overwritten. Cached legacy replays are not
 newly billed and cannot be compared naively to uncached latency/cost.
 
-
 ## Current conversational/service contract
 
-The prompt is `character-agent-context-v5-persona-card`: the v3 bounded-roleplay wording in the S7 layout (agent
+The prompt is `character-agent-context-v5-persona-card`: the v3 bounded-roleplay wording in the cache-friendly prompt layout (stable prefix first; agent
 state/tools after the history, a safety note right before the user utterance; see docs/goal2-serving.md), plus the
 persona card (docs/persona-authoring.md). It adds one policy sentence: background, example dialogues and
 lore are author-set notes, never evidence, never citable (v5 also said "never real memories"; v7 replaces that with "you

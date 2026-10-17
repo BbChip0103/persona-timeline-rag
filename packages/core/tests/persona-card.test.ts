@@ -3,7 +3,7 @@ import type { LoreEntry, Persona } from '@ptr/contracts';
 import { CoreError, InMemoryConversationStore, InMemoryPersonaRepository, LORE_BYTE_LIMIT, createLocalChat, greetingIndexFor, greetingsOf, loreBytes, matchLore, renderLoreMessage } from '../src';
 import { cardPersona, v1Persona } from './persona-fixtures';
 
-/**  (lore matching) and §3.5 (greetings, per-language disclosure). Synthetic personas only. */
+/** Synthetic personas only; cover lore matching, greetings and per-language AI disclosure. */
 const lore=(id:string,keys:string[],patch:Partial<LoreEntry>={}):LoreEntry=>({id,keys,content:`${id} 설정`,priority:50,sourceRefs:['web:1'],...patch});
 const withLore=(entries:LoreEntry[]):Persona=>({...cardPersona,lore:entries});
 const ids=(result:ReturnType<typeof matchLore>)=>result.entries.map(entry=>entry.id);
@@ -51,7 +51,7 @@ describe('matchLore',()=>{
   });
 });
 
-describe('greetings and AI disclosure (§3.5)',()=>{
+describe('greetings and AI disclosure',()=>{
   test('greeting list and deterministic index from sha256(session id)',()=>{
     expect(greetingsOf(v1Persona)).toEqual([v1Persona.greeting]);
     expect(greetingsOf(cardPersona)).toEqual([cardPersona.greeting,...cardPersona.alternateGreetings!]);

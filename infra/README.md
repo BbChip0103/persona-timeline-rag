@@ -34,8 +34,9 @@ RUN_STORAGE_DB_TESTS=1 DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm exec jest 
 Migrations run only after URL and connected database/user identity checks. They
 do not seed real personas or posts. Integration tests insert only synthetic,
 randomly scoped fixtures and never reset/drop/truncate tables or other resources.
-Do not use compose prune, shared Supabase CLI reset, or commands against existing
-or storage tests. Provider budget tables are initialized by the provider ledger.
+Do not use compose prune or shared Supabase CLI reset. Run storage tests only
+against the dedicated synthetic load-test database. Provider budget tables are
+initialized by the provider ledger.
 
 Source imports accept only `licensed_source` or `synthetic_fixture`; generated
 conversation content has no source-origin option. Source and persona revisions
@@ -65,7 +66,7 @@ DATABASE_URL="$PTR_LOADTEST_DATABASE_URL" pnpm db:migrate
 
 `compose.redis.yml` runs `ptr_goal2_redis` (Redis 8.10.2, pinned by digest) on
 `127.0.0.1:56479` only, with `maxmemory-policy noeviction` (required by BullMQ) and AOF.
-Access is an ACL : one app user `ptr` whose password is `PTR_REDIS_PASSWORD`,
+Access uses an ACL: one app user `ptr` whose password is `PTR_REDIS_PASSWORD`,
 limited to the `ptr:*` / `ptrtest:*` keys and channels and to every command except the
 `@dangerous` ones (`KEYS`, `CONFIG`, `FLUSHALL`, `CLIENT LIST`, ...) plus `INFO`, which BullMQ
 reads. The `default` user is off and there is no admin user; use `SCAN`, not `KEYS`, and

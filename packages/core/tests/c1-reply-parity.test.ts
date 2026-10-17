@@ -65,11 +65,11 @@ const roundTwoLeaks=[
   ['결혼했어?','축하해~ 결혼은 작년에 했는데…'],
 ] as const;
 
-test.each(roundTwoLeaks)('§14 blocks private disclosure: %s / %s',(utterance,reply)=>{
+test.each(roundTwoLeaks)('blocks private disclosure: %s / %s',(utterance,reply)=>{
   expect(guard(utterance,reply)?.reason).toBe('private_life');
 });
 
-test('§14 empathy replacement rotates away from the previous assistant text',()=>{
+test('empathy replacement rotates away from the previous assistant text',()=>{
   const first=voiceText('empathy_ask','ko','casual');
   const next=guardReply({utterance:'나 결혼해',reply:'축하해 결혼했어 작년에',realPerson:true,language:'ko',level:'casual',previousAssistantText:first,seed:'turn-14'});
   expect(next?.content).toBe(voiceText('empathy_ask','ko','casual',first,'turn-14'));
@@ -124,9 +124,9 @@ describe('C1 private reply sentence trimming',()=>{
   test.each([
     ['나의 동생이 왔어','동생이 와서 좋았겠다.'],
     ['내 아내가 축하했어','아내가 기뻐했겠다.'],
-  ])('preserves a reply outside the §14 bare list: %s / %s',(utterance,reply)=>
+  ])('preserves a reply outside the bare list: %s / %s',(utterance,reply)=>
     expect(guard(utterance,reply,/[A-Za-z]/.test(utterance)?'en':'ko')).toBeUndefined());
-  test('§16 allows I hope in an empathy clause',()=>
+  test('allows I hope in an empathy clause',()=>
     expect(guard('my mom is ill','I hope your mom feels better','en')).toBeUndefined());
   test.each([
     ['그림 좋네?', '응, 작년에 결혼했어~'],

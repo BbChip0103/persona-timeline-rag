@@ -27,12 +27,7 @@
   "creative_baseline": {
     "retrieval_mode": "off",
     "post_briefs_per_person": 3,
-    "image_briefs_per_person": 1,
-    "image_provider": "external-image",
-    "model": "GPT Image 2",
-    "quality": "medium",
-    "resolution": "1K",
-    "aspectRatio": "4:5",
-    "generateCount": 1
+    "image_briefs_per_person": 0,
+    "image_provider": "disabled"
   }
 }

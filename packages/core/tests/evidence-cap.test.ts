@@ -1,7 +1,7 @@
 import type { ChatMessage, Persona, ProviderMessage, SourcePost } from '@ptr/contracts';
 import { InMemoryConversationStore, InMemoryPersonaRepository, buildExperimentContext, createLocalChat, runCharacterAgent, EVIDENCE_POST_LIMIT, EXPERIMENT_PROMPT_BYTE_LIMIT } from '../src';
 
-//  (user decision, scope and fitting decided later): at most three posts in the character prompts (experiment and
+// At most three posts fit in the character prompts (experiment and
 // agent); whole posts in relevance order, a post that does not fit the byte budget is skipped (captions are never
 // sliced); CONTEXT_LIMIT only when the prompt does not fit even with no evidence. Retrieval and the goal1 legacy path keep
 // their limit. Synthetic fixtures only.

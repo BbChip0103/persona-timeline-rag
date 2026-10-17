@@ -1,4 +1,4 @@
-# : the image holds code and dependencies only. Private configuration, licensed research data, reports
+# The image holds code and dependencies only. Private configuration, licensed research data, reports
 # and author material are bind-mounted or stay on the host (packages/ops/test/packaging.test.ts checks this list).
 .env*
 **/.env*

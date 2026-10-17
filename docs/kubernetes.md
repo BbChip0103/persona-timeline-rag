@@ -21,8 +21,7 @@ limits the permitted paths.
 
 ## Why no LLM gateway
 
- (`private design notes` repo `<private-design-notes>` §1, §4 L4, §6.4)
-removes the LLM gateway from the active Kubernetes architecture. The worker
+The active Kubernetes deployment has no LLM gateway. The worker
 calls local vLLM through the EPP/InferencePool path, and the EPP owns
 routing/admission for local serving. Paid spillover is a worker-only direct
 OpenRouter call, guarded by the durable provider ledger and, by default, the provider key's
@@ -281,7 +280,7 @@ Open risk (stalled-but-healthy engine; `R4` in the acceptance record): an engine
 stalled during generation while still reporting healthy was not tested; EPP was observed routing to a fast-failing pod. Add a short generation
 liveness probe and repeat V8 with request-level evidence. V2: the worker drain
 defect was fixed, but the deleted worker pod was not proven to own the sampled
-in-flight jobs. Kind is one host with fake GPUs. Design §7's real-GPU-only
+in-flight jobs. Kind is one host with fake GPUs. Real-GPU-only
 checks remain open: vLLM/EPP metrics, model load and weight caching, SIGTERM
 streams, KEDA deadline fit, prefix scoring benefit, GPU Operator labels and
 pool separation, EPP versus callback TTFT/throughput, and minimum replica cost.

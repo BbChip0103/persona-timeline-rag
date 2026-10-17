@@ -1,5 +1,5 @@
 /**
- * Persona authoring CLI . JSON in, fail-closed checks, then an explicit publish.
+ * Persona authoring CLI. JSON in, fail-closed checks, then an explicit publish.
  *
  *   validate <file>                                    publish-time checks only; no database, nothing written
  *   publish  <file> --target research_db|loadtest_db   dry run (prints the target database); writes nothing

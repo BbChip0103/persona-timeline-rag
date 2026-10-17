@@ -46,7 +46,7 @@ export function prepare(raw:RawPost[],targets:Target[]):{sources:SourcePost[];pe
   return {sources,personas,split};
 }
 /**
- *  ①: personIds with an authored persona (scripts/persona.ts publish) keep their authored current revision,
+ * Person IDs with an authored persona (scripts/persona.ts publish) keep their authored current revision,
  * so their generated persona is still written to personas.json but not imported into the database.
  */
 export function importablePersonas(personas:Persona[],authored:Persona[]):{importable:Persona[];skipped:string[]} {
@@ -54,7 +54,7 @@ export function importablePersonas(personas:Persona[],authored:Persona[]):{impor
   return {importable:personas.filter(persona=>!owned.has(persona.personId)),skipped:personas.filter(persona=>owned.has(persona.personId)).map(persona=>persona.personId)};
 }
 /**
- * The authored list ( ①), fail-closed: PTR_AUTHORED_PERSONAS_FILE set but missing throws; the default
+ * The authored list is fail-closed: PTR_AUTHORED_PERSONAS_FILE set but missing throws; the default
  * (`data/research/personas.authored.json`, next to this script's other private files) may be missing, with a warning.
  * Accepts the CLI's `{database, personas}` list (its database must be DATABASE_URL's) or a plain array.
  */

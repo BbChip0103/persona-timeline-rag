@@ -44,7 +44,7 @@ services:
     command: [node, --import, tsx, apps/api/src/packaged-main.ts]
     volumes: *data
     healthcheck:
-      # D23: 200 only when the database answers SELECT 1 and Redis PING.
+      # The health endpoint returns 200 only when the database answers SELECT 1 and Redis PING.
       test: [CMD, node, -e, "fetch('http://127.0.0.1:56441/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
       timeout: 5s

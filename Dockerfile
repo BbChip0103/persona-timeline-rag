@@ -12,7 +12,6 @@ COPY --chmod=0755 apps/api/package.json apps/api/
 COPY --chmod=0755 apps/web/package.json apps/web/
 COPY --chmod=0755 packages/contracts/package.json packages/contracts/
 COPY --chmod=0755 packages/core/package.json packages/core/
-COPY --chmod=0755 packages/images/package.json packages/images/
 COPY --chmod=0755 packages/messaging/package.json packages/messaging/
 COPY --chmod=0755 packages/ops/package.json packages/ops/
 COPY --chmod=0755 packages/providers/package.json packages/providers/

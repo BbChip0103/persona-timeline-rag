@@ -23,7 +23,7 @@ const search = z.object({
 }).strict();
 /**
  * Hard cap of the user-visible message (code points). The prompt still asks for about 180 characters; the cap was 180
- * until , and engine-side guided decoding closed the string exactly there, mid-sentence ("…as my's"). The cap
+ * code points; engine-side guided decoding closed the string exactly there, mid-sentence ("…as my's"). The cap
  * is now headroom, and the agent trims a message that still reaches it to its last complete sentence.
  */
 export const AGENT_MESSAGE_MAX_CODE_POINTS=400;

@@ -29,7 +29,7 @@ describe('checkRendered',()=>{
     const rendered=`${turn('system','POLICY\n\nSTATE')}${turn('model','hello')}${turn('user','q1')}${turn('model','a1')}${turn('user','LORE')}${turn('user','EVIDENCE')}${turn('user','q2')}`;
     expect(checkRendered(messages,rendered,MARKERS).missing).toEqual([4]);
   });
-  test('the placement helpers find the S7/P4 positions',()=>{
+  test('the placement helpers find the prompt-layout positions',()=>{
     expect(systemAfterAssistant(messages)).toEqual([4]);
     expect(consecutiveUsers(messages)).toEqual([6,7]);
     expect(systemAfterAssistant([{role:'system',content:'a'},{role:'user',content:'b'}])).toEqual([]);

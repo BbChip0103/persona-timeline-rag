@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-//  (O5 acceptance 4): the image never carries private configuration, research data or reports.
+// The image never carries private configuration, research data or reports.
 const ROOT=join(__dirname,'..','..','..');
 
 test('.dockerignore keeps secrets, private data and local build state out of the image',()=>{

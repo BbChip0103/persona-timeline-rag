@@ -2,7 +2,6 @@
 
 > 현재 Python split 런타임의 로컬 주간 검수 절차입니다. 중앙 Langfuse 검수 복사본은 별도 명시 승인·설정 경로이며 기본적으로 비활성화되어 있습니다. 런타임 구조는 [framework runtime](framework-runtime.md), 실험 검수 범위는 [framework evaluation](framework-evaluation.md)을 참조하세요.
 
-
 가드와 프롬프트 정책을 검증하는 동안, 실제 대화 품질은 사람이 표본을 직접 읽어 판정합니다. 판정은 사람만 합니다. LLM 자동 판정으로 대신하지 않습니다.
 
 ## 에이전트 열람 금지
@@ -69,13 +68,11 @@ S8는 **선택 사항인 기존 로컬 결과 입력**입니다. 함께 검토�
 
 ## 반영
 
-- 사용자가 기준별 위반 수와 마스킹 id를 `private design notes` 레포의 비공개 설계 노트 결정 이력에 기록합니다. 원문은 옮기지 않습니다.
 - 중대 이상은 다음 프롬프트 정책 개정과 S8 재측정 후보로 올립니다.
 - 가드 정책 변경은 별도 검토합니다. 기존 동결 정책의 예외는 시트 1장에서 같은 유형 치명 위반이 2건 이상이거나 실존 인물 사생활 노출이 1건 있을 때뿐이며, 이때도 비공개 설계 노트에 먼저 기록한 뒤 고칩니다.
 
 ## 출처
 
-- 설계: `private design notes` 레포 `<private-design-notes>` §8, 결정 D26~D29
 - 스크립트와 시험: `scripts/review-sample.ts`, `scripts/review-sample.test.ts`
 - 턴·세션 및 역할 분리 스키마: `supabase/split/0001_owner_partition.sql`과 `supabase/migrations/0001_goal1.sql`. 응답 필드: `packages/contracts/src/index.ts`(`ChatReply`)
 - S8 행 형식: `scripts/s8-gates.ts`(`probe`)

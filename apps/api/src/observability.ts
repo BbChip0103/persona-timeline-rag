@@ -5,12 +5,12 @@ import {createLog} from '../../../packages/ops/src/log';
 import {bounded} from '../../../packages/ops/src/bounded';
 
 /**
- * Metrics and JSON log events of the api and worker roles . Labels are fixed enums or
+ * Metrics and JSON log events of the api and worker roles. Labels are fixed enums or
  * constant-like codes; turn ids appear in log lines only (never as labels), user and model text never.
  */
 const CODE=/^[A-Za-z0-9_]{1,40}$/;
 const code=(value:string|undefined)=>value!==undefined&&CODE.test(value)?value:'UNSPECIFIED';
-/** Model upstream kinds as recorded in reply.serving (D21). `litellm` remains only to read older stored replies safely. */
+/** Model upstream kinds as recorded in reply.serving. `litellm` remains only to read older stored replies safely. */
 const UPSTREAM_KINDS=new Set(['primary','secondary','local','local-pool','fake','openrouter','openrouter-primary','direct','litellm']);
 const GUARD_ACTIONS=new Set(['none','replaced','edited']);
 const GUARD_REASONS=new Set(['human_impersonation','missing_ai_disclosure','private_life','background_denial','meta_talk']);

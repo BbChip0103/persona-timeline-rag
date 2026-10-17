@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { LogFields } from './log';
 
 export const PROM_CONTENT_TYPE='text/plain; version=0.0.4; charset=utf-8';
-/** Default listener ports of the roles without their own HTTP server . */
+/** Default listener ports of the roles without their own HTTP server. */
 export const WORKER_METRICS_PORT=56442;
 
 /** PTR_METRICS_PORT (per-process listener override): the role default when unset, 0 = no listener, otherwise 1024–65535. */
@@ -27,7 +27,7 @@ export async function startMetricsListener(options:{port:number;render:()=>strin
   if(options.port===0) {options.onEvent('metrics_listener_disabled');return undefined;}
   const server:Server=createServer((req,res)=>{
     const path=(req.url??'').split('?')[0];
-    // `/healthz`: liveness for Compose healthchecks .
+    // `/healthz`: liveness for Compose healthchecks.
     void (path==='/metrics/prom'?servePrometheus(req.method,options.render)
       :path==='/healthz'&&req.method==='GET'?Promise.resolve({status:200,headers:{'Content-Type':'application/json'},body:'{"ok":true}'})
       :Promise.resolve({status:404,headers:{'Content-Type':'application/json'},body:'{"error":{"code":"NOT_FOUND"}}'}))
